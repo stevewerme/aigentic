@@ -165,9 +165,13 @@ additive.
    first. They never appear in the body and are never in a summary range.
 2. **Summary compactions** replace their range with one user-role message
    from `Author::System` whose text is the summary, prefixed by a fixed
-   marker line so the model knows what it is. A later summary that covers
-   an earlier one replaces it too (ranges nest by construction: each new
-   summary starts at seq 0 or at the previous summary's `to_seq + 1`).
+   marker line so the model knows what it is. Every summary starts at seq
+   0 and takes the previous summary's text as part of its input, so a
+   later summary always nests over an earlier one and the projection holds
+   exactly one summary message. (Chaining summaries from the previous
+   `to_seq + 1` was tried first: each compaction then reclaimed one turn
+   while the summaries themselves accumulated, and the 200-turn test
+   crossed the line.)
 3. **Truncation compactions** shorten every tool result in their range
    using the same head-and-tail rule the tools crate uses for display,
    with the payload's `max_bytes`.
@@ -204,11 +208,12 @@ compactable range is longer than `max_result_bytes`, append one
 turn outside the keep window. Re-measure with `count_tokens`. Most full
 contexts end here.
 
-**Rule 2, summarise.** If still over the line, pick the range: from the
-first event not already inside a summary, through the `turn_ended` that
-leaves exactly `keep_turns` complete turns after it. If fewer than
-`keep_turns + 1` turns exist, do nothing and let the budget stop the turn;
-summarising the turn in progress would break the tool-call contract. Call
+**Rule 2, summarise.** If still over the line, pick the range: from seq 0
+through the `turn_ended` that leaves exactly `keep_turns` complete turns
+after it. If fewer than `keep_turns + 1` turns exist, or that boundary has
+not moved since the last summary, do nothing and let the budget stop the
+turn; summarising the turn in progress would break the tool-call contract,
+and summarising the same range twice would only spend tokens. Call
 the same provider with the fixed summary prompt (section 5), no tools,
 `summary_max_output_tokens`. Append `compacted{Summary}` with the text,
 model and usage. The summary's own usage counts toward `/cost` under its

@@ -13,6 +13,7 @@ pub use aigentic_log;
 pub use aigentic_providers;
 pub use aigentic_tools;
 
+mod compaction;
 mod context;
 mod error;
 mod instructions;
@@ -22,8 +23,11 @@ pub mod seams;
 mod support;
 mod turn;
 
+pub use compaction::SUMMARY_PROMPT;
 pub use context::build_context;
 pub use error::RuntimeError;
 pub use instructions::load_instructions;
 pub use resume::{INTERRUPTED_RESULT, Resumed};
-pub use runtime::{DEFAULT_BUDGET, Runtime, Signal, TurnOutcome};
+pub use runtime::{
+    CompactionSettings, DEFAULT_BUDGET, DEFAULT_COMPACTION, Runtime, Signal, TurnOutcome,
+};

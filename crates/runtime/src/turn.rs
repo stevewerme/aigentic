@@ -58,8 +58,16 @@ impl Runtime {
             if let Some(reason) = self.budget_reason(&spent) {
                 return self.end_turn(reason, &spent, observe);
             }
+            // Compaction, at an iteration boundary only: every tool call
+            // already has its result, so no summary range splits a turn.
+            if let Err(e) = self.compact(observe).await {
+                if let RuntimeError::Provider(p) = &e {
+                    self.end_turn(&format!("provider_error: {p}"), &spent, observe)?;
+                }
+                return Err(e);
+            }
             let events = self.log.read_all()?;
-            let context = self.compact(build_context(self.instructions.as_deref(), &events)?);
+            let context = build_context(self.instructions.as_deref(), &events)?;
             let request = CompletionRequest {
                 messages: &context,
                 tools: &specs,
@@ -92,6 +100,12 @@ impl Runtime {
             flush_text(&mut text, &mut blocks);
             spent.iterations += 1;
             let agent = Author::Agent(self.agent.clone());
+            self.measured = usage.map(|u| {
+                (
+                    u.input_tokens + u.cache_read_tokens + u.cache_write_tokens,
+                    context.len(),
+                )
+            });
             let usage = usage.unwrap_or_else(|| self.estimate_usage(&context, &agent, &blocks));
             spent.tokens += usage.total();
             if let Some(e) = error {

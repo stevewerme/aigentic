@@ -10,6 +10,26 @@ pub const DEFAULT_BUDGET: Budget = Budget {
     max_wall_time: Duration::from_secs(600),
 };
 
+/// When and how the runtime compacts. See docs/PLAN-phase2.md section 4.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CompactionSettings {
+    /// Fraction of `Capabilities::max_context_tokens` that triggers compaction.
+    pub trigger_fraction: f32,
+    /// Complete turns kept verbatim after a summary.
+    pub keep_turns: usize,
+    /// Tool results longer than this are truncated first.
+    pub max_result_bytes: usize,
+    /// Output cap for the summarisation call.
+    pub summary_max_output_tokens: u64,
+}
+
+pub const DEFAULT_COMPACTION: CompactionSettings = CompactionSettings {
+    trigger_fraction: 0.7,
+    keep_turns: 8,
+    max_result_bytes: 4096,
+    summary_max_output_tokens: 2048,
+};
+
 /// One thread's runtime: the provider, the tool registry and the single
 /// writer for that thread's log.
 pub struct Runtime {
@@ -19,6 +39,12 @@ pub struct Runtime {
     pub(crate) agent: AgentId,
     pub(crate) budget: Budget,
     pub(crate) instructions: Option<String>,
+    pub(crate) compaction: CompactionSettings,
+    /// Label recorded on summaries; the provider trait has no name.
+    pub(crate) model_label: String,
+    /// The last call's reported prompt size and the context length it was
+    /// measured at, so window fill is exact plus the estimated growth.
+    pub(crate) measured: Option<(u64, usize)>,
 }
 
 impl Runtime {
@@ -35,7 +61,25 @@ impl Runtime {
             agent,
             budget: DEFAULT_BUDGET,
             instructions: None,
+            compaction: DEFAULT_COMPACTION,
+            model_label: "unknown".into(),
+            measured: None,
         }
+    }
+
+    pub fn with_compaction(mut self, settings: CompactionSettings) -> Self {
+        self.compaction = settings;
+        self
+    }
+
+    /// Recorded on summary compactions so they are auditable.
+    pub fn with_model_label(mut self, label: impl Into<String>) -> Self {
+        self.model_label = label.into();
+        self
+    }
+
+    pub fn compaction(&self) -> &CompactionSettings {
+        &self.compaction
     }
 
     pub fn with_budget(mut self, budget: Budget) -> Self {

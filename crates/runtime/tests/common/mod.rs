@@ -61,7 +61,7 @@ impl Provider for ScriptedProvider {
 }
 
 /// Echoes its `msg` argument and records every call.
-pub struct EchoTool(Arc<Mutex<Vec<serde_json::Value>>>);
+pub struct EchoTool(pub Arc<Mutex<Vec<serde_json::Value>>>);
 
 impl Tool for EchoTool {
     fn name(&self) -> &str {

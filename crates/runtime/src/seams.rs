@@ -1,11 +1,11 @@
-//! Named seams. Each currently passes through; later phases fill them in
-//! without touching the loop.
+//! Named seams. Each passes through until its phase fills it in without
+//! touching the loop.
 //!
 //! - [`Runtime::policy_check`]: phase 3, per-user per-project permissions.
 //! - [`Runtime::turn_queue_next`]: phase 5, queued messages and interrupts.
-//! - [`Runtime::compact`]: phase 2, truncation and summary compaction.
+//! - `Runtime::compact`: filled in by phase 2; see `compaction.rs`.
 
-use aigentic_core::{Author, ContentBlock, Message, ToolCall};
+use aigentic_core::{Author, ContentBlock, ToolCall};
 
 use crate::Runtime;
 
@@ -28,10 +28,5 @@ impl Runtime {
     /// queue, so there is never one.
     pub fn turn_queue_next(&mut self) -> Option<(Author, Vec<ContentBlock>)> {
         None
-    }
-
-    /// Compaction seam. Phase 0 returns the context unchanged.
-    pub fn compact(&self, context: Vec<Message>) -> Vec<Message> {
-        context
     }
 }
