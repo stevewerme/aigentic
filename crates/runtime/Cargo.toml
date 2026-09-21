@@ -1,0 +1,9 @@
+[package]
+name = "aigentic-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Aigentic runtime crate (not yet implemented)"
+
+[dependencies]

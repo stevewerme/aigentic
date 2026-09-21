@@ -1,0 +1,9 @@
+[package]
+name = "aigentic-tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Aigentic tools crate (not yet implemented)"
+
+[dependencies]

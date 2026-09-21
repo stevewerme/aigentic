@@ -1,0 +1,37 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/core",
+    "crates/log",
+    "crates/providers",
+    "crates/tools",
+    "crates/runtime",
+    "crates/tui",
+    "crates/skills",
+    "crates/policy",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/steve-werme/aigentic"
+
+[workspace.dependencies]
+aigentic-core = { path = "crates/core" }
+aigentic-log = { path = "crates/log" }
+aigentic-providers = { path = "crates/providers" }
+aigentic-tools = { path = "crates/tools" }
+aigentic-runtime = { path = "crates/runtime" }
+aigentic-skills = { path = "crates/skills" }
+aigentic-policy = { path = "crates/policy" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 0.8 is pinned deliberately: the `Tool::schema` signature returns
+# `schemars::schema::RootSchema`, which schemars 1.x removed.
+schemars = "0.8"
+ulid = { version = "3", features = ["serde"] }
+time = { version = "0.3", features = ["serde-well-known", "macros"] }
+thiserror = "2"
+futures-core = "0.3"

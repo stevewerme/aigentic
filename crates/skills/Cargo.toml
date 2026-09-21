@@ -1,0 +1,9 @@
+[package]
+name = "aigentic-skills"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Aigentic skills crate (not yet implemented)"
+
+[dependencies]
