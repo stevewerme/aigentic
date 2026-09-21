@@ -6,7 +6,11 @@ use aigentic_policy::Policy;
 use aigentic_skills::SkillSet;
 use aigentic_tools::ToolRegistry;
 
+use aigentic_core::{ContentBlock, Message, Role};
+use aigentic_tools::{KnowledgeSnapshot, SEARCH_KNOWLEDGE, SearchKnowledgeTool};
+
 use crate::approver::{Approver, DenyAll};
+use crate::knowledge::{Knowledge, KnowledgeMode};
 use crate::layers::Layers;
 use crate::seams::SessionGrant;
 
@@ -53,6 +57,9 @@ pub struct Runtime {
     pub(crate) agent: AgentId,
     pub(crate) budget: Budget,
     pub(crate) layers: Layers,
+    pub(crate) knowledge: Knowledge,
+    pub(crate) knowledge_mode: KnowledgeMode,
+    pub(crate) knowledge_snapshot: KnowledgeSnapshot,
     pub(crate) compaction: CompactionSettings,
     /// Label recorded on summaries; the provider trait has no name.
     pub(crate) model_label: String,
@@ -81,6 +88,9 @@ impl Runtime {
             agent,
             budget: DEFAULT_BUDGET,
             layers: Layers::default(),
+            knowledge: Knowledge::default(),
+            knowledge_mode: KnowledgeMode::Inline,
+            knowledge_snapshot: KnowledgeSnapshot::default(),
             compaction: DEFAULT_COMPACTION,
             model_label: "unknown".into(),
             measured: None,
@@ -160,7 +170,72 @@ impl Runtime {
     pub fn with_layers(mut self, layers: Layers) -> Self {
         self.layers = layers;
         self.measured = None;
+        // Knowledge cannot fail the constructor; an unreadable folder is
+        // reported on the first turn by `refresh_knowledge`.
+        let _ = self.reload_knowledge();
         self
+    }
+
+    /// Read the knowledge folder, count it with the provider, decide the
+    /// mode, and register or remove `search_knowledge` accordingly.
+    pub fn reload_knowledge(&mut self) -> Result<(), crate::ProjectError> {
+        let Some(project) = self.layers.project.as_ref() else {
+            return Ok(());
+        };
+        let dir = project.knowledge_dir();
+        let provider = &*self.provider;
+        let count = |text: &str| {
+            provider.count_tokens(&[Message {
+                role: Role::System,
+                author: aigentic_core::Author::System,
+                blocks: vec![ContentBlock::Text(text.to_owned())],
+            }])
+        };
+        let knowledge = Knowledge::load(&dir, &count)?;
+        let window = provider.capabilities().max_context_tokens;
+        let threshold = project.file.knowledge.threshold_fraction;
+        let max_hits = project.file.knowledge.max_hits;
+        let mode = knowledge.mode(window, threshold);
+        *self
+            .knowledge_snapshot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = knowledge.sections();
+        match mode {
+            KnowledgeMode::Index if self.registry.get(SEARCH_KNOWLEDGE).is_none() => {
+                let tool = SearchKnowledgeTool::new(self.knowledge_snapshot.clone(), max_hits);
+                let _ = self.registry.register(Box::new(tool));
+            }
+            KnowledgeMode::Inline => {
+                self.registry.remove(SEARCH_KNOWLEDGE);
+            }
+            KnowledgeMode::Index => {}
+        }
+        self.knowledge = knowledge;
+        self.knowledge_mode = mode;
+        self.measured = None;
+        Ok(())
+    }
+
+    /// Reload when the folder changed on disk. Called at the start of a
+    /// turn, never mid-turn.
+    pub(crate) fn refresh_knowledge(&mut self) -> Result<(), crate::ProjectError> {
+        let changed = self
+            .layers
+            .project
+            .as_ref()
+            .is_some_and(|p| self.knowledge.changed(&p.knowledge_dir()));
+        if changed {
+            self.reload_knowledge()?;
+        }
+        Ok(())
+    }
+
+    pub fn knowledge(&self) -> &Knowledge {
+        &self.knowledge
+    }
+
+    pub fn knowledge_mode(&self) -> KnowledgeMode {
+        self.knowledge_mode
     }
 
     pub fn layers(&self) -> &Layers {
@@ -176,7 +251,7 @@ impl Runtime {
         crate::Prefix {
             global: self.layers.global.instructions.as_deref(),
             project: self.layers.project_instructions(),
-            knowledge: None,
+            knowledge: self.knowledge.prefix(self.knowledge_mode),
             memory: self.layers.memory_prefix(),
             skills: self.skills_prefix(),
         }

@@ -82,6 +82,7 @@ dependencies = [
  "tokio",
  "toml",
  "ulid",
+ "walkdir",
 ]
 
 [[package]]

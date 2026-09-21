@@ -119,6 +119,13 @@ impl ToolRegistry {
         Ok(())
     }
 
+    /// Remove a tool by name; whether one was there.
+    pub fn remove(&mut self, name: &str) -> bool {
+        let before = self.tools.len();
+        self.tools.retain(|t| t.name() != name);
+        self.tools.len() != before
+    }
+
     /// Every tool as the model sees it, sorted by name so the request is
     /// byte-stable between turns.
     pub fn specs(&self) -> Vec<ToolSpec> {

@@ -11,4 +11,6 @@ pub enum RuntimeError {
     Provider(#[from] ProviderError),
     #[error("skill `{0}` is not enabled")]
     UnknownSkill(String),
+    #[error(transparent)]
+    Project(#[from] crate::ProjectError),
 }

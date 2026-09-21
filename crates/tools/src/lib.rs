@@ -10,6 +10,7 @@
 mod bash;
 mod files;
 mod fs;
+pub mod knowledge;
 pub mod mcp;
 mod registry;
 mod truncate;
@@ -18,6 +19,9 @@ mod workdir;
 pub use bash::BashTool;
 pub use files::{ReadFileTool, WriteFileTool};
 pub use fs::{DEFAULT_GREP_MATCHES, EditFileTool, GrepTool, ListDirTool};
+pub use knowledge::{
+    KnowledgeSnapshot, SEARCH_KNOWLEDGE, SearchKnowledgeTool, Section, search, split_sections,
+};
 pub use mcp::{McpError, McpServer, McpServerConfig, McpTool, McpTransport};
 pub use registry::{RegistryError, ToolRegistry};
 pub use truncate::{DEFAULT_OUTPUT_CAP, truncate_output};

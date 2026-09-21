@@ -64,6 +64,7 @@ impl Runtime {
             iterations: 0,
             tokens: 0,
         };
+        self.refresh_knowledge()?;
         let specs: Vec<ToolSpec> = self.tool_specs();
 
         loop {
