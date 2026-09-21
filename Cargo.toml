@@ -36,4 +36,5 @@ time = { version = "0.3", features = ["serde-well-known", "macros"] }
 thiserror = "2"
 futures-core = "0.3"
 tempfile = "3"
+nix = { version = "0.31", features = ["signal"] }
 tokio = { version = "1", features = ["rt", "process", "fs", "io-util", "time", "macros"] }
