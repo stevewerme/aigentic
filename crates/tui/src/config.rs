@@ -1,11 +1,12 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use aigentic_runtime::aigentic_core::Budget;
 use aigentic_runtime::aigentic_core::Provider;
 use aigentic_runtime::aigentic_providers::{
     Anthropic, AnthropicConfig, OpenAiCompat, OpenAiCompatConfig, Thinking,
 };
-use aigentic_runtime::{CompactionSettings, DEFAULT_COMPACTION};
+use aigentic_runtime::{CompactionSettings, DEFAULT_BUDGET, DEFAULT_COMPACTION};
 use anyhow::{Context, anyhow, bail};
 use serde::Deserialize;
 
@@ -48,6 +49,33 @@ pub struct Profile {
     /// When and how to compact; every field optional.
     #[serde(default)]
     pub compaction: Option<CompactionConfig>,
+    /// Per-turn budget; every field optional.
+    #[serde(default)]
+    pub budget: Option<BudgetConfig>,
+}
+
+/// `[profiles.<name>.budget]`. Missing fields take the runtime defaults.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetConfig {
+    #[serde(default)]
+    pub max_iterations: Option<u32>,
+    #[serde(default)]
+    pub max_tokens: Option<u64>,
+    #[serde(default)]
+    pub max_wall_time_secs: Option<u64>,
+}
+
+impl BudgetConfig {
+    pub fn budget(&self) -> Budget {
+        Budget {
+            max_iterations: self.max_iterations.unwrap_or(DEFAULT_BUDGET.max_iterations),
+            max_tokens: self.max_tokens.unwrap_or(DEFAULT_BUDGET.max_tokens),
+            max_wall_time: self
+                .max_wall_time_secs
+                .map_or(DEFAULT_BUDGET.max_wall_time, std::time::Duration::from_secs),
+        }
+    }
 }
 
 /// `[profiles.<name>.compaction]`. Missing fields take the runtime defaults.
@@ -177,6 +205,7 @@ impl Config {
                     max_output_tokens: None,
                     cache: None,
                     compaction: None,
+                    budget: None,
                 };
                 (
                     BTreeMap::from([("default".to_owned(), profile)]),
@@ -283,6 +312,12 @@ impl Profile {
         self.compaction
             .as_ref()
             .map_or(DEFAULT_COMPACTION, CompactionConfig::settings)
+    }
+
+    pub fn budget(&self) -> Budget {
+        self.budget
+            .as_ref()
+            .map_or(DEFAULT_BUDGET, BudgetConfig::budget)
     }
 
     /// Where requests go, for the banner. Never includes the key.
@@ -431,6 +466,14 @@ keep_turns = 3
         );
         assert!(Config::parse("[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n[profiles.a.compaction]\ntrigger_fraction = 2.0\n").is_err());
         assert!(Config::parse("[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n[profiles.a.compaction]\nnope = 1\n").is_err());
+        assert!(Config::parse("[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n[profiles.a.budget]\nnope = 1\n").is_err());
+        let c = Config::parse("[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n[profiles.a.budget]\nmax_tokens = 5\n").unwrap();
+        let b = c.profiles["a"].budget();
+        assert_eq!(
+            (b.max_iterations, b.max_tokens),
+            (DEFAULT_BUDGET.max_iterations, 5)
+        );
+        assert_eq!(b.max_wall_time, DEFAULT_BUDGET.max_wall_time);
     }
 
     #[test]

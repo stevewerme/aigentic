@@ -9,11 +9,14 @@ use aigentic_tools::ToolRegistry;
 use crate::approver::{Approver, DenyAll};
 use crate::seams::SessionGrant;
 
-/// Conservative per-turn defaults; projects raise them in phase 4.
+/// Per-turn defaults. `max_tokens` counts every call's input and output
+/// over the turn, so a growing context spends it fast: the phase 3
+/// acceptance used 225k over eleven iterations on one small ticket.
+/// `[profiles.<name>.budget]` in the config overrides any field.
 pub const DEFAULT_BUDGET: Budget = Budget {
-    max_iterations: 20,
-    max_tokens: 200_000,
-    max_wall_time: Duration::from_secs(600),
+    max_iterations: 50,
+    max_tokens: 2_000_000,
+    max_wall_time: Duration::from_secs(1800),
 };
 
 /// When and how the runtime compacts. See docs/PLAN-phase2.md section 4.

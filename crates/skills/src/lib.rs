@@ -126,9 +126,11 @@ impl SkillSet {
             out.push('\n');
         }
         if !model.is_empty() {
-            out.push_str(
-                "Available through the `load_skill` tool when the description fits the task:\n",
-            );
+            out.push_str(concat!(
+                "Available through the `load_skill` tool when the description fits the task. ",
+                "When a loaded skill's instructions refer to `/<name>` and that name is in this ",
+                "list, call `load_skill` with it before continuing:\n"
+            ));
             for m in model {
                 out.push_str(&format!("- {}\n", m.description_line()));
             }

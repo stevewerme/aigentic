@@ -108,7 +108,7 @@ async fn the_prefix_lists_skills_after_pins_and_offers_load_skill() {
         "# Skills\n\n\
          Run by the user as slash commands; do not load them yourself:\n\
          - implement: The implement skill.\n\n\
-         Available through the `load_skill` tool when the description fits the task:\n\
+         Available through the `load_skill` tool when the description fits the task. When a loaded skill's instructions refer to `/<name>` and that name is in this list, call `load_skill` with it before continuing:\n\
          - tdd: The tdd skill."
     );
     assert_eq!(texts(&ctx[3]), "hi");

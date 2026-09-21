@@ -170,6 +170,23 @@ fn lock_round_trips_through_toml() {
 }
 
 #[test]
+fn len_counts_entries_not_companion_files() {
+    let empty = Lockfile::default();
+    assert!(empty.is_empty());
+    assert_eq!(empty.len(), 0);
+
+    // `scripted` has two companion files; only its entry counts.
+    let lock = lock_for(&["plain", "scripted"]);
+    assert_eq!(lock.len(), 2);
+    assert!(!lock.is_empty());
+
+    // Upsert replaces by name, so re-adding does not grow the lock.
+    let mut merged = lock.clone();
+    merged.upsert(lock.get("scripted").unwrap().clone());
+    assert_eq!(merged.len(), 2);
+}
+
+#[test]
 fn hash_verification_passes_on_the_fixture_set_and_fails_on_one_byte() {
     let lock = lock_for(&["scripted"]);
     let set = SkillSet::load(&["scripted".into()], &roots(), &lock, &no_tools()).unwrap();
@@ -293,7 +310,7 @@ fn descriptions_are_sorted_grouped_and_stable() {
         "# Skills\n\n\
          Run by the user as slash commands; do not load them yourself:\n\
          - slash: The user's version of slash.\n\n\
-         Available through the `load_skill` tool when the description fits the task:\n\
+         Available through the `load_skill` tool when the description fits the task. When a loaded skill's instructions refer to `/<name>` and that name is in this list, call `load_skill` with it before continuing:\n\
          - plain: The project's own version of plain.\n\
          - url: Links out."
     );

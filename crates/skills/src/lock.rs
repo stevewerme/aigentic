@@ -206,6 +206,15 @@ impl Lockfile {
         })
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.skills.is_empty()
+    }
+
+    /// Number of entries, one per skill; companion files do not count.
+    pub fn len(&self) -> usize {
+        self.skills.len()
+    }
+
     pub fn get(&self, name: &str) -> Option<&LockEntry> {
         self.skills.iter().find(|e| e.name == name)
     }

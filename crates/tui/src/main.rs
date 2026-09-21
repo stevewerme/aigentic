@@ -122,6 +122,7 @@ async fn main() -> anyhow::Result<()> {
     let mut runtime = Runtime::new(provider, tools, log, AgentId("assistant".into()))
         .with_instructions(instructions)
         .with_compaction(profile.compaction_settings())
+        .with_budget(profile.budget())
         .with_model_label(&profile.model)
         .with_policy(project.policy())
         .with_skills(skills)

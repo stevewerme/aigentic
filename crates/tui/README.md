@@ -28,6 +28,10 @@ api_key_env = "ANTHROPIC_API_KEY"
 # effort = "high"                         # low | medium | high | xhigh | max
 # max_output_tokens = 64000
 # cache = true
+# [profiles.anthropic.budget]              # any profile; all optional; per turn
+# max_iterations = 50
+# max_tokens = 2000000                     # every call's input + output over the turn
+# max_wall_time_secs = 1800
 # [profiles.anthropic.compaction]          # any profile; all optional
 # trigger_fraction = 0.7                  # of the model's window
 # keep_turns = 8                          # verbatim tail after a summary
