@@ -44,5 +44,7 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 bytes = "1"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "json", "stream"] }
 tempfile = "3"
+sha2 = "0.10"
+walkdir = "2"
 nix = { version = "0.31", features = ["signal"] }
 tokio = { version = "1", features = ["rt", "process", "fs", "io-util", "time", "macros"] }
