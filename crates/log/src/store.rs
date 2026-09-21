@@ -61,6 +61,17 @@ pub enum LogError {
     UlidOverflow,
 }
 
+/// What [`ThreadLog::open_with`] may do to a damaged file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Repair {
+    /// Any damage is an error; today's `open`.
+    Refuse,
+    /// A torn last line (a crash mid-append) is cut at the byte offset the
+    /// error reports. Nothing acknowledged is ever lost: the torn bytes
+    /// were never a complete event. Other damage is still an error.
+    TruncateTornTail,
+}
+
 /// What a caller supplies to [`ThreadLog::append`]; the store assigns
 /// `id`, `thread_id`, `seq` and `created_at`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,18 +100,73 @@ impl ThreadLog {
     /// the next `seq` is known; a damaged file is an error, never repaired
     /// silently.
     pub fn open(dir: impl AsRef<Path>, thread_id: Ulid) -> Result<Self, LogError> {
+        Self::open_with(dir, thread_id, Repair::Refuse).map(|(log, _)| log)
+    }
+
+    /// `open`, optionally repairing a torn tail. Returns the log and how
+    /// many bytes were cut, if any.
+    pub fn open_with(
+        dir: impl AsRef<Path>,
+        thread_id: Ulid,
+        repair: Repair,
+    ) -> Result<(Self, Option<u64>), LogError> {
         let path = dir.as_ref().join(format!("{thread_id}.jsonl"));
+        let mut cut = None;
         let next_seq = if path.exists() {
-            read_file(&path, thread_id)?.len() as u64
+            match read_file(&path, thread_id) {
+                Ok(events) => events.len() as u64,
+                Err(LogError::TruncatedTail {
+                    offset,
+                    good_events,
+                    ..
+                }) if repair == Repair::TruncateTornTail => {
+                    let io = |source| LogError::Io {
+                        path: path.clone(),
+                        source,
+                    };
+                    let len = std::fs::metadata(&path).map_err(io)?.len();
+                    OpenOptions::new()
+                        .write(true)
+                        .open(&path)
+                        .map_err(io)?
+                        .set_len(offset)
+                        .map_err(io)?;
+                    cut = Some(len - offset);
+                    good_events as u64
+                }
+                Err(e) => return Err(e),
+            }
         } else {
             0
         };
-        Ok(Self {
-            thread_id,
-            path,
-            next_seq,
-            ids: Generator::new(),
-        })
+        Ok((
+            Self {
+                thread_id,
+                path,
+                next_seq,
+                ids: Generator::new(),
+            },
+            cut,
+        ))
+    }
+
+    /// The events of a turn that never ended: everything after the last
+    /// `turn_ended`, when that tail holds a message or a tool result.
+    /// Pins, compactions and interrupted notes between turns do not count.
+    pub fn open_turn(events: &[Event]) -> Option<&[Event]> {
+        let start = events
+            .iter()
+            .rposition(|e| e.kind == EventKind::TurnEnded)
+            .map_or(0, |i| i + 1);
+        let tail = &events[start..];
+        tail.iter()
+            .any(|e| {
+                matches!(
+                    e.kind,
+                    EventKind::UserMessage | EventKind::AssistantMessage | EventKind::ToolResult
+                )
+            })
+            .then_some(tail)
     }
 
     pub fn thread_id(&self) -> Ulid {
@@ -381,6 +447,70 @@ mod tests {
     }
 
     #[test]
+    fn torn_tail_can_be_cut_on_open_and_the_log_continues() {
+        let dir = tempfile::tempdir().unwrap();
+        let thread = Ulid::generate();
+        let mut log = ThreadLog::open(dir.path(), thread).unwrap();
+        log.append(user("one")).unwrap();
+        log.append(user("two")).unwrap();
+        let text = std::fs::read_to_string(log.path()).unwrap();
+        let first_len = text.find('\n').unwrap() + 1;
+        let cut = first_len + (text.len() - first_len) / 2;
+        std::fs::write(log.path(), &text[..cut]).unwrap();
+        drop(log);
+
+        assert!(matches!(
+            ThreadLog::open(dir.path(), thread).unwrap_err(),
+            LogError::TruncatedTail { .. }
+        ));
+        let (mut log, cut_bytes) =
+            ThreadLog::open_with(dir.path(), thread, Repair::TruncateTornTail).unwrap();
+        assert_eq!(cut_bytes, Some((cut - first_len) as u64));
+        assert_eq!(log.len(), 1);
+        let e = log.append(user("three")).unwrap();
+        assert_eq!(e.seq, 1);
+        let events = log.read_all().unwrap();
+        assert_eq!(events.len(), 2);
+
+        // A clean file reports no cut.
+        let (_, none) = ThreadLog::open_with(dir.path(), thread, Repair::TruncateTornTail).unwrap();
+        assert_eq!(none, None);
+    }
+
+    #[test]
+    fn open_turn_detects_a_turn_that_never_ended() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = ThreadLog::open(dir.path(), Ulid::generate()).unwrap();
+        log.append(user("one")).unwrap();
+        log.append(turn_ended()).unwrap();
+        assert!(ThreadLog::open_turn(&log.read_all().unwrap()).is_none());
+
+        log.append(NewEvent {
+            kind: EventKind::Pinned,
+            author: Author::System,
+            payload: json!({"text": "fact"}),
+            parent_event: None,
+        })
+        .unwrap();
+        assert!(
+            ThreadLog::open_turn(&log.read_all().unwrap()).is_none(),
+            "a pin is not a turn"
+        );
+
+        log.append(user("two")).unwrap();
+        log.append(assistant(vec![ContentBlock::Text("hm".into())]))
+            .unwrap();
+        let events = log.read_all().unwrap();
+        let open = ThreadLog::open_turn(&events).unwrap();
+        assert_eq!(
+            open.len(),
+            3,
+            "pin, user, assistant since the last turn_ended"
+        );
+        assert_eq!(open[1].kind, EventKind::UserMessage);
+    }
+
+    #[test]
     fn complete_last_line_without_newline_is_still_truncated() {
         let dir = tempfile::tempdir().unwrap();
         let thread = Ulid::generate();
@@ -455,7 +585,7 @@ mod tests {
         .unwrap();
         log.append(turn_ended()).unwrap();
 
-        let messages = project(&log.read_all().unwrap()).unwrap();
+        let messages = project(&log.read_all().unwrap()).unwrap().body;
         assert_eq!(messages.len(), 3, "turn_ended emits no message");
         assert_eq!(messages[0].role, Role::User);
         assert_eq!(messages[0].author, Author::User(UserId("steve".into())));
