@@ -100,7 +100,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Skills: the enabled set, hash-verified. A tampered or unlocked skill
     // refuses to start with its name; nothing loads silently.
-    let skills = skills_cmd::load_enabled(&project.skills.enabled, &skill_paths, &tools.names())
+    let mut available = tools.names();
+    available.extend(aigentic_runtime::harness_tools::harness_names());
+    let skills = skills_cmd::load_enabled(&project.skills.enabled, &skill_paths, &available)
         .context("loading skills")?;
 
     let threads_dir = config

@@ -68,6 +68,12 @@ pub fn harness_specs(offer_load_skill: bool) -> Vec<ToolSpec> {
     specs
 }
 
+/// The harness tools' names, for a skill's `requires` check: they are
+/// always available, whatever the registry holds.
+pub fn harness_names() -> Vec<String> {
+    vec![ASK_HUMAN.into(), LOAD_SKILL.into(), PIN.into()]
+}
+
 /// Whether the runtime answers this tool itself.
 pub fn is_harness_tool(name: &str) -> bool {
     matches!(name, PIN | ASK_HUMAN | LOAD_SKILL)
