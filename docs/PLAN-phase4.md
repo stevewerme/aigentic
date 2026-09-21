@@ -400,7 +400,8 @@ lists this project's threads. REPL: `/project` and `/threads`.
   short-versus-long fixture; symlinked knowledge loads, counts and
   detects change through the link; the `path_prefix` rule fires for
   `write_file` and `edit_file` under `.aigentic/memory/` and nowhere
-  else; the report's narrowing note.
+  else; the report's narrowing note; `ask_human` splits the turn and
+  resets the budget; `touched` on `turn_ended`.
 - **Pocock** (tui): the rendered files equal a snapshot taken from
   upstream's setup skill for the same answers.
 - Phase 0 to 3 tests unchanged apart from `build_context`'s signature and
@@ -455,6 +456,26 @@ scripted provider.
      counts non-empty memory files; `project show` and `/project` print
      "hidden, not a ban: bash is allowed" beside a hidden `write_file`
      or `edit_file` when `bash` is visible; test on the report text.
+   - `runtime: a human's answer starts a turn` — `ask_human` ends the
+     turn. The answer is still the call's `tool_result` (every provider
+     needs one), then a `turn_ended` with reason `asked_human` follows,
+     and the client continues with `continue_turn`, which is a new turn
+     with a fresh budget and its own `/cost` line. Memory extraction
+     runs only after `done`, so it waits for the real end. Seen in
+     thread `01M32SZ1SVD0MDGYS77H0558TP`: a review-and-implement request
+     was one turn, hit the 2M budget mid-edit and left the tree
+     uncompilable. Test: with `max_iterations = 2`, a scripted turn of
+     `ask_human` then two more iterations ends `done`, and the log reads
+     user, assistant, result, `turn_ended asked_human`, assistant,
+     result, assistant, `turn_ended done`.
+   - `log, runtime, tui: a budget stop names what it touched` —
+     `TurnEndedPayload` gains `touched: Vec<String>` (default empty, so
+     old lines read back): the `path` of every `write_file` and
+     `edit_file` call in the turn, in order, deduplicated, filled on
+     every `turn_ended` so `/cost` and a client can show it; the REPL
+     prints `[turn ended: max_tokens; wrote a.rs, b.rs]` on a budget
+     reason. Test: the payload lists the two paths a scripted turn
+     wrote, and a turn without writes has an empty list.
    - `docs: phase 4 acceptance closed` — the days of use recorded, the
      two remaining notes (the flat-layout fallback cannot tell which
      project a pre-phase-4 thread belonged to; models prefer `read_file`
@@ -518,8 +539,21 @@ and `cargo test` before its commit.
   not find one. Start with the pointer and see whether it helps.
 - `search_knowledge` over `memory/` too, once memory files grow past a
   page.
-- Phase 3 leftovers: `skills check` is red until the 33 unenabled
-  vendored skills are reviewed or its rule narrows to the enabled set;
-  the bundled skills root is the build repository, so a single-binary
-  install needs a home for `skills/`; tools accept unknown arguments
-  silently.
+- Phase 3 leftovers: the bundled skills root is the build repository,
+  so a single-binary install needs a home for `skills/`; tools accept
+  unknown arguments silently. (`skills check` went green on 2026-09-21
+  once the 33 pending skills were reviewed, 24 accepted and 9 rejected
+  with the new `rejected` state.)
+- From the review of the vendored set (2026-09-21), for phase 5:
+  `loop-me`'s idea sits between an edit mode and a routine and deserves
+  its own design rather than a vendored skill; `git-guardrails`'s
+  blocking of destructive git commands belongs in the policy core as a
+  default `bash` deny list ahead of the allow patterns, overridable per
+  project; the `requires` seeding reads verbs as tools (`code-review`
+  carries `requires = ["pin"]` from "Pin the fixed point"), so the seed
+  should match tool names as words in a call context, not anywhere.
+- A design answer given to `ask_human` is taken as go-ahead to
+  implement; the harness has no way to say "answer, but stop". With
+  step 9's turn split the answer at least starts a fresh turn; whether
+  the client should offer "answer and pause" is a phase 5 question with
+  the turn queue.
