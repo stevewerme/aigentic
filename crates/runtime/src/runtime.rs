@@ -3,6 +3,7 @@ use std::time::Duration;
 use aigentic_core::{AgentId, Budget, Event, Provider, ToolCall};
 use aigentic_log::ThreadLog;
 use aigentic_policy::Policy;
+use aigentic_skills::SkillSet;
 use aigentic_tools::ToolRegistry;
 
 use crate::approver::{Approver, DenyAll};
@@ -43,6 +44,7 @@ pub struct Runtime {
     pub(crate) policy: Policy,
     pub(crate) approver: Box<dyn Approver>,
     pub(crate) session_grants: Vec<SessionGrant>,
+    pub(crate) skills: SkillSet,
     pub(crate) log: ThreadLog,
     pub(crate) agent: AgentId,
     pub(crate) budget: Budget,
@@ -70,6 +72,7 @@ impl Runtime {
             policy: Policy::defaults(),
             approver: Box::new(DenyAll),
             session_grants: Vec::new(),
+            skills: SkillSet::default(),
             log,
             agent,
             budget: DEFAULT_BUDGET,
@@ -88,6 +91,23 @@ impl Runtime {
     pub fn with_approver(mut self, approver: Box<dyn Approver>) -> Self {
         self.approver = approver;
         self
+    }
+
+    /// The enabled, hash-verified skills. Their descriptions join the
+    /// stable prefix; a change here resets the window measure.
+    pub fn with_skills(mut self, skills: SkillSet) -> Self {
+        self.skills = skills;
+        self.measured = None;
+        self
+    }
+
+    pub fn skills(&self) -> &SkillSet {
+        &self.skills
+    }
+
+    /// The prefix block listing enabled skills, `None` when there are none.
+    pub(crate) fn skills_prefix(&self) -> Option<String> {
+        (!self.skills.is_empty()).then(|| self.skills.descriptions())
     }
 
     pub fn with_registry(mut self, registry: ToolRegistry) -> Self {

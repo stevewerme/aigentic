@@ -10,7 +10,7 @@ use aigentic_core::{
 use aigentic_log::{AssistantMessagePayload, ToolResultPayload, Usage, UserMessagePayload};
 use futures_util::StreamExt;
 
-use aigentic_log::PolicyRecord;
+use aigentic_log::{Invoker, PolicyRecord};
 
 use crate::harness_tools::{HARNESS_CLASS, harness_specs, is_harness_tool};
 use crate::seams::{Verdict, denial_text};
@@ -30,6 +30,27 @@ impl Runtime {
         let payload = serde_json::to_value(UserMessagePayload { blocks }).expect("serialisable");
         self.append(EventKind::UserMessage, author, payload, None, observe)?;
         self.continue_turn(observe).await
+    }
+
+    /// A user-invoked skill (`/implement fix the off-by-one`): appends
+    /// `skill_loaded` with the body, attributed to the user, then a user
+    /// message with the arguments, then runs the turn. Any enabled skill
+    /// can be invoked this way; the client decides which to expose.
+    pub async fn invoke_skill(
+        &mut self,
+        author: Author,
+        name: &str,
+        args: &str,
+        observe: &mut dyn FnMut(Signal<'_>),
+    ) -> Result<TurnOutcome, RuntimeError> {
+        self.append_skill_loaded_as(name, Invoker::User, author.clone(), observe)?;
+        let text = if args.trim().is_empty() {
+            format!("Run the `{name}` skill now.")
+        } else {
+            args.trim().to_owned()
+        };
+        self.run_turn(author, vec![ContentBlock::Text(text)], observe)
+            .await
     }
 
     /// The loop without a new user message: what `run_turn` does after the
@@ -66,7 +87,11 @@ impl Runtime {
                 return Err(e);
             }
             let events = self.log.read_all()?;
-            let context = build_context(self.instructions.as_deref(), &events)?;
+            let context = build_context(
+                self.instructions.as_deref(),
+                self.skills_prefix().as_deref(),
+                &events,
+            )?;
             let request = CompletionRequest {
                 messages: &context,
                 tools: &specs,
@@ -191,7 +216,7 @@ impl Runtime {
     /// Registry specs plus the harness tools, sorted by name.
     pub fn tool_specs(&self) -> Vec<ToolSpec> {
         let mut specs = self.registry.specs();
-        specs.extend(harness_specs());
+        specs.extend(harness_specs(!self.skills.model_invoked().is_empty()));
         specs.sort_by(|a, b| a.name.cmp(&b.name));
         specs
     }

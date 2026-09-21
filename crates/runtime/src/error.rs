@@ -9,4 +9,6 @@ pub enum RuntimeError {
     /// `provider_error` has already been appended when this is returned.
     #[error("provider: {0}")]
     Provider(#[from] ProviderError),
+    #[error("skill `{0}` is not enabled")]
+    UnknownSkill(String),
 }

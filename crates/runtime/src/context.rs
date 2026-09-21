@@ -2,15 +2,17 @@ use aigentic_core::{Author, ContentBlock, Event, Message, Role};
 use aigentic_log::{LogError, Projection, project};
 
 /// Model context, in cache-friendly order: the stable prefix first
-/// (repository instructions, then pinned facts, each as a system message;
-/// project instructions and knowledge join it in phase 4), then the thread
-/// body projected from the log with compaction applied, oldest to newest.
+/// (repository instructions, pinned facts, then the enabled skills' one
+/// line each, every block a system message; project instructions and
+/// knowledge join it in phase 4), then the thread body projected from the
+/// log with compaction applied, oldest to newest.
 pub fn build_context(
     instructions: Option<&str>,
+    skills: Option<&str>,
     events: &[Event],
 ) -> Result<Vec<Message>, LogError> {
     let Projection { pinned, body, .. } = project(events)?;
-    let mut context = Vec::with_capacity(body.len() + 2);
+    let mut context = Vec::with_capacity(body.len() + 3);
     if let Some(text) = instructions {
         context.push(system(text.to_owned()));
     }
@@ -21,6 +23,9 @@ pub fn build_context(
             .collect::<Vec<_>>()
             .join("\n");
         context.push(system(format!("Pinned facts:\n{facts}")));
+    }
+    if let Some(text) = skills {
+        context.push(system(text.to_owned()));
     }
     context.extend(body);
     Ok(context)
@@ -56,7 +61,7 @@ mod tests {
     }
 
     #[test]
-    fn prefix_is_instructions_then_pins_then_body() {
+    fn prefix_is_instructions_then_pins_then_skills_then_body() {
         let events = vec![
             ev(0, EventKind::Pinned, json!({"text": "Answer in Swedish."})),
             ev(
@@ -66,8 +71,8 @@ mod tests {
             ),
             ev(2, EventKind::Pinned, json!({"text": "Repo is aigentic."})),
         ];
-        let ctx = build_context(Some("Be terse."), &events).unwrap();
-        assert_eq!(ctx.len(), 3);
+        let ctx = build_context(Some("Be terse."), Some("# Skills\n\n- tdd: x"), &events).unwrap();
+        assert_eq!(ctx.len(), 4);
         assert_eq!(ctx[0].role, Role::System);
         assert_eq!(ctx[0].blocks, vec![ContentBlock::Text("Be terse.".into())]);
         assert_eq!(
@@ -76,9 +81,14 @@ mod tests {
                 "Pinned facts:\n- Answer in Swedish.\n- Repo is aigentic.".into()
             )]
         );
-        assert_eq!(ctx[2].role, Role::User);
+        assert_eq!(ctx[2].role, Role::System);
+        assert_eq!(
+            ctx[2].blocks,
+            vec![ContentBlock::Text("# Skills\n\n- tdd: x".into())]
+        );
+        assert_eq!(ctx[3].role, Role::User);
 
-        let ctx = build_context(None, &events[1..2]).unwrap();
+        let ctx = build_context(None, None, &events[1..2]).unwrap();
         assert_eq!(ctx.len(), 1, "no instructions, no pins: body only");
     }
 }

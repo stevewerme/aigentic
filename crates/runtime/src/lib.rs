@@ -13,6 +13,7 @@ pub use aigentic_core;
 pub use aigentic_log;
 pub use aigentic_policy;
 pub use aigentic_providers;
+pub use aigentic_skills;
 pub use aigentic_tools;
 
 mod approver;
