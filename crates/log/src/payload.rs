@@ -10,11 +10,15 @@ pub struct UserMessagePayload {
     pub blocks: Vec<ContentBlock>,
 }
 
-/// Token usage reported by the provider for one model call.
+/// Token usage for one model call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// `true` when the numbers came from `Provider::count_tokens` because
+    /// the provider reported no usage. `/cost` shows that share separately.
+    #[serde(default)]
+    pub estimated: bool,
 }
 
 /// Payload of an `assistant_message` event. Tool calls live in `blocks`.

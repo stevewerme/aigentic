@@ -2,8 +2,8 @@
 
 use std::time::Instant;
 
-use aigentic_core::{Author, ContentBlock, Event, EventKind, ToolCall, ToolResult};
-use aigentic_log::{NewEvent, TurnEndedPayload};
+use aigentic_core::{Author, ContentBlock, Event, EventKind, Message, Role, ToolCall, ToolResult};
+use aigentic_log::{NewEvent, TurnEndedPayload, Usage};
 
 use crate::{Runtime, RuntimeError, Signal, TurnOutcome};
 
@@ -15,6 +15,27 @@ pub(crate) struct Spent {
 }
 
 impl Runtime {
+    /// Usage for a call whose provider reported none: `count_tokens` over
+    /// the context for input and over the produced blocks for output,
+    /// flagged `estimated`.
+    pub(crate) fn estimate_usage(
+        &self,
+        context: &[Message],
+        agent: &Author,
+        blocks: &[ContentBlock],
+    ) -> Usage {
+        let produced = Message {
+            role: Role::Assistant,
+            author: agent.clone(),
+            blocks: blocks.to_vec(),
+        };
+        Usage {
+            input_tokens: self.provider.count_tokens(context),
+            output_tokens: self.provider.count_tokens(std::slice::from_ref(&produced)),
+            estimated: true,
+        }
+    }
+
     pub(crate) async fn run_tool(&self, call: &ToolCall) -> ToolResult {
         let id = call.id.clone();
         let Some(tool) = self.tools.iter().find(|t| t.name() == call.name) else {

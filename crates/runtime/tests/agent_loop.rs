@@ -220,8 +220,9 @@ async fn tool_call_round_trip_produces_the_exact_event_sequence() {
         ]
     );
     assert_eq!(
-        asst.usage.map(|u| (u.input_tokens, u.output_tokens)),
-        Some((10, 5))
+        asst.usage
+            .map(|u| (u.input_tokens, u.output_tokens, u.estimated)),
+        Some((10, 5, false))
     );
 
     for (event, id, content) in [
@@ -286,18 +287,12 @@ async fn budget_stop_is_an_event_with_the_reason() {
     assert_eq!(outcome.reason, "max_iterations");
     assert_eq!(outcome.iterations, 2);
     assert_eq!(
-        outcome.tokens, 14,
-        "no usage reported: count_tokens estimate per call"
+        outcome.tokens, 28,
+        "no usage reported: count_tokens estimate for input and output, per call"
     );
 
-    let kinds: Vec<EventKind> = h
-        .runtime
-        .log()
-        .read_all()
-        .unwrap()
-        .iter()
-        .map(|e| e.kind)
-        .collect();
+    let events = h.runtime.log().read_all().unwrap();
+    let kinds: Vec<EventKind> = events.iter().map(|e| e.kind).collect();
     assert_eq!(
         kinds,
         vec![
@@ -309,9 +304,17 @@ async fn budget_stop_is_an_event_with_the_reason() {
             EventKind::TurnEnded,
         ]
     );
-    let events = h.runtime.log().read_all().unwrap();
     let end: TurnEndedPayload = serde_json::from_value(events[5].payload.clone()).unwrap();
     assert_eq!(end.reason, "max_iterations");
+    for i in [1, 3] {
+        let asst: AssistantMessagePayload =
+            serde_json::from_value(events[i].payload.clone()).unwrap();
+        assert_eq!(
+            asst.usage
+                .map(|u| (u.input_tokens, u.output_tokens, u.estimated)),
+            Some((7, 7, true))
+        );
+    }
 }
 
 #[tokio::test]
@@ -338,6 +341,50 @@ async fn token_budget_stops_after_the_call_that_crosses_it() {
         (outcome.reason.as_str(), outcome.tokens),
         ("max_tokens", 1100)
     );
+    // Tools ran before the stop: the call has its result, so the log resumes.
+    let kinds: Vec<EventKind> = h
+        .runtime
+        .log()
+        .read_all()
+        .unwrap()
+        .iter()
+        .map(|e| e.kind)
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            EventKind::UserMessage,
+            EventKind::AssistantMessage,
+            EventKind::ToolResult,
+            EventKind::TurnEnded,
+        ]
+    );
+}
+
+#[tokio::test]
+async fn wall_time_budget_is_named_in_the_turn_ended_event() {
+    let mut h = harness(
+        vec![vec![
+            ProviderEvent::ToolCall(call("c", "x")),
+            done("tool_calls"),
+        ]],
+        None,
+    );
+    h.runtime = h.runtime.with_budget(Budget {
+        max_iterations: 10,
+        max_tokens: u64::MAX,
+        max_wall_time: Duration::ZERO,
+    });
+    let outcome = h
+        .runtime
+        .run_turn(steve(), vec![], &mut |_| {})
+        .await
+        .unwrap();
+    assert_eq!(outcome.reason, "max_wall_time");
+    let events = h.runtime.log().read_all().unwrap();
+    let end: TurnEndedPayload =
+        serde_json::from_value(events.last().unwrap().payload.clone()).unwrap();
+    assert_eq!(end.reason, "max_wall_time");
 }
 
 #[tokio::test]

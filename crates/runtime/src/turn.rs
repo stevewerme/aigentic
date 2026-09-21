@@ -40,6 +40,12 @@ impl Runtime {
         loop {
             // Seam: an interrupt from the turn queue would be handled here.
             let _ = self.turn_queue_next();
+            // The budget is checked here, before a model call, and never
+            // between an assistant message and its tool results. Once an
+            // assistant message with tool calls is in the log, every call
+            // must get a result: OpenAI-compatible endpoints reject a
+            // conversation whose tool calls have no matching tool message,
+            // so a log left in that state could not be resumed.
             if let Some(reason) = self.budget_reason(&spent) {
                 return self.end_turn(reason, &spent, observe);
             }
@@ -72,6 +78,7 @@ impl Runtime {
                         usage = Some(Usage {
                             input_tokens,
                             output_tokens,
+                            estimated: false,
                         });
                     }
                     ProviderEvent::Done { .. } => {}
@@ -84,9 +91,9 @@ impl Runtime {
             drop(stream);
             flush_text(&mut text, &mut blocks);
             spent.iterations += 1;
-            spent.tokens += usage
-                .map(|u| u.input_tokens + u.output_tokens)
-                .unwrap_or_else(|| self.provider.count_tokens(&context));
+            let agent = Author::Agent(self.agent.clone());
+            let usage = usage.unwrap_or_else(|| self.estimate_usage(&context, &agent, &blocks));
+            spent.tokens += usage.input_tokens + usage.output_tokens;
             if let Some(e) = error {
                 self.end_turn(&format!("provider_error: {e}"), &spent, observe)?;
                 return Err(RuntimeError::Provider(e));
@@ -99,9 +106,11 @@ impl Runtime {
                     _ => None,
                 })
                 .collect();
-            let payload = serde_json::to_value(AssistantMessagePayload { blocks, usage })
-                .expect("serialisable");
-            let agent = Author::Agent(self.agent.clone());
+            let payload = serde_json::to_value(AssistantMessagePayload {
+                blocks,
+                usage: Some(usage),
+            })
+            .expect("serialisable");
             let assistant =
                 self.append(EventKind::AssistantMessage, agent, payload, None, observe)?;
             if calls.is_empty() {
