@@ -1,0 +1,15 @@
+data: {"id": "9464a7a348a04ce08db6d35057b66364", "object": "chat.completion.chunk", "created": 1789990636, "model": "z-ai/glm-5.3", "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}}]}
+
+data: {"id": "9464a7a348a04ce08db6d35057b66364", "created": 1789990636, "model": "z-ai/glm-5.3", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": "The"}}]}
+
+data: {"id": "9464a7a348a04ce08db6d35057b66364", "created": 1789990636, "model": "z-ai/glm-5.3", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": " user wants three paragraphs about the"}}]}
+
+data: {"id": "9464a7a348a04ce08db6d35057b66364", "created": 1789990636, "model": "z-ai/glm-5.3", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": " sea"}}]}
+
+data: {"id": "9464a7a348a04ce08db6d35057b66364", "object": "chat.completion.chunk", "created": 1789990636, "model": "z-ai/glm-5.3", "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]}
+
+data: {"id": "9464a7a348a04ce08db6d35057b66364", "created": 1789990636, "model": "z-ai/glm-5.3", "object": "chat.completion.chunk", "choices": [], "usage": {"completion_tokens": 8, "prompt_tokens": 19, "total_tokens": 27, "completion_tokens_details": {"reasoning_tokens": 13, "text_tokens": 0}}}
+
+data: [DONE]
+
+

@@ -258,9 +258,10 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    // Raw streams recorded from TensorX (z-ai/glm-5.3) by fixtures/record.sh.
     const TEXT: &str = include_str!("../../fixtures/text.sse");
     const TOOL_CALLS: &str = include_str!("../../fixtures/tool_calls.sse");
-    const FINISH_NO_DONE: &str = include_str!("../../fixtures/finish_no_done.sse");
+    const LENGTH: &str = include_str!("../../fixtures/length.sse");
 
     /// Run a fixture through the parser and translator as one chunk.
     fn translate(fixture: &str) -> Vec<ProviderEvent> {
@@ -277,66 +278,111 @@ mod tests {
         out
     }
 
+    fn reasoning_of(event: &ProviderEvent) -> &str {
+        match event {
+            ProviderEvent::Blob(b) => {
+                assert_eq!(b.provider, PROVIDER_NAME);
+                b.data["reasoning_content"].as_str().unwrap()
+            }
+            other => panic!("expected a reasoning blob, got {other:?}"),
+        }
+    }
+
     #[test]
-    fn text_deltas_usage_and_finish() {
+    fn recorded_text_reply() {
+        let events = translate(TEXT);
+        assert_eq!(events.len(), 5, "{events:#?}");
+        assert_eq!(events[0], ProviderEvent::TextDelta("Hello".into()));
+        assert_eq!(events[1], ProviderEvent::TextDelta(", world.".into()));
         assert_eq!(
-            translate(TEXT),
-            vec![
-                ProviderEvent::TextDelta("Hello".into()),
-                ProviderEvent::TextDelta(", world".into()),
-                ProviderEvent::Usage {
-                    input_tokens: 12,
-                    output_tokens: 3
-                },
-                ProviderEvent::Done {
-                    finish_reason: "stop".into()
-                },
-            ]
+            events[2],
+            ProviderEvent::Usage {
+                input_tokens: 20,
+                output_tokens: 111
+            }
+        );
+        let reasoning = reasoning_of(&events[3]);
+        assert!(
+            reasoning.starts_with("The user has asked me"),
+            "{reasoning}"
+        );
+        assert!(
+            reasoning.ends_with("My reply: Hello, world."),
+            "{reasoning}"
+        );
+        assert_eq!(
+            events[4],
+            ProviderEvent::Done {
+                finish_reason: "stop".into()
+            }
         );
     }
 
     #[test]
-    fn tool_call_deltas_are_assembled_with_ids_preserved() {
+    fn recorded_tool_calls_are_assembled_with_ids_preserved() {
+        let events = translate(TOOL_CALLS);
+        assert_eq!(events.len(), 5, "{events:#?}");
         assert_eq!(
-            translate(TOOL_CALLS),
-            vec![
-                ProviderEvent::TextDelta("Let me look.".into()),
-                ProviderEvent::ToolCall(ToolCall {
-                    id: "call_abc123".into(),
-                    name: "read_file".into(),
-                    args: json!({"path": "Cargo.toml"}),
-                }),
-                ProviderEvent::ToolCall(ToolCall {
-                    id: "call_def456".into(),
-                    name: "bash".into(),
-                    args: json!({"command": "ls -la"}),
-                }),
-                ProviderEvent::Usage {
-                    input_tokens: 40,
-                    output_tokens: 21
-                },
-                ProviderEvent::Done {
-                    finish_reason: "tool_calls".into()
-                },
-            ]
+            events[0],
+            ProviderEvent::ToolCall(ToolCall {
+                id: "call_6ffbcedb83e54acb8131381a".into(),
+                name: "read_file".into(),
+                args: json!({"path": "Cargo.toml"}),
+            })
+        );
+        assert_eq!(
+            events[1],
+            ProviderEvent::ToolCall(ToolCall {
+                id: "call_edb3bbd387df417e97042e4d".into(),
+                name: "bash".into(),
+                args: json!({"command": "ls -la"}),
+            })
+        );
+        assert_eq!(
+            events[2],
+            ProviderEvent::Usage {
+                input_tokens: 234,
+                output_tokens: 59
+            }
+        );
+        assert!(reasoning_of(&events[3]).contains("make both in the same block"));
+        assert_eq!(
+            events[4],
+            ProviderEvent::Done {
+                finish_reason: "tool_calls".into()
+            }
         );
     }
 
     #[test]
-    fn finish_with_inline_usage_and_no_done_marker() {
+    fn recorded_length_stop_with_reasoning_only() {
+        // The whole output budget went to reasoning: no text at all.
+        let events = translate(LENGTH);
+        assert_eq!(events.len(), 3, "{events:#?}");
         assert_eq!(
-            translate(FINISH_NO_DONE),
-            vec![
-                ProviderEvent::TextDelta("partial".into()),
-                ProviderEvent::Usage {
-                    input_tokens: 5,
-                    output_tokens: 1
-                },
-                ProviderEvent::Done {
-                    finish_reason: "length".into()
-                },
-            ]
+            events[0],
+            ProviderEvent::Usage {
+                input_tokens: 19,
+                output_tokens: 8
+            }
         );
+        assert_eq!(
+            reasoning_of(&events[1]),
+            "The user wants three paragraphs about the sea"
+        );
+        assert_eq!(
+            events[2],
+            ProviderEvent::Done {
+                finish_reason: "length".into()
+            }
+        );
+    }
+
+    #[test]
+    fn eof_without_done_marker_completes_the_same_way() {
+        let cut = LENGTH.rsplit_once("data: [DONE]").unwrap().0;
+        assert!(!cut.contains("[DONE]"));
+        assert_eq!(translate(cut), translate(LENGTH));
     }
 
     #[test]
@@ -349,29 +395,6 @@ mod tests {
             out,
             vec![
                 ProviderEvent::TextDelta("hi".into()),
-                ProviderEvent::Done {
-                    finish_reason: "stop".into()
-                },
-            ]
-        );
-        assert!(!out.iter().any(|e| matches!(e, ProviderEvent::Usage { .. })));
-    }
-
-    #[test]
-    fn reasoning_is_collected_into_one_blob_before_done() {
-        let mut t = Translator::new();
-        let mut out = t.on_data(r#"{"choices":[{"delta":{"reasoning_content":"think "}}]}"#);
-        out.extend(t.on_data(r#"{"choices":[{"delta":{"reasoning_content":"hard"}}]}"#));
-        out.extend(t.on_data(r#"{"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}"#));
-        out.extend(t.on_data("[DONE]"));
-        assert_eq!(
-            out,
-            vec![
-                ProviderEvent::TextDelta("ok".into()),
-                ProviderEvent::Blob(ProviderBlob {
-                    provider: PROVIDER_NAME.into(),
-                    data: json!({"reasoning_content": "think hard"}),
-                }),
                 ProviderEvent::Done {
                     finish_reason: "stop".into()
                 },
@@ -417,16 +440,18 @@ mod tests {
 
     #[tokio::test]
     async fn parse_stream_is_chunk_boundary_agnostic() {
-        for chunk_size in [1usize, 7, 64, 100_000] {
-            let chunks: Vec<Result<Bytes, std::io::Error>> = TOOL_CALLS
-                .as_bytes()
-                .chunks(chunk_size)
-                .map(|c| Ok(Bytes::copy_from_slice(c)))
-                .collect();
-            let events: Vec<ProviderEvent> = parse_stream(futures_util::stream::iter(chunks))
-                .collect()
-                .await;
-            assert_eq!(events, translate(TOOL_CALLS), "chunk size {chunk_size}");
+        for fixture in [TEXT, TOOL_CALLS, LENGTH] {
+            for chunk_size in [1usize, 7, 64, 100_000] {
+                let chunks: Vec<Result<Bytes, std::io::Error>> = fixture
+                    .as_bytes()
+                    .chunks(chunk_size)
+                    .map(|c| Ok(Bytes::copy_from_slice(c)))
+                    .collect();
+                let events: Vec<ProviderEvent> = parse_stream(futures_util::stream::iter(chunks))
+                    .collect()
+                    .await;
+                assert_eq!(events, translate(fixture), "chunk size {chunk_size}");
+            }
         }
     }
 

@@ -1,12 +1,91 @@
-data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1758456000,"model":"qwen","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+data: {"id": "8cc02daab04449e29f5212b00d69b4e7", "object": "chat.completion.chunk", "created": 1789990631, "model": "z-ai/glm-5.3", "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}}]}
 
-data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1758456000,"model":"qwen","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}
+data: {"id": "8cc02daab04449e29f5212b00d69b4e7", "created": 1789990631, "model": "z-ai/glm-5.3", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": "The"}}]}
 
-data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1758456000,"model":"qwen","choices":[{"index":0,"delta":{"content":", world"},"finish_reason":null}]}
+data: {"id": "8cc02daab04449e29f5212b00d69b4e7", "created": 1789990631, "model": "z-ai/glm-5.3", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": " user has"}}]}
 
-data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1758456000,"model":"qwen","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+data: {"id": "8cc02daab04449e29f5212b00d69b4e7", "created": 1789990631, "model": "z-ai/glm-5.3", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": " asked me to reply with exactly"}}]}
 
-data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1758456000,"model":"qwen","choices":[],"usage":{"prompt_tokens":12,"completion_tokens":3,"total_tokens":15}}
+data: {"id": "8cc02daab04449e29f5212b00d69b4e7", "created": 1789990631, "model": "z-ai/glm-5.3", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": " \"Hello, world.\" This"}}]}
+
+data: {"id": "8cc02daab04449e29f5212b00d69b4e7", "created": 1789990631, "model": "z-ai/glm-5.3", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": " is a simple,"}}]}
+
+data: {"id": "8cc02daab04449e29f5212b00d69b4e7", "created": 1789990631, "model": "z-ai/glm-5.3", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": " straightforward"}}]}
+
+data: {"id": "8cc02daab04449e29f5212b00d69b4e7", "created": 1789990631, "model": "z-ai/glm-5.3", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": " request. There"}}]}
+
+data: {"id": "8cc02daab04449e29f5212b00d69b4e7", "created": 1789990631, "model": "z-ai/glm-5.3", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": "'s nothing ambiguous"}}]}
+
+data: {"id": "8cc02daab04449e29f5212b00d69b4e7", "created": 1789990631, "model": "z-ai/glm-5.3", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": " or concerning"}}]}
+
+data: {"id": "8cc02daab04449e29f5212b00d69b4e7", "created": 1789990631, "model": "z-ai/glm-5.3", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": " here —"}}]}
+
+data: {"id": "8cc02daab04449e29f5212b00d69b4e7", "created": 1789990631, "model": "z-ai/glm-5.3", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": " it"}}]}
+
+data: {"id": "8cc02daab04449e29f5212b00d69b4e7", "created": 1789990631, "model": "z-ai/glm-5.3", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": "'s likely"}}]}
+
+data: {"id": "8cc02daab04449e29f5212b00d69b4e7", "created": 1789990631, "model": "z-ai/glm-5.3", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": " a test of instruction"}}]}
+
+data: {"id": "8cc02daab04449e29f5212b00d69b4e7", "created": 1789990631, "model": "z-ai/glm-5.3", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": "-follow"}}]}
+
+data: {"id": "8cc02daab04449e29f5212b00d69b4e7", "created": 1789990631, "model": "z-ai/glm-5.3", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": "ing or"}}]}
+
+data: {"id": "8cc02daab04449e29f5212b00d69b4e7", "created": 1789990631, "model": "z-ai/glm-5.3", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": " just"}}]}
+
+data: {"id": "8cc02daab04449e29f5212b00d69b4e7", "created": 1789990631, "model": "z-ai/glm-5.3", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": " a playful"}}]}
+
+data: {"id": "8cc02daab04449e29f5212b00d69b4e7", "created": 1789990631, "model": "z-ai/glm-5.3", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": " request"}}]}
+
+data: {"id": "8cc02daab04449e29f5212b00d69b4e7", "created": 1789990631, "model": "z-ai/glm-5.3", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": ".\n\nThe instruction is"}}]}
+
+data: {"id": "8cc02daab04449e29f5212b00d69b4e7", "created": 1789990631, "model": "z-ai/glm-5.3", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": " to reply with exactly that"}}]}
+
+data: {"id": "8cc02daab04449e29f5212b00d69b4e7", "created": 1789990631, "model": "z-ai/glm-5.3", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": " text,"}}]}
+
+data: {"id": "8cc02daab04449e29f5212b00d69b4e7", "created": 1789990631, "model": "z-ai/glm-5.3", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": " so I should not"}}]}
+
+data: {"id": "8cc02daab04449e29f5212b00d69b4e7", "created": 1789990631, "model": "z-ai/glm-5.3", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": " add any additional"}}]}
+
+data: {"id": "8cc02daab04449e29f5212b00d69b4e7", "created": 1789990631, "model": "z-ai/glm-5.3", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": " text"}}]}
+
+data: {"id": "8cc02daab04449e29f5212b00d69b4e7", "created": 1789990631, "model": "z-ai/glm-5.3", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": ", explanations"}}]}
+
+data: {"id": "8cc02daab04449e29f5212b00d69b4e7", "created": 1789990631, "model": "z-ai/glm-5.3", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": ", or formatting"}}]}
+
+data: {"id": "8cc02daab04449e29f5212b00d69b4e7", "created": 1789990631, "model": "z-ai/glm-5.3", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": ". Just"}}]}
+
+data: {"id": "8cc02daab04449e29f5212b00d69b4e7", "created": 1789990631, "model": "z-ai/glm-5.3", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": " the exact phrase"}}]}
+
+data: {"id": "8cc02daab04449e29f5212b00d69b4e7", "created": 1789990631, "model": "z-ai/glm-5.3", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": ".\n\n"}}]}
+
+data: {"id": "8cc02daab04449e29f5212b00d69b4e7", "created": 1789990631, "model": "z-ai/glm-5.3", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": "The"}}]}
+
+data: {"id": "8cc02daab04449e29f5212b00d69b4e7", "created": 1789990631, "model": "z-ai/glm-5.3", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": " user wrote:"}}]}
+
+data: {"id": "8cc02daab04449e29f5212b00d69b4e7", "created": 1789990631, "model": "z-ai/glm-5.3", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": " \"Hello, world.\""}}]}
+
+data: {"id": "8cc02daab04449e29f5212b00d69b4e7", "created": 1789990631, "model": "z-ai/glm-5.3", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": " — with a period at"}}]}
+
+data: {"id": "8cc02daab04449e29f5212b00d69b4e7", "created": 1789990631, "model": "z-ai/glm-5.3", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": " the end. So"}}]}
+
+data: {"id": "8cc02daab04449e29f5212b00d69b4e7", "created": 1789990631, "model": "z-ai/glm-5.3", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": " I should include"}}]}
+
+data: {"id": "8cc02daab04449e29f5212b00d69b4e7", "created": 1789990631, "model": "z-ai/glm-5.3", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": " the period.\n\n"}}]}
+
+data: {"id": "8cc02daab04449e29f5212b00d69b4e7", "created": 1789990631, "model": "z-ai/glm-5.3", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": "My"}}]}
+
+data: {"id": "8cc02daab04449e29f5212b00d69b4e7", "created": 1789990631, "model": "z-ai/glm-5.3", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": " reply:"}}]}
+
+data: {"id": "8cc02daab04449e29f5212b00d69b4e7", "created": 1789990631, "model": "z-ai/glm-5.3", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": " Hello, world."}}]}
+
+data: {"id": "8cc02daab04449e29f5212b00d69b4e7", "object": "chat.completion.chunk", "created": 1789990631, "model": "z-ai/glm-5.3", "choices": [{"index": 0, "delta": {"content": "Hello"}}]}
+
+data: {"id": "8cc02daab04449e29f5212b00d69b4e7", "object": "chat.completion.chunk", "created": 1789990631, "model": "z-ai/glm-5.3", "choices": [{"index": 0, "delta": {"content": ", world."}}]}
+
+data: {"id": "8cc02daab04449e29f5212b00d69b4e7", "object": "chat.completion.chunk", "created": 1789990631, "model": "z-ai/glm-5.3", "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+
+data: {"id": "8cc02daab04449e29f5212b00d69b4e7", "created": 1789990631, "model": "z-ai/glm-5.3", "object": "chat.completion.chunk", "choices": [], "usage": {"completion_tokens": 111, "prompt_tokens": 20, "total_tokens": 131, "completion_tokens_details": {"reasoning_tokens": 106, "text_tokens": 5}}}
 
 data: [DONE]
+
 

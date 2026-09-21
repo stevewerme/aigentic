@@ -50,9 +50,21 @@ finish reason and is emitted on `[DONE]` or EOF. A non-2xx response, a
 transport failure or an `error` object in the stream becomes a single
 `ProviderEvent::Error` and closes the stream.
 
-Tests run the parser and translator over the fixtures in `fixtures/` (text
-deltas, tool call deltas, a llama.cpp-style finish without `[DONE]`) and
-check the wire translation round-trips. No test touches the network.
+Tests run the parser and translator over recorded streams in `fixtures/`:
+a text reply, a two-tool-call reply and a `length` stop, all captured raw
+from TensorX (`z-ai/glm-5.3`) by `fixtures/record.sh`. The recordings show
+what the documented format leaves out: reasoning streams as
+`reasoning_content` deltas before any text, the first chunk omits
+`finish_reason` rather than sending `null`, and a short `max_tokens` can be
+spent entirely on reasoning with no visible text. Re-record with:
+
+```bash
+cd crates/providers/fixtures && ./record.sh https://api.tensorx.ai/v1 z-ai/glm-5.3
+```
+
+The key is read from `TENSORX_API_KEY` (or the variable named by
+`AIGENTIC_API_KEY_ENV`) and never printed. Wire translation is checked by
+round-trip tests. No test touches the network.
 
 ## Manual check against llama.cpp
 
@@ -93,6 +105,4 @@ Status: step 5 (a hosted OpenAI-compatible provider) passed on 2026-09-21
 against TensorX with `z-ai/glm-5.3`: streamed text, multi-step tool calls
 and usage all arrived as expected, via the `aigentic` REPL's acceptance run
 (see `crates/tui/README.md`). Steps 1 to 4 against a local llama.cpp have
-not yet been run; no local install exists on this machine. The fixtures are
-still hand-written to the documented chunk format and are due to be
-replaced with recordings.
+not yet been run; no local install exists on this machine.
