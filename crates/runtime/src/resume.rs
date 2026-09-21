@@ -3,7 +3,8 @@
 
 use aigentic_core::{Author, ContentBlock, Event, EventKind, ToolResult};
 use aigentic_log::{
-    AssistantMessagePayload, InterruptedPayload, ThreadLog, ToolResultPayload, TurnEndedPayload,
+    AssistantMessagePayload, InterruptedPayload, PolicyRecord, ThreadLog, ToolResultPayload,
+    TurnEndedPayload,
 };
 
 use crate::{Runtime, RuntimeError, Signal};
@@ -94,7 +95,7 @@ impl Runtime {
                 .filter_map(|e| {
                     serde_json::from_value::<ToolResultPayload>(e.payload.clone())
                         .ok()
-                        .map(|p| p.0.id)
+                        .map(|p| p.result.id)
                 })
                 .collect();
             for id in tool_call_ids(assistant)? {
@@ -115,11 +116,14 @@ impl Runtime {
         }
         let mut ids = Vec::new();
         for (id, parent) in unanswered {
-            let payload = serde_json::to_value(ToolResultPayload(ToolResult {
-                id: id.clone(),
-                content: INTERRUPTED_RESULT.into(),
-                is_error: true,
-            }))
+            let payload = serde_json::to_value(ToolResultPayload::new(
+                ToolResult {
+                    id: id.clone(),
+                    content: INTERRUPTED_RESULT.into(),
+                    is_error: true,
+                },
+                PolicyRecord::synthetic(),
+            ))
             .expect("serialisable");
             self.append(
                 EventKind::ToolResult,

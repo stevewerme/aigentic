@@ -102,7 +102,11 @@ async fn tool_call_round_trip_produces_the_exact_event_sequence() {
         assert_eq!(event.parent_event, Some(events[1].id));
         let r: ToolResultPayload = serde_json::from_value(event.payload.clone()).unwrap();
         assert_eq!(
-            (r.0.id.as_str(), r.0.content.as_str(), r.0.is_error),
+            (
+                r.result.id.as_str(),
+                r.result.content.as_str(),
+                r.result.is_error
+            ),
             (id, content, false)
         );
     }
@@ -283,9 +287,9 @@ async fn unknown_tool_and_tool_error_become_error_results_not_crashes() {
         .unwrap();
     let events = h.runtime.log().read_all().unwrap();
     let r: ToolResultPayload = serde_json::from_value(events[2].payload.clone()).unwrap();
-    assert!(r.0.is_error && r.0.content.contains("unknown tool: nope"));
+    assert!(r.result.is_error && r.result.content.contains("unknown tool: nope"));
     let r: ToolResultPayload = serde_json::from_value(events[3].payload.clone()).unwrap();
-    assert!(r.0.is_error && r.0.content.contains("msg missing"));
+    assert!(r.result.is_error && r.result.content.contains("msg missing"));
     assert_eq!(events.last().unwrap().kind, EventKind::TurnEnded);
 }
 

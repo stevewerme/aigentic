@@ -7,7 +7,7 @@ use time::format_description::well_known::Rfc3339;
 
 use crate::payload::{
     AssistantMessagePayload, CompactedPayload, CompactionStrategy, InterruptedPayload,
-    PinnedPayload, ToolResultPayload, UserMessagePayload,
+    PinnedPayload, SkillLoadedPayload, ToolResultPayload, UserMessagePayload,
 };
 use crate::store::LogError;
 
@@ -48,7 +48,10 @@ struct Truncation {
 /// summaries win where ranges overlap); truncations shorten tool results in
 /// their range; provider blobs are dropped from every assistant message
 /// that predates the latest summary compaction; an interrupted event
-/// becomes a short note; `turn_ended` and `compacted` emit nothing.
+/// becomes a short note; a loaded skill becomes a user-role message from
+/// the system author (a marker line, then the body); `turn_ended`,
+/// `compacted`, `permission_requested` and `permission_decided` emit
+/// nothing (a refused call is visible as its error tool result).
 pub fn project(events: &[Event]) -> Result<Projection, LogError> {
     let mut summaries: Vec<Summary> = Vec::new();
     let mut truncations: Vec<Truncation> = Vec::new();
@@ -134,7 +137,7 @@ pub fn project(events: &[Event]) -> Result<Projection, LogError> {
                 });
             }
             EventKind::ToolResult => {
-                let ToolResultPayload(mut result) = payload(event)?;
+                let ToolResultPayload { mut result, .. } = payload(event)?;
                 if let Some(max) = truncations
                     .iter()
                     .filter(|t| t.from <= event.seq && event.seq <= t.to)
@@ -168,7 +171,23 @@ pub fn project(events: &[Event]) -> Result<Projection, LogError> {
                     ))],
                 });
             }
-            EventKind::TurnEnded | EventKind::Compacted | EventKind::Pinned => {}
+            EventKind::SkillLoaded => {
+                let p: SkillLoadedPayload = payload(event)?;
+                body.push(Message {
+                    role: Role::User,
+                    author: Author::System,
+                    blocks: vec![ContentBlock::Text(format!(
+                        "{}\n\n{}",
+                        skill_marker(&p.name),
+                        p.body
+                    ))],
+                });
+            }
+            EventKind::TurnEnded
+            | EventKind::Compacted
+            | EventKind::Pinned
+            | EventKind::PermissionRequested
+            | EventKind::PermissionDecided => {}
         }
     }
 
@@ -184,6 +203,11 @@ pub fn summary_marker(from_seq: u64, to_seq: u64, model: &str, date: &str) -> St
     format!(
         "[Summary of events {from_seq} to {to_seq}, written by {model} on {date}; the originals are in the log]"
     )
+}
+
+/// The line placed before a loaded skill's body so the model knows what it is.
+pub fn skill_marker(name: &str) -> String {
+    format!("[Skill `{name}` loaded; follow it for this task]")
 }
 
 fn payload<T: serde::de::DeserializeOwned>(event: &Event) -> Result<T, LogError> {
@@ -462,6 +486,81 @@ mod tests {
             "{note}"
         );
         assert!(note.contains("c1"), "{note}");
+    }
+
+    #[test]
+    fn a_loaded_skill_is_a_system_message_with_marker_and_body() {
+        let events = vec![
+            ev(
+                0,
+                EventKind::SkillLoaded,
+                steve(),
+                json!({"name": "tdd", "hash": "abc", "source": "s", "body": "# TDD\n\nRed, green, refactor.", "invoked_by": "user"}),
+            ),
+            user(1, "implement the thing"),
+        ];
+        let p = project(&events).unwrap();
+        assert_eq!(p.body.len(), 2);
+        assert_eq!(p.body[0].role, Role::User);
+        assert_eq!(p.body[0].author, Author::System);
+        let t = texts(&p);
+        assert_eq!(
+            t[0],
+            "[Skill `tdd` loaded; follow it for this task]\n\n# TDD\n\nRed, green, refactor."
+        );
+        assert_eq!(t[1], "implement the thing");
+    }
+
+    #[test]
+    fn permission_events_emit_nothing_and_a_policy_record_is_invisible() {
+        let events = vec![
+            user(0, "go"),
+            assistant(1, "calling", false),
+            ev(
+                2,
+                EventKind::PermissionRequested,
+                Author::System,
+                json!({"call": {"id": "c1", "name": "bash", "args": {}}, "class": "exec", "reason": "class exec: ask"}),
+            ),
+            ev(
+                3,
+                EventKind::PermissionDecided,
+                steve(),
+                json!({"call_id": "c1", "allow": true, "scope": "once"}),
+            ),
+            ev(
+                4,
+                EventKind::ToolResult,
+                Author::System,
+                json!({"id": "c1", "content": "ok", "is_error": false, "policy": {"kind": "rule", "rule": "class read", "decision": "allow"}}),
+            ),
+            ended(5),
+        ];
+        let p = project(&events).unwrap();
+        assert_eq!(texts(&p), vec!["go", "calling", "result:ok"]);
+        assert_eq!(p.body[2].role, Role::Tool);
+    }
+
+    #[test]
+    fn a_summary_covers_a_loaded_skill_like_any_body_event() {
+        let events = vec![
+            ev(
+                0,
+                EventKind::SkillLoaded,
+                steve(),
+                json!({"name": "tdd", "hash": "abc", "source": "s", "body": "long body", "invoked_by": "user"}),
+            ),
+            user(1, "one"),
+            assistant(2, "reply one", false),
+            ended(3),
+            user(4, "two"),
+            summary(5, 0, 3, "Loaded tdd and did one."),
+        ];
+        let p = project(&events).unwrap();
+        let t = texts(&p);
+        assert_eq!(t.len(), 2, "{t:#?}");
+        assert!(t[0].ends_with("Loaded tdd and did one."));
+        assert_eq!(t[1], "two");
     }
 
     #[test]

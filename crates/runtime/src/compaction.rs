@@ -150,7 +150,7 @@ impl Runtime {
             e.kind == EventKind::ToolResult
                 && (from..=to).contains(&e.seq)
                 && serde_json::from_value::<ToolResultPayload>(e.payload.clone())
-                    .is_ok_and(|p| p.0.content.len() > max)
+                    .is_ok_and(|p| p.result.content.len() > max)
                 && !already
                     .iter()
                     .any(|(f, t, m)| *f <= e.seq && e.seq <= *t && *m <= max)

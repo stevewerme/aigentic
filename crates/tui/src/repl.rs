@@ -165,7 +165,9 @@ fn render(signal: Signal<'_>, at_line_start: &mut bool) {
             *at_line_start = true;
         }
         Signal::Event(event) if event.kind == EventKind::ToolResult => {
-            if let Ok(ToolResultPayload(r)) = serde_json::from_value(event.payload.clone()) {
+            if let Ok(ToolResultPayload { result: r, .. }) =
+                serde_json::from_value(event.payload.clone())
+            {
                 let marker = if r.is_error { "✗" } else { "✓" };
                 for line in truncate_for_display(&r.content, RESULT_LINES, RESULT_BYTES).lines() {
                     println!("  {marker} {line}");

@@ -1,8 +1,9 @@
 //! Kind-specific payload shapes. `Event.payload` is free JSON on the wire;
-//! these structs are the contract for what each phase-0 kind carries.
+//! these structs are the contract for what each kind carries.
 
-use aigentic_core::{ContentBlock, ToolResult};
+use aigentic_core::{ContentBlock, RiskClass, ToolCall, ToolResult};
 use serde::{Deserialize, Serialize};
+use ulid::Ulid;
 
 /// Payload of a `user_message` event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,11 +65,55 @@ pub struct AssistantMessagePayload {
     pub usage: Option<Usage>,
 }
 
+/// What let a tool call run (or refused it). Recorded on every
+/// `tool_result` so the log can be audited: no result without a record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PolicyRecord {
+    /// A policy rule decided; `rule` names it, e.g. `"class read"` or
+    /// `"bash allow-pattern cargo test"`, and `decision` is `"allow"` or
+    /// `"deny"`.
+    Rule { rule: String, decision: String },
+    /// A human decided; `event` is the `permission_decided` event.
+    Human { event: Ulid, allow: bool },
+}
+
+impl PolicyRecord {
+    pub fn rule(rule: impl Into<String>, decision: impl Into<String>) -> Self {
+        Self::Rule {
+            rule: rule.into(),
+            decision: decision.into(),
+        }
+    }
+
+    /// The record the resume path puts on its synthetic error results.
+    pub fn synthetic() -> Self {
+        Self::rule("resume", "synthetic")
+    }
+}
+
 /// Payload of a `tool_result` event; `parent_event` points at the
 /// `assistant_message` that made the call.
+///
+/// The result's fields are flattened, so the wire shape is the phase 0
+/// one plus an optional `policy`; lines written before phase 3 read back
+/// with `policy: None`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct ToolResultPayload(pub ToolResult);
+pub struct ToolResultPayload {
+    #[serde(flatten)]
+    pub result: ToolResult,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<PolicyRecord>,
+}
+
+impl ToolResultPayload {
+    pub fn new(result: ToolResult, policy: PolicyRecord) -> Self {
+        Self {
+            result,
+            policy: Some(policy),
+        }
+    }
+}
 
 /// Payload of a `turn_ended` event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,4 +163,158 @@ pub struct InterruptedPayload {
     /// Tool call ids that received synthetic error results.
     #[serde(default)]
     pub unanswered_calls: Vec<String>,
+}
+
+/// Who invoked a skill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Invoker {
+    /// A slash command in the client.
+    User,
+    /// The `load_skill` tool.
+    Model,
+}
+
+/// Payload of a `skill_loaded` event: the body of a skill entered the
+/// thread. `hash` and `source` are the lock entry's, so a regression can be
+/// traced to a skill version.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillLoadedPayload {
+    pub name: String,
+    pub hash: String,
+    pub source: String,
+    pub body: String,
+    pub invoked_by: Invoker,
+}
+
+/// Payload of a `permission_requested` event: a tool call that policy
+/// says a human must answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionRequestedPayload {
+    pub call: ToolCall,
+    pub class: RiskClass,
+    pub reason: String,
+}
+
+/// How long a human's answer holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionScope {
+    /// This call only.
+    Once,
+    /// Every identical call until the process exits; never persisted.
+    Session,
+}
+
+/// Payload of a `permission_decided` event; the event's author is who
+/// answered and `parent_event` is the `permission_requested` event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionDecidedPayload {
+    pub call_id: String,
+    pub allow: bool,
+    pub scope: DecisionScope,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn phase0_tool_result_lines_read_back_without_policy() {
+        let line = json!({"id": "c1", "content": "ok", "is_error": false});
+        let p: ToolResultPayload = serde_json::from_value(line).unwrap();
+        assert_eq!(p.result.id, "c1");
+        assert_eq!(p.policy, None);
+    }
+
+    #[test]
+    fn tool_result_wire_shape_is_flat_with_optional_policy() {
+        let result = ToolResult {
+            id: "c1".into(),
+            content: "ok".into(),
+            is_error: false,
+        };
+        let bare = ToolResultPayload {
+            result: result.clone(),
+            policy: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&bare).unwrap(),
+            json!({"id": "c1", "content": "ok", "is_error": false})
+        );
+
+        let by_rule =
+            ToolResultPayload::new(result.clone(), PolicyRecord::rule("class read", "allow"));
+        let value = serde_json::to_value(&by_rule).unwrap();
+        assert_eq!(
+            value["policy"],
+            json!({"kind": "rule", "rule": "class read", "decision": "allow"})
+        );
+        assert_eq!(
+            serde_json::from_value::<ToolResultPayload>(value).unwrap(),
+            by_rule
+        );
+
+        let event = Ulid::from_parts(1_700_000_000_000, 7);
+        let by_human = ToolResultPayload::new(result, PolicyRecord::Human { event, allow: true });
+        let value = serde_json::to_value(&by_human).unwrap();
+        assert_eq!(
+            value["policy"],
+            json!({"kind": "human", "event": event.to_string(), "allow": true})
+        );
+        assert_eq!(
+            serde_json::from_value::<ToolResultPayload>(value).unwrap(),
+            by_human
+        );
+    }
+
+    #[test]
+    fn phase3_payloads_round_trip_in_snake_case() {
+        let loaded = SkillLoadedPayload {
+            name: "tdd".into(),
+            hash: "abc".into(),
+            source: "github.com/mattpocock/skills@c55ee46".into(),
+            body: "# TDD".into(),
+            invoked_by: Invoker::Model,
+        };
+        let value = serde_json::to_value(&loaded).unwrap();
+        assert_eq!(value["invoked_by"], "model");
+        assert_eq!(
+            serde_json::from_value::<SkillLoadedPayload>(value).unwrap(),
+            loaded
+        );
+
+        let requested = PermissionRequestedPayload {
+            call: ToolCall {
+                id: "c2".into(),
+                name: "bash".into(),
+                args: json!({"command": "rm -rf build"}),
+            },
+            class: RiskClass::Exec,
+            reason: "class exec: ask".into(),
+        };
+        let value = serde_json::to_value(&requested).unwrap();
+        assert_eq!(value["class"], "exec");
+        assert_eq!(value["call"]["name"], "bash");
+        assert_eq!(
+            serde_json::from_value::<PermissionRequestedPayload>(value).unwrap(),
+            requested
+        );
+
+        let decided = PermissionDecidedPayload {
+            call_id: "c2".into(),
+            allow: false,
+            scope: DecisionScope::Session,
+        };
+        let value = serde_json::to_value(&decided).unwrap();
+        assert_eq!(
+            value,
+            json!({"call_id": "c2", "allow": false, "scope": "session"})
+        );
+        assert_eq!(
+            serde_json::from_value::<PermissionDecidedPayload>(value).unwrap(),
+            decided
+        );
+    }
 }

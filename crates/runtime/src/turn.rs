@@ -141,8 +141,11 @@ impl Runtime {
                         is_error: true,
                     },
                 };
-                let payload =
-                    serde_json::to_value(ToolResultPayload(result)).expect("serialisable");
+                let payload = serde_json::to_value(ToolResultPayload {
+                    result,
+                    policy: None,
+                })
+                .expect("serialisable");
                 self.append(
                     EventKind::ToolResult,
                     Author::System,

@@ -5,8 +5,7 @@ use ulid::Ulid;
 use crate::Author;
 
 /// Kind of a log event. Kinds are added, never changed, so old logs always
-/// replay. The rest of the PRD list (`permission_requested`,
-/// `permission_decided`, `skill_loaded`, ...) arrives in later phases.
+/// replay.
 ///
 /// Tool calls are not an event kind: they live as `ToolCall` blocks inside
 /// the `assistant_message` event.
@@ -23,6 +22,12 @@ pub enum EventKind {
     Pinned,
     /// The process died mid-turn; appended on resume, never edited in.
     Interrupted,
+    /// The body of a skill entered the thread.
+    SkillLoaded,
+    /// A tool call needs a human.
+    PermissionRequested,
+    /// A human answered; the author is who answered.
+    PermissionDecided,
 }
 
 /// One line of a thread's append-only log. The log is the source of truth;
@@ -117,8 +122,27 @@ mod tests {
                 Author::System,
                 json!({"reason": "process exited mid-turn", "after_seq": 5, "unanswered_calls": []}),
             ),
+            event(
+                7,
+                EventKind::SkillLoaded,
+                steve_again(),
+                json!({"name": "tdd", "hash": "abc", "source": "github.com/mattpocock/skills@c55ee46", "body": "# TDD", "invoked_by": "user"}),
+            ),
+            event(
+                8,
+                EventKind::PermissionRequested,
+                Author::System,
+                json!({"call": {"id": "call_2", "name": "bash", "args": {"command": "rm -rf build"}}, "class": "exec", "reason": "class exec: ask"}),
+            ),
+            event(
+                9,
+                EventKind::PermissionDecided,
+                steve_again(),
+                json!({"call_id": "call_2", "allow": true, "scope": "once"}),
+            ),
         ];
         events[2].parent_event = Some(events[1].id);
+        events[9].parent_event = Some(events[8].id);
         events
     }
 
@@ -149,6 +173,18 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&events[6]).unwrap()["kind"],
             "interrupted"
+        );
+        assert_eq!(
+            serde_json::to_value(&events[7]).unwrap()["kind"],
+            "skill_loaded"
+        );
+        assert_eq!(
+            serde_json::to_value(&events[8]).unwrap()["kind"],
+            "permission_requested"
+        );
+        assert_eq!(
+            serde_json::to_value(&events[9]).unwrap()["kind"],
+            "permission_decided"
         );
         assert_eq!(value["seq"], 2);
         assert_eq!(value["author"], json!({"kind": "system"}));

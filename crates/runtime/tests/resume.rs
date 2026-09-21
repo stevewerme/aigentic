@@ -2,8 +2,8 @@
 
 use aigentic_core::{Author, ContentBlock, EventKind, ProviderEvent, ToolCall};
 use aigentic_log::{
-    AssistantMessagePayload, InterruptedPayload, NewEvent, Repair, ThreadLog, ToolResultPayload,
-    TurnEndedPayload, UserMessagePayload,
+    AssistantMessagePayload, InterruptedPayload, NewEvent, PolicyRecord, Repair, ThreadLog,
+    ToolResultPayload, TurnEndedPayload, UserMessagePayload,
 };
 use aigentic_runtime::{INTERRUPTED_RESULT, Resumed};
 use serde_json::json;
@@ -173,7 +173,9 @@ async fn unanswered_tool_calls_get_synthetic_error_results() {
         ]
     );
     for (i, id) in [(3, "c2"), (4, "c3")] {
-        let ToolResultPayload(r) = serde_json::from_value(events[i].payload.clone()).unwrap();
+        let ToolResultPayload { result: r, policy } =
+            serde_json::from_value(events[i].payload.clone()).unwrap();
+        assert_eq!(policy, Some(PolicyRecord::synthetic()));
         assert_eq!(
             (r.id.as_str(), r.is_error, r.content.as_str()),
             (id, true, INTERRUPTED_RESULT)

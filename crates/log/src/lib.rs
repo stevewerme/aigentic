@@ -12,8 +12,12 @@ mod projection;
 mod store;
 
 pub use payload::{
-    AssistantMessagePayload, CompactedPayload, CompactionStrategy, InterruptedPayload,
-    PinnedPayload, ToolResultPayload, TurnEndedPayload, Usage, UserMessagePayload,
+    AssistantMessagePayload, CompactedPayload, CompactionStrategy, DecisionScope,
+    InterruptedPayload, Invoker, PermissionDecidedPayload, PermissionRequestedPayload,
+    PinnedPayload, PolicyRecord, SkillLoadedPayload, ToolResultPayload, TurnEndedPayload, Usage,
+    UserMessagePayload,
 };
-pub use projection::{Projection, project, project_body, summary_marker, truncate_middle};
+pub use projection::{
+    Projection, project, project_body, skill_marker, summary_marker, truncate_middle,
+};
 pub use store::{LogError, NewEvent, Repair, ThreadLog};
