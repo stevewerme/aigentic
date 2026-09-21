@@ -447,8 +447,27 @@ fourteen docs under `.aigentic/knowledge/` and `threshold_fraction =
   copy of `accolm-sequence.md` had drifted from `docs/`, the cost of
   copying files into `.aigentic/knowledge/`.
 
+- Item 19 on Anthropic (`claude-opus-5`), 2026-09-21, in Vendela, thread
+  `01M32P070950D9TZY75V0981JZ`: "For the record, our on-call rotation
+  changes on Wednesdays" was pinned by the model and filed by extraction
+  (`[memory: 1 lines written]`); the recall turn answered from the
+  prefix after a grep and a knowledge search found nothing else; the
+  guess turn filed nothing; the line edited by hand to Fridays was in
+  the next turn's prefix (that call wrote 66.7k tokens to cache where
+  the earlier ones had read, the one invalidation the PRD describes),
+  and the model raised the contradiction with its own pin and asked
+  which stood. `/cost`: 4 extractions, 1 line. A TensorX rerun of the
+  same item without the profile flag (`01M32NT8DHQS6X097NPBZRT5H1`)
+  showed a new finding: the prefix's memory block names the files, so
+  the model located `.aigentic/memory/facts.md` and appended the fact
+  itself with `edit_file`, and extraction then filed the same fact in
+  other words, which byte-level dedup cannot catch. Open item: the
+  memory heading should say the harness writes these files, and a
+  default policy rule should refuse writes under `.aigentic/memory/`.
+
 Done-when 1 to 5 hold on TensorX as of 2026-09-21 (items 16 to 20
 above), with one harness fix along the way (`c437679`, memory re-read
 at turn start) and one checklist correction (item 17's allow list).
-Still to run: the same items on Anthropic, and the week of daily use in
-both projects that done-when 1 asks for.
+On Anthropic, items 17 and 19 have passed; 16, 18 and 20 are still to
+run there, as is the week of daily use in both projects that done-when
+1 asks for.
