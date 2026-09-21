@@ -15,7 +15,7 @@ members = [
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/steve-werme/aigentic"
+repository = "https://github.com/stevewerme/aigentic"
 
 [workspace.dependencies]
 aigentic-core = { path = "crates/core" }
