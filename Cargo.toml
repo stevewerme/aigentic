@@ -35,3 +35,4 @@ ulid = { version = "3", features = ["serde"] }
 time = { version = "0.3", features = ["serde-well-known", "macros"] }
 thiserror = "2"
 futures-core = "0.3"
+tempfile = "3"
