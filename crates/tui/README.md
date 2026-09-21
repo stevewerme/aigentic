@@ -409,3 +409,27 @@ fourteen docs under `.aigentic/knowledge/` and `threshold_fraction =
   wrong project (aigentic, no knowledge) got twenty tool calls and an
   invented answer rather than "not here"; model behaviour, noted for
   the memory filter's sake.
+- Item 19 on TensorX, 2026-09-21, in Vendela. Thread
+  `01M32K8XNBMG3MMPGMD834AEKS`: "Decision: we deploy on Fridays only,
+  never on a Monday" ended with `[memory: 1 lines written]`, a
+  `memory_extracted` event carrying the line at `at_seq 0` (the user
+  message), and the bullet in `.aigentic/memory/decisions.md` with the
+  date and thread id. The next turn answered from the prefix; an
+  inference turn ("what day do you think we cut releases") and two
+  others filed nothing (`/cost`: 4 extractions, 1 line). The hand edit
+  (Fridays to Thursdays) did not reach the following turn: memory was
+  re-read only at startup and after an extraction, one turn late. Fixed
+  in `c437679` (the turn re-reads memory files like knowledge); on the
+  resumed thread the edit was in the next prefix, and the model noticed
+  it contradicted its pin and the docs and called `ask_human` rather
+  than pick one. With `every_n_turns = 2`, thread
+  `01M32MNX7B7G7PS54Y9B69A5ZD` ran a turn with no extraction event, and
+  the second turn extracted once over both (`/cost`: 1 extraction, 1
+  line). Two findings. First, the model read the bare "Decision: ..."
+  as a request to file it in the repository (Vendela's instructions say
+  decisions live in owning docs), edited two docs, ran the tests and
+  committed, every step behind a permission prompt the human answered;
+  the commit was dropped afterwards. A statement of fact ("For the
+  record, ...") is filed by memory without that. Second, the model
+  pins facts on its own alongside memory, so a fact can live in the
+  thread prefix and the project files at once.
