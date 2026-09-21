@@ -1,7 +1,7 @@
 //! Kind-specific payload shapes. `Event.payload` is free JSON on the wire;
 //! these structs are the contract for what each kind carries.
 
-use aigentic_core::{ContentBlock, RiskClass, ToolCall, ToolResult};
+use aigentic_core::{Author, ContentBlock, RiskClass, ToolCall, ToolResult};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -215,10 +215,67 @@ pub struct PermissionDecidedPayload {
     pub scope: DecisionScope,
 }
 
+/// One line memory extraction wrote, with where it was stated so the
+/// "only what a participant said" rule is auditable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryLine {
+    /// File under the project's memory folder, e.g. `decisions.md`.
+    pub file: String,
+    pub text: String,
+    pub stated_by: Author,
+    /// The `user_message` (or a participant's `assistant_message`) seq
+    /// the line came from.
+    pub at_seq: u64,
+}
+
+/// Payload of a `memory_extracted` event, appended after a turn once the
+/// project's memory files were updated. `through_seq` is the cursor the
+/// next extraction starts after.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryExtractedPayload {
+    /// Events considered, inclusive.
+    pub through_seq: u64,
+    /// What landed in the files; empty when the model found nothing new.
+    #[serde(default)]
+    pub written: Vec<MemoryLine>,
+    pub model: String,
+    pub usage: Usage,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn memory_extracted_round_trips_with_an_empty_written_default() {
+        let p = MemoryExtractedPayload {
+            through_seq: 12,
+            written: vec![MemoryLine {
+                file: "decisions.md".into(),
+                text: "Use Swedish.".into(),
+                stated_by: Author::User(aigentic_core::UserId("steve".into())),
+                at_seq: 3,
+            }],
+            model: "m".into(),
+            usage: Usage::reported(aigentic_core::Usage::default()),
+        };
+        let value = serde_json::to_value(&p).unwrap();
+        assert_eq!(
+            value["written"][0]["stated_by"],
+            json!({"kind": "user", "id": "steve"})
+        );
+        assert_eq!(
+            serde_json::from_value::<MemoryExtractedPayload>(value).unwrap(),
+            p
+        );
+        let bare: MemoryExtractedPayload = serde_json::from_value(json!({
+            "through_seq": 1, "model": "m",
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        }))
+        .unwrap();
+        assert!(bare.written.is_empty());
+    }
 
     #[test]
     fn phase0_tool_result_lines_read_back_without_policy() {

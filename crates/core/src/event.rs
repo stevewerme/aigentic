@@ -28,6 +28,9 @@ pub enum EventKind {
     PermissionRequested,
     /// A human answered; the author is who answered.
     PermissionDecided,
+    /// Facts stated in the thread were written to the project's memory
+    /// files; carries what was written and the cursor for the next run.
+    MemoryExtracted,
 }
 
 /// One line of a thread's append-only log. The log is the source of truth;
@@ -140,6 +143,13 @@ mod tests {
                 steve_again(),
                 json!({"call_id": "call_2", "allow": true, "scope": "once"}),
             ),
+            event(
+                10,
+                EventKind::MemoryExtracted,
+                agent_again(),
+                json!({"through_seq": 9, "written": [{"file": "decisions.md", "text": "Use Swedish.", "stated_by": {"kind": "user", "id": "steve"}, "at_seq": 0}],
+                       "model": "m", "usage": {"input_tokens": 10, "output_tokens": 2}}),
+            ),
         ];
         events[2].parent_event = Some(events[1].id);
         events[9].parent_event = Some(events[8].id);
@@ -148,6 +158,10 @@ mod tests {
 
     fn steve_again() -> Author {
         Author::User(UserId("steve".into()))
+    }
+
+    fn agent_again() -> Author {
+        Author::Agent(AgentId("worker".into()))
     }
 
     #[test]
@@ -185,6 +199,10 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&events[9]).unwrap()["kind"],
             "permission_decided"
+        );
+        assert_eq!(
+            serde_json::to_value(&events[10]).unwrap()["kind"],
+            "memory_extracted"
         );
         assert_eq!(value["seq"], 2);
         assert_eq!(value["author"], json!({"kind": "system"}));

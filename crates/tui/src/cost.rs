@@ -2,7 +2,7 @@ use std::fmt;
 
 use aigentic_runtime::aigentic_core::{Event, EventKind};
 use aigentic_runtime::aigentic_log::{
-    AssistantMessagePayload, CompactedPayload, CompactionStrategy,
+    AssistantMessagePayload, CompactedPayload, CompactionStrategy, MemoryExtractedPayload,
 };
 
 /// Token totals for a thread, with the estimated share kept apart.
@@ -21,6 +21,10 @@ pub struct Cost {
     pub summaries: u32,
     pub summary_input: u64,
     pub summary_output: u64,
+    pub extractions: u32,
+    pub extraction_lines: u32,
+    pub extraction_input: u64,
+    pub extraction_output: u64,
 }
 
 /// Sum usage over every `assistant_message` in the log.
@@ -39,6 +43,19 @@ pub fn cost_of(events: &[Event]) -> Cost {
                 cost.summary_output += usage.output_tokens;
             }
         }
+    }
+    for event in events
+        .iter()
+        .filter(|e| e.kind == EventKind::MemoryExtracted)
+    {
+        let Ok(p) = serde_json::from_value::<MemoryExtractedPayload>(event.payload.clone()) else {
+            continue;
+        };
+        cost.extractions += 1;
+        cost.extraction_lines += p.written.len() as u32;
+        cost.extraction_input +=
+            p.usage.input_tokens + p.usage.cache_read_tokens + p.usage.cache_write_tokens;
+        cost.extraction_output += p.usage.output_tokens;
     }
     for event in events
         .iter()
@@ -100,6 +117,16 @@ impl fmt::Display for Cost {
                 self.summary_output
             )?;
         }
+        if self.extractions > 0 {
+            writeln!(
+                f,
+                "memory     {} extractions, {} lines   tokens in {} out {}",
+                self.extractions,
+                self.extraction_lines,
+                self.extraction_input,
+                self.extraction_output
+            )?;
+        }
         write!(
             f,
             "total      in {:>9}  out {:>9}",
@@ -107,8 +134,9 @@ impl fmt::Display for Cost {
                 + self.cache_read
                 + self.cache_write
                 + self.estimated_input
-                + self.summary_input,
-            self.output + self.estimated_output + self.summary_output
+                + self.summary_input
+                + self.extraction_input,
+            self.output + self.estimated_output + self.summary_output + self.extraction_output
         )
     }
 }
@@ -168,6 +196,11 @@ mod tests {
                 json!({"from_seq": 0, "to_seq": 4, "strategy": {"kind": "summary", "text": "s", "model": "m",
                        "usage": {"input_tokens": 1000, "output_tokens": 50, "cache_read_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": null, "estimated": false}}}),
             ),
+            event(
+                EventKind::MemoryExtracted,
+                json!({"through_seq": 5, "written": [{"file": "decisions.md", "text": "x", "stated_by": {"kind": "system"}, "at_seq": 0}, {"file": "facts.md", "text": "y", "stated_by": {"kind": "system"}, "at_seq": 0}],
+                       "model": "m", "usage": {"input_tokens": 300, "output_tokens": 20}}),
+            ),
         ];
         let cost = cost_of(&events);
         assert_eq!(
@@ -186,7 +219,16 @@ mod tests {
                 summaries: 1,
                 summary_input: 1000,
                 summary_output: 50,
+                extractions: 1,
+                extraction_lines: 2,
+                extraction_input: 300,
+                extraction_output: 20,
             }
+        );
+        assert!(
+            cost.to_string()
+                .contains("memory     1 extractions, 2 lines   tokens in 300 out 20"),
+            "{cost}"
         );
         let text_all = cost.to_string();
         assert!(
@@ -202,6 +244,6 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("reasoning             6"), "{text}");
-        assert!(text.contains("total      in      1417"), "{text}");
+        assert!(text.contains("total      in      1717"), "{text}");
     }
 }

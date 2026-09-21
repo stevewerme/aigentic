@@ -13,9 +13,9 @@ mod store;
 
 pub use payload::{
     AssistantMessagePayload, CompactedPayload, CompactionStrategy, DecisionScope,
-    InterruptedPayload, Invoker, PermissionDecidedPayload, PermissionRequestedPayload,
-    PinnedPayload, PolicyRecord, SkillLoadedPayload, ToolResultPayload, TurnEndedPayload, Usage,
-    UserMessagePayload,
+    InterruptedPayload, Invoker, MemoryExtractedPayload, MemoryLine, PermissionDecidedPayload,
+    PermissionRequestedPayload, PinnedPayload, PolicyRecord, SkillLoadedPayload, ToolResultPayload,
+    TurnEndedPayload, Usage, UserMessagePayload,
 };
 pub use projection::{
     Projection, project, project_body, skill_marker, summary_marker, truncate_middle,

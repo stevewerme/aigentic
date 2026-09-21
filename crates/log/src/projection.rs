@@ -51,7 +51,8 @@ struct Truncation {
 /// becomes a short note; a loaded skill becomes a user-role message from
 /// the system author (a marker line, then the body); `turn_ended`,
 /// `compacted`, `permission_requested` and `permission_decided` emit
-/// nothing (a refused call is visible as its error tool result).
+/// nothing (a refused call is visible as its error tool result), as does
+/// `memory_extracted` (the memory files are read into the prefix).
 ///
 /// Every provider requires an assistant message's tool results to follow
 /// it immediately, so a message produced between an assistant message and
@@ -258,7 +259,8 @@ pub fn project(events: &[Event]) -> Result<Projection, LogError> {
             | EventKind::Compacted
             | EventKind::Pinned
             | EventKind::PermissionRequested
-            | EventKind::PermissionDecided => {}
+            | EventKind::PermissionDecided
+            | EventKind::MemoryExtracted => {}
         }
     }
 
@@ -665,6 +667,22 @@ mod tests {
         );
         assert!(texts(&p)[4].starts_with("[Skill `tdd` loaded"));
         assert_eq!(texts(&p)[2], "result:loaded");
+    }
+
+    #[test]
+    fn memory_extracted_emits_nothing() {
+        let events = vec![
+            user(0, "go"),
+            assistant(1, "ok", false),
+            ended(2),
+            ev(
+                3,
+                EventKind::MemoryExtracted,
+                agent(),
+                json!({"through_seq": 2, "written": [], "model": "m", "usage": {"input_tokens": 1, "output_tokens": 1}}),
+            ),
+        ];
+        assert_eq!(texts(&project(&events).unwrap()), vec!["go", "ok"]);
     }
 
     #[test]
