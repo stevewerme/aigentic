@@ -99,7 +99,9 @@ adapter change.
    check `/cost` shows `cache read > 0`. Then resume once more with the
    TensorX profile and confirm it still answers from context.
 
-Status: all seven steps passed on 2026-09-21 against TensorX
-(`https://api.tensorx.ai/v1`, model `z-ai/glm-5.3`). The resumed thread
-answered from context with no tool calls. Re-run after changes to the
-loop, the tools or the adapter.
+Status: steps 1 to 7 passed on 2026-09-21 against TensorX
+(`https://api.tensorx.ai/v1`, model `z-ai/glm-5.3`). Step 8 passed the same
+day: the thread resumed on `claude-opus-5`, answered from context, made a
+tool call on the next turn with `cache read > 0`, and then resumed again on
+TensorX with a correct summary from memory. Re-run after changes to the
+loop, the tools or an adapter.

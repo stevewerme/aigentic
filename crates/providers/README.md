@@ -136,17 +136,16 @@ let provider = Anthropic::new(
 | Stop reasons | `end_turn`, `tool_use`, `max_tokens`, `refusal`, `pause_turn` pass through as the finish reason. On `refusal` an unfinished tool call is dropped, never run |
 | Append-only | The API checks that earlier turns are unchanged when thinking blocks are replayed. The log is append-only, so this holds; phase 2 compaction must replace the whole body, never rewrite the middle |
 
-Fixtures under `fixtures/anthropic/` are currently **hand-written** to the
-documented event shapes (each file says so on its first line). Record real
-ones with a key:
+Fixtures under `fixtures/anthropic/` are recorded from `claude-opus-5`.
+Re-record with a key:
 
 ```bash
 cd crates/providers/fixtures && ANTHROPIC_API_KEY=... ./record.sh anthropic claude-opus-5
 ```
 
-The recording sends a system prompt above the cache minimum so
-`tool_calls.sse`, recorded second, shows `cache_read_input_tokens > 0`.
-Replacing the fixtures must not change any test.
+The recording sends a system prompt above the cache minimum and sends the
+tool-call request twice, keeping the second, so `tool_calls.sse` shows
+`cache_read_input_tokens > 0`.
 
 ### Manual check against the Messages API
 
@@ -158,4 +157,9 @@ Replacing the fixtures must not change any test.
 4. Resume a thread recorded on TensorX with `--profile anthropic` and ask
    what happened earlier; then the reverse.
 
-Status: not yet run; no Anthropic key was available at the time of writing.
+Status: all four steps passed on 2026-09-21 with `claude-opus-5`. Fixtures
+were recorded; the parser needed no change. A thread produced entirely on
+TensorX resumed on Anthropic and answered from context with no tool call;
+the next turn showed `cache read 10381, write 5642`; resuming the same
+thread on TensorX afterwards, with Anthropic thinking blobs now in the log,
+produced a correct five-point summary from memory. Phase 1 done-when met.
