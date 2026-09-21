@@ -6,32 +6,54 @@ full-screen application; the terminal keeps its normal scrollback, and
 
 ## Configuration
 
-`~/.config/aigentic/config.toml` (override with `--config`):
+`~/.config/aigentic/config.toml` (override with `--config`). One profile per
+backend; `--profile` picks one, `default_profile` picks otherwise:
 
 ```toml
-base_url = "https://api.tensorx.ai/v1"   # any OpenAI-compatible endpoint
-model = "glm-5.3"
+default_profile = "tensorx"
+
+[profiles.tensorx]
+provider = "openai_compat"                # any OpenAI-compatible endpoint
+base_url = "https://api.tensorx.ai/v1"
+model = "z-ai/glm-5.3"
 api_key_env = "TENSORX_API_KEY"          # NAME of the variable holding the key
 # max_context_tokens = 131072
+
+[profiles.anthropic]
+provider = "anthropic"
+model = "claude-opus-5"
+api_key_env = "ANTHROPIC_API_KEY"
+# base_url = "https://api.anthropic.com"
+# thinking = "adaptive"                   # or "off"
+# effort = "high"                         # low | medium | high | xhigh | max
+# max_output_tokens = 64000
+# cache = true
+
 # user = "steve"                          # author id on your messages ($USER by default)
 # threads_dir = "/path/to/threads"        # default ~/.local/share/aigentic/threads
 ```
 
+The phase 0 flat form (top-level `base_url`, `model`, `api_key_env`) still
+works and is read as a single profile named `default`.
+
 The key is read only from the named environment variable, never from the
-config file, and is never logged or printed. A `.env` file in the current
+config file, and is never logged or printed. Unknown fields are rejected, so
+a pasted `api_key` line fails to load. A `.env` file in the current
 directory is loaded at startup if present; see `.env.example` at the repo
-root. For a local llama.cpp server that needs no key, set the variable to any
-non-empty value.
+root. For a local llama.cpp server that needs no key, set the variable to
+any non-empty value.
 
 ## Usage
 
 ```bash
-cargo run -p aigentic-tui --                 # new thread; prints its id
-cargo run -p aigentic-tui -- --thread <ULID> # resume by replaying the log
+cargo run -p aigentic-tui --                                     # new thread; prints its id
+cargo run -p aigentic-tui -- --thread <ULID>                     # resume by replaying the log
+cargo run -p aigentic-tui -- --thread <ULID> --profile anthropic # same thread, other backend
 ```
 
 Slash commands: `/cost` (input and output tokens for the thread, reported and
-estimated shown separately), `/quit`. Anything else starting with `/` prints
+estimated shown separately, plus cache reads and writes and the reasoning
+share), `/quit`. Anything else starting with `/` prints
 `unknown command`. Ctrl-D quits; Ctrl-C clears the line.
 
 Assistant text streams as it arrives. Tool calls print as `→ name {args}`
@@ -72,6 +94,10 @@ adapter change.
 
    Expect "resumed with N events". Ask "What did you change earlier?" and
    confirm the answer reflects steps 3 to 5 without re-reading anything.
+8. Phase 1: resume the same thread with `--profile anthropic` and ask the
+   same question. Expect an answer from context. Send one more message and
+   check `/cost` shows `cache read > 0`. Then resume once more with the
+   TensorX profile and confirm it still answers from context.
 
 Status: all seven steps passed on 2026-09-21 against TensorX
 (`https://api.tensorx.ai/v1`, model `z-ai/glm-5.3`). The resumed thread

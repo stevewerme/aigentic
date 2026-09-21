@@ -9,7 +9,6 @@ use std::path::PathBuf;
 
 use aigentic_runtime::aigentic_core::{AgentId, Author, UserId};
 use aigentic_runtime::aigentic_log::ThreadLog;
-use aigentic_runtime::aigentic_providers::{OpenAiCompat, OpenAiCompatConfig};
 use aigentic_runtime::aigentic_tools::{Workdir, builtin_tools};
 use aigentic_runtime::{Runtime, load_instructions};
 use anyhow::Context;
@@ -31,6 +30,9 @@ struct Cli {
     /// Thread to resume. Omit to start a new thread; its id is printed.
     #[arg(long)]
     thread: Option<Ulid>,
+    /// Profile from the config file (default: its default_profile).
+    #[arg(long)]
+    profile: Option<String>,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -41,14 +43,11 @@ async fn main() -> anyhow::Result<()> {
 
     let config_path = cli.config.unwrap_or_else(config::default_config_path);
     let config = Config::load(&config_path)?;
-    let api_key = config.api_key()?;
+    let (profile_name, profile) = config.select(cli.profile.as_deref())?;
+    let api_key = profile.api_key()?;
 
     let cwd = std::env::current_dir().context("current directory")?;
-    let provider = OpenAiCompat::new(
-        OpenAiCompatConfig::new(&config.base_url, &config.model)
-            .with_api_key(api_key)
-            .with_max_context_tokens(config.max_context_tokens),
-    );
+    let provider = profile.build_provider(api_key);
     let tools = builtin_tools(Workdir::new(&cwd));
 
     let threads_dir = config
@@ -64,10 +63,14 @@ async fn main() -> anyhow::Result<()> {
     let log = ThreadLog::open(&threads_dir, thread_id)?;
     let instructions = load_instructions(&cwd).context("reading repository instructions")?;
 
-    let runtime = Runtime::new(Box::new(provider), tools, log, AgentId("assistant".into()))
+    let runtime = Runtime::new(provider, tools, log, AgentId("assistant".into()))
         .with_instructions(instructions);
 
-    println!("aigentic · {} · {}", config.model, config.base_url);
+    println!(
+        "aigentic · profile {profile_name} · {} · {}",
+        profile.model,
+        profile.endpoint()
+    );
     if resumed {
         println!(
             "thread {thread_id} resumed with {} events from {}",

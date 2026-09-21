@@ -1,39 +1,98 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, anyhow};
+use aigentic_runtime::aigentic_core::Provider;
+use aigentic_runtime::aigentic_providers::{
+    Anthropic, AnthropicConfig, OpenAiCompat, OpenAiCompatConfig, Thinking,
+};
+use anyhow::{Context, anyhow, bail};
 use serde::Deserialize;
 
-/// `config.toml`. The API key is deliberately absent: only its environment
-/// variable's name is configured here, and unknown fields (such as a stray
-/// `api_key`) are rejected.
+/// Which adapter a profile uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderKind {
+    #[default]
+    OpenaiCompat,
+    Anthropic,
+}
+
+/// One backend. The API key is deliberately absent: only its environment
+/// variable's name is configured here.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Config {
-    /// e.g. `https://api.tensorx.ai/v1` or `http://127.0.0.1:8080/v1`.
-    pub base_url: String,
+pub struct Profile {
+    #[serde(default)]
+    pub provider: ProviderKind,
+    /// Required for `openai_compat`; optional override for `anthropic`.
+    #[serde(default)]
+    pub base_url: Option<String>,
     pub model: String,
     /// Name of the environment variable holding the API key.
     pub api_key_env: String,
-    #[serde(default = "default_max_context")]
-    pub max_context_tokens: u64,
-    /// Author id for your messages; defaults to `$USER`.
     #[serde(default)]
+    pub max_context_tokens: Option<u64>,
+    /// `anthropic` only: `adaptive` (default) or `off`.
+    #[serde(default)]
+    pub thinking: Option<String>,
+    /// `anthropic` only: `low` | `medium` | `high` | `xhigh` | `max`.
+    #[serde(default)]
+    pub effort: Option<String>,
+    /// `anthropic` only: `max_tokens` when the runtime sets no cap.
+    #[serde(default)]
+    pub max_output_tokens: Option<u64>,
+    /// `anthropic` only: emit cache breakpoints (default true).
+    #[serde(default)]
+    pub cache: Option<bool>,
+}
+
+/// The file on disk. Either the phase 0 flat form (top-level `base_url`,
+/// `model`, `api_key_env`) or named `[profiles.<name>]` tables; not both.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfigFile {
+    #[serde(default)]
+    base_url: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    api_key_env: Option<String>,
+    #[serde(default)]
+    max_context_tokens: Option<u64>,
+    #[serde(default)]
+    default_profile: Option<String>,
+    #[serde(default)]
+    profiles: BTreeMap<String, Profile>,
+    #[serde(default)]
+    user: Option<String>,
+    #[serde(default)]
+    threads_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Config {
+    pub profiles: BTreeMap<String, Profile>,
+    pub default_profile: String,
+    /// Author id for your messages; defaults to `$USER`.
     pub user: Option<String>,
     /// Where thread logs live; defaults to `~/.local/share/aigentic/threads`.
-    #[serde(default)]
     pub threads_dir: Option<PathBuf>,
 }
 
-fn default_max_context() -> u64 {
-    32_768
-}
+const EXAMPLE: &str = r#"default_profile = "tensorx"
 
-const EXAMPLE: &str = r#"base_url = "https://api.tensorx.ai/v1"
-model = "glm-5.3"
+[profiles.tensorx]
+provider = "openai_compat"
+base_url = "https://api.tensorx.ai/v1"
+model = "z-ai/glm-5.3"
 api_key_env = "TENSORX_API_KEY"
-# max_context_tokens = 131072
-# user = "steve"
-# threads_dir = "/path/to/threads"
+
+[profiles.anthropic]
+provider = "anthropic"
+model = "claude-opus-5"
+api_key_env = "ANTHROPIC_API_KEY"
+# effort = "high"
+# thinking = "adaptive"
 "#;
 
 impl Config {
@@ -51,13 +110,114 @@ impl Config {
     /// parser's default error quotes the offending line, which could echo a
     /// secret someone pasted into the file.
     pub fn parse(text: &str) -> anyhow::Result<Self> {
-        toml::from_str(text).map_err(|e| {
+        let file: ConfigFile = toml::from_str(text).map_err(|e| {
             let at = e
                 .span()
                 .map(|s| format!(" at byte {}", s.start))
                 .unwrap_or_default();
             anyhow!("{}{at}", e.message())
+        })?;
+
+        let flat = file.base_url.is_some() || file.model.is_some() || file.api_key_env.is_some();
+        let (profiles, default_profile) = match (flat, file.profiles.is_empty()) {
+            (true, false) => {
+                bail!("use either top-level base_url/model/api_key_env or [profiles.*], not both")
+            }
+            (true, true) => {
+                let profile = Profile {
+                    provider: ProviderKind::OpenaiCompat,
+                    base_url: Some(file.base_url.ok_or_else(|| anyhow!("missing base_url"))?),
+                    model: file.model.ok_or_else(|| anyhow!("missing model"))?,
+                    api_key_env: file
+                        .api_key_env
+                        .ok_or_else(|| anyhow!("missing api_key_env"))?,
+                    max_context_tokens: file.max_context_tokens,
+                    thinking: None,
+                    effort: None,
+                    max_output_tokens: None,
+                    cache: None,
+                };
+                (
+                    BTreeMap::from([("default".to_owned(), profile)]),
+                    "default".to_owned(),
+                )
+            }
+            (false, true) => bail!("no profiles configured"),
+            (false, false) => {
+                let default = match file.default_profile {
+                    Some(name) => name,
+                    None if file.profiles.len() == 1 => {
+                        file.profiles.keys().next().unwrap().clone()
+                    }
+                    None => {
+                        bail!("default_profile is required when more than one profile is defined")
+                    }
+                };
+                if !file.profiles.contains_key(&default) {
+                    bail!("default_profile {default:?} is not a defined profile");
+                }
+                (file.profiles, default)
+            }
+        };
+        for (name, p) in &profiles {
+            p.validate().with_context(|| format!("profile {name:?}"))?;
+        }
+        Ok(Self {
+            profiles,
+            default_profile,
+            user: file.user,
+            threads_dir: file.threads_dir,
         })
+    }
+
+    /// The named profile, or the default.
+    pub fn select(&self, name: Option<&str>) -> anyhow::Result<(&str, &Profile)> {
+        let name = name.unwrap_or(&self.default_profile);
+        let (name, profile) = self.profiles.get_key_value(name).ok_or_else(|| {
+            anyhow!(
+                "no profile {name:?}; defined: {}",
+                self.profiles.keys().cloned().collect::<Vec<_>>().join(", ")
+            )
+        })?;
+        Ok((name.as_str(), profile))
+    }
+
+    pub fn user_name(&self) -> String {
+        self.user
+            .clone()
+            .or_else(|| std::env::var("USER").ok())
+            .unwrap_or_else(|| "user".into())
+    }
+}
+
+impl Profile {
+    fn validate(&self) -> anyhow::Result<()> {
+        match self.provider {
+            ProviderKind::OpenaiCompat => {
+                if self.base_url.is_none() {
+                    bail!("base_url is required for provider = \"openai_compat\"");
+                }
+                for (field, set) in [
+                    ("thinking", self.thinking.is_some()),
+                    ("effort", self.effort.is_some()),
+                    ("max_output_tokens", self.max_output_tokens.is_some()),
+                    ("cache", self.cache.is_some()),
+                ] {
+                    if set {
+                        bail!("{field} only applies to provider = \"anthropic\"");
+                    }
+                }
+            }
+            ProviderKind::Anthropic => {
+                if let Some(t) = &self.thinking
+                    && t != "adaptive"
+                    && t != "off"
+                {
+                    bail!("thinking must be \"adaptive\" or \"off\", got {t:?}");
+                }
+            }
+        }
+        Ok(())
     }
 
     /// The key, read only from the named environment variable.
@@ -71,11 +231,53 @@ impl Config {
         })
     }
 
-    pub fn user_name(&self) -> String {
-        self.user
-            .clone()
-            .or_else(|| std::env::var("USER").ok())
-            .unwrap_or_else(|| "user".into())
+    /// Where requests go, for the banner. Never includes the key.
+    pub fn endpoint(&self) -> String {
+        match self.provider {
+            ProviderKind::OpenaiCompat => self.base_url.clone().unwrap_or_default(),
+            ProviderKind::Anthropic => self
+                .base_url
+                .clone()
+                .unwrap_or_else(|| "api.anthropic.com".into()),
+        }
+    }
+
+    /// Build the adapter. `api_key` is passed in so this stays testable
+    /// without touching the environment.
+    pub fn build_provider(&self, api_key: String) -> Box<dyn Provider> {
+        match self.provider {
+            ProviderKind::OpenaiCompat => {
+                let mut c =
+                    OpenAiCompatConfig::new(self.base_url.clone().unwrap_or_default(), &self.model)
+                        .with_api_key(api_key);
+                if let Some(n) = self.max_context_tokens {
+                    c = c.with_max_context_tokens(n);
+                }
+                Box::new(OpenAiCompat::new(c))
+            }
+            ProviderKind::Anthropic => {
+                let mut c = AnthropicConfig::new(api_key, &self.model);
+                if let Some(u) = &self.base_url {
+                    c = c.with_base_url(u);
+                }
+                if let Some(n) = self.max_context_tokens {
+                    c = c.with_max_context_tokens(n);
+                }
+                if let Some(n) = self.max_output_tokens {
+                    c = c.with_max_output_tokens(n);
+                }
+                if self.thinking.as_deref() == Some("off") {
+                    c = c.with_thinking(Thinking::Off);
+                }
+                if let Some(e) = &self.effort {
+                    c = c.with_effort(e);
+                }
+                if let Some(cache) = self.cache {
+                    c = c.with_cache(cache);
+                }
+                Box::new(Anthropic::new(c))
+            }
+        }
     }
 }
 
@@ -107,38 +309,82 @@ pub fn default_threads_dir() -> PathBuf {
 mod tests {
     use super::*;
 
+    const FLAT: &str = r#"base_url = "https://api.tensorx.ai/v1"
+model = "z-ai/glm-5.3"
+api_key_env = "TENSORX_API_KEY"
+"#;
+
     #[test]
-    fn parses_the_example_and_applies_defaults() {
+    fn flat_phase0_file_becomes_a_default_profile() {
+        let c = Config::parse(FLAT).unwrap();
+        assert_eq!(c.default_profile, "default");
+        let (name, p) = c.select(None).unwrap();
+        assert_eq!(name, "default");
+        assert_eq!(p.provider, ProviderKind::OpenaiCompat);
+        assert_eq!(p.base_url.as_deref(), Some("https://api.tensorx.ai/v1"));
+        assert_eq!(p.model, "z-ai/glm-5.3");
+        assert_eq!(p.api_key_env, "TENSORX_API_KEY");
+        assert!(c.select(Some("anthropic")).is_err());
+    }
+
+    #[test]
+    fn profiles_parse_select_and_build() {
         let c = Config::parse(EXAMPLE).unwrap();
-        assert_eq!(c.base_url, "https://api.tensorx.ai/v1");
-        assert_eq!(c.model, "glm-5.3");
-        assert_eq!(c.api_key_env, "TENSORX_API_KEY");
-        assert_eq!(c.max_context_tokens, 32_768);
-        assert_eq!(c.user, None);
-        assert_eq!(c.threads_dir, None);
+        assert_eq!(c.default_profile, "tensorx");
+        assert_eq!(c.select(None).unwrap().0, "tensorx");
+        let (_, a) = c.select(Some("anthropic")).unwrap();
+        assert_eq!(a.provider, ProviderKind::Anthropic);
+        assert_eq!(a.base_url, None);
+        assert_eq!(a.endpoint(), "api.anthropic.com");
+        let provider = a.build_provider("k".into());
+        assert!(provider.capabilities().supports_caching);
+        assert_eq!(provider.capabilities().max_context_tokens, 1_000_000);
+        let (_, t) = c.select(Some("tensorx")).unwrap();
+        assert!(!t.build_provider("k".into()).capabilities().supports_caching);
     }
 
     #[test]
-    fn a_key_in_the_config_is_rejected() {
-        let text = format!("{EXAMPLE}\napi_key = \"sk-oops\"\n");
-        let err = Config::parse(&text).unwrap_err().to_string();
-        assert!(err.contains("api_key"), "{err}");
-        assert!(
-            !err.contains("sk-oops"),
-            "the value must never be echoed: {err}"
-        );
+    fn single_profile_needs_no_default() {
+        let c = Config::parse(
+            r#"[profiles.only]
+provider = "anthropic"
+model = "claude-opus-5"
+api_key_env = "ANTHROPIC_API_KEY"
+thinking = "off"
+effort = "low"
+cache = false
+"#,
+        )
+        .unwrap();
+        assert_eq!(c.default_profile, "only");
+        let (_, p) = c.select(None).unwrap();
+        assert!(!p.build_provider("k".into()).capabilities().supports_caching);
     }
 
     #[test]
-    fn missing_fields_are_reported() {
-        assert!(Config::parse("model = \"m\"\n").is_err());
+    fn bad_files_are_rejected_without_echoing_values() {
+        let cases = [
+            format!("{EXAMPLE}\napi_key = \"sk-oops\"\n"),
+            format!("{FLAT}\n[profiles.x]\nmodel = \"m\"\napi_key_env = \"K\"\nbase_url = \"u\"\n"),
+            "default_profile = \"nope\"\n[profiles.a]\nmodel = \"m\"\napi_key_env = \"K\"\nbase_url = \"u\"\n".into(),
+            "[profiles.a]\nmodel = \"m\"\napi_key_env = \"K\"\n".into(), // openai without base_url
+            "[profiles.a]\nprovider = \"anthropic\"\nmodel = \"m\"\napi_key_env = \"K\"\nthinking = \"lots\"\n".into(),
+            "[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\neffort = \"high\"\n".into(),
+            "[profiles.a]\nprovider = \"gemini\"\nmodel = \"m\"\napi_key_env = \"K\"\n".into(),
+            "model = \"m\"\n".into(),
+        ];
+        for text in cases {
+            let err = Config::parse(&text).unwrap_err().to_string();
+            assert!(!err.contains("sk-oops"), "value echoed: {err}");
+        }
     }
 
     #[test]
     fn api_key_comes_only_from_the_named_variable() {
-        let mut c = Config::parse(EXAMPLE).unwrap();
-        c.api_key_env = "AIGENTIC_TEST_KEY_THAT_IS_UNSET".into();
-        let err = c.api_key().unwrap_err().to_string();
+        let c = Config::parse(FLAT).unwrap();
+        let mut p = c.select(None).unwrap().1.clone();
+        p.api_key_env = "AIGENTIC_TEST_KEY_THAT_IS_UNSET".into();
+        let err = p.api_key().unwrap_err().to_string();
         assert!(err.contains("AIGENTIC_TEST_KEY_THAT_IS_UNSET"));
     }
 }
