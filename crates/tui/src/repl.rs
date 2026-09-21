@@ -11,6 +11,7 @@ use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 
 use crate::cost::cost_of;
+use crate::project_cmd::{list_threads, render_threads, report};
 
 /// Lines of tool output shown before truncating.
 const RESULT_LINES: usize = 12;
@@ -21,6 +22,10 @@ pub struct Repl {
     runtime: Runtime,
     user: Author,
     history: PathBuf,
+    /// This project's threads, for `/threads`.
+    threads_dir: PathBuf,
+    /// The global layer's file, named in `/project`.
+    global_instructions: PathBuf,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -29,6 +34,8 @@ pub enum Command<'a> {
     Quit,
     Help,
     Skills,
+    Project,
+    Threads,
     Pin(&'a str),
     Compact,
     /// A user-invoked skill: its name and the rest of the line.
@@ -54,6 +61,8 @@ pub fn parse_line<'a>(line: &'a str, skills: &[String]) -> Command<'a> {
         ("quit" | "exit", _) => Command::Quit,
         ("help", _) => Command::Help,
         ("skills", _) => Command::Skills,
+        ("project", _) => Command::Project,
+        ("threads", _) => Command::Threads,
         ("compact", _) => Command::Compact,
         ("pin", text) if !text.is_empty() => Command::Pin(text),
         (name, args) if skills.iter().any(|s| s == name) => Command::Skill(name, args),
@@ -66,6 +75,8 @@ const HELP: &str = "\
 /pin <text>      pin a fact to the stable prefix
 /compact         run compaction now
 /skills          list enabled skills; user-invoked ones are slash commands
+/project         the layers, the knowledge mode and every tool's fate
+/threads         this project's threads, newest first
 /<skill> [args]  run a user-invoked skill
 /help            this list
 /quit            exit (Ctrl-D too)
@@ -77,7 +88,19 @@ impl Repl {
             runtime,
             user,
             history,
+            threads_dir: PathBuf::new(),
+            global_instructions: PathBuf::new(),
         }
+    }
+
+    pub fn with_project_paths(
+        mut self,
+        threads_dir: PathBuf,
+        global_instructions: PathBuf,
+    ) -> Self {
+        self.threads_dir = threads_dir;
+        self.global_instructions = global_instructions;
+        self
     }
 
     /// Start the REPL. `resumed` is what `Runtime::resume` found; an
@@ -137,6 +160,13 @@ impl Repl {
                     let events = self.runtime.log().read_all()?;
                     println!("{}", cost_of(&events));
                 }
+                Command::Project => {
+                    println!("{}", report(&self.runtime, &self.global_instructions));
+                }
+                Command::Threads => match list_threads(&self.threads_dir) {
+                    Ok(threads) => println!("{}", render_threads(&threads, &self.threads_dir)),
+                    Err(e) => println!("[error: {e}]"),
+                },
                 Command::Pin(text) => {
                     let _ = editor.add_history_entry(line.trim());
                     match self
@@ -356,6 +386,8 @@ mod tests {
         assert_eq!(parse_line("/help", &none), Command::Help);
         assert_eq!(parse_line("/skills", &none), Command::Skills);
         assert_eq!(parse_line("/compact", &none), Command::Compact);
+        assert_eq!(parse_line("/project", &none), Command::Project);
+        assert_eq!(parse_line("/threads", &none), Command::Threads);
         assert_eq!(
             parse_line("/pin  Answer in Swedish. ", &none),
             Command::Pin("Answer in Swedish.")

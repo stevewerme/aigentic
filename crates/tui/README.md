@@ -59,15 +59,29 @@ any non-empty value.
 cargo run -p aigentic-tui --                                     # new thread; prints its id
 cargo run -p aigentic-tui -- --thread <ULID>                     # resume by replaying the log
 cargo run -p aigentic-tui -- --thread <ULID> --profile anthropic # same thread, other backend
+cargo run -p aigentic-tui -- project init                        # aigentic.toml + .aigentic/{knowledge,memory}
+cargo run -p aigentic-tui -- project show                        # layers, knowledge mode, every tool's fate
+cargo run -p aigentic-tui -- threads                             # this project's threads, newest first
 ```
 
+The profile is `--profile`, else the project's `[model] profile`, else the
+config's `default_profile`. The banner names the project, the layers it
+loaded (global, project, knowledge with its mode, memory), the skill and
+tool counts and how many threads the project has.
+
 Slash commands: `/cost` (input and output tokens for the thread, reported and
-estimated shown separately, plus cache reads and writes, the reasoning share
-and compactions), `/pin <text>` (a fact for the stable prefix, never
-summarised), `/compact` (run compaction now and report what it did),
-`/skills` (the enabled set), `/<skill> [args]` for every enabled
-user-invoked skill, `/help`, `/quit`. Anything else starting with `/`
-prints `unknown command`. Ctrl-D quits; Ctrl-C clears the line.
+estimated shown separately, plus cache reads and writes, the reasoning share,
+compactions and memory extractions), `/pin <text>` (a fact for the stable
+prefix, never summarised), `/compact` (run compaction now and report what it
+did), `/skills` (the enabled set), `/project` (the same report as `project
+show`, over the live registry so MCP tools are included), `/threads`,
+`/<skill> [args]` for every enabled user-invoked skill, `/help`, `/quit`.
+Anything else starting with `/` prints `unknown command`. Ctrl-D quits;
+Ctrl-C clears the line.
+
+After a turn that ends `done`, memory extraction runs with the project's
+model and prints `[memory: N lines written]` when anything new landed in
+`.aigentic/memory/`; `[memory] enabled = false` turns it off.
 
 Assistant text streams as it arrives. Tool calls print as `→ name {args}`
 and their output follows, truncated to twelve lines or 1200 bytes with a
@@ -132,9 +146,12 @@ each recorded source at its head, shows `diff -ru` per changed skill with
 the new findings, and applies only what you accept; an applied skill is
 pending again.
 
-Thread logs are JSONL files, one per thread, under `threads_dir`. The
-working directory at launch is the tools' working directory and the source
-of repository instructions (`.aigentic/instructions.md`, else `AGENTS.md`).
+Thread logs are JSONL files, one per thread, under
+`threads_dir/<project name>/` (`threads_dir/_none/` outside a project).
+The nearest `aigentic.toml` at or above the working directory is the
+project; the working directory at launch stays the tools' working
+directory. Project instructions are `.aigentic/instructions.md`, else
+`AGENTS.md`; no other product's file is read.
 
 Compaction runs before each model call when the window is past
 `trigger_fraction`: old tool results are truncated first, then everything

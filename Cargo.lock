@@ -124,6 +124,8 @@ dependencies = [
  "anyhow",
  "clap",
  "dotenvy",
+ "futures-core",
+ "futures-util",
  "rustyline",
  "serde",
  "serde_json",
