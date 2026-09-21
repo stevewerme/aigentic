@@ -183,8 +183,20 @@ impl Repl {
         }
         match outcome {
             Ok(o) if o.reason != "done" => println!("[turn ended: {}]", o.reason),
-            Ok(_) => {}
+            Ok(_) => self.after_done().await,
             Err(e) => println!("[error: {e}]"),
+        }
+    }
+
+    /// After a turn that ended `done`: memory extraction, never during a
+    /// turn. Prints `[memory: N lines written]` or nothing.
+    async fn after_done(&mut self) {
+        match self.runtime.extract_memory(&mut |_| {}).await {
+            Ok(Some(p)) if !p.written.is_empty() => {
+                println!("[memory: {} lines written]", p.written.len());
+            }
+            Ok(_) => {}
+            Err(e) => println!("[memory: {e}]"),
         }
     }
 
@@ -211,7 +223,7 @@ impl Repl {
         }
         match outcome {
             Ok(o) if o.reason != "done" => println!("[turn ended: {}]", o.reason),
-            Ok(_) => {}
+            Ok(_) => self.after_done().await,
             Err(e) => println!("[error: {e}]"),
         }
     }

@@ -246,6 +246,13 @@ impl Runtime {
         self.layers.project.as_ref()
     }
 
+    /// For a client that reloads memory after a hand edit; the prefix
+    /// measure is reset so the next fill is exact.
+    pub fn project_mut(&mut self) -> Option<&mut crate::Project> {
+        self.measured = None;
+        self.layers.project.as_mut()
+    }
+
     /// The prefix for the next call, from the layers and the skills.
     pub(crate) fn prefix(&self) -> crate::Prefix<'_> {
         crate::Prefix {
