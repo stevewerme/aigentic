@@ -1,6 +1,31 @@
-# Per-repository proto-project file (phase 3, decision 2); becomes
-# project.toml in phase 4. Optional: without it no skills are enabled, the
+# The project file (docs/PLAN-phase4.md section 3): the nearest one at or
+# above the working directory is the project. Its folders live under
+# .aigentic/ (instructions.md, knowledge/, memory/); AGENTS.md is the
+# instructions fallback. Optional: without it no skills are enabled, the
 # default policy applies and no MCP servers connect.
+
+[project]
+name = "aigentic"
+description = "Open source agent harness in Rust"
+
+# [model]
+# profile = "tensorx"            # a profile in config.toml; --profile overrides
+
+# [tools]
+# allow = ["read_file", "bash"]  # empty or absent: every registered tool
+
+# [knowledge]
+# threshold_fraction = 0.4       # of the model's window; over it, index + search_knowledge
+# max_hits = 5
+
+# [memory]
+# enabled = true
+# every_n_turns = 1
+
+[pocock]
+issue_tracker = "github"         # `aigentic project setup` renders docs/agents/*.md
+# triage_labels = { needs-triage = "bug:triage" }
+# docs_dir = "docs"
 
 [skills]
 enabled = ["implement", "tdd", "code-review", "diagnosing-bugs", "grilling"]

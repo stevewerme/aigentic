@@ -298,3 +298,45 @@ its `aigentic.toml`:
   three tools and descriptions at connect, `mcp.echo.echo` prompted as
   class `network`, and the result `echo: phase 3 acceptance` is in the
   log with the human's decision event.
+
+### Phase 4 acceptance (docs/PLAN-phase4.md done-when 1 to 5)
+
+Not yet run. Do these in this repository and in Vendela, on both
+backends, over a week of daily use, and record thread ids below.
+
+16. Projects: in Vendela, `aigentic project init`, then add `[pocock]
+    issue_tracker = "github"` and run `aigentic project setup`. Start
+    `aigentic` in each repository and in a subdirectory of each; expect
+    the banner to name the project and the layers loaded, `aigentic
+    threads` to list only that project's threads, and a thread started
+    in one never to mention the other's instructions, knowledge or
+    memory. Resume one pre-phase-4 thread by id and expect the
+    "pre-project layout" note.
+17. Layers: put `[tools] denied = ["write_file"]` in `config.toml` and
+    `allow = ["read_file", "write_file", "bash"]` in a project's
+    `[tools]`. `aigentic project show` and `/project` must list
+    `write_file` as `denied by global`, `edit_file` as `not in project
+    allow`; ask the model to write a file and expect it not to see the
+    tool (an `unknown tool` refusal if it tries). Send two turns and
+    check on Anthropic that the second reads the prefix from cache.
+18. Knowledge: in Vendela (over the threshold) expect `index` in the
+    banner and `search_knowledge` among the tools; ask a question only
+    a knowledge section answers and expect a `→ search_knowledge` call
+    whose result names `path#heading`, then a correct answer. Here
+    (under the threshold, once `.aigentic/knowledge/` has a file) expect
+    `inline` and no tool. Edit a knowledge file between turns and expect
+    the next turn's mode and prefix to reflect it.
+19. Memory: state a decision in a turn ("From now on we deploy on
+    Fridays."). Expect `[memory: 1 lines written]`, a `memory_extracted`
+    event in the log with the line and its `at_seq`, the line in
+    `.aigentic/memory/decisions.md` with the date and thread id, and the
+    next turn's prefix (visible in `/cost` as a cache invalidation on
+    Anthropic, or by asking) to contain it. Have the model infer
+    something you did not state and confirm nothing is filed. Edit the
+    file by hand and expect the next prefix to change. Set
+    `every_n_turns = 2` and confirm one turn is skipped.
+20. Pocock: `docs/agents/issue-tracker.md` must be byte-identical to the
+    vendored `issue-tracker-github.md` (`cmp`), and `/code-review` on a
+    branch with `Closes #N` in a commit must fetch the issue through
+    `gh` as that file says, without `/setup-matt-pocock-skills` having
+    run.
