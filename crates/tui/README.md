@@ -433,3 +433,22 @@ fourteen docs under `.aigentic/knowledge/` and `threshold_fraction =
   record, ...") is filed by memory without that. Second, the model
   pins facts on its own alongside memory, so a fact can live in the
   thread prefix and the project files at once.
+- Item 20 on TensorX, 2026-09-21, in Vendela, thread
+  `01M32MXNY0SP78PKV482HTEF41`. `docs/agents/issue-tracker.md` was
+  byte-identical to the vendored `issue-tracker-github.md` (`cmp`), with
+  `/setup-matt-pocock-skills` never run. Asked in prose to review since
+  `HEAD~1` (the skill is model-invoked, so `/code-review` is not a
+  slash command), the model called `load_skill` for `code-review`, read
+  `docs/agents/issue-tracker.md`, ran `gh issue list` and `gh issue view
+  49 --comments` as that file says, matched the issue by title although
+  the commit said `Closes #N` with the placeholder left in, and wrote
+  the two-axis report with #49 as the spec source. It ended with an
+  `ask_human` about closing the issue. It also noticed the knowledge
+  copy of `accolm-sequence.md` had drifted from `docs/`, the cost of
+  copying files into `.aigentic/knowledge/`.
+
+Done-when 1 to 5 hold on TensorX as of 2026-09-21 (items 16 to 20
+above), with one harness fix along the way (`c437679`, memory re-read
+at turn start) and one checklist correction (item 17's allow list).
+Still to run: the same items on Anthropic, and the week of daily use in
+both projects that done-when 1 asks for.
