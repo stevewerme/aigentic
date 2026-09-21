@@ -16,6 +16,31 @@ pub struct Capabilities {
     pub max_context_tokens: u64,
 }
 
+/// Token usage for one model call, as the backend reports it.
+///
+/// `input_tokens` is the uncached remainder only; the whole prompt is
+/// `input_tokens + cache_read_tokens + cache_write_tokens`. Cache fields are
+/// zero on backends without caching; `reasoning_tokens` is `None` when the
+/// backend does not split reasoning out of output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Usage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub cache_write_tokens: u64,
+    #[serde(default)]
+    pub reasoning_tokens: Option<u64>,
+}
+
+impl Usage {
+    /// Every token the call consumed or produced, for budgets.
+    pub fn total(&self) -> u64 {
+        self.input_tokens + self.cache_read_tokens + self.cache_write_tokens + self.output_tokens
+    }
+}
+
 /// One item of a streamed completion.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderEvent {
@@ -25,10 +50,7 @@ pub enum ProviderEvent {
     ToolCall(ToolCall),
     /// Opaque provider content (thinking, signatures) to store and replay verbatim.
     Blob(ProviderBlob),
-    Usage {
-        input_tokens: u64,
-        output_tokens: u64,
-    },
+    Usage(Usage),
     Done {
         finish_reason: String,
     },

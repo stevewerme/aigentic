@@ -10,15 +10,50 @@ pub struct UserMessagePayload {
     pub blocks: Vec<ContentBlock>,
 }
 
-/// Token usage for one model call.
+/// Token usage for one model call, as persisted. The token fields mirror
+/// `aigentic_core::Usage`; older log lines without the cache fields read
+/// back as zero.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub cache_write_tokens: u64,
+    #[serde(default)]
+    pub reasoning_tokens: Option<u64>,
     /// `true` when the numbers came from `Provider::count_tokens` because
     /// the provider reported no usage. `/cost` shows that share separately.
     #[serde(default)]
     pub estimated: bool,
+}
+
+impl Usage {
+    /// Persist what the provider reported.
+    pub fn reported(u: aigentic_core::Usage) -> Self {
+        Self::from_core(u, false)
+    }
+
+    /// Persist an estimate made by the runtime.
+    pub fn estimated(u: aigentic_core::Usage) -> Self {
+        Self::from_core(u, true)
+    }
+
+    fn from_core(u: aigentic_core::Usage, estimated: bool) -> Self {
+        Self {
+            input_tokens: u.input_tokens,
+            output_tokens: u.output_tokens,
+            cache_read_tokens: u.cache_read_tokens,
+            cache_write_tokens: u.cache_write_tokens,
+            reasoning_tokens: u.reasoning_tokens,
+            estimated,
+        }
+    }
+
+    pub fn total(&self) -> u64 {
+        self.input_tokens + self.cache_read_tokens + self.cache_write_tokens + self.output_tokens
+    }
 }
 
 /// Payload of an `assistant_message` event. Tool calls live in `blocks`.

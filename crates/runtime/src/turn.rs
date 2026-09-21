@@ -71,16 +71,7 @@ impl Runtime {
                         blocks.push(ContentBlock::ToolCall(call));
                     }
                     ProviderEvent::Blob(blob) => blocks.push(ContentBlock::ProviderBlob(blob)),
-                    ProviderEvent::Usage {
-                        input_tokens,
-                        output_tokens,
-                    } => {
-                        usage = Some(Usage {
-                            input_tokens,
-                            output_tokens,
-                            estimated: false,
-                        });
-                    }
+                    ProviderEvent::Usage(u) => usage = Some(Usage::reported(u)),
                     ProviderEvent::Done { .. } => {}
                     ProviderEvent::Error(e) => {
                         error = Some(e);
@@ -93,7 +84,7 @@ impl Runtime {
             spent.iterations += 1;
             let agent = Author::Agent(self.agent.clone());
             let usage = usage.unwrap_or_else(|| self.estimate_usage(&context, &agent, &blocks));
-            spent.tokens += usage.input_tokens + usage.output_tokens;
+            spent.tokens += usage.total();
             if let Some(e) = error {
                 self.end_turn(&format!("provider_error: {e}"), &spent, observe)?;
                 return Err(RuntimeError::Provider(e));

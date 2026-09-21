@@ -107,10 +107,11 @@ fn done(reason: &str) -> ProviderEvent {
 }
 
 fn usage(i: u64, o: u64) -> ProviderEvent {
-    ProviderEvent::Usage {
+    ProviderEvent::Usage(aigentic_core::Usage {
         input_tokens: i,
         output_tokens: o,
-    }
+        ..Default::default()
+    })
 }
 
 struct Harness {

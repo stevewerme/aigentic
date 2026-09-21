@@ -29,11 +29,11 @@ impl Runtime {
             author: agent.clone(),
             blocks: blocks.to_vec(),
         };
-        Usage {
+        Usage::estimated(aigentic_core::Usage {
             input_tokens: self.provider.count_tokens(context),
             output_tokens: self.provider.count_tokens(std::slice::from_ref(&produced)),
-            estimated: true,
-        }
+            ..Default::default()
+        })
     }
 
     pub(crate) async fn run_tool(&self, call: &ToolCall) -> ToolResult {

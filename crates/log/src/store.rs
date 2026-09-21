@@ -254,11 +254,11 @@ mod tests {
             author: Author::Agent(AgentId("worker".into())),
             payload: serde_json::to_value(AssistantMessagePayload {
                 blocks,
-                usage: Some(Usage {
+                usage: Some(Usage::reported(aigentic_core::Usage {
                     input_tokens: 10,
                     output_tokens: 5,
-                    estimated: false,
-                }),
+                    ..Default::default()
+                })),
             })
             .unwrap(),
             parent_event: None,

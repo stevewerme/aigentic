@@ -10,6 +10,9 @@ pub struct Cost {
     pub output: u64,
     pub estimated_input: u64,
     pub estimated_output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    pub reasoning: u64,
     pub calls: u32,
     pub estimated_calls: u32,
 }
@@ -33,6 +36,9 @@ pub fn cost_of(events: &[Event]) -> Cost {
         } else {
             cost.input += u.input_tokens;
             cost.output += u.output_tokens;
+            cost.cache_read += u.cache_read_tokens;
+            cost.cache_write += u.cache_write_tokens;
+            cost.reasoning += u.reasoning_tokens.unwrap_or(0);
             cost.calls += 1;
         }
     }
@@ -51,10 +57,22 @@ impl fmt::Display for Cost {
             "estimated  in {:>9}  out {:>9}  ({} calls without provider usage)",
             self.estimated_input, self.estimated_output, self.estimated_calls
         )?;
+        writeln!(
+            f,
+            "cache      read {:>7}  write {:>7}  (zero on backends without caching)",
+            self.cache_read, self.cache_write
+        )?;
+        if self.reasoning > 0 {
+            writeln!(
+                f,
+                "reasoning  {:>12}  (share of reported output tokens)",
+                self.reasoning
+            )?;
+        }
         write!(
             f,
             "total      in {:>9}  out {:>9}",
-            self.input + self.estimated_input,
+            self.input + self.cache_read + self.cache_write + self.estimated_input,
             self.output + self.estimated_output
         )
     }
@@ -86,6 +104,9 @@ mod tests {
             usage: Some(Usage {
                 input_tokens: input,
                 output_tokens: output,
+                cache_read_tokens: if estimated { 0 } else { 50 },
+                cache_write_tokens: if estimated { 0 } else { 5 },
+                reasoning_tokens: if estimated { None } else { Some(3) },
                 estimated,
             }),
         };
@@ -112,6 +133,9 @@ mod tests {
                 output: 30,
                 estimated_input: 7,
                 estimated_output: 7,
+                cache_read: 100,
+                cache_write: 10,
+                reasoning: 6,
                 calls: 2,
                 estimated_calls: 1,
             }
@@ -119,6 +143,11 @@ mod tests {
         let text = cost.to_string();
         assert!(text.contains("reported   in       300"), "{text}");
         assert!(text.contains("estimated  in         7"), "{text}");
-        assert!(text.contains("total      in       307"), "{text}");
+        assert!(
+            text.contains("cache      read     100  write      10"),
+            "{text}"
+        );
+        assert!(text.contains("reasoning             6"), "{text}");
+        assert!(text.contains("total      in       417"), "{text}");
     }
 }

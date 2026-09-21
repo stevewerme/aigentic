@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Display;
 use std::pin::Pin;
 
-use aigentic_core::{ProviderBlob, ProviderError, ProviderEvent, ToolCall};
+use aigentic_core::{ProviderBlob, ProviderError, ProviderEvent, ToolCall, Usage};
 use bytes::Bytes;
 use futures_core::Stream;
 use futures_util::StreamExt;
@@ -64,6 +64,38 @@ struct FunctionDelta {
 struct WireUsage {
     prompt_tokens: u64,
     completion_tokens: u64,
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptDetails>,
+    #[serde(default)]
+    completion_tokens_details: Option<CompletionDetails>,
+}
+
+/// OpenAI reports cache hits here; most compatible servers omit it.
+#[derive(Debug, Default, Deserialize)]
+struct PromptDetails {
+    #[serde(default)]
+    cached_tokens: u64,
+}
+
+/// GLM, DeepSeek and OpenAI split reasoning out of completion tokens here.
+#[derive(Debug, Default, Deserialize)]
+struct CompletionDetails {
+    #[serde(default)]
+    reasoning_tokens: Option<u64>,
+}
+
+impl From<WireUsage> for Usage {
+    fn from(u: WireUsage) -> Self {
+        let cached = u.prompt_tokens_details.map_or(0, |d| d.cached_tokens);
+        Usage {
+            // prompt_tokens includes cached tokens on this API; core wants the remainder.
+            input_tokens: u.prompt_tokens.saturating_sub(cached),
+            output_tokens: u.completion_tokens,
+            cache_read_tokens: cached,
+            cache_write_tokens: 0,
+            reasoning_tokens: u.completion_tokens_details.and_then(|d| d.reasoning_tokens),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -145,10 +177,7 @@ impl Translator {
             }
         }
         if let Some(u) = chunk.usage {
-            out.push(ProviderEvent::Usage {
-                input_tokens: u.prompt_tokens,
-                output_tokens: u.completion_tokens,
-            });
+            out.push(ProviderEvent::Usage(u.into()));
         }
         out
     }
@@ -296,10 +325,12 @@ mod tests {
         assert_eq!(events[1], ProviderEvent::TextDelta(", world.".into()));
         assert_eq!(
             events[2],
-            ProviderEvent::Usage {
+            ProviderEvent::Usage(Usage {
                 input_tokens: 20,
-                output_tokens: 111
-            }
+                output_tokens: 111,
+                reasoning_tokens: Some(106),
+                ..Default::default()
+            })
         );
         let reasoning = reasoning_of(&events[3]);
         assert!(
@@ -340,10 +371,12 @@ mod tests {
         );
         assert_eq!(
             events[2],
-            ProviderEvent::Usage {
+            ProviderEvent::Usage(Usage {
                 input_tokens: 234,
-                output_tokens: 59
-            }
+                output_tokens: 59,
+                reasoning_tokens: Some(35),
+                ..Default::default()
+            })
         );
         assert!(reasoning_of(&events[3]).contains("make both in the same block"));
         assert_eq!(
@@ -361,10 +394,12 @@ mod tests {
         assert_eq!(events.len(), 3, "{events:#?}");
         assert_eq!(
             events[0],
-            ProviderEvent::Usage {
+            ProviderEvent::Usage(Usage {
                 input_tokens: 19,
-                output_tokens: 8
-            }
+                output_tokens: 8,
+                reasoning_tokens: Some(13),
+                ..Default::default()
+            })
         );
         assert_eq!(
             reasoning_of(&events[1]),
@@ -399,6 +434,24 @@ mod tests {
                     finish_reason: "stop".into()
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn openai_cached_tokens_become_cache_reads() {
+        let mut t = Translator::new();
+        let out = t.on_data(
+            r#"{"choices":[],"usage":{"prompt_tokens":1000,"completion_tokens":10,"prompt_tokens_details":{"cached_tokens":800}}}"#,
+        );
+        assert_eq!(
+            out,
+            vec![ProviderEvent::Usage(Usage {
+                input_tokens: 200,
+                output_tokens: 10,
+                cache_read_tokens: 800,
+                cache_write_tokens: 0,
+                reasoning_tokens: None,
+            })]
         );
     }
 
