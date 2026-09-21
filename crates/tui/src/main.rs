@@ -4,6 +4,8 @@
 mod approve;
 mod config;
 mod cost;
+mod pocock;
+mod pocock_templates;
 mod project_cmd;
 mod repl;
 mod skills_cmd;
@@ -107,6 +109,9 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Project {
             command: ProjectCommand::Init,
         }) => std::process::exit(project_cmd::init(&cwd)?),
+        Some(Command::Project {
+            command: ProjectCommand::Setup,
+        }) => std::process::exit(pocock::run(opened.as_ref())?),
         Some(Command::Threads) => {
             let threads = project_cmd::list_threads(&threads_dir)?;
             println!("{}", project_cmd::render_threads(&threads, &threads_dir));

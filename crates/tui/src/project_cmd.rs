@@ -1,4 +1,4 @@
-//! `aigentic project init | show`, `aigentic threads`, the threads
+//! `aigentic project init | setup | show`, `aigentic threads`, the threads
 //! directory per project, and the report `/project` and `project show`
 //! share. See `docs/PLAN-phase4.md` sections 5, 7 and 8.
 
@@ -19,6 +19,8 @@ pub const NO_PROJECT_DIR: &str = "_none";
 pub enum ProjectCommand {
     /// Write a minimal aigentic.toml here and create .aigentic/{knowledge,memory}.
     Init,
+    /// Render docs/agents/*.md and the `## Agent skills` block from [pocock].
+    Setup,
     /// The layers, the knowledge mode and every tool's fate.
     Show,
 }

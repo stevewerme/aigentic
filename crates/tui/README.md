@@ -60,6 +60,7 @@ cargo run -p aigentic-tui --                                     # new thread; p
 cargo run -p aigentic-tui -- --thread <ULID>                     # resume by replaying the log
 cargo run -p aigentic-tui -- --thread <ULID> --profile anthropic # same thread, other backend
 cargo run -p aigentic-tui -- project init                        # aigentic.toml + .aigentic/{knowledge,memory}
+cargo run -p aigentic-tui -- project setup                       # render docs/agents/*.md from [pocock]
 cargo run -p aigentic-tui -- project show                        # layers, knowledge mode, every tool's fate
 cargo run -p aigentic-tui -- threads                             # this project's threads, newest first
 ```
@@ -116,6 +117,24 @@ descriptions (the server's own text, shown so you see what the model
 sees) and register as `mcp.<server>.<tool>` with the server's class,
 `network` unless set. A server that fails to connect is reported and
 skipped.
+
+## Pocock setup
+
+`[pocock]` in `aigentic.toml` holds the answers upstream's
+`setup-matt-pocock-skills` would ask for, and `aigentic project setup`
+writes what that skill would write, byte for byte for the default
+answers: `docs/agents/issue-tracker.md` for `issue_tracker = "github" |
+"gitlab" | "local"`, `docs/agents/domain.md` (single-context), and
+`docs/agents/triage-labels.md` when the `triage` skill is enabled or
+`triage_labels` maps a canonical role to this tracker's label
+(`triage_labels = { needs-triage = "bug:triage" }`). `docs_dir` moves the
+`agents/` folder; `prs_as_requests = true` flips upstream's request-surface
+flag. The `## Agent skills` block goes into `.aigentic/instructions.md` if
+present, else `AGENTS.md`, replaced in place on a rerun; no other file is
+touched. The files are generated: edit `aigentic.toml` and rerun, and
+commit the result. A test asserts the embedded templates still equal the
+vendored skill's, so a `skills update` that changes them fails until the
+snapshot is regenerated.
 
 ## Skills CLI
 

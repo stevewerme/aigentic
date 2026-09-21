@@ -145,10 +145,17 @@ impl Default for MemorySection {
 pub struct PocockSection {
     /// `github`, `gitlab` or `local`.
     pub issue_tracker: String,
+    /// Overrides for the five canonical triage roles, role to this
+    /// tracker's label (`needs-triage = "bug:triage"`); absent roles keep
+    /// their canonical name.
     #[serde(default)]
-    pub triage_labels: Vec<String>,
+    pub triage_labels: std::collections::BTreeMap<String, String>,
+    /// Where `agents/` goes; default `docs`.
     #[serde(default)]
     pub docs_dir: Option<String>,
+    /// Upstream's "PRs as a request surface" flag, off by default.
+    #[serde(default)]
+    pub prs_as_requests: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
@@ -455,7 +462,7 @@ every_n_turns = 2
 
 [pocock]
 issue_tracker = "github"
-triage_labels = ["bug", "feature"]
+triage_labels = { needs-triage = "bug:triage" }
 docs_dir = "docs"
 
 [skills]
@@ -498,7 +505,11 @@ enabled = ["implement"]
         assert_eq!(p.memory.every_n_turns, 2);
         let pocock = p.pocock.as_ref().unwrap();
         assert_eq!(pocock.issue_tracker, "github");
-        assert_eq!(pocock.triage_labels, vec!["bug", "feature"]);
+        assert_eq!(
+            pocock.triage_labels.get("needs-triage").map(String::as_str),
+            Some("bug:triage")
+        );
+        assert!(!pocock.prs_as_requests);
         assert!(p.has_phase4_sections());
     }
 
