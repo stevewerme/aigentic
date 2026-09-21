@@ -8,7 +8,7 @@ mod wire;
 use std::pin::Pin;
 
 use aigentic_core::{
-    Capabilities, CompletionRequest, ContentBlock, Message, Provider, ProviderError, ProviderEvent,
+    Capabilities, CompletionRequest, Message, Provider, ProviderError, ProviderEvent,
 };
 use futures_core::Stream;
 use futures_util::StreamExt;
@@ -175,28 +175,8 @@ impl Provider for OpenAiCompat {
         Box::pin(futures_util::stream::once(response).flatten())
     }
 
-    /// An estimate for pre-call sizing only: about four bytes per token plus
-    /// a few per message. Tokenizers differ per model, so this is never used
-    /// for accounting; the runtime records real usage from
-    /// `ProviderEvent::Usage`.
     fn count_tokens(&self, context: &[Message]) -> u64 {
-        let bytes: usize = context
-            .iter()
-            .map(|m| {
-                4 + m
-                    .blocks
-                    .iter()
-                    .map(|b| match b {
-                        ContentBlock::Text(t) => t.len(),
-                        ContentBlock::ToolCall(c) => c.name.len() + c.args.to_string().len(),
-                        ContentBlock::ToolResult(r) => r.content.len(),
-                        ContentBlock::Image(i) => i.data.len() / 4,
-                        ContentBlock::ProviderBlob(b) => b.data.to_string().len(),
-                    })
-                    .sum::<usize>()
-            })
-            .sum();
-        (bytes as u64).div_ceil(4)
+        crate::estimate::estimate_tokens(context)
     }
 
     fn capabilities(&self) -> Capabilities {
@@ -213,7 +193,7 @@ impl Provider for OpenAiCompat {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aigentic_core::{Author, Role, ToolSpec, UserId};
+    use aigentic_core::{Author, ContentBlock, Role, ToolSpec, UserId};
     use serde_json::json;
 
     #[test]

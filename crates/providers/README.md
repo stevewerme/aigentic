@@ -1,9 +1,14 @@
 # aigentic-providers
 
-Provider adapters for the Aigentic harness. One adapter so far:
-`OpenAiCompat`, which speaks the OpenAI chat completions API with streaming
-SSE and tool calls. That covers vLLM, llama.cpp, Mistral and most EU hosts.
-Written against raw HTTP with `reqwest` and `serde`; no vendor SDK.
+Provider adapters for the Aigentic harness, written against raw HTTP with
+`reqwest` and `serde`; no vendor SDK.
+
+- `OpenAiCompat` speaks the OpenAI chat completions API with streaming SSE
+  and tool calls. That covers vLLM, llama.cpp, Mistral and most EU hosts.
+- `Anthropic` speaks the Messages API: tool calls and results as content
+  blocks, explicit cache breakpoints, thinking blocks replayed with their
+  signature. It is the second, deliberately different backend that keeps
+  the `Provider` trait honest.
 
 ## Configuration
 
@@ -107,3 +112,50 @@ against TensorX with `z-ai/glm-5.3`: streamed text, multi-step tool calls
 and usage all arrived as expected, via the `aigentic` REPL's acceptance run
 (see `crates/tui/README.md`). Steps 1 to 4 against a local llama.cpp have
 not yet been run; no local install exists on this machine.
+
+## Anthropic adapter
+
+```rust
+use aigentic_providers::{Anthropic, AnthropicConfig, Thinking};
+
+let provider = Anthropic::new(
+    AnthropicConfig::new(api_key, "claude-opus-5")
+        .with_effort("high")             // optional: low | medium | high | xhigh | max
+        .with_thinking(Thinking::Adaptive) // default; Off omits the field
+        .with_cache(true),               // default; emits two cache_control breakpoints
+);
+```
+
+| Concern | Handling |
+| --- | --- |
+| Tool calls | `tool_use` blocks on the assistant message; `input` is a JSON object; ids preserved |
+| Tool results | `tool_result` blocks inside a **user** message, all results for one assistant message in one user message. `is_error` is native. One way only, log to wire |
+| Roles | Must alternate; same-role neighbours are merged. Only the leading run of system messages becomes the top-level `system` array |
+| Thinking | Adaptive by default. Each thinking block becomes a `ProviderBlob` (provider `anthropic`) holding the whole block, replayed verbatim in position. Other adapters' blobs are dropped, and this adapter's blobs are dropped by them |
+| Caching | Breakpoint on the last system block (covers tools) and on the last block of the last user message. `Usage` carries `cache_read_tokens` and `cache_write_tokens`; the minimum cacheable prefix on Opus 5 is 512 tokens, so a toy prompt never caches |
+| Stop reasons | `end_turn`, `tool_use`, `max_tokens`, `refusal`, `pause_turn` pass through as the finish reason. On `refusal` an unfinished tool call is dropped, never run |
+| Append-only | The API checks that earlier turns are unchanged when thinking blocks are replayed. The log is append-only, so this holds; phase 2 compaction must replace the whole body, never rewrite the middle |
+
+Fixtures under `fixtures/anthropic/` are currently **hand-written** to the
+documented event shapes (each file says so on its first line). Record real
+ones with a key:
+
+```bash
+cd crates/providers/fixtures && ANTHROPIC_API_KEY=... ./record.sh anthropic claude-opus-5
+```
+
+The recording sends a system prompt above the cache minimum so
+`tool_calls.sse`, recorded second, shows `cache_read_input_tokens > 0`.
+Replacing the fixtures must not change any test.
+
+### Manual check against the Messages API
+
+1. Record the fixtures as above and run `cargo test -p aigentic-providers`.
+2. Point the REPL at an `anthropic` profile (see `crates/tui/README.md`) and
+   run the phase 0 acceptance steps: read, edit, `cargo test`, `/cost`,
+   `/quit`, resume.
+3. On the second turn `/cost` must show `cache read > 0`.
+4. Resume a thread recorded on TensorX with `--profile anthropic` and ask
+   what happened earlier; then the reverse.
+
+Status: not yet run; no Anthropic key was available at the time of writing.
