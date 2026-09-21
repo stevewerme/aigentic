@@ -222,3 +222,43 @@ the cache read the summary plus tail on the next call. The run also met an
 Anthropic overload wave lasting minutes, recorded as `provider_error` turn
 endings; the adapter now retries such replies three times. Re-run after
 changes to the loop, the tools or an adapter.
+
+Phase 3 passed on 2026-09-21, in this repository with the five skills in
+its `aigentic.toml`:
+
+- Done-when 1 on TensorX (`z-ai/glm-5.3`), thread
+  `01M3288192XFT8GWBR5K0CFJCM`: `/implement Add a Lockfile::len() method
+  to the skills crate with a test` loaded `implement`, wrote the failing
+  test, made it pass, ran the crate's tests; sixteen tool results, ten by
+  rule and six by the human, every one with its record. Two findings: the
+  model did TDD from memory instead of calling `load_skill` for `tdd`
+  after reading "Use /tdd", and the turn hit the 200k token budget on its
+  eleventh iteration. The prefix block now tells the model to call
+  `load_skill` for a `/<name>` it sees, and the default budget rose to 2M
+  tokens and 50 iterations with `[profiles.<name>.budget]` to override.
+- Done-when 1 on Anthropic (`claude-opus-5`), thread
+  `01M328Z40PB7HEH28C9SC45R0X`: `/implement Add a Lockfile::names()
+  method ...` loaded `implement`, called `load_skill` for `tdd`, then hit
+  a 400 because the projection had placed the skill body between the
+  `tool_use` and its `tool_result`. Fixed in the projection (a message
+  produced while calls are unanswered waits for the results); the thread
+  resumed, went red then green, ran fmt, clippy and the full suite, loaded
+  `code-review` on its own, reviewed the diff and committed `dff1de8`.
+  Eleven prompts answered by `steve`, fourteen results all recorded,
+  147k of 165k input tokens read from cache.
+- Done-when 2: both logs above audited, no `tool_result` without a policy
+  record; the test harness audits every runtime test log at drop; the
+  loop has one execution call site, `execute` in `turn.rs`, behind
+  `policy_check`.
+- Done-when 3: a newline appended to the vendored `tdd/SKILL.md` refused
+  startup with the hash mismatch naming the skill and both hashes;
+  `aigentic skills check` reported the same. An unlocked project skill
+  refused with "no entry in skills.lock.toml".
+- Done-when 4: the planted injection fixture is flagged on every count
+  (`crates/skills/tests`), and `aigentic skills check` exits 1 while the
+  33 unreviewed vendored skills with findings stay pending.
+- Done-when 5 on TensorX, thread `01M329YYKP7PTX0VB6RCZ6NE18`: the echo
+  server from the tools crate declared in `aigentic.toml` printed its
+  three tools and descriptions at connect, `mcp.echo.echo` prompted as
+  class `network`, and the result `echo: phase 3 acceptance` is in the
+  log with the human's decision event.

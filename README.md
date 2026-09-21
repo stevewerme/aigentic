@@ -12,7 +12,7 @@ with every event attributed. **Projects:** a scoping layer that carries
 instructions, knowledge and memory across threads.
 
 The design is in [docs/PRD.md](docs/PRD.md); the current phase's plan is in
-[docs/PLAN-phase0.md](docs/PLAN-phase0.md); conventions for contributors
+[docs/PLAN-phase3.md](docs/PLAN-phase3.md); conventions for contributors
 and agents are in [AGENTS.md](AGENTS.md).
 
 ## Status
@@ -22,14 +22,16 @@ and agents are in [AGENTS.md](AGENTS.md).
 | 0 Loop | Canonical types, OpenAI-compatible adapter, three tools, streaming REPL | Done, accepted live 2026-09-21 |
 | 1 Two providers | Anthropic adapter, capability struct, caching contract | Done, accepted live 2026-09-21 |
 | 2 Event log | Resume, compaction, `/cost` over long threads | Done, accepted live 2026-09-21 |
-| 3 Skills and policy | Skill loader, risk classes, permission prompts, MCP client | Next |
-| 4 Projects | `project.toml`, instruction layering, knowledge, memory | |
+| 3 Skills and policy | Skill loader, risk classes, permission prompts, MCP client | Done, accepted live 2026-09-21 |
+| 4 Projects | `project.toml`, instruction layering, knowledge, memory | Next |
 | 5 Server and multiplayer | Daemon, socket API, turn queue, per-user permissions | |
 | 6 Orchestrator | Portfolio project coordinating work across projects | |
 
-Phase 0 is usable but has no permission prompts: the `bash` tool runs
-whatever the model asks, in the directory you launch from. Use it in
-repositories you would let an agent loose in.
+Every tool call passes a policy you own: reads and an allow-list of
+build and test commands run without asking, writes, other shell commands
+and MCP tools prompt inline, and every decision is an attributed event in
+the thread log. Skills are vendored, hashed and reviewed before they
+load; `aigentic.toml` in a repository enables them.
 
 ## Quick start
 
@@ -69,12 +71,13 @@ dependency rule and the event-log rule are in [AGENTS.md](AGENTS.md).
 ```
 crates/core       canonical message, event and tool types; Provider and Tool traits
 crates/log        append-only JSONL event store and projection
-crates/providers  OpenAI-compatible adapter (Anthropic in phase 1)
-crates/tools      read_file, write_file, bash
-crates/runtime    the agent loop and its seams
-crates/tui        the `aigentic` binary, a streaming REPL
-crates/skills     phase 3
-crates/policy     phase 3
+crates/providers  OpenAI-compatible and Anthropic adapters
+crates/tools      read_file, write_file, edit_file, list_dir, grep, bash; the registry; MCP client
+crates/runtime    the agent loop, policy in the loop, harness tools, skills in the prefix
+crates/tui        the `aigentic` binary: streaming REPL, permission prompt, skills CLI
+crates/skills     SKILL.md manifests, skills.lock.toml, discovery, the static check
+crates/policy     rules, defaults, bash allow patterns
+skills/           the vendored Pocock set; skills.lock.toml and docs/skills-review.md beside it
 ```
 
 ## Developing
