@@ -1,6 +1,6 @@
 # Phase 4 plan
 
-Status: steps 1 to 7 landed on 2026-09-21; step 8 (acceptance) pending · Follows `docs/PRD.md` (the Projects phase) and the phase 0 to 3 plans
+Status: steps 1 to 7 landed and done-when 1 to 5 passed on both backends on 2026-09-21; step 9 (acceptance follow-ups) planned, then the days of use · Follows `docs/PRD.md` (the Projects phase) and the phase 0 to 3 plans
 
 ## 0. Goal and done-when
 
@@ -18,8 +18,11 @@ Done when:
    knowledge folder and a memory folder. Starting `aigentic` in either
    directory prints the project's name, the layers it loaded and the
    thread count; `aigentic threads` lists that project's threads; a
-   thread started in one never sees the other's files. Daily use for a
-   week on both, on both backends.
+   thread started in one never sees the other's files. Two days of real
+   use on both, on both backends, with at least one genuine task per
+   project per backend (amended from "a week" on 2026-09-21: the
+   scripted items are recorded per backend in the tui README, and two
+   days of real tasks is what catches what they cannot).
 2. **Layers narrow, never widen.** The prefix is global instructions,
    project instructions, knowledge, memory, pinned facts, skills, in that
    order, byte-stable between turns. A tool or skill the global config
@@ -391,6 +394,11 @@ lists this project's threads. REPL: `/project` and `/threads`.
   the event carries it, the next request's prefix contains it; a
   hand-edited file changes the prefix; `every_n_turns = 2` skips a turn.
 - **Threads** (tui): the directory per project; the listing's shape.
+- **Step 9** (runtime, tools, policy, tui): the normalised ranking on a
+  short-versus-long fixture; symlinked knowledge loads, counts and
+  detects change through the link; the `path_prefix` rule fires for
+  `write_file` and `edit_file` under `.aigentic/memory/` and nowhere
+  else; the report's narrowing note.
 - **Pocock** (tui): the rendered files equal a snapshot taken from
   upstream's setup skill for the same answers.
 - Phase 0 to 3 tests unchanged apart from `build_context`'s signature and
@@ -420,6 +428,36 @@ scripted provider.
 8. Acceptance: `aigentic project init` here and in Vendela, a week of
    daily use on both backends, done-when 1 to 5 by hand with thread ids
    recorded in the READMEs.
+
+9. Acceptance follow-ups, one commit each, from the 2026-09-21 run
+   (recorded in `crates/tui/README.md`, phase 4 results):
+   - `runtime, tools: knowledge search normalises length` — BM25's
+     length term (k1 = 1.2, b = 0.75) over the section length, so a
+     short section holding every query term outranks a long one that
+     mentions them; test: `FOUNDATION.md#Invariants`-shaped fixture
+     beats an `adr#Context`-shaped one for a two-term query.
+   - `runtime: knowledge follows symlinks` — `WalkDir` follows links
+     and `changed` reads the target's mtime, so
+     `.aigentic/knowledge/adr -> ../../docs/adr` is a pointer, not a
+     copy; a loop or a dangling link is a `ProjectError`; test on a
+     linked folder, plus the Vendela copies replaced by links.
+   - `policy, runtime: memory files are the harness's` — `Rule` gains
+     `path_prefix`, matched against the call's `path` argument relative
+     to the project root; the default table denies `write_file` and
+     `edit_file` under `.aigentic/memory/` with the reason "memory is
+     written by extraction; edit it outside the thread"; the memory
+     block's heading says the same. `bash` is not covered, as section 5
+     says; test: the rule fires for both tools and not for a sibling
+     path.
+   - `tui: banner and show say what narrowing means` — the banner
+     counts non-empty memory files; `project show` and `/project` print
+     "hidden, not a ban: bash is allowed" beside a hidden `write_file`
+     or `edit_file` when `bash` is visible; test on the report text.
+   - `docs: phase 4 acceptance closed` — the days of use recorded, the
+     two remaining notes (the flat-layout fallback cannot tell which
+     project a pre-phase-4 thread belonged to; models prefer `read_file`
+     on a known path over `search_knowledge` when the file is in the
+     repository) kept as open items for phase 5.
 
 Each step passes `cargo fmt`, `cargo clippy --all-targets -- -D warnings`
 and `cargo test` before its commit.
