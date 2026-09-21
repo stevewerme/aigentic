@@ -73,5 +73,7 @@ adapter change.
    Expect "resumed with N events". Ask "What did you change earlier?" and
    confirm the answer reflects steps 3 to 5 without re-reading anything.
 
-Status: not yet run against a live endpoint on this machine; no local model
-server is installed and no hosted key was available at the time of writing.
+Status: all seven steps passed on 2026-09-21 against TensorX
+(`https://api.tensorx.ai/v1`, model `z-ai/glm-5.3`). The resumed thread
+answered from context with no tool calls. Re-run after changes to the
+loop, the tools or the adapter.

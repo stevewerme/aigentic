@@ -89,6 +89,10 @@ Not automated; run it when touching the adapter or upgrading `reqwest`.
    `AIGENTIC_BASE_URL`, `AIGENTIC_MODEL` and `AIGENTIC_API_KEY` and repeat
    steps 3 and 4.
 
-Status: steps 1 to 5 have not yet been run on this machine (no local
-llama.cpp install at the time of writing). The fixtures follow the
-documented chunk format from OpenAI, vLLM and llama.cpp.
+Status: step 5 (a hosted OpenAI-compatible provider) passed on 2026-09-21
+against TensorX with `z-ai/glm-5.3`: streamed text, multi-step tool calls
+and usage all arrived as expected, via the `aigentic` REPL's acceptance run
+(see `crates/tui/README.md`). Steps 1 to 4 against a local llama.cpp have
+not yet been run; no local install exists on this machine. The fixtures are
+still hand-written to the documented chunk format and are due to be
+replaced with recordings.
