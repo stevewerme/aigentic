@@ -2,7 +2,6 @@
 //! Mistral and most EU hosts: anything that serves `POST /v1/chat/completions`
 //! with `stream: true`.
 
-mod sse;
 mod stream;
 mod wire;
 
@@ -15,7 +14,6 @@ use futures_core::Stream;
 use futures_util::StreamExt;
 use serde::Serialize;
 
-pub use sse::SseParser;
 pub use stream::{Translator, parse_stream};
 pub use wire::{WireMessage, from_wire, to_wire};
 

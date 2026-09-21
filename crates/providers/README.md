@@ -50,7 +50,8 @@ finish reason and is emitted on `[DONE]` or EOF. A non-2xx response, a
 transport failure or an `error` object in the stream becomes a single
 `ProviderEvent::Error` and closes the stream.
 
-Tests run the parser and translator over recorded streams in `fixtures/`:
+Tests run the parser and translator over recorded streams in
+`fixtures/openai_compat/`:
 a text reply, a two-tool-call reply and a `length` stop, all captured raw
 from TensorX (`z-ai/glm-5.3`) by `fixtures/record.sh`. The recordings show
 what the documented format leaves out: reasoning streams as

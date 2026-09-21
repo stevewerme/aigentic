@@ -4,5 +4,6 @@
 //! against raw HTTP with `reqwest` and `serde`; no vendor SDKs.
 
 pub mod openai_compat;
+pub mod sse;
 
 pub use openai_compat::{OpenAiCompat, OpenAiCompatConfig};

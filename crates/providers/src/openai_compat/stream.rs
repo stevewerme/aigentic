@@ -9,7 +9,7 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 
 use super::PROVIDER_NAME;
-use super::sse::SseParser;
+use crate::sse::SseParser;
 
 /// One `chat.completion.chunk`. Only the fields the translator needs; the
 /// rest is ignored so vendor extensions never break parsing.
@@ -259,8 +259,8 @@ where
             }
             match st.bytes.next().await {
                 Some(Ok(chunk)) => {
-                    for data in st.parser.feed(&chunk) {
-                        st.pending.extend(st.translator.on_data(&data));
+                    for event in st.parser.feed(&chunk) {
+                        st.pending.extend(st.translator.on_data(&event.data));
                     }
                 }
                 Some(Err(e)) => {
@@ -271,8 +271,8 @@ where
                     st.ended = true;
                 }
                 None => {
-                    if let Some(data) = st.parser.finish() {
-                        st.pending.extend(st.translator.on_data(&data));
+                    if let Some(event) = st.parser.finish() {
+                        st.pending.extend(st.translator.on_data(&event.data));
                     }
                     st.pending.extend(st.translator.finish());
                     st.ended = true;
@@ -288,20 +288,20 @@ mod tests {
     use serde_json::json;
 
     // Raw streams recorded from TensorX (z-ai/glm-5.3) by fixtures/record.sh.
-    const TEXT: &str = include_str!("../../fixtures/text.sse");
-    const TOOL_CALLS: &str = include_str!("../../fixtures/tool_calls.sse");
-    const LENGTH: &str = include_str!("../../fixtures/length.sse");
+    const TEXT: &str = include_str!("../../fixtures/openai_compat/text.sse");
+    const TOOL_CALLS: &str = include_str!("../../fixtures/openai_compat/tool_calls.sse");
+    const LENGTH: &str = include_str!("../../fixtures/openai_compat/length.sse");
 
     /// Run a fixture through the parser and translator as one chunk.
     fn translate(fixture: &str) -> Vec<ProviderEvent> {
         let mut parser = SseParser::new();
         let mut translator = Translator::new();
         let mut out = Vec::new();
-        for data in parser.feed(fixture.as_bytes()) {
-            out.extend(translator.on_data(&data));
+        for event in parser.feed(fixture.as_bytes()) {
+            out.extend(translator.on_data(&event.data));
         }
-        if let Some(data) = parser.finish() {
-            out.extend(translator.on_data(&data));
+        if let Some(event) = parser.finish() {
+            out.extend(translator.on_data(&event.data));
         }
         out.extend(translator.finish());
         out

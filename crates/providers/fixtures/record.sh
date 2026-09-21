@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Record raw SSE streams from an OpenAI-compatible endpoint into this
-# directory. The files are byte-for-byte what the server sent; the parser
+# Record raw SSE streams from an OpenAI-compatible endpoint into
+# ./openai_compat/. The files are byte-for-byte what the server sent; the parser
 # tests run against them. Re-run when the endpoint or model changes.
 #
 #   TENSORX_API_KEY=... ./record.sh https://api.tensorx.ai/v1 z-ai/glm-5.3
@@ -12,7 +12,8 @@ base_url="${1:?base url, e.g. https://api.tensorx.ai/v1}"
 model="${2:?model id}"
 key_env="${AIGENTIC_API_KEY_ENV:-TENSORX_API_KEY}"
 key="${!key_env:?environment variable $key_env is not set}"
-dir="$(cd "$(dirname "$0")" && pwd)"
+dir="$(cd "$(dirname "$0")" && pwd)/openai_compat"
+mkdir -p "$dir"
 
 post() { # name, json body
   curl -sS -N --fail-with-body \
