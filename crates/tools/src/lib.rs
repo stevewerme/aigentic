@@ -1,6 +1,7 @@
-//! Built-in tools: `read_file`, `write_file` and `bash`.
+//! Built-in tools (`read_file`, `write_file`, `edit_file`, `list_dir`,
+//! `grep`, `bash`) and the [`ToolRegistry`] that holds them.
 //!
-//! All three share a [`Workdir`]: `bash` keeps its current directory across
+//! All of them share a [`Workdir`]: `bash` keeps its current directory across
 //! calls (a `cd` in one call is seen by the next), and the file tools resolve
 //! relative paths against it. Every tool caps what it returns with
 //! [`truncate_output`], keeping the head and the tail and noting what was
@@ -8,19 +9,21 @@
 
 mod bash;
 mod files;
+mod fs;
+mod registry;
 mod truncate;
 mod workdir;
 
 pub use bash::BashTool;
 pub use files::{ReadFileTool, WriteFileTool};
+pub use fs::{DEFAULT_GREP_MATCHES, EditFileTool, GrepTool, ListDirTool};
+pub use registry::{RegistryError, ToolRegistry};
 pub use truncate::{DEFAULT_OUTPUT_CAP, truncate_output};
 pub use workdir::Workdir;
 
-/// The three phase-0 tools, sharing one working directory.
+/// The built-in tools as a plain vector, sharing one working directory.
+/// `ToolRegistry::builtin` is the same set; this form feeds
+/// `Runtime::new` until phase 3 step 7 switches it to the registry.
 pub fn builtin_tools(workdir: Workdir) -> Vec<Box<dyn aigentic_core::Tool>> {
-    vec![
-        Box::new(ReadFileTool::new(workdir.clone())),
-        Box::new(WriteFileTool::new(workdir.clone())),
-        Box::new(BashTool::new(workdir)),
-    ]
+    ToolRegistry::builtin(workdir).into_tools()
 }

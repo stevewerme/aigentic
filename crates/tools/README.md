@@ -1,12 +1,28 @@
 # aigentic-tools
 
-Built-in tools for the Aigentic harness: `read_file`, `write_file` and `bash`.
-Each implements the `Tool` trait from `aigentic-core` with a schemars-derived
-argument schema and a risk class (`Read`, `Write`, `Exec`).
+Built-in tools for the Aigentic harness and the registry that holds them.
+Each tool implements the `Tool` trait from `aigentic-core` with a
+schemars-derived argument schema and a risk class.
+
+| Tool | Class | Does |
+| --- | --- | --- |
+| `read_file` | read | Read a UTF-8 file, capped head and tail |
+| `list_dir` | read | One directory, sorted, `name/` for directories, `name  <bytes>` for files |
+| `grep` | read | Regex search, recursive, `.gitignore` and hidden files respected, binaries skipped, `path:line:text`, capped at 200 matches then by bytes |
+| `write_file` | write | Create or replace a file |
+| `edit_file` | write | Replace one exact occurrence of a string; refuses on zero or many |
+| `bash` | exec | Run a command with a timeout and output cap |
+
+## Registry
+
+`ToolRegistry::builtin(workdir)` holds the six; `register` adds more and
+refuses a duplicate name; `specs()` is sorted by name so the request the
+model sees is byte-stable; `names()` is what a skill's `requires` is
+checked against. MCP-backed tools join the registry in phase 3 step 6.
 
 ## Shared working directory
 
-All three tools take a `Workdir`, a cheap-to-clone handle to the current
+All tools take a `Workdir`, a cheap-to-clone handle to the current
 directory. A `cd` in one bash call is seen by the next bash call and by
 relative paths in the file tools. The shell reports its final directory by
 writing a temp file and renaming it over the real one, so a partial path is
