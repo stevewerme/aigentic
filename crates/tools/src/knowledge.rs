@@ -109,8 +109,23 @@ fn count_word(hay_lower: &str, term: &str) -> usize {
         .count()
 }
 
+/// BM25's term-frequency saturation and length normalisation. A long
+/// section that mentions every term must not outrank a short one that
+/// is about them (phase 4 acceptance item 18).
+const BM25_K1: f64 = 1.2;
+const BM25_B: f64 = 0.75;
+
+fn word_count(hay_lower: &str) -> usize {
+    hay_lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .count()
+}
+
 /// Sections scoring above zero for `query`, best first, ties in folder
-/// order, at most `max_hits`.
+/// order, at most `max_hits`. BM25 over whole-word matches: IDF per
+/// term, term frequency saturated by `k1` and normalised by the
+/// section's length against the average.
 pub fn search<'a>(sections: &'a [Section], query: &str, max_hits: usize) -> Vec<&'a Section> {
     let terms = terms(query);
     if terms.is_empty() || sections.is_empty() {
@@ -125,14 +140,20 @@ pub fn search<'a>(sections: &'a [Section], query: &str, max_hits: usize) -> Vec<
             (1.0 + n / (1.0 + df)).ln()
         })
         .collect();
+    let lengths: Vec<f64> = lowered.iter().map(|s| word_count(s) as f64).collect();
+    let avg_len = (lengths.iter().sum::<f64>() / n).max(1.0);
     let mut scored: Vec<(f64, usize)> = lowered
         .iter()
         .enumerate()
         .map(|(i, s)| {
+            let norm = 1.0 - BM25_B + BM25_B * lengths[i] / avg_len;
             let score: f64 = terms
                 .iter()
                 .zip(&idf)
-                .map(|(t, w)| count_word(s, t) as f64 * w)
+                .map(|(t, w)| {
+                    let tf = count_word(s, t) as f64;
+                    w * tf * (BM25_K1 + 1.0) / (tf + BM25_K1 * norm)
+                })
                 .sum();
             (score, i)
         })
@@ -266,6 +287,22 @@ mod tests {
         assert!(search(&s, "the and of", 5).is_empty());
         assert!(search(&s, "kubernetes", 5).is_empty());
         assert_eq!(search(&s, "deploy rollback billing", 1).len(), 1);
+    }
+
+    #[test]
+    fn a_short_section_about_the_terms_beats_a_long_one_that_mentions_them() {
+        // The shape from Vendela: a short invariants list holding the
+        // answer, and a long context section that mentions the same
+        // words twice among two hundred others.
+        let filler = "lorem ipsum dolor sit amet consectetur ".repeat(30);
+        let doc = format!(
+            "# Invariants\n\nEvery claim carries its evidence: the provenance tag.\n\n# Context\n\n{filler}The provenance tag was earned; {filler}every claim carries its evidence, the provenance tag again. {filler}\n"
+        );
+        let s = split_sections("f.md", &doc);
+        let hits = search(&s, "provenance tag evidence", 5);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].heading, "Invariants", "short and about it wins");
+        assert_eq!(hits[1].heading, "Context");
     }
 
     #[tokio::test]

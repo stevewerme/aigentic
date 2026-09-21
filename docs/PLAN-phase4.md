@@ -243,9 +243,11 @@ never mid-turn.
 `max_hits` sections, each as `path#heading` then the text, ranked by a
 simple score: for each query term (lowercased, split on whitespace, stop
 words dropped) the count of whole-word matches in the section, weighted
-by inverse document frequency over sections, ties broken by file order.
-That is BM25's shape without its length normalisation, which the PRD's
-"grep or BM25 first" allows and a hundred-section folder does not need.
+by inverse document frequency over sections, saturated and
+length-normalised as BM25 does (k1 = 1.2, b = 0.75), ties broken by file
+order. Phase 4 shipped without the length term and the acceptance run
+showed a fourteen-file folder needs it: a long context section outranked
+the short list that held the answer (step 9).
 The tool is `read` class and confined to the snapshot the runtime built;
 it never reads the filesystem itself.
 
