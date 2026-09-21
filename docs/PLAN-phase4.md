@@ -1,6 +1,6 @@
 # Phase 4 plan
 
-Status: draft · Follows `docs/PRD.md` (the Projects phase) and the phase 0 to 3 plans
+Status: steps 1 to 7 landed on 2026-09-21; step 8 (acceptance) pending · Follows `docs/PRD.md` (the Projects phase) and the phase 0 to 3 plans
 
 ## 0. Goal and done-when
 
@@ -93,6 +93,7 @@ pub struct MemoryExtractedPayload {
     pub usage: Usage,
 }
 pub struct MemoryLine { pub file: String, pub text: String, pub stated_by: Author, pub at_seq: u64 }
+// at_seq is a user_message or a user's skill_loaded (phase 4); agent participants in phase 5
 
 // crates/runtime/src/project.rs
 pub struct Project {
@@ -115,7 +116,8 @@ pub struct ProjectFile { /* phase 3 fields */
     pub tools: ToolsSection,          // allow: Vec<String>; empty means every registered tool
     pub knowledge: KnowledgeSection,  // threshold_fraction (default 0.4), max_hits (default 5)
     pub memory: MemorySection,        // enabled (default true), every_n_turns (default 1)
-    pub pocock: Option<PocockSection>,// issue_tracker, triage_labels, docs_dir
+    pub pocock: Option<PocockSection>,// issue_tracker, triage_labels (role -> label overrides),
+                                      // docs_dir, prs_as_requests
 }
 
 // crates/runtime/src/layers.rs
@@ -202,11 +204,18 @@ registered tool. `[skills] enabled` is unchanged. Both are narrowed again
 by the global layer (section 5).
 
 **Pocock.** `[pocock] issue_tracker = "github" | "gitlab" | "local"`,
-`triage_labels = [...]`, `docs_dir = "docs"`. `aigentic project setup`
-renders `docs/agents/issue-tracker.md` and the labels file from these,
-byte-for-byte what upstream's `setup-matt-pocock-skills` would write for
-the same answers, so the vendored skills find what they read. The files
-are generated, committed, and regenerated when the fields change.
+`triage_labels = { needs-triage = "bug:triage" }` (overrides for the five
+canonical roles; absent roles keep their name), `docs_dir = "docs"`,
+`prs_as_requests = false` (upstream's request-surface flag). `aigentic
+project setup` renders `docs/agents/issue-tracker.md`, `domain.md` and,
+when the `triage` skill is enabled or overrides are given,
+`triage-labels.md`, byte-for-byte what upstream's
+`setup-matt-pocock-skills` would write for the same answers, and puts
+the `## Agent skills` block into the project's instructions file
+(`.aigentic/instructions.md` if present, else `AGENTS.md`) so it is in
+the prefix. The templates are a snapshot in the tui crate; a test holds
+them equal to the vendored skill's. The files are generated, committed,
+and regenerated when the fields change.
 
 ## 4. Knowledge
 
@@ -271,21 +280,25 @@ prints `[memory: 2 lines written]` or nothing.
 
 **What.** One model call with the project's own model, a fixed prompt
 (`MEMORY_PROMPT`, versioned like the summary prompt) and the events since
-the last `memory_extracted` event's `through_seq`, projected as the model
-would see them. The model returns lines tagged `decision`, `constraint`
-or `fact`, each with the seq of the user or agent message that stated it.
-The runtime keeps only lines whose `at_seq` points at a `user_message`
-or a `skill_loaded` by a user, or an `assistant_message` whose author is
-a named agent participant; anything else is dropped as inference, which
-is how "only what a participant stated" is enforced rather than hoped
-for. In phase 4 the only agent participant is the thread's own agent, so
-in practice the filter keeps what the human said.
+the last `memory_extracted` event's `through_seq`, rendered as a
+transcript with one entry per message-bearing event tagged
+`[seq N] kind author:` (the projection carries no seqs, so it cannot be
+used as is; provider blobs are dropped and tool results shortened). The
+model returns lines `<kind> @<seq>: <text>` with kind `decision`,
+`constraint` or `fact`. The runtime keeps only lines whose `at_seq`, in
+the range considered, is a `user_message` or a `skill_loaded` by a user;
+anything else is dropped as inference, which is how "only what a
+participant stated" is enforced rather than hoped for. An
+`assistant_message` by a named agent participant joins the rule in phase
+5 with participants; in phase 4 the only agent is the thread's own and
+its messages are inference.
 
 **Where.** `.aigentic/memory/decisions.md`, `constraints.md`, `facts.md`,
 one bullet per line with the date and the thread id in a trailing
-comment. A line already present byte-for-byte is not written twice.
-Humans edit or delete lines directly; the harness never rewrites a line
-it did not just add.
+comment. A line whose bullet text is already present (comment ignored,
+so the same decision from another thread or day is not repeated) is not
+written twice. Humans edit or delete lines directly; the harness never
+rewrites a line it did not just add.
 
 **The event.** `memory_extracted` carries `through_seq`, the lines
 written with their sources, the model and usage. It is the audit and the
@@ -299,7 +312,9 @@ invalidated once.
 ## 7. Threads per project
 
 `threads_dir/<project name>/` holds a project's logs; a run outside any
-project uses `threads_dir/_none/`. `aigentic threads` lists the current
+project uses `threads_dir/_none/`. Logs from before phase 4 stay flat in
+`threads_dir/`; `--thread <id>` falls back to that location when the id
+is not under the project and says so. `aigentic threads` lists the current
 project's threads newest first with id, date, event count and the first
 user message's first line; `/threads` does the same in the REPL. The log
 gains no field: the directory is the index, and a `project` field on the
@@ -312,7 +327,7 @@ from outside a working directory.
 # aigentic.toml, the project file. Phase 3 sections unchanged.
 [project]
 name = "vendela"
-description = "Bostadsrättsförening admin, Next.js on Vercel"
+description = "The second real project of the phase 4 acceptance"
 
 [model]
 profile = "tensorx"            # a profile in config.toml; --profile overrides
@@ -333,8 +348,9 @@ every_n_turns = 1
 
 [pocock]
 issue_tracker = "github"
-triage_labels = ["bug", "feature", "chore"]
+triage_labels = { needs-triage = "bug:triage" }   # role -> this tracker's label
 docs_dir = "docs"
+prs_as_requests = false
 ```
 
 ```toml

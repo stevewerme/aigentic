@@ -440,7 +440,7 @@ class = "read"
     const PHASE4: &str = r#"
 [project]
 name = "vendela"
-description = "Bostadsrättsförening admin"
+description = "The second real project of the phase 4 acceptance"
 
 [model]
 profile = "tensorx"
