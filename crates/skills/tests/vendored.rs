@@ -67,11 +67,27 @@ fn every_vendored_skill_loads_against_the_lock() {
         bundled: Some(repo.join("skills/pocock")),
     };
     let tools: Vec<String> = ["bash", "grep", "pin"].map(String::from).to_vec();
-    let set = SkillSet::load(&names, &roots, &lock, &tools).unwrap();
-    assert_eq!(set.len(), 38);
+    let rejected = |name: &String| {
+        matches!(
+            lock.get(name).map(|e| &e.review),
+            Some(aigentic_skills::Review::Rejected { .. })
+        )
+    };
+    let (declined, wanted): (Vec<String>, Vec<String>) = names.iter().cloned().partition(rejected);
+    assert_eq!(names.len(), 38);
+    assert_eq!(declined.len(), 9, "{declined:?}");
+    let set = SkillSet::load(&wanted, &roots, &lock, &tools).unwrap();
+    assert_eq!(set.len(), 29);
     assert!(set.get("tdd").is_some() && set.get("implement").is_some());
-    assert_eq!(set.user_invoked().len(), 22);
-    assert_eq!(set.model_invoked().len(), 16);
+    assert_eq!(set.user_invoked().len() + set.model_invoked().len(), 29);
+    // A rejected skill refuses to load however it is asked for.
+    for name in &declined {
+        let err = SkillSet::load(std::slice::from_ref(name), &roots, &lock, &tools).unwrap_err();
+        assert!(
+            matches!(&err, aigentic_skills::SkillError::Rejected { skill, .. } if skill == name),
+            "{name}: {err}"
+        );
+    }
 }
 
 #[test]

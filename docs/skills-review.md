@@ -4,7 +4,7 @@ Findings from the static check (pattern version 1) over the vendored set. Genera
 
 ## ask-matt
 
-user-invoked · review pending · `skills/pocock/engineering/ask-matt`
+user-invoked · rejected by steve on 2026-09-21 · `skills/pocock/engineering/ask-matt`
 
 Tools referenced: bash
 
@@ -55,7 +55,7 @@ Tool references:
 
 ## git-guardrails-claude-code
 
-model-invoked · review pending · `skills/pocock/misc/git-guardrails-claude-code`
+model-invoked · rejected by steve on 2026-09-21 · `skills/pocock/misc/git-guardrails-claude-code`
 
 Tools referenced: bash, grep
 
@@ -73,7 +73,7 @@ Tool references:
 
 ## improve-codebase-architecture
 
-user-invoked · review pending · `skills/pocock/engineering/improve-codebase-architecture`
+user-invoked · accepted by steve on 2026-09-21 · `skills/pocock/engineering/improve-codebase-architecture`
 
 URLs:
 
@@ -81,7 +81,7 @@ URLs:
 
 ## loop-me
 
-user-invoked · review pending · `skills/pocock/in-progress/loop-me`
+user-invoked · rejected by steve on 2026-09-21 · `skills/pocock/in-progress/loop-me`
 
 Widens permissions:
 
@@ -89,7 +89,7 @@ Widens permissions:
 
 ## migrate-to-shoehorn
 
-model-invoked · review pending · `skills/pocock/misc/migrate-to-shoehorn`
+model-invoked · rejected by steve on 2026-09-21 · `skills/pocock/misc/migrate-to-shoehorn`
 
 Tools referenced: bash, grep
 
@@ -100,7 +100,7 @@ Tool references:
 
 ## pr
 
-model-invoked · review pending · `skills/pocock/in-progress/pr`
+model-invoked · accepted by steve on 2026-09-21 · `skills/pocock/in-progress/pr`
 
 URLs:
 
@@ -110,7 +110,7 @@ URLs:
 
 ## scaffold-exercises
 
-model-invoked · review pending · `skills/pocock/misc/scaffold-exercises`
+model-invoked · rejected by steve on 2026-09-21 · `skills/pocock/misc/scaffold-exercises`
 
 Tools referenced: bash
 
@@ -121,7 +121,7 @@ Tool references:
 
 ## setup-matt-pocock-skills
 
-user-invoked · review pending · `skills/pocock/engineering/setup-matt-pocock-skills`
+user-invoked · rejected by steve on 2026-09-21 · `skills/pocock/engineering/setup-matt-pocock-skills`
 
 Widens permissions:
 
@@ -134,7 +134,7 @@ URLs:
 
 ## setup-pre-commit
 
-model-invoked · review pending · `skills/pocock/misc/setup-pre-commit`
+model-invoked · rejected by steve on 2026-09-21 · `skills/pocock/misc/setup-pre-commit`
 
 Tools referenced: bash
 
@@ -144,7 +144,7 @@ Tool references:
 
 ## setup-ts-deep-modules
 
-user-invoked · review pending · `skills/pocock/in-progress/setup-ts-deep-modules`
+user-invoked · rejected by steve on 2026-09-21 · `skills/pocock/in-progress/setup-ts-deep-modules`
 
 Scripts and shell:
 
@@ -156,7 +156,7 @@ URLs:
 
 ## teach
 
-user-invoked · review pending · `skills/pocock/productivity/teach`
+user-invoked · accepted by steve on 2026-09-21 · `skills/pocock/productivity/teach`
 
 URLs:
 
@@ -166,7 +166,7 @@ URLs:
 
 ## wayfinder
 
-user-invoked · review pending · `skills/pocock/engineering/wayfinder`
+user-invoked · accepted by steve on 2026-09-21 · `skills/pocock/engineering/wayfinder`
 
 Tools referenced: pin
 
@@ -177,7 +177,7 @@ Tool references:
 
 ## wizard
 
-model-invoked · review pending · `skills/pocock/engineering/wizard`
+model-invoked · rejected by steve on 2026-09-21 · `skills/pocock/engineering/wizard`
 
 Tools referenced: bash, grep
 
@@ -200,7 +200,7 @@ Tool references:
 
 ## writing-for-agents
 
-model-invoked · review pending · `skills/pocock/productivity/writing-for-agents`
+model-invoked · accepted by steve on 2026-09-21 · `skills/pocock/productivity/writing-for-agents`
 
 Widens permissions:
 
