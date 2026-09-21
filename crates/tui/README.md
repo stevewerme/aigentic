@@ -301,8 +301,9 @@ its `aigentic.toml`:
 
 ### Phase 4 acceptance (docs/PLAN-phase4.md done-when 1 to 5)
 
-Not yet run. Do these in this repository and in Vendela, on both
-backends, over a week of daily use, and record thread ids below.
+Do these in this repository and in Vendela, on both backends, over a
+week of daily use, and record thread ids below. Results so far follow
+item 20.
 
 16. Projects: in Vendela, `aigentic project init`, then add `[pocock]
     issue_tracker = "github"` and run `aigentic project setup`. Start
@@ -340,3 +341,25 @@ backends, over a week of daily use, and record thread ids below.
     branch with `Closes #N` in a commit must fetch the issue through
     `gh` as that file says, without `/setup-matt-pocock-skills` having
     run.
+
+Phase 4 results, in this repository and Vendela (`~/Projects/vendela`,
+set up on 2026-09-21 with `aigentic project init`, a curated copy of
+fourteen docs under `.aigentic/knowledge/` and `threshold_fraction =
+0.02` so the index switches on under the Anthropic window too):
+
+- Item 16 on TensorX (`z-ai/glm-5.3`), 2026-09-21: starting in Vendela's
+  root printed `project vendela · layers: global, project, knowledge
+  (index, 14 files) · 3 skills · 0 threads`; thread
+  `01M32HQF6Q35NMDE9JDYMV7Q52` answered "what do you know about this
+  project" from `AGENTS.md`, `WHERE-WE-ARE.md` and `CONTEXT.md`, and
+  its `memory_extracted` event followed the turn with nothing written
+  (`/cost` listed one extraction, 1530 in, 469 out). `aigentic threads`
+  listed that one thread with 7 events and the first line. Starting in
+  `packages/verify` still resolved to `vendela` with `1 threads`
+  (`01M32HX7GJXS9XNVVH1N2YHX0G`); starting here printed `project
+  aigentic · layers: global, project · 5 skills · 0 threads`
+  (`01M32HYAAG3YS9YM1A4YYYH3Q2`). Two notes: the model read the docs
+  with `read_file` rather than `search_knowledge`, since the knowledge
+  files are copies of files it can name from `AGENTS.md`; and a thread
+  appears in the listing only after its first event. The pre-phase-4
+  resume and the Anthropic pass are still to run.
