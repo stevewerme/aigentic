@@ -40,11 +40,13 @@ fn assistant_ev(blocks: Vec<ContentBlock>) -> NewEvent {
         serde_json::to_value(p).unwrap(),
     )
 }
+/// A result as a phase 3 runtime writes it, with its policy record.
 fn result_ev(id: &str) -> NewEvent {
     new_event(
         EventKind::ToolResult,
         Author::System,
-        json!({"id": id, "content": "echo: ok", "is_error": false}),
+        json!({"id": id, "content": "echo: ok", "is_error": false,
+               "policy": {"kind": "rule", "rule": "class safe", "decision": "allow"}}),
     )
 }
 fn ended_ev() -> NewEvent {

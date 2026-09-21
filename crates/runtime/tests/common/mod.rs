@@ -10,7 +10,8 @@ use aigentic_core::{
     RiskClass, Tool, ToolCall, ToolError, ToolOutput, UserId,
 };
 use aigentic_log::ThreadLog;
-use aigentic_runtime::Runtime;
+use aigentic_runtime::{Runtime, audit_tool_results};
+use aigentic_tools::ToolRegistry;
 use futures_core::Stream;
 use serde_json::json;
 
@@ -119,6 +120,22 @@ pub struct Harness {
     pub dir: tempfile::TempDir,
 }
 
+/// The audit behind done-when 2 runs over every log a harness produced:
+/// no `tool_result` without a policy record, or the test fails at drop.
+impl Drop for Harness {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            return;
+        }
+        let events = self.runtime.log().read_all().expect("log reads back");
+        let missing = audit_tool_results(&events);
+        assert!(
+            missing.is_empty(),
+            "tool_result events without a policy record at seqs {missing:?}"
+        );
+    }
+}
+
 pub fn harness(script: Vec<Vec<ProviderEvent>>, instructions: Option<&str>) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let log = ThreadLog::open(dir.path(), ulid::Ulid::generate()).unwrap();
@@ -134,13 +151,9 @@ pub fn harness_with_log(
 ) -> Harness {
     let (provider, seen) = scripted(script);
     let calls = Arc::new(Mutex::new(Vec::new()));
-    let runtime = Runtime::new(
-        provider,
-        vec![Box::new(EchoTool(calls.clone()))],
-        log,
-        AgentId("worker".into()),
-    )
-    .with_instructions(instructions.map(str::to_owned));
+    let registry: ToolRegistry = vec![Box::new(EchoTool(calls.clone())) as Box<dyn Tool>].into();
+    let runtime = Runtime::new(provider, registry, log, AgentId("worker".into()))
+        .with_instructions(instructions.map(str::to_owned));
     Harness {
         runtime,
         seen,

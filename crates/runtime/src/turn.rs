@@ -10,7 +10,10 @@ use aigentic_core::{
 use aigentic_log::{AssistantMessagePayload, ToolResultPayload, Usage, UserMessagePayload};
 use futures_util::StreamExt;
 
-use crate::seams::PolicyDecision;
+use aigentic_log::PolicyRecord;
+
+use crate::harness_tools::{HARNESS_CLASS, harness_specs, is_harness_tool};
+use crate::seams::{Verdict, denial_text};
 use crate::support::{Spent, flush_text};
 use crate::{Runtime, RuntimeError, Signal, TurnOutcome, build_context};
 
@@ -40,11 +43,7 @@ impl Runtime {
             iterations: 0,
             tokens: 0,
         };
-        let specs: Vec<ToolSpec> = self
-            .tools
-            .iter()
-            .map(|t| ToolSpec::from(t.as_ref()))
-            .collect();
+        let specs: Vec<ToolSpec> = self.tool_specs();
 
         loop {
             // Seam: an interrupt from the turn queue would be handled here.
@@ -133,19 +132,9 @@ impl Runtime {
 
             for call in calls {
                 observe(Signal::ToolCallStarted(&call));
-                let result = match self.policy_check(&call) {
-                    PolicyDecision::Allowed => self.run_tool(&call).await,
-                    PolicyDecision::Denied(reason) => ToolResult {
-                        id: call.id.clone(),
-                        content: reason,
-                        is_error: true,
-                    },
-                };
-                let payload = serde_json::to_value(ToolResultPayload {
-                    result,
-                    policy: None,
-                })
-                .expect("serialisable");
+                let (result, record) = self.execute(&call, observe).await?;
+                let payload = serde_json::to_value(ToolResultPayload::new(result, record))
+                    .expect("serialisable");
                 self.append(
                     EventKind::ToolResult,
                     Author::System,
@@ -155,5 +144,55 @@ impl Runtime {
                 )?;
             }
         }
+    }
+
+    /// The one call site for tool execution, behind `policy_check`. An
+    /// unknown tool is refused with a rule record; a harness tool is
+    /// answered here; anything else runs from the registry.
+    async fn execute(
+        &mut self,
+        call: &ToolCall,
+        observe: &mut dyn FnMut(Signal<'_>),
+    ) -> Result<(ToolResult, PolicyRecord), RuntimeError> {
+        let class = if is_harness_tool(&call.name) {
+            HARNESS_CLASS
+        } else if let Some(tool) = self.registry.get(&call.name) {
+            tool.risk_class()
+        } else {
+            return Ok((
+                ToolResult {
+                    id: call.id.clone(),
+                    content: format!("unknown tool: {}", call.name),
+                    is_error: true,
+                },
+                PolicyRecord::rule("unknown tool", "deny"),
+            ));
+        };
+        match self.policy_check(call, class, observe)? {
+            Verdict::Run(record) => {
+                let result = if is_harness_tool(&call.name) {
+                    self.run_harness_tool(call, observe)?
+                } else {
+                    self.run_tool(call).await
+                };
+                Ok((result, record))
+            }
+            Verdict::Refuse(record) => Ok((
+                ToolResult {
+                    id: call.id.clone(),
+                    content: denial_text(&record),
+                    is_error: true,
+                },
+                record,
+            )),
+        }
+    }
+
+    /// Registry specs plus the harness tools, sorted by name.
+    pub fn tool_specs(&self) -> Vec<ToolSpec> {
+        let mut specs = self.registry.specs();
+        specs.extend(harness_specs());
+        specs.sort_by(|a, b| a.name.cmp(&b.name));
+        specs
     }
 }

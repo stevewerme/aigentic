@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use aigentic_runtime::aigentic_core::{AgentId, Author, UserId};
 use aigentic_runtime::aigentic_log::{Repair, ThreadLog};
-use aigentic_runtime::aigentic_tools::{Workdir, builtin_tools};
+use aigentic_runtime::aigentic_tools::{ToolRegistry, Workdir};
 use aigentic_runtime::{Runtime, load_instructions};
 use anyhow::Context;
 use clap::Parser;
@@ -48,7 +48,7 @@ async fn main() -> anyhow::Result<()> {
 
     let cwd = std::env::current_dir().context("current directory")?;
     let provider = profile.build_provider(api_key);
-    let tools = builtin_tools(Workdir::new(&cwd));
+    let tools = ToolRegistry::builtin(Workdir::new(&cwd));
 
     let threads_dir = config
         .threads_dir

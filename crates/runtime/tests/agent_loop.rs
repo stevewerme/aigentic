@@ -146,7 +146,7 @@ async fn tool_call_round_trip_produces_the_exact_event_sequence() {
 async fn budget_stop_is_an_event_with_the_reason() {
     let forever = || vec![ProviderEvent::ToolCall(call("c", "x")), done("tool_calls")];
     let mut h = harness(vec![forever(), forever(), forever()], None);
-    h.runtime = h.runtime.with_budget(Budget {
+    h.runtime.set_budget(Budget {
         max_iterations: 2,
         max_tokens: u64::MAX,
         max_wall_time: Duration::from_secs(60),
@@ -200,7 +200,7 @@ async fn token_budget_stops_after_the_call_that_crosses_it() {
         ]],
         None,
     );
-    h.runtime = h.runtime.with_budget(Budget {
+    h.runtime.set_budget(Budget {
         max_iterations: 10,
         max_tokens: 1000,
         max_wall_time: Duration::from_secs(60),
@@ -243,7 +243,7 @@ async fn wall_time_budget_is_named_in_the_turn_ended_event() {
         ]],
         None,
     );
-    h.runtime = h.runtime.with_budget(Budget {
+    h.runtime.set_budget(Budget {
         max_iterations: 10,
         max_tokens: u64::MAX,
         max_wall_time: Duration::ZERO,

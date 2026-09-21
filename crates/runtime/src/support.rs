@@ -38,7 +38,7 @@ impl Runtime {
 
     pub(crate) async fn run_tool(&self, call: &ToolCall) -> ToolResult {
         let id = call.id.clone();
-        let Some(tool) = self.tools.iter().find(|t| t.name() == call.name) else {
+        let Some(tool) = self.registry.get(&call.name) else {
             return ToolResult {
                 id,
                 content: format!("unknown tool: {}", call.name),

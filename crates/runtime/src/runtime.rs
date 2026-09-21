@@ -1,7 +1,12 @@
 use std::time::Duration;
 
-use aigentic_core::{AgentId, Budget, Event, Provider, Tool, ToolCall};
+use aigentic_core::{AgentId, Budget, Event, Provider, ToolCall};
 use aigentic_log::ThreadLog;
+use aigentic_policy::Policy;
+use aigentic_tools::ToolRegistry;
+
+use crate::approver::{Approver, DenyAll};
+use crate::seams::SessionGrant;
 
 /// Conservative per-turn defaults; projects raise them in phase 4.
 pub const DEFAULT_BUDGET: Budget = Budget {
@@ -34,7 +39,10 @@ pub const DEFAULT_COMPACTION: CompactionSettings = CompactionSettings {
 /// writer for that thread's log.
 pub struct Runtime {
     pub(crate) provider: Box<dyn Provider>,
-    pub(crate) tools: Vec<Box<dyn Tool>>,
+    pub(crate) registry: ToolRegistry,
+    pub(crate) policy: Policy,
+    pub(crate) approver: Box<dyn Approver>,
+    pub(crate) session_grants: Vec<SessionGrant>,
     pub(crate) log: ThreadLog,
     pub(crate) agent: AgentId,
     pub(crate) budget: Budget,
@@ -48,15 +56,20 @@ pub struct Runtime {
 }
 
 impl Runtime {
+    /// A runtime with the default policy and no approver: everything
+    /// policy would ask about is denied until `with_approver`.
     pub fn new(
         provider: Box<dyn Provider>,
-        tools: Vec<Box<dyn Tool>>,
+        registry: ToolRegistry,
         log: ThreadLog,
         agent: AgentId,
     ) -> Self {
         Self {
             provider,
-            tools,
+            registry,
+            policy: Policy::defaults(),
+            approver: Box::new(DenyAll),
+            session_grants: Vec::new(),
             log,
             agent,
             budget: DEFAULT_BUDGET,
@@ -65,6 +78,33 @@ impl Runtime {
             model_label: "unknown".into(),
             measured: None,
         }
+    }
+
+    pub fn with_policy(mut self, policy: Policy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    pub fn with_approver(mut self, approver: Box<dyn Approver>) -> Self {
+        self.approver = approver;
+        self
+    }
+
+    pub fn with_registry(mut self, registry: ToolRegistry) -> Self {
+        self.registry = registry;
+        self
+    }
+
+    pub fn registry(&self) -> &ToolRegistry {
+        &self.registry
+    }
+
+    pub fn registry_mut(&mut self) -> &mut ToolRegistry {
+        &mut self.registry
+    }
+
+    pub fn policy(&self) -> &Policy {
+        &self.policy
     }
 
     pub fn with_compaction(mut self, settings: CompactionSettings) -> Self {
@@ -85,6 +125,10 @@ impl Runtime {
     pub fn with_budget(mut self, budget: Budget) -> Self {
         self.budget = budget;
         self
+    }
+
+    pub fn set_budget(&mut self, budget: Budget) {
+        self.budget = budget;
     }
 
     /// Repository instructions for the stable prefix; see

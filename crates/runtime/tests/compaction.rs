@@ -130,15 +130,12 @@ async fn two_hundred_turns_stay_under_budget() {
         max_result_bytes: 500,
         summary_max_output_tokens: 256,
     };
-    let mut rt = Runtime::new(
-        Box::new(provider),
-        vec![Box::new(EchoTool(calls))],
-        log,
-        AgentId("worker".into()),
-    )
-    .with_instructions(Some("Be terse.".into()))
-    .with_compaction(settings)
-    .with_model_label("scripted");
+    let registry: aigentic_tools::ToolRegistry =
+        vec![Box::new(EchoTool(calls)) as Box<dyn aigentic_core::Tool>].into();
+    let mut rt = Runtime::new(Box::new(provider), registry, log, AgentId("worker".into()))
+        .with_instructions(Some("Be terse.".into()))
+        .with_compaction(settings)
+        .with_model_label("scripted");
     let line = rt.window_line();
     assert_eq!(line, 5_600);
 
@@ -256,11 +253,16 @@ async fn compact_now_reports_what_it_did_and_pin_lands_in_the_prefix() {
         turn: Mutex::new(0),
     };
     let log = ThreadLog::open(dir.path(), ulid::Ulid::generate()).unwrap();
-    let mut rt = Runtime::new(Box::new(provider), vec![], log, AgentId("worker".into()))
-        .with_compaction(CompactionSettings {
-            keep_turns: 1,
-            ..aigentic_runtime::DEFAULT_COMPACTION
-        });
+    let mut rt = Runtime::new(
+        Box::new(provider),
+        aigentic_tools::ToolRegistry::empty(),
+        log,
+        AgentId("worker".into()),
+    )
+    .with_compaction(CompactionSettings {
+        keep_turns: 1,
+        ..aigentic_runtime::DEFAULT_COMPACTION
+    });
     let steve = Author::User(aigentic_core::UserId("steve".into()));
 
     assert!(
