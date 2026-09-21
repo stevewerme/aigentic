@@ -28,6 +28,11 @@ api_key_env = "ANTHROPIC_API_KEY"
 # effort = "high"                         # low | medium | high | xhigh | max
 # max_output_tokens = 64000
 # cache = true
+# [profiles.anthropic.compaction]          # any profile; all optional
+# trigger_fraction = 0.7                  # of the model's window
+# keep_turns = 8                          # verbatim tail after a summary
+# max_result_bytes = 4096                 # truncation target for old tool results
+# summary_max_output_tokens = 2048
 
 # user = "steve"                          # author id on your messages ($USER by default)
 # threads_dir = "/path/to/threads"        # default ~/.local/share/aigentic/threads
@@ -52,8 +57,10 @@ cargo run -p aigentic-tui -- --thread <ULID> --profile anthropic # same thread, 
 ```
 
 Slash commands: `/cost` (input and output tokens for the thread, reported and
-estimated shown separately, plus cache reads and writes and the reasoning
-share), `/quit`. Anything else starting with `/` prints
+estimated shown separately, plus cache reads and writes, the reasoning share
+and compactions), `/pin <text>` (a fact for the stable prefix, never
+summarised), `/compact` (run compaction now and report what it did),
+`/quit`. Anything else starting with `/` prints
 `unknown command`. Ctrl-D quits; Ctrl-C clears the line.
 
 Assistant text streams as it arrives. Tool calls print as `→ name {args}`
@@ -64,6 +71,16 @@ policy seam allows everything.
 Thread logs are JSONL files, one per thread, under `threads_dir`. The
 working directory at launch is the tools' working directory and the source
 of repository instructions (`AGENTS.md`, falling back to `CLAUDE.md`).
+
+Compaction runs before each model call when the window is past
+`trigger_fraction`: old tool results are truncated first, then everything
+but the last `keep_turns` turns is summarised by the same model. Both are
+`compacted` events in the log; the originals stay. The REPL prints a line
+for each.
+
+Resume after a crash: a torn last line is cut (and reported), tool calls
+that never got a result receive synthetic error results, an `interrupted`
+event is appended, and the turn continues before the first prompt.
 
 ## Manual acceptance
 
@@ -98,6 +115,17 @@ adapter change.
    same question. Expect an answer from context. Send one more message and
    check `/cost` shows `cache read > 0`. Then resume once more with the
    TensorX profile and confirm it still answers from context.
+9. Phase 2, kill mid-tool: ask "Run `sleep 30` with bash, then tell me the
+   time." and `kill -9` the process while the sleep runs. Restart with the
+   same `--thread`. Expect the interrupted line, no prompt until the turn
+   finishes, and an answer that acknowledges the tool result is unknown.
+10. Phase 2, kill mid-stream: ask for a long answer and `kill -9` while it
+    streams. Restart; expect the turn to continue and end cleanly.
+11. Phase 2, compaction: set `trigger_fraction = 0.05` on the profile,
+    hold a conversation until `[compacted: ... summarised ...]` prints,
+    then ask about something from before the summary. Check `/cost` lists
+    the compaction and, on Anthropic, that the following turn's cache
+    write is roughly the summary plus the tail and the one after reads it.
 
 Status: steps 1 to 7 passed on 2026-09-21 against TensorX
 (`https://api.tensorx.ai/v1`, model `z-ai/glm-5.3`). Step 8 passed the same

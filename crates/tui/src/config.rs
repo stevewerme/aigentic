@@ -5,6 +5,7 @@ use aigentic_runtime::aigentic_core::Provider;
 use aigentic_runtime::aigentic_providers::{
     Anthropic, AnthropicConfig, OpenAiCompat, OpenAiCompatConfig, Thinking,
 };
+use aigentic_runtime::{CompactionSettings, DEFAULT_COMPACTION};
 use anyhow::{Context, anyhow, bail};
 use serde::Deserialize;
 
@@ -19,7 +20,7 @@ pub enum ProviderKind {
 
 /// One backend. The API key is deliberately absent: only its environment
 /// variable's name is configured here.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
     #[serde(default)]
@@ -44,6 +45,40 @@ pub struct Profile {
     /// `anthropic` only: emit cache breakpoints (default true).
     #[serde(default)]
     pub cache: Option<bool>,
+    /// When and how to compact; every field optional.
+    #[serde(default)]
+    pub compaction: Option<CompactionConfig>,
+}
+
+/// `[profiles.<name>.compaction]`. Missing fields take the runtime defaults.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompactionConfig {
+    #[serde(default)]
+    pub trigger_fraction: Option<f32>,
+    #[serde(default)]
+    pub keep_turns: Option<usize>,
+    #[serde(default)]
+    pub max_result_bytes: Option<usize>,
+    #[serde(default)]
+    pub summary_max_output_tokens: Option<u64>,
+}
+
+impl CompactionConfig {
+    pub fn settings(&self) -> CompactionSettings {
+        CompactionSettings {
+            trigger_fraction: self
+                .trigger_fraction
+                .unwrap_or(DEFAULT_COMPACTION.trigger_fraction),
+            keep_turns: self.keep_turns.unwrap_or(DEFAULT_COMPACTION.keep_turns),
+            max_result_bytes: self
+                .max_result_bytes
+                .unwrap_or(DEFAULT_COMPACTION.max_result_bytes),
+            summary_max_output_tokens: self
+                .summary_max_output_tokens
+                .unwrap_or(DEFAULT_COMPACTION.summary_max_output_tokens),
+        }
+    }
 }
 
 /// The file on disk. Either the phase 0 flat form (top-level `base_url`,
@@ -69,7 +104,7 @@ struct ConfigFile {
     threads_dir: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     pub profiles: BTreeMap<String, Profile>,
     pub default_profile: String,
@@ -136,6 +171,7 @@ impl Config {
                     effort: None,
                     max_output_tokens: None,
                     cache: None,
+                    compaction: None,
                 };
                 (
                     BTreeMap::from([("default".to_owned(), profile)]),
@@ -192,6 +228,12 @@ impl Config {
 
 impl Profile {
     fn validate(&self) -> anyhow::Result<()> {
+        if let Some(c) = &self.compaction
+            && let Some(f) = c.trigger_fraction
+            && !(0.05..=0.95).contains(&f)
+        {
+            bail!("compaction.trigger_fraction must be between 0.05 and 0.95, got {f}");
+        }
         match self.provider {
             ProviderKind::OpenaiCompat => {
                 if self.base_url.is_none() {
@@ -229,6 +271,12 @@ impl Profile {
                 self.api_key_env
             )
         })
+    }
+
+    pub fn compaction_settings(&self) -> CompactionSettings {
+        self.compaction
+            .as_ref()
+            .map_or(DEFAULT_COMPACTION, CompactionConfig::settings)
     }
 
     /// Where requests go, for the banner. Never includes the key.
@@ -353,12 +401,30 @@ api_key_env = "ANTHROPIC_API_KEY"
 thinking = "off"
 effort = "low"
 cache = false
+
+[profiles.only.compaction]
+trigger_fraction = 0.5
+keep_turns = 3
 "#,
         )
         .unwrap();
         assert_eq!(c.default_profile, "only");
         let (_, p) = c.select(None).unwrap();
         assert!(!p.build_provider("k".into()).capabilities().supports_caching);
+        let s = p.compaction_settings();
+        assert_eq!((s.trigger_fraction, s.keep_turns), (0.5, 3));
+        assert_eq!(s.max_result_bytes, DEFAULT_COMPACTION.max_result_bytes);
+        assert_eq!(
+            Config::parse(FLAT)
+                .unwrap()
+                .select(None)
+                .unwrap()
+                .1
+                .compaction_settings(),
+            DEFAULT_COMPACTION
+        );
+        assert!(Config::parse("[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n[profiles.a.compaction]\ntrigger_fraction = 2.0\n").is_err());
+        assert!(Config::parse("[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n[profiles.a.compaction]\nnope = 1\n").is_err());
     }
 
     #[test]

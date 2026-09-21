@@ -2,8 +2,8 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use aigentic_runtime::aigentic_core::{Author, ContentBlock, EventKind, ToolCall};
-use aigentic_runtime::aigentic_log::ToolResultPayload;
-use aigentic_runtime::{Runtime, Signal};
+use aigentic_runtime::aigentic_log::{CompactedPayload, CompactionStrategy, ToolResultPayload};
+use aigentic_runtime::{Resumed, Runtime, Signal};
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 
@@ -24,6 +24,8 @@ pub struct Repl {
 pub enum Command<'a> {
     Cost,
     Quit,
+    Pin(&'a str),
+    Compact,
     Unknown(&'a str),
     Chat(&'a str),
     Empty,
@@ -37,9 +39,12 @@ pub fn parse_line(line: &str) -> Command<'_> {
     let Some(rest) = trimmed.strip_prefix('/') else {
         return Command::Chat(trimmed);
     };
-    match rest.split_whitespace().next() {
-        Some("cost") => Command::Cost,
-        Some("quit") | Some("exit") => Command::Quit,
+    let (head, tail) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    match (head, tail.trim()) {
+        ("cost", _) => Command::Cost,
+        ("quit" | "exit", _) => Command::Quit,
+        ("compact", _) => Command::Compact,
+        ("pin", text) if !text.is_empty() => Command::Pin(text),
         _ => Command::Unknown(trimmed),
     }
 }
@@ -53,7 +58,20 @@ impl Repl {
         }
     }
 
-    pub async fn run(&mut self) -> anyhow::Result<()> {
+    /// Start the REPL. `resumed` is what `Runtime::resume` found; an
+    /// interrupted turn is finished before the first prompt.
+    pub async fn run(&mut self, resumed: Resumed) -> anyhow::Result<()> {
+        if let Resumed::Interrupted {
+            after_seq,
+            unanswered_calls,
+            ..
+        } = resumed
+        {
+            println!(
+                "[turn interrupted after event {after_seq}; {unanswered_calls} tool call(s) got synthetic results; continuing]"
+            );
+            self.finish_turn(None).await;
+        }
         let mut editor = DefaultEditor::new()?;
         let _ = editor.load_history(&self.history);
         loop {
@@ -70,10 +88,32 @@ impl Repl {
                     let events = self.runtime.log().read_all()?;
                     println!("{}", cost_of(&events));
                 }
+                Command::Pin(text) => {
+                    let _ = editor.add_history_entry(line.trim());
+                    match self
+                        .runtime
+                        .pin(self.user.clone(), text.to_owned(), &mut |_| {})
+                    {
+                        Ok(_) => println!("[pinned]"),
+                        Err(e) => println!("[error: {e}]"),
+                    }
+                }
+                Command::Compact => {
+                    let mut at_line_start = true;
+                    match self
+                        .runtime
+                        .compact_now(&mut |s| render(s, &mut at_line_start))
+                        .await
+                    {
+                        Ok(did) if did.is_empty() => println!("[nothing to compact]"),
+                        Ok(_) => {}
+                        Err(e) => println!("[error: {e}]"),
+                    }
+                }
                 Command::Unknown(cmd) => println!("unknown command: {cmd}"),
                 Command::Chat(text) => {
                     let _ = editor.add_history_entry(text);
-                    self.turn(text).await;
+                    self.finish_turn(Some(text)).await;
                 }
             }
         }
@@ -81,15 +121,24 @@ impl Repl {
         Ok(())
     }
 
-    async fn turn(&mut self, text: &str) {
-        let blocks = vec![ContentBlock::Text(text.to_owned())];
+    /// A new turn for `text`, or the continuation of an interrupted one.
+    async fn finish_turn(&mut self, text: Option<&str>) {
         let mut at_line_start = true;
-        let outcome = self
-            .runtime
-            .run_turn(self.user.clone(), blocks, &mut |signal| {
-                render(signal, &mut at_line_start)
-            })
-            .await;
+        let outcome = match text {
+            Some(text) => {
+                let blocks = vec![ContentBlock::Text(text.to_owned())];
+                self.runtime
+                    .run_turn(self.user.clone(), blocks, &mut |signal| {
+                        render(signal, &mut at_line_start)
+                    })
+                    .await
+            }
+            None => {
+                self.runtime
+                    .continue_turn(&mut |signal| render(signal, &mut at_line_start))
+                    .await
+            }
+        };
         if !at_line_start {
             println!();
         }
@@ -120,6 +169,27 @@ fn render(signal: Signal<'_>, at_line_start: &mut bool) {
                 let marker = if r.is_error { "✗" } else { "✓" };
                 for line in truncate_for_display(&r.content, RESULT_LINES, RESULT_BYTES).lines() {
                     println!("  {marker} {line}");
+                }
+            }
+            *at_line_start = true;
+        }
+        Signal::Event(event) if event.kind == EventKind::Compacted => {
+            if !*at_line_start {
+                println!();
+            }
+            if let Ok(p) = serde_json::from_value::<CompactedPayload>(event.payload.clone()) {
+                match p.strategy {
+                    CompactionStrategy::TruncateResults { max_bytes } => println!(
+                        "[compacted: tool results in events {}-{} truncated to {max_bytes} bytes]",
+                        p.from_seq, p.to_seq
+                    ),
+                    CompactionStrategy::Summary { usage, .. } => println!(
+                        "[compacted: events {}-{} summarised ({} tokens in, {} out)]",
+                        p.from_seq,
+                        p.to_seq,
+                        usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens,
+                        usage.output_tokens
+                    ),
                 }
             }
             *at_line_start = true;
@@ -170,6 +240,12 @@ mod tests {
         assert_eq!(parse_line("/cost"), Command::Cost);
         assert_eq!(parse_line("  /quit  "), Command::Quit);
         assert_eq!(parse_line("/exit"), Command::Quit);
+        assert_eq!(parse_line("/compact"), Command::Compact);
+        assert_eq!(
+            parse_line("/pin  Answer in Swedish. "),
+            Command::Pin("Answer in Swedish.")
+        );
+        assert_eq!(parse_line("/pin"), Command::Unknown("/pin"));
         assert_eq!(parse_line("/nope arg"), Command::Unknown("/nope arg"));
         assert_eq!(parse_line("hello /cost"), Command::Chat("hello /cost"));
         assert_eq!(parse_line("   "), Command::Empty);

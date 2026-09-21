@@ -1,7 +1,9 @@
 use std::fmt;
 
 use aigentic_runtime::aigentic_core::{Event, EventKind};
-use aigentic_runtime::aigentic_log::AssistantMessagePayload;
+use aigentic_runtime::aigentic_log::{
+    AssistantMessagePayload, CompactedPayload, CompactionStrategy,
+};
 
 /// Token totals for a thread, with the estimated share kept apart.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -15,11 +17,29 @@ pub struct Cost {
     pub reasoning: u64,
     pub calls: u32,
     pub estimated_calls: u32,
+    pub truncations: u32,
+    pub summaries: u32,
+    pub summary_input: u64,
+    pub summary_output: u64,
 }
 
 /// Sum usage over every `assistant_message` in the log.
 pub fn cost_of(events: &[Event]) -> Cost {
     let mut cost = Cost::default();
+    for event in events.iter().filter(|e| e.kind == EventKind::Compacted) {
+        let Ok(p) = serde_json::from_value::<CompactedPayload>(event.payload.clone()) else {
+            continue;
+        };
+        match p.strategy {
+            CompactionStrategy::TruncateResults { .. } => cost.truncations += 1,
+            CompactionStrategy::Summary { usage, .. } => {
+                cost.summaries += 1;
+                cost.summary_input +=
+                    usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens;
+                cost.summary_output += usage.output_tokens;
+            }
+        }
+    }
     for event in events
         .iter()
         .filter(|e| e.kind == EventKind::AssistantMessage)
@@ -69,11 +89,26 @@ impl fmt::Display for Cost {
                 self.reasoning
             )?;
         }
+        if self.truncations + self.summaries > 0 {
+            writeln!(
+                f,
+                "compactions {} ({} truncate, {} summary)   summary tokens in {} out {}",
+                self.truncations + self.summaries,
+                self.truncations,
+                self.summaries,
+                self.summary_input,
+                self.summary_output
+            )?;
+        }
         write!(
             f,
             "total      in {:>9}  out {:>9}",
-            self.input + self.cache_read + self.cache_write + self.estimated_input,
-            self.output + self.estimated_output
+            self.input
+                + self.cache_read
+                + self.cache_write
+                + self.estimated_input
+                + self.summary_input,
+            self.output + self.estimated_output + self.summary_output
         )
     }
 }
@@ -124,6 +159,15 @@ mod tests {
             assistant(7, 7, true),
             assistant(200, 20, false),
             event(EventKind::TurnEnded, json!({"reason": "done"})),
+            event(
+                EventKind::Compacted,
+                json!({"from_seq": 0, "to_seq": 4, "strategy": {"kind": "truncate_results", "max_bytes": 100}}),
+            ),
+            event(
+                EventKind::Compacted,
+                json!({"from_seq": 0, "to_seq": 4, "strategy": {"kind": "summary", "text": "s", "model": "m",
+                       "usage": {"input_tokens": 1000, "output_tokens": 50, "cache_read_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": null, "estimated": false}}}),
+            ),
         ];
         let cost = cost_of(&events);
         assert_eq!(
@@ -138,7 +182,17 @@ mod tests {
                 reasoning: 6,
                 calls: 2,
                 estimated_calls: 1,
+                truncations: 1,
+                summaries: 1,
+                summary_input: 1000,
+                summary_output: 50,
             }
+        );
+        let text_all = cost.to_string();
+        assert!(
+            text_all
+                .contains("compactions 2 (1 truncate, 1 summary)   summary tokens in 1000 out 50"),
+            "{text_all}"
         );
         let text = cost.to_string();
         assert!(text.contains("reported   in       300"), "{text}");
@@ -148,6 +202,6 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("reasoning             6"), "{text}");
-        assert!(text.contains("total      in       417"), "{text}");
+        assert!(text.contains("total      in      1417"), "{text}");
     }
 }

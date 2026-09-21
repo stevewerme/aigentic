@@ -8,7 +8,7 @@ mod repl;
 use std::path::PathBuf;
 
 use aigentic_runtime::aigentic_core::{AgentId, Author, UserId};
-use aigentic_runtime::aigentic_log::ThreadLog;
+use aigentic_runtime::aigentic_log::{Repair, ThreadLog};
 use aigentic_runtime::aigentic_tools::{Workdir, builtin_tools};
 use aigentic_runtime::{Runtime, load_instructions};
 use anyhow::Context;
@@ -60,11 +60,13 @@ async fn main() -> anyhow::Result<()> {
         Some(id) => (id, true),
         None => (Ulid::generate(), false),
     };
-    let log = ThreadLog::open(&threads_dir, thread_id)?;
+    let (log, torn) = ThreadLog::open_with(&threads_dir, thread_id, Repair::TruncateTornTail)?;
     let instructions = load_instructions(&cwd).context("reading repository instructions")?;
 
-    let runtime = Runtime::new(provider, tools, log, AgentId("assistant".into()))
-        .with_instructions(instructions);
+    let mut runtime = Runtime::new(provider, tools, log, AgentId("assistant".into()))
+        .with_instructions(instructions)
+        .with_compaction(profile.compaction_settings())
+        .with_model_label(&profile.model);
 
     println!(
         "aigentic · profile {profile_name} · {} · {}",
@@ -80,9 +82,13 @@ async fn main() -> anyhow::Result<()> {
     } else {
         println!("new thread {thread_id} (resume with --thread {thread_id})");
     }
-    println!("/cost shows tokens, /quit exits");
+    if let Some(bytes) = torn {
+        println!("[repaired torn tail: {bytes} bytes of an unfinished event were cut]");
+    }
+    println!("/cost shows tokens, /pin <text> pins a fact, /compact compacts, /quit exits");
 
+    let resumed = runtime.resume(torn, &mut |_| {})?;
     let user = Author::User(UserId(config.user_name()));
     let history = config_path.with_file_name("history");
-    repl::Repl::new(runtime, user, history).run().await
+    repl::Repl::new(runtime, user, history).run(resumed).await
 }
