@@ -81,6 +81,7 @@ pub fn render_review(manifests: &[Manifest], lock: &Lockfile) -> String {
             entry.map_or("unlocked".to_owned(), |e| match &e.review {
                 crate::Review::Pending => "review pending".to_owned(),
                 crate::Review::Accepted { by, on } => format!("accepted by {by} on {on}"),
+                crate::Review::Rejected { by, on } => format!("rejected by {by} on {on}"),
             }),
             entry.map_or_else(|| m.path.display().to_string(), |e| e.path.clone())
         ));

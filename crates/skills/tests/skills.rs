@@ -226,6 +226,33 @@ fn hash_verification_passes_on_the_fixture_set_and_fails_on_one_byte() {
 }
 
 #[test]
+fn a_rejected_skill_refuses_to_load_even_when_enabled() {
+    let mut lock = lock_for(&["plain"]);
+    let entry = lock.get("plain").unwrap().clone();
+    let mut rejected = entry.clone();
+    rejected.review = aigentic_skills::Review::Rejected {
+        by: "steve".into(),
+        on: "2026-09-21".into(),
+    };
+    lock.upsert(rejected);
+    let err = SkillSet::load(&["plain".into()], &roots(), &lock, &no_tools()).unwrap_err();
+    assert!(
+        matches!(&err, SkillError::Rejected { skill, by, .. } if skill == "plain" && by == "steve"),
+        "{err}"
+    );
+    assert!(err.to_string().contains("remove it from [skills] enabled"));
+    // The verdict survives a lockfile round trip and does not count as pending.
+    let back = Lockfile::parse(&lock.to_toml()).unwrap();
+    assert_eq!(
+        back.get("plain").unwrap().review,
+        lock.get("plain").unwrap().review
+    );
+    assert!(!back.get("plain").unwrap().review.is_pending());
+    lock.upsert(entry);
+    assert!(SkillSet::load(&["plain".into()], &roots(), &lock, &no_tools()).is_ok());
+}
+
+#[test]
 fn an_unlocked_or_missing_skill_does_not_load() {
     let lock = lock_for(&["plain"]);
     let err = SkillSet::load(&["url".into()], &roots(), &lock, &no_tools()).unwrap_err();

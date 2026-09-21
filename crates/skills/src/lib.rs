@@ -45,6 +45,14 @@ pub enum SkillError {
     NotFound(String),
     #[error("skill `{skill}` requires tool `{tool}`, which is not available")]
     MissingRequirement { skill: String, tool: String },
+    #[error(
+        "skill `{skill}` was rejected at review by {by} on {on}; remove it from [skills] enabled"
+    )]
+    Rejected {
+        skill: String,
+        by: String,
+        on: String,
+    },
     #[error("{path}: {message}")]
     Frontmatter { path: PathBuf, message: String },
     #[error("{path}: {message}")]
@@ -92,6 +100,13 @@ impl SkillSet {
                 .cloned()
                 .ok_or_else(|| SkillError::NotInLock(name.clone()))?;
             entry.verify(&manifest)?;
+            if let Review::Rejected { by, on } = &entry.review {
+                return Err(SkillError::Rejected {
+                    skill: name.clone(),
+                    by: by.clone(),
+                    on: on.clone(),
+                });
+            }
             if let Some(tool) = entry.requires.iter().find(|t| !tools.contains(t)) {
                 return Err(SkillError::MissingRequirement {
                     skill: name.clone(),

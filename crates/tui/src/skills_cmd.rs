@@ -137,6 +137,7 @@ fn list(paths: &SkillPaths) -> anyhow::Result<i32> {
                 match &e.review {
                     Review::Pending => "pending".to_owned(),
                     Review::Accepted { by, on } => format!("accepted {by} {on}"),
+                    Review::Rejected { by, on } => format!("rejected {by} {on}"),
                 },
                 format!("{}@{}", e.source, e.commit.get(..7).unwrap_or(&e.commit)),
             ),

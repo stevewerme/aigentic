@@ -11,10 +11,14 @@ use sha2::{Digest, Sha256};
 
 use crate::{Invocation, Manifest, SkillError};
 
-/// Whether a human has read the static check's findings and accepted them.
+/// Whether a human has read the static check's findings and accepted or
+/// rejected them. Rejection records the verdict; it does not remove the
+/// skill from the vendored set, and an update that changes its hashes
+/// brings it back to `Pending`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Review {
     Accepted { by: String, on: String },
+    Rejected { by: String, on: String },
     Pending,
 }
 
@@ -24,12 +28,28 @@ impl Review {
     }
 }
 
-/// TOML: `review = "pending"` or `review = { by = "steve", on = "2026-09-21" }`.
+/// TOML: `review = "pending"`, `review = { by, on }` (accepted) or
+/// `review = { state = "rejected", by, on }`. The `state` field is what
+/// tells a rejected table from an accepted one, so it must stay first.
 #[derive(Serialize, Deserialize)]
 #[serde(untagged)]
 enum ReviewWire {
-    Accepted { by: String, on: String },
+    Rejected {
+        state: RejectedTag,
+        by: String,
+        on: String,
+    },
+    Accepted {
+        by: String,
+        on: String,
+    },
     Pending(PendingTag),
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum RejectedTag {
+    Rejected,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -45,6 +65,11 @@ impl Serialize for Review {
                 by: by.clone(),
                 on: on.clone(),
             },
+            Review::Rejected { by, on } => ReviewWire::Rejected {
+                state: RejectedTag::Rejected,
+                by: by.clone(),
+                on: on.clone(),
+            },
             Review::Pending => ReviewWire::Pending(PendingTag::Pending),
         };
         wire.serialize(s)
@@ -55,6 +80,7 @@ impl<'de> Deserialize<'de> for Review {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         Ok(match ReviewWire::deserialize(d)? {
             ReviewWire::Accepted { by, on } => Review::Accepted { by, on },
+            ReviewWire::Rejected { by, on, .. } => Review::Rejected { by, on },
             ReviewWire::Pending(_) => Review::Pending,
         })
     }
@@ -292,6 +318,16 @@ mod tests {
         let text = pending.to_toml();
         assert!(text.contains("review = \"pending\""), "{text}");
         assert_eq!(Lockfile::parse(&text).unwrap(), pending);
+
+        let mut rejected = pending.clone();
+        rejected.skills[0].review = Review::Rejected {
+            by: "steve".into(),
+            on: "2026-09-21".into(),
+        };
+        let text = rejected.to_toml();
+        assert!(text.contains("state = \"rejected\""), "{text}");
+        assert_eq!(Lockfile::parse(&text).unwrap(), rejected);
+        assert!(!rejected.skills[0].review.is_pending());
 
         let mut accepted = pending.clone();
         accepted.skills[0].review = Review::Accepted {
