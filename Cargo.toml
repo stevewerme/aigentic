@@ -34,6 +34,11 @@ schemars = { version = "0.8", features = ["derive"] }
 ulid = { version = "3", features = ["serde"] }
 time = { version = "0.3", features = ["serde-well-known", "macros"] }
 thiserror = "2"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+dotenvy = "0.15"
+rustyline = "18"
+toml = "1"
 futures-core = "0.3"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 bytes = "1"

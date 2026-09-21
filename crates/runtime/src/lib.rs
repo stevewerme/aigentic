@@ -6,6 +6,13 @@
 //! Phase 0 leaves three named seams that currently pass through, see
 //! [`seams`]: the policy check, the turn queue and compaction.
 
+// Re-exported so a client can build a `Runtime` while depending on this
+// crate alone, per the dependency rule.
+pub use aigentic_core;
+pub use aigentic_log;
+pub use aigentic_providers;
+pub use aigentic_tools;
+
 mod context;
 mod error;
 mod instructions;

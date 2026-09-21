@@ -27,7 +27,9 @@ crate.
 use only `serde`, `serde_json`, `schemars`, `ulid`, `futures-core`, `time` and
 `thiserror`. Every other crate depends on `core`. `runtime` is the only crate
 that knows about `log`, `providers`, `tools`, `skills` and `policy`. `tui`
-depends on the runtime API only. Never add an edge that breaks this: the
+depends on the runtime API only; `runtime` re-exports `aigentic_core`,
+`aigentic_log`, `aigentic_providers` and `aigentic_tools` so a client can
+construct a `Runtime` without adding Cargo edges of its own. Never add an edge that breaks this: the
 model is a function behind the `Provider` trait, and `core` must never import
 a provider SDK.
 
@@ -71,6 +73,15 @@ cargo test
   output and stating how many bytes were omitted.
 - The working directory is shared by the built-in tools and persists across
   bash calls; a `cd` in a call that times out is discarded.
+
+## Configuration and secrets
+
+The binary reads base URL, model and the *name* of the environment variable
+holding the API key from `~/.config/aigentic/config.toml` (override with
+`--config`). The key itself comes only from that environment variable, never
+from the config file, and is never logged or printed. `.env` in the current
+directory is loaded at startup and is gitignored; `.env.example` shows the
+expected variables.
 
 ## Conventions
 
