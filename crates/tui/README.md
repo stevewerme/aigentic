@@ -479,9 +479,31 @@ fourteen docs under `.aigentic/knowledge/` and `threshold_fraction =
   `.aigentic/`, which the PRD's plain-files rule says not to do. The
   residue was removed by hand afterwards.
 
-Done-when 1 to 5 hold on TensorX as of 2026-09-21 (items 16 to 20
-above), with one harness fix along the way (`c437679`, memory re-read
-at turn start) and one checklist correction (item 17's allow list).
-On Anthropic, items 17, 18 and 19 have passed; 16 and 20 are still to
-run there, as is the week of daily use in both projects that done-when
-1 asks for.
+- Item 16 on Anthropic, 2026-09-21: Vendela's root printed the
+  `claude-opus-5` banner with the same layers, and thread
+  `01M32PB9EHZJVGZVW3N4814ZPZ` answered "what is this project" from two
+  `search_knowledge` calls made unprompted. Resuming the phase 3 thread
+  `01M328Z40PB7HEH28C9SC45R0X` printed the pre-project-layout note and
+  57 events. That thread belongs to this repository, and started from
+  Vendela it resumed under Vendela's layers: the flat layout has no
+  project field (plan decision 8), so the fallback cannot tell. Noted,
+  not fixed.
+- Item 20 on Anthropic, 2026-09-21, in Vendela, thread
+  `01M32PY61X42J4P34QFCVEDH9K`: the model ran `gh issue view 50` from
+  the commit message before loading `code-review`, then called
+  `load_skill`, separated the committed diff from the uncommitted
+  `docs/agents` rewrites it had first conflated, ran the tests, and
+  reported both axes with #50 as the spec. No sub-agents exist here, so
+  the two axes ran in sequence, which it said.
+
+Done-when 1 to 5 hold on both backends as of 2026-09-21 (items 16 to
+20 above, each on TensorX `z-ai/glm-5.3` and Anthropic `claude-opus-5`),
+with one harness fix along the way (`c437679`, memory re-read at turn
+start) and one checklist correction (item 17's allow list). What
+remains of done-when 1 is the week of daily use in both projects. Open
+items the run produced: length normalisation in the knowledge scorer;
+a memory heading that says the harness writes the files, plus a default
+policy rule refusing writes under `.aigentic/memory/`; knowledge as
+pointers or symlinks so copies do not drift; the banner counting only
+non-empty memory files; `project show` saying that a hidden write tool
+is not a write ban while `bash` is allowed.
