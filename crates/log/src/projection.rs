@@ -52,6 +52,11 @@ struct Truncation {
 /// the system author (a marker line, then the body); `turn_ended`,
 /// `compacted`, `permission_requested` and `permission_decided` emit
 /// nothing (a refused call is visible as its error tool result).
+///
+/// Every provider requires an assistant message's tool results to follow
+/// it immediately, so a message produced between an assistant message and
+/// its results (a `skill_loaded` from `load_skill`, say) is held back and
+/// emitted after the last of those results.
 pub fn project(events: &[Event]) -> Result<Projection, LogError> {
     let mut summaries: Vec<Summary> = Vec::new();
     let mut truncations: Vec<Truncation> = Vec::new();
@@ -98,8 +103,44 @@ pub fn project(events: &[Event]) -> Result<Projection, LogError> {
         }
     }
 
-    let mut body = Vec::with_capacity(events.len());
+    let mut body: Vec<Message> = Vec::with_capacity(events.len());
     let mut emitted: Vec<u64> = Vec::new(); // summaries (by `at`) already placed
+    // Tool call ids of the last assistant message still without a result,
+    // and the messages held back until they all have one.
+    let mut pending_calls: Vec<String> = Vec::new();
+    let mut held: Vec<Message> = Vec::new();
+    let push = |body: &mut Vec<Message>,
+                pending: &mut Vec<String>,
+                held: &mut Vec<Message>,
+                message: Message| {
+        match &message.role {
+            Role::Tool => {
+                for block in &message.blocks {
+                    if let ContentBlock::ToolResult(r) = block {
+                        pending.retain(|id| id != &r.id);
+                    }
+                }
+                body.push(message);
+                if pending.is_empty() {
+                    body.append(held);
+                }
+            }
+            Role::Assistant => {
+                // A new assistant message ends the previous call group
+                // whatever was answered (resume synthesises the rest).
+                body.append(held);
+                pending.clear();
+                for block in &message.blocks {
+                    if let ContentBlock::ToolCall(c) = block {
+                        pending.push(c.id.clone());
+                    }
+                }
+                body.push(message);
+            }
+            _ if !pending.is_empty() => held.push(message),
+            _ => body.push(message),
+        }
+    };
     for event in events {
         // Covered by a summary? The latest-appended one that contains this seq wins.
         if let Some(summary) = summaries
@@ -109,18 +150,28 @@ pub fn project(events: &[Event]) -> Result<Projection, LogError> {
         {
             if !emitted.contains(&summary.at) {
                 emitted.push(summary.at);
-                body.push(summary.message.clone());
+                push(
+                    &mut body,
+                    &mut pending_calls,
+                    &mut held,
+                    summary.message.clone(),
+                );
             }
             continue;
         }
         match event.kind {
             EventKind::UserMessage => {
                 let p: UserMessagePayload = payload(event)?;
-                body.push(Message {
-                    role: Role::User,
-                    author: event.author.clone(),
-                    blocks: p.blocks,
-                });
+                push(
+                    &mut body,
+                    &mut pending_calls,
+                    &mut held,
+                    Message {
+                        role: Role::User,
+                        author: event.author.clone(),
+                        blocks: p.blocks,
+                    },
+                );
             }
             EventKind::AssistantMessage => {
                 let p: AssistantMessagePayload = payload(event)?;
@@ -130,11 +181,16 @@ pub fn project(events: &[Event]) -> Result<Projection, LogError> {
                     .into_iter()
                     .filter(|b| !(drop_blobs && matches!(b, ContentBlock::ProviderBlob(_))))
                     .collect();
-                body.push(Message {
-                    role: Role::Assistant,
-                    author: event.author.clone(),
-                    blocks,
-                });
+                push(
+                    &mut body,
+                    &mut pending_calls,
+                    &mut held,
+                    Message {
+                        role: Role::Assistant,
+                        author: event.author.clone(),
+                        blocks,
+                    },
+                );
             }
             EventKind::ToolResult => {
                 let ToolResultPayload { mut result, .. } = payload(event)?;
@@ -146,11 +202,16 @@ pub fn project(events: &[Event]) -> Result<Projection, LogError> {
                 {
                     result.content = truncate_middle(&result.content, max);
                 }
-                body.push(Message {
-                    role: Role::Tool,
-                    author: event.author.clone(),
-                    blocks: vec![ContentBlock::ToolResult(result)],
-                });
+                push(
+                    &mut body,
+                    &mut pending_calls,
+                    &mut held,
+                    Message {
+                        role: Role::Tool,
+                        author: event.author.clone(),
+                        blocks: vec![ContentBlock::ToolResult(result)],
+                    },
+                );
             }
             EventKind::Interrupted => {
                 let p: InterruptedPayload = payload(event)?;
@@ -162,26 +223,36 @@ pub fn project(events: &[Event]) -> Result<Projection, LogError> {
                         p.unanswered_calls.join(", ")
                     )
                 };
-                body.push(Message {
-                    role: Role::User,
-                    author: Author::System,
-                    blocks: vec![ContentBlock::Text(format!(
-                        "[The previous turn was interrupted: {}.{calls} Continue from here; rerun anything whose outcome is unknown.]",
-                        p.reason
-                    ))],
-                });
+                push(
+                    &mut body,
+                    &mut pending_calls,
+                    &mut held,
+                    Message {
+                        role: Role::User,
+                        author: Author::System,
+                        blocks: vec![ContentBlock::Text(format!(
+                            "[The previous turn was interrupted: {}.{calls} Continue from here; rerun anything whose outcome is unknown.]",
+                            p.reason
+                        ))],
+                    },
+                );
             }
             EventKind::SkillLoaded => {
                 let p: SkillLoadedPayload = payload(event)?;
-                body.push(Message {
-                    role: Role::User,
-                    author: Author::System,
-                    blocks: vec![ContentBlock::Text(format!(
-                        "{}\n\n{}",
-                        skill_marker(&p.name),
-                        p.body
-                    ))],
-                });
+                push(
+                    &mut body,
+                    &mut pending_calls,
+                    &mut held,
+                    Message {
+                        role: Role::User,
+                        author: Author::System,
+                        blocks: vec![ContentBlock::Text(format!(
+                            "{}\n\n{}",
+                            skill_marker(&p.name),
+                            p.body
+                        ))],
+                    },
+                );
             }
             EventKind::TurnEnded
             | EventKind::Compacted
@@ -190,6 +261,8 @@ pub fn project(events: &[Event]) -> Result<Projection, LogError> {
             | EventKind::PermissionDecided => {}
         }
     }
+
+    body.append(&mut held);
 
     Ok(Projection {
         pinned,
@@ -539,6 +612,78 @@ mod tests {
         let p = project(&events).unwrap();
         assert_eq!(texts(&p), vec!["go", "calling", "result:ok"]);
         assert_eq!(p.body[2].role, Role::Tool);
+    }
+
+    #[test]
+    fn a_skill_loaded_between_a_call_and_its_result_moves_after_the_result() {
+        let events = vec![
+            user(0, "go"),
+            ev(
+                1,
+                EventKind::AssistantMessage,
+                agent(),
+                serde_json::to_value(AssistantMessagePayload {
+                    blocks: vec![
+                        ContentBlock::ToolCall(ToolCall {
+                            id: "c1".into(),
+                            name: "load_skill".into(),
+                            args: json!({"name": "tdd"}),
+                        }),
+                        ContentBlock::ToolCall(ToolCall {
+                            id: "c2".into(),
+                            name: "read_file".into(),
+                            args: json!({}),
+                        }),
+                    ],
+                    usage: None,
+                })
+                .unwrap(),
+            ),
+            ev(
+                2,
+                EventKind::SkillLoaded,
+                agent(),
+                json!({"name": "tdd", "hash": "h", "source": "s", "body": "# TDD", "invoked_by": "model"}),
+            ),
+            result(3, "c1", "loaded"),
+            result(4, "c2", "contents"),
+            assistant(5, "reply", false),
+            ended(6),
+        ];
+        let p = project(&events).unwrap();
+        let roles: Vec<Role> = p.body.iter().map(|m| m.role).collect();
+        assert_eq!(
+            roles,
+            vec![
+                Role::User,
+                Role::Assistant,
+                Role::Tool,
+                Role::Tool,
+                Role::User,
+                Role::Assistant
+            ]
+        );
+        assert!(texts(&p)[4].starts_with("[Skill `tdd` loaded"));
+        assert_eq!(texts(&p)[2], "result:loaded");
+    }
+
+    #[test]
+    fn a_skill_loaded_with_no_open_calls_stays_in_place() {
+        let events = vec![
+            ev(
+                0,
+                EventKind::SkillLoaded,
+                steve(),
+                json!({"name": "implement", "hash": "h", "source": "s", "body": "# I", "invoked_by": "user"}),
+            ),
+            user(1, "do it"),
+            assistant(2, "reply", false),
+            ended(3),
+        ];
+        let p = project(&events).unwrap();
+        let roles: Vec<Role> = p.body.iter().map(|m| m.role).collect();
+        assert_eq!(roles, vec![Role::User, Role::User, Role::Assistant]);
+        assert!(texts(&p)[0].starts_with("[Skill `implement` loaded"));
     }
 
     #[test]

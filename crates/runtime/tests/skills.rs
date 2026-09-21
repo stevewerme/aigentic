@@ -186,9 +186,10 @@ async fn load_skill_appends_skill_loaded_and_the_body_is_in_the_next_request() {
         .position(|m| std::ptr::eq(m, skill_msg))
         .unwrap();
     assert!(
-        matches!(second[idx - 1].role, Role::Assistant),
-        "body follows the assistant message that called load_skill"
+        matches!(second[idx - 1].role, Role::Tool),
+        "body follows the tool result, never splitting a call from its result"
     );
+    assert!(matches!(second[idx - 2].role, Role::Assistant));
 }
 
 #[tokio::test]
