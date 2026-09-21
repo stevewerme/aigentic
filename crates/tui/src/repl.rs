@@ -236,7 +236,13 @@ impl Repl {
                         println!();
                     }
                 }
-                Ok(o) if o.reason != "done" => return println!("[turn ended: {}]", o.reason),
+                Ok(o) if o.reason != "done" => {
+                    return if o.touched.is_empty() {
+                        println!("[turn ended: {}]", o.reason)
+                    } else {
+                        println!("[turn ended: {}; wrote {}]", o.reason, o.touched.join(", "))
+                    };
+                }
                 Ok(_) => return self.after_done().await,
                 Err(e) => return println!("[error: {e}]"),
             }

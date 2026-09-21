@@ -335,10 +335,7 @@ mod tests {
         NewEvent {
             kind: EventKind::TurnEnded,
             author: Author::Agent(AgentId("worker".into())),
-            payload: serde_json::to_value(TurnEndedPayload {
-                reason: "done".into(),
-            })
-            .unwrap(),
+            payload: serde_json::to_value(TurnEndedPayload::new("done")).unwrap(),
             parent_event: None,
         }
     }

@@ -77,8 +77,10 @@ impl Runtime {
         spent: &Spent,
         observe: &mut dyn FnMut(Signal<'_>),
     ) -> Result<TurnOutcome, RuntimeError> {
+        let touched = self.touched_this_turn()?;
         let payload = serde_json::to_value(TurnEndedPayload {
             reason: reason.to_owned(),
+            touched: touched.clone(),
         })
         .expect("serialisable");
         self.append(
@@ -93,7 +95,57 @@ impl Runtime {
             iterations: spent.iterations,
             tokens: spent.tokens,
             elapsed: spent.started.elapsed(),
+            touched,
         })
+    }
+
+    /// Paths of `write_file` and `edit_file` calls since the last
+    /// `turn_ended` whose result is not an error, in order, each once.
+    pub(crate) fn touched_this_turn(&self) -> Result<Vec<String>, RuntimeError> {
+        let events = self.log.read_all()?;
+        let start = events
+            .iter()
+            .rposition(|e| e.kind == EventKind::TurnEnded)
+            .map_or(0, |i| i + 1);
+        let mut pending: Vec<(String, String)> = Vec::new();
+        let mut touched: Vec<String> = Vec::new();
+        for e in &events[start..] {
+            match e.kind {
+                EventKind::AssistantMessage => {
+                    let Ok(p) = serde_json::from_value::<aigentic_log::AssistantMessagePayload>(
+                        e.payload.clone(),
+                    ) else {
+                        continue;
+                    };
+                    for b in p.blocks {
+                        if let ContentBlock::ToolCall(c) = b
+                            && (c.name == "write_file" || c.name == "edit_file")
+                            && let Some(path) = c.args.get("path").and_then(|v| v.as_str())
+                        {
+                            pending.push((c.id, path.to_owned()));
+                        }
+                    }
+                }
+                EventKind::ToolResult => {
+                    let Ok(p) = serde_json::from_value::<aigentic_log::ToolResultPayload>(
+                        e.payload.clone(),
+                    ) else {
+                        continue;
+                    };
+                    if p.result.is_error {
+                        continue;
+                    }
+                    if let Some(i) = pending.iter().position(|(id, _)| *id == p.result.id) {
+                        let (_, path) = pending.remove(i);
+                        if !touched.contains(&path) {
+                            touched.push(path);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(touched)
     }
 
     pub(crate) fn append(

@@ -67,10 +67,8 @@ impl Runtime {
         if last_turn_event.kind == EventKind::AssistantMessage
             && tool_call_ids(last_turn_event)?.is_empty()
         {
-            let payload = serde_json::to_value(TurnEndedPayload {
-                reason: "resumed".into(),
-            })
-            .expect("serialisable");
+            let payload =
+                serde_json::to_value(TurnEndedPayload::new("resumed")).expect("serialisable");
             self.append(
                 EventKind::TurnEnded,
                 Author::Agent(self.agent.clone()),

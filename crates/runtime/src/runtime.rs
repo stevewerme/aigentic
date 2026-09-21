@@ -323,4 +323,7 @@ pub struct TurnOutcome {
     pub iterations: u32,
     pub tokens: u64,
     pub elapsed: Duration,
+    /// Files written or edited without error this turn; see
+    /// `TurnEndedPayload::touched`.
+    pub touched: Vec<String>,
 }

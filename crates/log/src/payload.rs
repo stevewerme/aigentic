@@ -138,8 +138,24 @@ impl ToolResultPayload {
 /// Payload of a `turn_ended` event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnEndedPayload {
-    /// `"done"`, `"resumed"`, the budget that was hit, or `provider_error: ...`.
+    /// `"done"`, `"resumed"`, `"asked_human"`, the budget that was hit,
+    /// or `provider_error: ...`.
     pub reason: String,
+    /// The `path` of every `write_file` and `edit_file` call in the turn
+    /// that returned without error, in order, each once; so a stop on a
+    /// budget can say which files it was in. Empty on lines written before
+    /// phase 4 step 9.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub touched: Vec<String>,
+}
+
+impl TurnEndedPayload {
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            touched: Vec::new(),
+        }
+    }
 }
 
 /// What a `compacted` event does to its range in the projection.
