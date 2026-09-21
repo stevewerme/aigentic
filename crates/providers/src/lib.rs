@@ -5,4 +5,4 @@
 
 pub mod openai_compat;
 
-pub use openai_compat::{OpenAiCompat, OpenAiCompatConfig, ToolDefinition};
+pub use openai_compat::{OpenAiCompat, OpenAiCompatConfig};

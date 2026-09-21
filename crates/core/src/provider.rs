@@ -3,7 +3,7 @@ use std::pin::Pin;
 use futures_core::Stream;
 use serde::{Deserialize, Serialize};
 
-use crate::{Message, ProviderBlob, ToolCall};
+use crate::{Message, ProviderBlob, ToolCall, ToolSpec};
 
 /// What a backend can do. The runtime adapts its behaviour to these flags
 /// rather than to the provider's name.
@@ -51,14 +51,23 @@ pub enum ProviderError {
     Unsupported(String),
 }
 
-/// The model as a function: context in, a stream of events out.
+/// Everything one model call needs. Tools are per call because the
+/// registry (and the policy narrowing it) can change between turns.
+#[derive(Debug, Clone, Copy)]
+pub struct CompletionRequest<'a> {
+    pub messages: &'a [Message],
+    pub tools: &'a [ToolSpec],
+    pub max_output_tokens: Option<u64>,
+}
+
+/// The model as a function: request in, a stream of events out.
 ///
 /// Object-safe so the runtime can hold `Box<dyn Provider>` and swap backends
 /// by configuration alone.
 pub trait Provider: Send + Sync {
     fn complete(
         &self,
-        context: &[Message],
+        request: &CompletionRequest<'_>,
     ) -> Pin<Box<dyn Stream<Item = ProviderEvent> + Send + '_>>;
     fn count_tokens(&self, context: &[Message]) -> u64;
     fn capabilities(&self) -> Capabilities;

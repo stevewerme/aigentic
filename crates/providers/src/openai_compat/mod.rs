@@ -9,7 +9,7 @@ mod wire;
 use std::pin::Pin;
 
 use aigentic_core::{
-    Capabilities, ContentBlock, Message, Provider, ProviderError, ProviderEvent, Tool,
+    Capabilities, CompletionRequest, ContentBlock, Message, Provider, ProviderError, ProviderEvent,
 };
 use futures_core::Stream;
 use futures_util::StreamExt;
@@ -63,32 +63,12 @@ impl OpenAiCompatConfig {
     }
 }
 
-/// A tool as advertised to the model.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ToolDefinition {
-    pub name: String,
-    pub description: String,
-    /// JSON Schema for the arguments.
-    pub parameters: serde_json::Value,
-}
-
-impl ToolDefinition {
-    pub fn from_tool(tool: &dyn Tool) -> Self {
-        Self {
-            name: tool.name().to_owned(),
-            description: tool.description().to_owned(),
-            parameters: serde_json::to_value(tool.schema()).expect("schema is serialisable"),
-        }
-    }
-}
-
-/// The adapter. Holds the HTTP client, the connection settings and the
-/// tool definitions to advertise on every call.
+/// The adapter. Holds the HTTP client and the connection settings; tools
+/// and the output cap arrive with each `CompletionRequest`.
 #[derive(Debug, Clone)]
 pub struct OpenAiCompat {
     client: reqwest::Client,
     config: OpenAiCompatConfig,
-    tools: Vec<ToolDefinition>,
 }
 
 impl OpenAiCompat {
@@ -96,28 +76,20 @@ impl OpenAiCompat {
         Self {
             client: reqwest::Client::new(),
             config,
-            tools: Vec::new(),
         }
-    }
-
-    /// Tools to advertise. `Provider::complete` takes only the context, so
-    /// the tool list is part of the adapter's configuration.
-    pub fn with_tools(mut self, tools: Vec<ToolDefinition>) -> Self {
-        self.tools = tools;
-        self
     }
 
     pub fn config(&self) -> &OpenAiCompatConfig {
         &self.config
     }
 
-    /// The request body for `context`, exposed so tests can check the wire
-    /// shape without a network.
-    pub fn build_request(&self, context: &[Message]) -> ChatRequest {
+    /// The request body, exposed so tests can check the wire shape without
+    /// a network.
+    pub fn build_request(&self, request: &CompletionRequest<'_>) -> ChatRequest {
         ChatRequest {
             model: self.config.model.clone(),
-            messages: to_wire(context),
-            tools: self
+            messages: to_wire(request.messages),
+            tools: request
                 .tools
                 .iter()
                 .map(|t| WireTool {
@@ -125,11 +97,14 @@ impl OpenAiCompat {
                     function: WireFunctionDef {
                         name: t.name.clone(),
                         description: t.description.clone(),
-                        parameters: t.parameters.clone(),
+                        parameters: t.schema.clone(),
                     },
                 })
                 .collect(),
+            max_tokens: request.max_output_tokens,
             stream: true,
+            // Asks for a final usage chunk. Servers that ignore it simply
+            // send no `Usage` event; the parser does not require one.
             stream_options: StreamOptions {
                 include_usage: true,
             },
@@ -144,6 +119,8 @@ pub struct ChatRequest {
     pub messages: Vec<WireMessage>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<WireTool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u64>,
     pub stream: bool,
     pub stream_options: StreamOptions,
 }
@@ -170,8 +147,8 @@ pub struct StreamOptions {
 type EventStream<'a> = Pin<Box<dyn Stream<Item = ProviderEvent> + Send + 'a>>;
 
 impl Provider for OpenAiCompat {
-    fn complete(&self, context: &[Message]) -> EventStream<'_> {
-        let body = self.build_request(context);
+    fn complete(&self, request: &CompletionRequest<'_>) -> EventStream<'_> {
+        let body = self.build_request(request);
         let url = format!(
             "{}/chat/completions",
             self.config.base_url.trim_end_matches('/')
@@ -200,9 +177,10 @@ impl Provider for OpenAiCompat {
         Box::pin(futures_util::stream::once(response).flatten())
     }
 
-    /// A heuristic: about four bytes per token plus a few per message. Real
-    /// tokenizers differ per model; compaction thresholds are fractions of
-    /// the window, so an estimate is enough for phase 0.
+    /// An estimate for pre-call sizing only: about four bytes per token plus
+    /// a few per message. Tokenizers differ per model, so this is never used
+    /// for accounting; the runtime records real usage from
+    /// `ProviderEvent::Usage`.
     fn count_tokens(&self, context: &[Message]) -> u64 {
         let bytes: usize = context
             .iter()
@@ -237,27 +215,32 @@ impl Provider for OpenAiCompat {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aigentic_core::{Author, Role, UserId};
+    use aigentic_core::{Author, Role, ToolSpec, UserId};
     use serde_json::json;
 
     #[test]
-    fn request_has_model_messages_tools_and_streaming() {
-        let provider = OpenAiCompat::new(OpenAiCompatConfig::new("http://x/v1", "m")).with_tools(
-            vec![ToolDefinition {
-                name: "read_file".into(),
-                description: "Read".into(),
-                parameters: json!({"type": "object", "properties": {"path": {"type": "string"}}}),
-            }],
-        );
-        let context = [Message {
+    fn request_has_model_messages_tools_cap_and_streaming() {
+        let provider = OpenAiCompat::new(OpenAiCompatConfig::new("http://x/v1", "m"));
+        let tools = [ToolSpec {
+            name: "read_file".into(),
+            description: "Read".into(),
+            schema: json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+        }];
+        let messages = [Message {
             role: Role::User,
             author: Author::User(UserId("steve".into())),
             blocks: vec![ContentBlock::Text("hi".into())],
         }];
-        let body = serde_json::to_value(provider.build_request(&context)).unwrap();
+        let request = CompletionRequest {
+            messages: &messages,
+            tools: &tools,
+            max_output_tokens: Some(512),
+        };
+        let body = serde_json::to_value(provider.build_request(&request)).unwrap();
         assert_eq!(body["model"], "m");
         assert_eq!(body["stream"], true);
         assert_eq!(body["stream_options"]["include_usage"], true);
+        assert_eq!(body["max_tokens"], 512);
         assert_eq!(body["messages"][0]["role"], "user");
         assert_eq!(body["messages"][0]["content"], "hi");
         assert_eq!(body["tools"][0]["type"], "function");
@@ -266,10 +249,16 @@ mod tests {
     }
 
     #[test]
-    fn no_tools_means_no_tools_field() {
+    fn no_tools_and_no_cap_means_no_fields() {
         let provider = OpenAiCompat::new(OpenAiCompatConfig::new("http://x/v1", "m"));
-        let body = serde_json::to_value(provider.build_request(&[])).unwrap();
+        let request = CompletionRequest {
+            messages: &[],
+            tools: &[],
+            max_output_tokens: None,
+        };
+        let body = serde_json::to_value(provider.build_request(&request)).unwrap();
         assert!(body.get("tools").is_none());
+        assert!(body.get("max_tokens").is_none());
     }
 
     #[test]

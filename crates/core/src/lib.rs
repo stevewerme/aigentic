@@ -19,9 +19,9 @@ pub use budget::Budget;
 pub use content::{ContentBlock, Image, ProviderBlob, ToolCall, ToolResult};
 pub use event::{Event, EventKind};
 pub use message::Message;
-pub use provider::{Capabilities, Provider, ProviderError, ProviderEvent};
+pub use provider::{Capabilities, CompletionRequest, Provider, ProviderError, ProviderEvent};
 pub use role::Role;
-pub use tool::{RiskClass, Tool, ToolError, ToolOutput};
+pub use tool::{RiskClass, Tool, ToolError, ToolOutput, ToolSpec};
 
 use std::future::Future;
 use std::pin::Pin;

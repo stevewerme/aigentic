@@ -8,31 +8,37 @@ Written against raw HTTP with `reqwest` and `serde`; no vendor SDK.
 ## Configuration
 
 ```rust
-use aigentic_providers::{OpenAiCompat, OpenAiCompatConfig, ToolDefinition};
+use aigentic_core::{CompletionRequest, Provider, ToolSpec};
+use aigentic_providers::{OpenAiCompat, OpenAiCompatConfig};
 
 let provider = OpenAiCompat::new(
     OpenAiCompatConfig::new("http://127.0.0.1:8080/v1", "qwen2.5-coder")
         .with_api_key("sk-...")            // optional
         .with_max_context_tokens(32_768)   // advertised via Capabilities
         .with_images(false),
-)
-.with_tools(tools.iter().map(|t| ToolDefinition::from_tool(t.as_ref())).collect());
-```
+);
 
-`Provider::complete` takes only the context, per the core signature, so the
-tool list is adapter configuration rather than a per-call argument.
+// Tools and the output cap are per call; the runtime builds the list from
+// its registry with `ToolSpec::from(&*tool)`.
+let tools: Vec<ToolSpec> = registry.iter().map(|t| ToolSpec::from(t.as_ref())).collect();
+let stream = provider.complete(&CompletionRequest {
+    messages: &context,
+    tools: &tools,
+    max_output_tokens: Some(4096),
+});
+```
 
 ## What leaks through the abstraction, and where it goes
 
 | Concern | Handling |
 | --- | --- |
 | Tool call shape | Separate `tool_calls` field on the assistant message; arguments are a JSON string on the wire and a `serde_json::Value` in canonical form. Ids are preserved verbatim; a server that omits them gets `call_<index>`. |
-| Tool result placement | One `tool` role message per `ToolResult` block, linked by `tool_call_id`. `is_error` is not representable on the wire and reads back `false`. |
+| Tool result placement | One `tool` role message per `ToolResult` block, linked by `tool_call_id`. Translated one way only, log to wire. `is_error` has no wire representation; a failed result is sent with its content prefixed by `[error] `. |
 | Images | `image_url` parts with `data:<media_type>;base64,<data>` URLs. |
 | Thinking / reasoning | `reasoning_content` deltas are collected into one `ProviderBlob` (provider `openai_compat`) emitted before `Done`. On replay, blobs with that name are flattened into the assistant message; other adapters' blobs are dropped. |
 | Attribution | Author ids ride on the optional `name` field. |
-| Token counting | Heuristic (about four bytes per token). Compaction thresholds are fractions of the window, so this is enough for phase 0. |
-| Usage | `stream_options.include_usage` is requested; usage is emitted whenever the server sends it (a trailing chunk on OpenAI and vLLM, on the finish chunk on llama.cpp). |
+| Token counting | `count_tokens` is an estimate for pre-call sizing only (about four bytes per token). The runtime records real usage from `ProviderEvent::Usage`. |
+| Usage | `stream_options: { include_usage: true }` is sent so usage arrives in the final chunk. Usage is emitted whenever the server sends it (a trailing chunk on OpenAI and vLLM, on the finish chunk on llama.cpp); a server that sends none produces no `Usage` event and the stream still completes. |
 
 ## Stream handling
 

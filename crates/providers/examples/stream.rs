@@ -2,8 +2,11 @@
 //!
 //! cargo run -p aigentic-providers --example stream -- "What is 2+2?"
 
-use aigentic_core::{Author, ContentBlock, Message, Provider, ProviderEvent, Role, UserId};
-use aigentic_providers::{OpenAiCompat, OpenAiCompatConfig, ToolDefinition};
+use aigentic_core::{
+    Author, CompletionRequest, ContentBlock, Message, Provider, ProviderEvent, Role, ToolSpec,
+    UserId,
+};
+use aigentic_providers::{OpenAiCompat, OpenAiCompatConfig};
 use futures_util::StreamExt;
 use std::io::Write;
 
@@ -20,23 +23,28 @@ async fn main() {
         config = config.with_api_key(key);
     }
 
-    let provider = OpenAiCompat::new(config).with_tools(vec![ToolDefinition {
+    let provider = OpenAiCompat::new(config);
+    let tools = [ToolSpec {
         name: "get_time".into(),
         description: "Current time in the given IANA timezone".into(),
-        parameters: serde_json::json!({
+        schema: serde_json::json!({
             "type": "object",
             "properties": {"timezone": {"type": "string"}},
             "required": ["timezone"]
         }),
-    }]);
-
-    let context = [Message {
+    }];
+    let messages = [Message {
         role: Role::User,
         author: Author::User(UserId("steve".into())),
         blocks: vec![ContentBlock::Text(prompt)],
     }];
+    let request = CompletionRequest {
+        messages: &messages,
+        tools: &tools,
+        max_output_tokens: Some(1024),
+    };
 
-    let mut stream = provider.complete(&context);
+    let mut stream = provider.complete(&request);
     while let Some(event) = stream.next().await {
         match event {
             ProviderEvent::TextDelta(t) => {

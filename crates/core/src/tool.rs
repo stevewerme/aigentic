@@ -33,6 +33,25 @@ pub enum ToolError {
     Cancelled,
 }
 
+/// A tool as advertised to the model: what a provider needs, nothing more.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolSpec {
+    pub name: String,
+    pub description: String,
+    /// JSON Schema for the arguments.
+    pub schema: serde_json::Value,
+}
+
+impl From<&dyn Tool> for ToolSpec {
+    fn from(tool: &dyn Tool) -> Self {
+        Self {
+            name: tool.name().to_owned(),
+            description: tool.description().to_owned(),
+            schema: serde_json::to_value(tool.schema()).expect("a schema is always serialisable"),
+        }
+    }
+}
+
 /// A callable tool. Object-safe so the registry can hold `Box<dyn Tool>`.
 pub trait Tool: Send + Sync {
     fn name(&self) -> &str;

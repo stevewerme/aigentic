@@ -6,9 +6,13 @@
 //! with this adapter's name are flattened back into the assistant message
 //! (`reasoning_content` and friends); blobs from other adapters are dropped.
 //! Author names ride on the optional `name` field.
+//!
+//! Tool results are translated one way only, log to wire. `is_error` has
+//! no wire representation; a failed result is sent with its content
+//! prefixed by `[error] ` so the model can tell, and nothing reads it back.
 
 use aigentic_core::{
-    AgentId, Author, ContentBlock, Image, Message, ProviderBlob, Role, ToolCall, ToolResult, UserId,
+    AgentId, Author, ContentBlock, Image, Message, ProviderBlob, Role, ToolCall, UserId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -94,11 +98,18 @@ fn joined_text(blocks: &[ContentBlock]) -> String {
         .join("\n")
 }
 
+/// Prefix on the content of a tool result whose `is_error` is set.
+pub const ERROR_PREFIX: &str = "[error] ";
+
 fn tool_result_messages(blocks: &[ContentBlock]) -> impl Iterator<Item = WireMessage> + '_ {
     blocks.iter().filter_map(|b| match b {
         ContentBlock::ToolResult(r) => Some(WireMessage::Tool {
             tool_call_id: r.id.clone(),
-            content: r.content.clone(),
+            content: if r.is_error {
+                format!("{ERROR_PREFIX}{}", r.content)
+            } else {
+                r.content.clone()
+            },
         }),
         _ => None,
     })
@@ -187,10 +198,10 @@ fn parse_data_url(url: &str) -> Option<Image> {
     })
 }
 
-/// One wire message back to canonical. `is_error` on tool results is not
-/// representable on the wire and comes back `false`.
-pub fn from_wire(wire: &WireMessage) -> Message {
-    match wire {
+/// One wire message back to canonical. Returns `None` for `tool` messages:
+/// tool results only travel log to wire, never back.
+pub fn from_wire(wire: &WireMessage) -> Option<Message> {
+    Some(match wire {
         WireMessage::System { content } => Message {
             role: Role::System,
             author: Author::System,
@@ -247,24 +258,14 @@ pub fn from_wire(wire: &WireMessage) -> Message {
                 blocks,
             }
         }
-        WireMessage::Tool {
-            tool_call_id,
-            content,
-        } => Message {
-            role: Role::Tool,
-            author: Author::System,
-            blocks: vec![ContentBlock::ToolResult(ToolResult {
-                id: tool_call_id.clone(),
-                content: content.clone(),
-                is_error: false,
-            })],
-        },
-    }
+        WireMessage::Tool { .. } => return None,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aigentic_core::ToolResult;
     use serde_json::json;
 
     fn sample() -> Vec<Message> {
@@ -301,16 +302,26 @@ mod tests {
                     }),
                 ],
             },
-            Message {
-                role: Role::Tool,
-                author: Author::System,
-                blocks: vec![ContentBlock::ToolResult(ToolResult {
+        ]
+    }
+
+    fn tool_results() -> Message {
+        Message {
+            role: Role::Tool,
+            author: Author::System,
+            blocks: vec![
+                ContentBlock::ToolResult(ToolResult {
                     id: "call_abc123".into(),
                     content: "[workspace]".into(),
                     is_error: false,
-                })],
-            },
-        ]
+                }),
+                ContentBlock::ToolResult(ToolResult {
+                    id: "call_def456".into(),
+                    content: "No such file".into(),
+                    is_error: true,
+                }),
+            ],
+        }
     }
 
     #[test]
@@ -320,8 +331,21 @@ mod tests {
         let json = serde_json::to_string(&wire).unwrap();
         let parsed: Vec<WireMessage> = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, wire);
-        let back: Vec<Message> = parsed.iter().map(from_wire).collect();
+        let back: Vec<Message> = parsed.iter().filter_map(from_wire).collect();
         assert_eq!(back, original);
+    }
+
+    #[test]
+    fn tool_results_go_one_way_with_an_error_prefix() {
+        let wire = to_wire(&[tool_results()]);
+        assert_eq!(
+            serde_json::to_value(&wire).unwrap(),
+            json!([
+                {"role": "tool", "tool_call_id": "call_abc123", "content": "[workspace]"},
+                {"role": "tool", "tool_call_id": "call_def456", "content": "[error] No such file"},
+            ])
+        );
+        assert!(wire.iter().all(|w| from_wire(w).is_none()));
     }
 
     #[test]
@@ -351,10 +375,6 @@ mod tests {
             r#"{"path":"Cargo.toml"}"#
         );
         assert_eq!(wire[2]["reasoning_content"], "hmm");
-        assert_eq!(
-            wire[3],
-            json!({"role": "tool", "tool_call_id": "call_abc123", "content": "[workspace]"})
-        );
     }
 
     #[test]
@@ -386,7 +406,7 @@ mod tests {
     fn assistant_without_name_parses() {
         let wire: WireMessage =
             serde_json::from_str(r#"{"role":"assistant","content":"ok"}"#).unwrap();
-        let m = from_wire(&wire);
+        let m = from_wire(&wire).unwrap();
         assert_eq!(m.author, Author::Agent(AgentId("assistant".into())));
         assert_eq!(m.blocks, vec![ContentBlock::Text("ok".into())]);
     }

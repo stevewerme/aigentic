@@ -144,12 +144,18 @@ pub enum ProviderEvent {
     // ... (thinking/blob replay events surface here too)
 }
 
+pub struct CompletionRequest<'a> {
+    pub messages: &'a [Message],
+    pub tools: &'a [ToolSpec],     // per call: the registry and policy can change between turns
+    pub max_output_tokens: Option<u64>,
+}
+
 pub trait Provider {
     fn complete(
         &self,
-        context: &[Message],
+        request: &CompletionRequest<'_>,
     ) -> Pin<Box<dyn Stream<Item = ProviderEvent> + Send + '_>>;
-    fn count_tokens(&self, context: &[Message]) -> u64;
+    fn count_tokens(&self, context: &[Message]) -> u64; // estimate for pre-call sizing; real usage comes from ProviderEvent::Usage
     fn capabilities(&self) -> Capabilities;
 }
 
@@ -166,6 +172,13 @@ pub struct ToolOutput {
     pub content: String,
     pub is_error: bool,
 }
+
+pub struct ToolSpec {          // what a provider advertises to the model
+    pub name: String,
+    pub description: String,
+    pub schema: serde_json::Value,
+}
+impl From<&dyn Tool> for ToolSpec { /* runtime builds the list from its registry */ }
 
 pub trait Tool {
     fn name(&self) -> &str;
@@ -230,7 +243,7 @@ turn:                                       # scheduler / turn queue attaches he
 
 ## 5. Decisions
 
-1. `core` depends on no workspace crates and no `tokio`; it may use `serde`, `serde_json`, `schemars`, `ulid`, `futures-core` and `time`. `Provider` and `Tool` are object-safe: `complete` returns `Pin<Box<dyn Stream<Item = ProviderEvent> + Send + '_>>`, `call` returns `BoxFuture<'_, Result<ToolOutput, ToolError>>`.
+1. `core` depends on no workspace crates and no `tokio`; it may use `serde`, `serde_json`, `schemars`, `ulid`, `futures-core` and `time`. `Provider` and `Tool` are object-safe: `complete` takes a `&CompletionRequest` (messages, tools, output cap) and returns `Pin<Box<dyn Stream<Item = ProviderEvent> + Send + '_>>`, `call` returns `BoxFuture<'_, Result<ToolOutput, ToolError>>`. Tools are per call, not adapter configuration.
 2. Persist to JSONL in phase 0; the log writer is part of phase 0. Compaction is phase 2.
 3. `Image.data` is a base64 `String` with a `media_type`.
 4. `TextDelta` from the start; streaming is a phase 0 requirement.

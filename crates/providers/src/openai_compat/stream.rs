@@ -340,6 +340,24 @@ mod tests {
     }
 
     #[test]
+    fn a_stream_without_usage_still_completes() {
+        let mut t = Translator::new();
+        let mut out =
+            t.on_data(r#"{"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}"#);
+        out.extend(t.on_data("[DONE]"));
+        assert_eq!(
+            out,
+            vec![
+                ProviderEvent::TextDelta("hi".into()),
+                ProviderEvent::Done {
+                    finish_reason: "stop".into()
+                },
+            ]
+        );
+        assert!(!out.iter().any(|e| matches!(e, ProviderEvent::Usage { .. })));
+    }
+
+    #[test]
     fn reasoning_is_collected_into_one_blob_before_done() {
         let mut t = Translator::new();
         let mut out = t.on_data(r#"{"choices":[{"delta":{"reasoning_content":"think "}}]}"#);
