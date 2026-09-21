@@ -109,7 +109,7 @@ pub struct Anthropic {
 impl Anthropic {
     pub fn new(config: AnthropicConfig) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: crate::http_client(),
             config,
         }
     }
@@ -127,32 +127,100 @@ impl Anthropic {
 
 type EventStream<'a> = Pin<Box<dyn Stream<Item = ProviderEvent> + Send + 'a>>;
 
+/// Retries for an overloaded or rate-limited reply before any content
+/// has streamed: HTTP 429/503/529, or a stream whose first event is an
+/// `overloaded_error`. Backoff 1s, 3s, 8s. Overload waves observed during
+/// the phase 2 acceptance lasted minutes; anything longer belongs to the
+/// user, who sees the error as a turn_ended event and can re-ask.
+const RETRIES: usize = 3;
+const BACKOFF: [std::time::Duration; RETRIES] = [
+    std::time::Duration::from_secs(1),
+    std::time::Duration::from_secs(3),
+    std::time::Duration::from_secs(8),
+];
+
+/// Debugging aid: with `AIGENTIC_DUMP_REQUESTS=<dir>` every request body
+/// is written there as `<unix-millis>.json`. Never includes the key.
+/// Diffing two consecutive bodies is how a silent cache invalidator is
+/// found.
+fn dump_request(body: &MessagesRequest) {
+    let Some(dir) = std::env::var_os("AIGENTIC_DUMP_REQUESTS") else {
+        return;
+    };
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let path = std::path::Path::new(&dir).join(format!("{millis}.json"));
+    if let Ok(json) = serde_json::to_string_pretty(body) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
+fn retryable_status(status: u16) -> bool {
+    matches!(status, 429 | 503 | 529)
+}
+
+fn is_overloaded(event: &ProviderEvent) -> bool {
+    matches!(event, ProviderEvent::Error(ProviderError::Protocol(m)) if m.contains("overloaded_error"))
+}
+
 impl Provider for Anthropic {
     fn complete(&self, request: &CompletionRequest<'_>) -> EventStream<'_> {
         let body = self.build_request(request);
+        dump_request(&body);
         let url = format!("{}/v1/messages", self.config.base_url.trim_end_matches('/'));
-        let request = self
-            .client
-            .post(url)
-            .header("x-api-key", &self.config.api_key)
-            .header("anthropic-version", API_VERSION)
-            .json(&body);
+        let client = self.client.clone();
+        let api_key = self.config.api_key.clone();
 
         let response = async move {
-            let events: EventStream<'static> = match request.send().await {
-                Err(e) => Box::pin(futures_util::stream::once(async move {
-                    ProviderEvent::Error(ProviderError::Transport(e.to_string()))
-                })),
-                Ok(resp) if !resp.status().is_success() => {
-                    let status = resp.status().as_u16();
-                    let body = resp.text().await.unwrap_or_default();
-                    Box::pin(futures_util::stream::once(async move {
-                        ProviderEvent::Error(ProviderError::Http { status, body })
-                    }))
+            let mut attempt = 0;
+            loop {
+                let request = client
+                    .post(&url)
+                    .header("x-api-key", &api_key)
+                    .header("anthropic-version", API_VERSION)
+                    .json(&body);
+                let outcome: Result<EventStream<'static>, ProviderEvent> =
+                    match request.send().await {
+                        Err(e) => Err(ProviderEvent::Error(ProviderError::Transport(
+                            e.to_string(),
+                        ))),
+                        Ok(resp) if !resp.status().is_success() => {
+                            let status = resp.status().as_u16();
+                            let body = resp.text().await.unwrap_or_default();
+                            Err(ProviderEvent::Error(ProviderError::Http { status, body }))
+                        }
+                        Ok(resp) => {
+                            // Peek the first event: an overload arrives as an
+                            // `error` event on a 200 stream.
+                            let mut events = Box::pin(parse_stream(resp.bytes_stream()).peekable());
+                            match events.as_mut().peek().await {
+                                Some(first) if is_overloaded(first) => Err(first.clone()),
+                                _ => Ok(Box::pin(events) as EventStream<'static>),
+                            }
+                        }
+                    };
+                match outcome {
+                    Ok(events) => return events,
+                    Err(failure) => {
+                        let retry = attempt < RETRIES
+                            && match &failure {
+                                ProviderEvent::Error(ProviderError::Http { status, .. }) => {
+                                    retryable_status(*status)
+                                }
+                                other => is_overloaded(other),
+                            };
+                        if !retry {
+                            let stream: EventStream<'static> =
+                                Box::pin(futures_util::stream::once(async move { failure }));
+                            return stream;
+                        }
+                        tokio::time::sleep(BACKOFF[attempt]).await;
+                        attempt += 1;
+                    }
                 }
-                Ok(resp) => Box::pin(parse_stream(resp.bytes_stream())),
-            };
-            events
+            }
         };
         Box::pin(futures_util::stream::once(response).flatten())
     }
@@ -175,6 +243,18 @@ impl Provider for Anthropic {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overload_detection() {
+        assert!(is_overloaded(&ProviderEvent::Error(
+            ProviderError::Protocol(r#"{"type":"overloaded_error","message":"Overloaded"}"#.into())
+        )));
+        assert!(!is_overloaded(&ProviderEvent::Error(
+            ProviderError::Protocol("bad json".into())
+        )));
+        assert!(!is_overloaded(&ProviderEvent::TextDelta("x".into())));
+        assert!(retryable_status(529) && retryable_status(429) && !retryable_status(400));
+    }
 
     #[test]
     fn capabilities_follow_config() {

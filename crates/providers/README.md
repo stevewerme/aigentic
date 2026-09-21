@@ -134,6 +134,7 @@ let provider = Anthropic::new(
 | Thinking | Adaptive by default. Each thinking block becomes a `ProviderBlob` (provider `anthropic`) holding the whole block, replayed verbatim in position. Other adapters' blobs are dropped, and this adapter's blobs are dropped by them |
 | Caching | Breakpoint on the last system block (covers tools) and on the last block of the last user message. `Usage` carries `cache_read_tokens` and `cache_write_tokens`; the minimum cacheable prefix on Opus 5 is 512 tokens, so a toy prompt never caches |
 | Stop reasons | `end_turn`, `tool_use`, `max_tokens`, `refusal`, `pause_turn` pass through as the finish reason. On `refusal` an unfinished tool call is dropped, never run |
+| Overload | HTTP 429/503/529, or a stream whose first event is `overloaded_error`, is retried three times (1s, 3s, 8s) before any content has streamed. Anything after content starts is not retried; the runtime records the error |
 | Append-only | The API checks that earlier turns are unchanged when thinking blocks are replayed. The log is append-only, so this holds; phase 2 compaction must replace the whole body, never rewrite the middle |
 
 Fixtures under `fixtures/anthropic/` are recorded from `claude-opus-5`.
@@ -156,6 +157,10 @@ tool-call request twice, keeping the second, so `tool_calls.sse` shows
 3. On the second turn `/cost` must show `cache read > 0`.
 4. Resume a thread recorded on TensorX with `--profile anthropic` and ask
    what happened earlier; then the reverse.
+
+Set `AIGENTIC_DUMP_REQUESTS=<dir>` to write every request body there as
+JSON (never the key); diffing two consecutive bodies is how a silent cache
+invalidator is found.
 
 Status: all four steps passed on 2026-09-21 with `claude-opus-5`. Fixtures
 were recorded; the parser needed no change. A thread produced entirely on

@@ -181,6 +181,14 @@ impl Runtime {
         if messages.is_empty() {
             return Ok(None);
         }
+        // Provider blobs (thinking blocks) are bound to the prefix that
+        // produced them and mean nothing to a summary: replaying them under
+        // the summary prompt is rejected by Anthropic.
+        for m in &mut messages {
+            m.blocks
+                .retain(|b| !matches!(b, ContentBlock::ProviderBlob(_)));
+        }
+        messages.retain(|m| !m.blocks.is_empty());
         messages.insert(0, system(SUMMARY_PROMPT));
         messages.push(Message {
             role: Role::User,

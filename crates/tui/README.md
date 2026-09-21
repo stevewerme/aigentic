@@ -131,5 +131,14 @@ Status: steps 1 to 7 passed on 2026-09-21 against TensorX
 (`https://api.tensorx.ai/v1`, model `z-ai/glm-5.3`). Step 8 passed the same
 day: the thread resumed on `claude-opus-5`, answered from context, made a
 tool call on the next turn with `cache read > 0`, and then resumed again on
-TensorX with a correct summary from memory. Re-run after changes to the
-loop, the tools or an adapter.
+TensorX with a correct summary from memory. Steps 9 to 11 passed on
+2026-09-21: a `kill -9` during a 30-second bash command resumed with a
+synthetic result and an interrupted note, and the model reran the command
+saying the first outcome was unknown; a kill mid-stream lost only the
+in-flight call and the turn finished on restart; with `trigger_fraction =
+0.05` on Anthropic a summary and a truncation both fired, the model
+answered pre-summary facts from the summary alone, `/cost` listed both, and
+the cache read the summary plus tail on the next call. The run also met an
+Anthropic overload wave lasting minutes, recorded as `provider_error` turn
+endings; the adapter now retries such replies three times. Re-run after
+changes to the loop, the tools or an adapter.

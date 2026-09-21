@@ -21,8 +21,8 @@ and agents are in [AGENTS.md](AGENTS.md).
 | --- | --- | --- |
 | 0 Loop | Canonical types, OpenAI-compatible adapter, three tools, streaming REPL | Done, accepted live 2026-09-21 |
 | 1 Two providers | Anthropic adapter, capability struct, caching contract | Done, accepted live 2026-09-21 |
-| 2 Event log | Resume, compaction, `/cost` over long threads | Next |
-| 3 Skills and policy | Skill loader, risk classes, permission prompts, MCP client | |
+| 2 Event log | Resume, compaction, `/cost` over long threads | Done, accepted live 2026-09-21 |
+| 3 Skills and policy | Skill loader, risk classes, permission prompts, MCP client | Next |
 | 4 Projects | `project.toml`, instruction layering, knowledge, memory | |
 | 5 Server and multiplayer | Daemon, socket API, turn queue, per-user permissions | |
 | 6 Orchestrator | Portfolio project coordinating work across projects | |
