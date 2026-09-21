@@ -90,23 +90,38 @@ const STOP_WORDS: &[&str] = &[
     "with", "you", "your",
 ];
 
-/// Lowercased alphanumeric terms with stop words dropped.
+/// A word as the scorer compares it: lowercase, and a plural's trailing
+/// `s` dropped past three letters so `invariant` meets `invariants`.
+/// Crude on purpose; a stemmer is the step after measured misses.
+fn norm(word: &str) -> &str {
+    if word.len() > 3 && word.ends_with('s') && !word.ends_with("ss") {
+        &word[..word.len() - 1]
+    } else {
+        word
+    }
+}
+
+/// Lowercased alphanumeric terms, singularised, with stop words dropped.
 pub fn terms(query: &str) -> Vec<String> {
     let mut out: Vec<String> = query
         .to_lowercase()
         .split(|c: char| !c.is_alphanumeric())
         .filter(|t| t.len() > 1 && !STOP_WORDS.contains(t))
-        .map(str::to_owned)
+        .map(|t| norm(t).to_owned())
         .collect();
     out.dedup();
     out
 }
 
-fn count_word(hay_lower: &str, term: &str) -> usize {
+fn words(hay_lower: &str) -> impl Iterator<Item = &str> {
     hay_lower
         .split(|c: char| !c.is_alphanumeric())
-        .filter(|w| *w == term)
-        .count()
+        .filter(|w| !w.is_empty())
+        .map(norm)
+}
+
+fn count_word(hay_lower: &str, term: &str) -> usize {
+    words(hay_lower).filter(|w| *w == term).count()
 }
 
 /// BM25's term-frequency saturation and length normalisation. A long
@@ -116,22 +131,24 @@ const BM25_K1: f64 = 1.2;
 const BM25_B: f64 = 0.75;
 
 fn word_count(hay_lower: &str) -> usize {
-    hay_lower
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|w| !w.is_empty())
-        .count()
+    words(hay_lower).count()
 }
 
 /// Sections scoring above zero for `query`, best first, ties in folder
-/// order, at most `max_hits`. BM25 over whole-word matches: IDF per
-/// term, term frequency saturated by `k1` and normalised by the
-/// section's length against the average.
+/// order, at most `max_hits`. BM25 over whole-word matches in the
+/// section's locator (`path#heading`) and text: IDF per term, term
+/// frequency saturated by `k1` and normalised by the section's length
+/// against the average. The locator counts so a query that names a
+/// file or heading, as the index invites, finds it.
 pub fn search<'a>(sections: &'a [Section], query: &str, max_hits: usize) -> Vec<&'a Section> {
     let terms = terms(query);
     if terms.is_empty() || sections.is_empty() {
         return Vec::new();
     }
-    let lowered: Vec<String> = sections.iter().map(|s| s.text.to_lowercase()).collect();
+    let lowered: Vec<String> = sections
+        .iter()
+        .map(|s| format!("{}\n{}", s.locator(), s.text).to_lowercase())
+        .collect();
     let n = sections.len() as f64;
     let idf: Vec<f64> = terms
         .iter()
@@ -287,6 +304,26 @@ mod tests {
         assert!(search(&s, "the and of", 5).is_empty());
         assert!(search(&s, "kubernetes", 5).is_empty());
         assert_eq!(search(&s, "deploy rollback billing", 1).len(), 1);
+    }
+
+    #[test]
+    fn locators_count_and_plurals_meet() {
+        assert_eq!(
+            terms("Invariants and the invariant class"),
+            vec!["invariant", "class"]
+        );
+        let s = split_sections(
+            "FOUNDATION.md",
+            "# Product\n\nWhat it is.\n\n## Invariants\n\nEvery claim carries its evidence.\n",
+        );
+        let hits = search(&s, "foundation invariants", 5);
+        assert_eq!(
+            hits[0].locator(),
+            "FOUNDATION.md#Invariants",
+            "the locator is searchable"
+        );
+        let hits = search(&s, "invariant", 5);
+        assert_eq!(hits.len(), 1, "singular finds the plural heading");
     }
 
     #[test]
