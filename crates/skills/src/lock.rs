@@ -215,6 +215,13 @@ impl Lockfile {
         self.skills.len()
     }
 
+    /// Every skill's name, sorted, whatever order the lockfile lists them in.
+    pub fn names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.skills.iter().map(|e| e.name.clone()).collect();
+        names.sort();
+        names
+    }
+
     pub fn get(&self, name: &str) -> Option<&LockEntry> {
         self.skills.iter().find(|e| e.name == name)
     }
@@ -307,6 +314,26 @@ mod tests {
         let two = "[[skill]]\nname = \"a\"\npath = \"p\"\nsource = \"s\"\ncommit = \"c\"\nsha256 = \"0\"\ninvocation = \"model\"\nreview = \"pending\"\n";
         let err = Lockfile::parse(&format!("{two}{two}")).unwrap_err();
         assert!(err.contains("duplicate"), "{err}");
+    }
+
+    #[test]
+    fn names_are_sorted_whatever_the_file_order() {
+        let entry = |name: &str| LockEntry {
+            name: name.into(),
+            path: format!("skills/{name}"),
+            source: "local".into(),
+            commit: String::new(),
+            sha256: "00".into(),
+            files: BTreeMap::new(),
+            invocation: Invocation::Model,
+            requires: vec![],
+            review: Review::Pending,
+        };
+        let lock = Lockfile {
+            skills: vec![entry("tdd"), entry("code-review"), entry("grilling")],
+        };
+        assert_eq!(lock.names(), vec!["code-review", "grilling", "tdd"]);
+        assert!(Lockfile::default().names().is_empty());
     }
 
     #[test]
