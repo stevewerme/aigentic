@@ -44,7 +44,11 @@ pub fn project(events: &[Event]) -> Result<Vec<Message>, LogError> {
                     blocks: vec![ContentBlock::ToolResult(p.0)],
                 });
             }
-            EventKind::TurnEnded => {}
+            // Given meaning by the compaction-aware projection (phase 2 step 2).
+            EventKind::TurnEnded
+            | EventKind::Compacted
+            | EventKind::Pinned
+            | EventKind::Interrupted => {}
         }
     }
     Ok(messages)

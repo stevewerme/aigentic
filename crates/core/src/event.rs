@@ -4,9 +4,9 @@ use ulid::Ulid;
 
 use crate::Author;
 
-/// Kind of a log event. Phase 0 subset; the full PRD list
-/// (`permission_requested`, `interrupted`, `compacted`, `pinned`,
-/// `skill_loaded`, ...) is added in later phases, never changed.
+/// Kind of a log event. Kinds are added, never changed, so old logs always
+/// replay. The rest of the PRD list (`permission_requested`,
+/// `permission_decided`, `skill_loaded`, ...) arrives in later phases.
 ///
 /// Tool calls are not an event kind: they live as `ToolCall` blocks inside
 /// the `assistant_message` event.
@@ -17,6 +17,12 @@ pub enum EventKind {
     AssistantMessage,
     ToolResult,
     TurnEnded,
+    /// Replaces a range of events in the projection; the originals stay.
+    Compacted,
+    /// A fact for the stable prefix; never summarised.
+    Pinned,
+    /// The process died mid-turn; appended on resume, never edited in.
+    Interrupted,
 }
 
 /// One line of a thread's append-only log. The log is the source of truth;
@@ -87,10 +93,37 @@ mod tests {
                 Author::System,
                 json!({"id": "call_1", "content": "[workspace]", "is_error": false}),
             ),
-            event(3, EventKind::TurnEnded, agent, json!({"reason": "done"})),
+            event(
+                3,
+                EventKind::TurnEnded,
+                agent.clone(),
+                json!({"reason": "done"}),
+            ),
+            event(
+                4,
+                EventKind::Compacted,
+                agent,
+                json!({"from_seq": 0, "to_seq": 3, "strategy": {"kind": "truncate_results", "max_bytes": 4096}}),
+            ),
+            event(
+                5,
+                EventKind::Pinned,
+                steve_again(),
+                json!({"text": "Use Swedish."}),
+            ),
+            event(
+                6,
+                EventKind::Interrupted,
+                Author::System,
+                json!({"reason": "process exited mid-turn", "after_seq": 5, "unanswered_calls": []}),
+            ),
         ];
         events[2].parent_event = Some(events[1].id);
         events
+    }
+
+    fn steve_again() -> Author {
+        Author::User(UserId("steve".into()))
     }
 
     #[test]
@@ -108,6 +141,15 @@ mod tests {
         let events = one_of_each_kind();
         let value = serde_json::to_value(&events[2]).unwrap();
         assert_eq!(value["kind"], "tool_result");
+        assert_eq!(
+            serde_json::to_value(&events[4]).unwrap()["kind"],
+            "compacted"
+        );
+        assert_eq!(serde_json::to_value(&events[5]).unwrap()["kind"], "pinned");
+        assert_eq!(
+            serde_json::to_value(&events[6]).unwrap()["kind"],
+            "interrupted"
+        );
         assert_eq!(value["seq"], 2);
         assert_eq!(value["author"], json!({"kind": "system"}));
         assert_eq!(value["created_at"], "2026-09-21T12:00:00Z");

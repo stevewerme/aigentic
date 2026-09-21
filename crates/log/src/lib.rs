@@ -10,7 +10,8 @@ mod projection;
 mod store;
 
 pub use payload::{
-    AssistantMessagePayload, ToolResultPayload, TurnEndedPayload, Usage, UserMessagePayload,
+    AssistantMessagePayload, CompactedPayload, CompactionStrategy, InterruptedPayload,
+    PinnedPayload, ToolResultPayload, TurnEndedPayload, Usage, UserMessagePayload,
 };
 pub use projection::project;
 pub use store::{LogError, NewEvent, ThreadLog};

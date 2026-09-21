@@ -73,6 +73,49 @@ pub struct ToolResultPayload(pub ToolResult);
 /// Payload of a `turn_ended` event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnEndedPayload {
-    /// `"done"`, or the budget that was hit.
+    /// `"done"`, `"resumed"`, the budget that was hit, or `provider_error: ...`.
     pub reason: String,
+}
+
+/// What a `compacted` event does to its range in the projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CompactionStrategy {
+    /// Tool results in the range are shortened to head and tail. Reclaims
+    /// most of a full context and costs no model call.
+    TruncateResults { max_bytes: usize },
+    /// Events in the range are replaced by one summary message.
+    Summary {
+        text: String,
+        model: String,
+        usage: Usage,
+    },
+}
+
+/// Payload of a `compacted` event. Originals stay in the log; only the
+/// projection changes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactedPayload {
+    /// Inclusive.
+    pub from_seq: u64,
+    /// Inclusive; always a turn boundary.
+    pub to_seq: u64,
+    pub strategy: CompactionStrategy,
+}
+
+/// Payload of a `pinned` event; the event's author is who pinned it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PinnedPayload {
+    pub text: String,
+}
+
+/// Payload of an `interrupted` event, appended on resume after a crash.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InterruptedPayload {
+    pub reason: String,
+    /// Last event that was fully written before the crash.
+    pub after_seq: u64,
+    /// Tool call ids that received synthetic error results.
+    #[serde(default)]
+    pub unanswered_calls: Vec<String>,
 }
