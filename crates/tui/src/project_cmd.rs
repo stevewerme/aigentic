@@ -262,8 +262,20 @@ pub fn report(runtime: &Runtime, global_instructions: &Path) -> String {
     names.dedup();
     out.push_str("tools\n");
     let width = names.iter().map(String::len).max().unwrap_or(0);
+    let bash_visible = layers.decided_tool("bash") == Decided::Allowed;
     for name in &names {
-        out.push_str(&format!("  {name:<width$}  {}\n", fate(layers, name)));
+        let fate = fate(layers, name);
+        // Narrowing hides; it does not forbid. A hidden write tool with
+        // the shell still visible is not a write ban (plan section 5).
+        let note = if bash_visible
+            && (name == "write_file" || name == "edit_file")
+            && layers.decided_tool(name) != Decided::Allowed
+        {
+            "  (hidden, not a ban: bash is allowed)"
+        } else {
+            ""
+        };
+        out.push_str(&format!("  {name:<width$}  {fate}{note}\n"));
     }
     out.trim_end().to_owned()
 }
@@ -461,7 +473,10 @@ mod tests {
                 .unwrap_or_else(|| panic!("{name} missing in {text}"))
         };
         assert_eq!(fate_of("bash"), "allowed");
-        assert_eq!(fate_of("edit_file"), "not in project allow");
+        assert_eq!(
+            fate_of("edit_file"),
+            "not in project allow  (hidden, not a ban: bash is allowed)"
+        );
         assert_eq!(fate_of("pin"), "denied by global");
         assert_eq!(fate_of("load_skill"), "not in project allow");
     }

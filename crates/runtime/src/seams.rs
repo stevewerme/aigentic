@@ -69,8 +69,13 @@ impl Runtime {
             Outcome::Allow { rule } => {
                 return Ok(Verdict::Run(PolicyRecord::rule(rule, "allow")));
             }
-            Outcome::Deny { rule } => {
+            Outcome::Deny { rule, reason } if reason.is_empty() => {
                 return Ok(Verdict::Refuse(PolicyRecord::rule(rule, "deny")));
+            }
+            Outcome::Deny { rule, reason } => {
+                return Ok(Verdict::Refuse(PolicyRecord::rule_with_reason(
+                    rule, "deny", reason,
+                )));
             }
             Outcome::Ask { reason } => reason,
         };
@@ -179,6 +184,11 @@ impl Runtime {
 /// The text of a refused call's error result.
 pub fn denial_text(record: &PolicyRecord) -> String {
     match record {
+        PolicyRecord::Rule {
+            rule,
+            reason: Some(reason),
+            ..
+        } => format!("denied by policy: {rule} ({reason})"),
         PolicyRecord::Rule { rule, .. } => format!("denied by policy: {rule}"),
         PolicyRecord::Human { .. } => "denied by policy: the human declined this call".into(),
     }

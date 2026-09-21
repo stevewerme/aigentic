@@ -72,15 +72,35 @@ pub struct AssistantMessagePayload {
 pub enum PolicyRecord {
     /// A policy rule decided; `rule` names it, e.g. `"class read"` or
     /// `"bash allow-pattern cargo test"`, and `decision` is `"allow"` or
-    /// `"deny"`.
-    Rule { rule: String, decision: String },
+    /// `"deny"`. `reason` is the rule's own text, carried on a denial so
+    /// the model reads why; absent on lines written before phase 4 step 9.
+    Rule {
+        rule: String,
+        decision: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
     /// A human decided; `event` is the `permission_decided` event.
     Human { event: Ulid, allow: bool },
 }
 
 impl PolicyRecord {
+    /// A rule record carrying the rule's reason text.
+    pub fn rule_with_reason(
+        rule: impl Into<String>,
+        decision: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self::Rule {
+            rule: rule.into(),
+            decision: decision.into(),
+            reason: Some(reason.into()),
+        }
+    }
+
     pub fn rule(rule: impl Into<String>, decision: impl Into<String>) -> Self {
         Self::Rule {
+            reason: None,
             rule: rule.into(),
             decision: decision.into(),
         }

@@ -22,8 +22,9 @@ pub enum Outcome {
     Allow { rule: String },
     /// Append `permission_requested` and ask the approver.
     Ask { reason: String },
-    /// Refuse with an error tool result naming `rule`.
-    Deny { rule: String },
+    /// Refuse with an error tool result naming `rule` and, when the rule
+    /// has one, its `reason`.
+    Deny { rule: String, reason: String },
 }
 
 /// The rule set and bash allow patterns. `rules` is evaluated first match
@@ -133,7 +134,10 @@ impl Policy {
             }
             return match rule.decision {
                 Decision::Allow => Outcome::Allow { rule: name },
-                Decision::Deny => Outcome::Deny { rule: name },
+                Decision::Deny => Outcome::Deny {
+                    rule: name,
+                    reason: rule.reason.clone(),
+                },
                 Decision::Ask => Outcome::Ask {
                     reason: if rule.reason.is_empty() {
                         format!("{name}: ask")
@@ -270,7 +274,8 @@ mod tests {
         assert_eq!(
             p.decide(&bash("cargo test"), RiskClass::Exec),
             Outcome::Deny {
-                rule: "tool bash".into()
+                rule: "tool bash".into(),
+                reason: "no shell here".into()
             },
             "a prepended deny beats the default allow pattern"
         );
@@ -413,7 +418,8 @@ mod tests {
                 assert_eq!(
                     p.decide(&call(tool, json!({"path": path})), RiskClass::Write),
                     Outcome::Deny {
-                        rule: format!("tool {tool} path .aigentic/memory/")
+                        rule: format!("tool {tool} path .aigentic/memory/"),
+                        reason: MEMORY_REASON.into()
                     },
                     "{tool} {path}"
                 );

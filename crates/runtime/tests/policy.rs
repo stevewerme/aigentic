@@ -362,9 +362,16 @@ async fn a_rule_deny_refuses_without_asking() {
         ]
     );
     let p = result_at(&r, 2);
-    assert_eq!(p.result.content, "denied by policy: tool touch");
+    assert_eq!(p.result.content, "denied by policy: tool touch (never)");
     assert!(p.result.is_error);
-    assert_eq!(p.policy, Some(PolicyRecord::rule("tool touch", "deny")));
+    assert_eq!(
+        p.policy,
+        Some(PolicyRecord::rule_with_reason(
+            "tool touch",
+            "deny",
+            "never"
+        ))
+    );
     assert!(r.touched.lock().unwrap().is_empty());
     audit(&r);
 }

@@ -260,8 +260,13 @@ async fn main() -> anyhow::Result<()> {
                     runtime.knowledge().files.len()
                 ));
             }
-            if !p.memory.is_empty() {
-                layers_loaded.push(format!("memory ({} files)", p.memory.len()));
+            let memory_files = p
+                .memory
+                .iter()
+                .filter(|(_, text)| !text.trim().is_empty())
+                .count();
+            if memory_files > 0 {
+                layers_loaded.push(format!("memory ({memory_files} files)"));
             }
             let thread_count = project_cmd::list_threads(&threads_dir)
                 .map(|t| t.len())
