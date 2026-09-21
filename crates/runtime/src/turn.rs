@@ -12,7 +12,8 @@ use futures_util::StreamExt;
 
 use aigentic_log::{Invoker, PolicyRecord};
 
-use crate::harness_tools::{HARNESS_CLASS, harness_specs, is_harness_tool};
+use crate::harness_tools::{ASK_HUMAN, HARNESS_CLASS, harness_specs, is_harness_tool};
+use crate::runtime::ASKED_HUMAN;
 use crate::seams::{Verdict, denial_text};
 use crate::support::{Spent, flush_text};
 use crate::{Runtime, RuntimeError, Signal, TurnOutcome, build_context};
@@ -153,9 +154,11 @@ impl Runtime {
                 return self.end_turn("done", &spent, observe);
             }
 
+            let mut answered = false;
             for call in calls {
                 observe(Signal::ToolCallStarted(&call));
                 let (result, record) = self.execute(&call, observe).await?;
+                answered |= call.name == ASK_HUMAN && !result.is_error;
                 let payload = serde_json::to_value(ToolResultPayload::new(result, record))
                     .expect("serialisable");
                 self.append(
@@ -165,6 +168,11 @@ impl Runtime {
                     Some(assistant.id),
                     observe,
                 )?;
+            }
+            // A human's answer starts a turn: everything after it is new
+            // work with its own budget. The client continues at once.
+            if answered {
+                return self.end_turn(ASKED_HUMAN, &spent, observe);
             }
         }
     }

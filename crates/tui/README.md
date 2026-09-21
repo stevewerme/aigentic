@@ -80,6 +80,12 @@ show`, over the live registry so MCP tools are included), `/threads`,
 Anything else starting with `/` prints `unknown command`. Ctrl-D quits;
 Ctrl-C clears the line.
 
+An answered `ask_human` ends the turn with reason `asked_human` and the
+REPL continues at once: what follows the answer is a new turn with its
+own budget and `/cost` line. A thread quit or killed right after an
+answer continues on the next start, after `[the human's answer is
+recorded; continuing]`.
+
 After a turn that ends `done`, memory extraction runs with the project's
 model and prints `[memory: N lines written]` when anything new landed in
 `.aigentic/memory/`; `[memory] enabled = false` turns it off.

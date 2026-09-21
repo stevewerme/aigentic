@@ -43,6 +43,7 @@ pub use memory::{MEMORY_FILES, MEMORY_PROMPT};
 pub use project::{Project, ProjectError, ProjectFile};
 pub use resume::{INTERRUPTED_RESULT, Resumed};
 pub use runtime::{
-    CompactionSettings, DEFAULT_BUDGET, DEFAULT_COMPACTION, Runtime, Signal, TurnOutcome,
+    ASKED_HUMAN, CompactionSettings, DEFAULT_BUDGET, DEFAULT_COMPACTION, Runtime, Signal,
+    TurnOutcome,
 };
 pub use seams::Verdict;

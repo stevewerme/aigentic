@@ -464,10 +464,15 @@ async fn pin_and_ask_human_are_harness_tools_in_the_specs() {
             "write_file"
         ]
     );
-    r.runtime
+    let asked = r
+        .runtime
         .run_turn(steve(), vec![ContentBlock::Text("go".into())], &mut |_| {})
         .await
         .unwrap();
+    // The answered question ends the turn (phase 4 step 9); the client
+    // continues, and the model's reply lands in the next one.
+    assert_eq!(asked.reason, aigentic_runtime::ASKED_HUMAN);
+    r.runtime.continue_turn(&mut |_| {}).await.unwrap();
     let events = r.runtime.log().read_all().unwrap();
     let k: Vec<EventKind> = events.iter().map(|e| e.kind).collect();
     assert_eq!(
@@ -478,6 +483,7 @@ async fn pin_and_ask_human_are_harness_tools_in_the_specs() {
             EventKind::Pinned,
             EventKind::ToolResult,
             EventKind::ToolResult,
+            EventKind::TurnEnded,
             EventKind::AssistantMessage,
             EventKind::TurnEnded,
         ]

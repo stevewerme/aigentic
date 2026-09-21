@@ -283,6 +283,18 @@ impl Runtime {
         &self.log
     }
 
+    /// Whether the log's last event is a `turn_ended` with reason
+    /// `asked_human`: the human's answer is recorded and the model has not
+    /// yet seen it, so the client should `continue_turn`.
+    pub fn awaiting_continuation(&self) -> Result<bool, crate::RuntimeError> {
+        let events = self.log.read_all()?;
+        Ok(events.last().is_some_and(|e| {
+            e.kind == aigentic_core::EventKind::TurnEnded
+                && serde_json::from_value::<aigentic_log::TurnEndedPayload>(e.payload.clone())
+                    .is_ok_and(|p| p.reason == ASKED_HUMAN)
+        }))
+    }
+
     pub fn budget(&self) -> &Budget {
         &self.budget
     }
@@ -296,6 +308,11 @@ pub enum Signal<'a> {
     ToolCallStarted(&'a ToolCall),
     Event(&'a Event),
 }
+
+/// The `turn_ended` reason when a human answered `ask_human`: the answer
+/// is in the log as the call's result, and the client continues with
+/// `continue_turn`, a new turn with a fresh budget.
+pub const ASKED_HUMAN: &str = "asked_human";
 
 /// How a turn ended. The same information is in the `turn_ended` event.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -6,7 +6,7 @@ use aigentic_runtime::aigentic_log::{
     CompactedPayload, CompactionStrategy, DecisionScope, PermissionDecidedPayload,
     SkillLoadedPayload, ToolResultPayload,
 };
-use aigentic_runtime::{Resumed, Runtime, Signal};
+use aigentic_runtime::{ASKED_HUMAN, Resumed, Runtime, Signal};
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 
@@ -116,6 +116,9 @@ impl Repl {
                 "[turn interrupted after event {after_seq}; {unanswered_calls} tool call(s) got synthetic results; continuing]"
             );
             self.finish_turn(None).await;
+        } else if self.runtime.awaiting_continuation().unwrap_or(false) {
+            println!("[the human's answer is recorded; continuing]");
+            self.finish_turn(None).await;
         }
         let mut editor = DefaultEditor::new()?;
         let _ = editor.load_history(&self.history);
@@ -211,10 +214,32 @@ impl Repl {
         if !at_line_start {
             println!();
         }
-        match outcome {
-            Ok(o) if o.reason != "done" => println!("[turn ended: {}]", o.reason),
-            Ok(_) => self.after_done().await,
-            Err(e) => println!("[error: {e}]"),
+        self.settle(outcome).await;
+    }
+
+    /// The end of a turn: continue after a human's answer (a new turn with
+    /// its own budget), extract memory after `done`, or say why it stopped.
+    async fn settle(
+        &mut self,
+        outcome: anyhow::Result<aigentic_runtime::TurnOutcome, aigentic_runtime::RuntimeError>,
+    ) {
+        let mut outcome = outcome;
+        loop {
+            match outcome {
+                Ok(o) if o.reason == ASKED_HUMAN => {
+                    let mut at_line_start = true;
+                    outcome = self
+                        .runtime
+                        .continue_turn(&mut |signal| render(signal, &mut at_line_start))
+                        .await;
+                    if !at_line_start {
+                        println!();
+                    }
+                }
+                Ok(o) if o.reason != "done" => return println!("[turn ended: {}]", o.reason),
+                Ok(_) => return self.after_done().await,
+                Err(e) => return println!("[error: {e}]"),
+            }
         }
     }
 
@@ -251,11 +276,7 @@ impl Repl {
         if !at_line_start {
             println!();
         }
-        match outcome {
-            Ok(o) if o.reason != "done" => println!("[turn ended: {}]", o.reason),
-            Ok(_) => self.after_done().await,
-            Err(e) => println!("[error: {e}]"),
-        }
+        self.settle(outcome).await;
     }
 }
 
