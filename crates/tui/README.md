@@ -465,9 +465,23 @@ fourteen docs under `.aigentic/knowledge/` and `threshold_fraction =
   memory heading should say the harness writes these files, and a
   default policy rule should refuse writes under `.aigentic/memory/`.
 
+- Item 18 on Anthropic, 2026-09-21, in Vendela, thread
+  `01M32PEREWQWNBC0SGX131NV9R`: unlike GLM, Opus called
+  `search_knowledge` on its own for the omission-guard question and the
+  first hit was `adr/0005-...md#Scope`; it then read the ADR from
+  `docs/` for the full text. The invariant question ranked
+  `adr/0006#Context` above `FOUNDATION.md#Invariants` again (a second
+  query hit the file's top section and the answer quoted invariant 7
+  correctly). A line appended to the knowledge copy of
+  `accolm-sequence.md` mid-thread came back from the first search of
+  the next turn; the model then diffed the copy against `docs/`, called
+  the appended lines test residue, and proposed gitignoring
+  `.aigentic/`, which the PRD's plain-files rule says not to do. The
+  residue was removed by hand afterwards.
+
 Done-when 1 to 5 hold on TensorX as of 2026-09-21 (items 16 to 20
 above), with one harness fix along the way (`c437679`, memory re-read
 at turn start) and one checklist correction (item 17's allow list).
-On Anthropic, items 17 and 19 have passed; 16, 18 and 20 are still to
+On Anthropic, items 17, 18 and 19 have passed; 16 and 20 are still to
 run there, as is the week of daily use in both projects that done-when
 1 asks for.
