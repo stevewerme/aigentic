@@ -29,11 +29,7 @@ impl Runtime {
         observe: &mut dyn FnMut(Signal<'_>),
     ) -> Result<bool, RuntimeError> {
         let events = self.log.read_all()?;
-        let context = build_context(
-            self.instructions.as_deref(),
-            self.skills_prefix().as_deref(),
-            &events,
-        )?;
+        let context = build_context(&self.prefix(), &events)?;
         if self.fill(&context) < self.window_line() {
             return Ok(false);
         }
@@ -97,11 +93,7 @@ impl Runtime {
             done.push(strategy);
             if !force {
                 let events = self.log.read_all()?;
-                let context = build_context(
-                    self.instructions.as_deref(),
-                    self.skills_prefix().as_deref(),
-                    &events,
-                )?;
+                let context = build_context(&self.prefix(), &events)?;
                 if self.fill(&context) < self.window_line() {
                     return Ok(done);
                 }

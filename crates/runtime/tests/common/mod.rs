@@ -10,7 +10,7 @@ use aigentic_core::{
     RiskClass, Tool, ToolCall, ToolError, ToolOutput, UserId,
 };
 use aigentic_log::ThreadLog;
-use aigentic_runtime::{Runtime, audit_tool_results};
+use aigentic_runtime::{Layers, Runtime, audit_tool_results};
 use aigentic_tools::ToolRegistry;
 use futures_core::Stream;
 use serde_json::json;
@@ -153,7 +153,7 @@ pub fn harness_with_log(
     let calls = Arc::new(Mutex::new(Vec::new()));
     let registry: ToolRegistry = vec![Box::new(EchoTool(calls.clone())) as Box<dyn Tool>].into();
     let runtime = Runtime::new(provider, registry, log, AgentId("worker".into()))
-        .with_instructions(instructions.map(str::to_owned));
+        .with_layers(instructions.map_or_else(Layers::default, Layers::global_instructions));
     Harness {
         runtime,
         seen,

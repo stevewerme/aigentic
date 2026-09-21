@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use aigentic_runtime::aigentic_core::{AgentId, Author, UserId};
 use aigentic_runtime::aigentic_log::{Repair, ThreadLog};
 use aigentic_runtime::aigentic_tools::{ToolRegistry, Workdir};
-use aigentic_runtime::{Project, ProjectFile, Runtime};
+use aigentic_runtime::{GlobalLayer, Layers, Project, ProjectFile, Runtime};
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use ulid::Ulid;
@@ -104,12 +104,29 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Skills: the enabled set, hash-verified. A tampered or unlocked skill
-    // refuses to start with its name; nothing loads silently.
+    // Layers: the owner's instructions and denials, then the project.
+    let global = GlobalLayer::load(
+        &config
+            .global_instructions
+            .clone()
+            .unwrap_or_else(|| config_dir.join("instructions.md")),
+        config.denied_tools.clone(),
+        config.denied_skills.clone(),
+    )?;
+    let layers = Layers {
+        global,
+        project: opened.clone(),
+    };
+
+    // Skills: the enabled set minus global denials, hash-verified against
+    // the tools the model will see. A tampered or unlocked skill refuses
+    // to start with its name; nothing loads silently.
     let mut available = tools.names();
     available.extend(aigentic_runtime::harness_tools::harness_names());
-    let skills = skills_cmd::load_enabled(&project.skills.enabled, &skill_paths, &available)
-        .context("loading skills")?;
+    let available = layers.allowed_tools(&available);
+    let enabled = layers.allowed_skills(&project.skills.enabled);
+    let skills =
+        skills_cmd::load_enabled(&enabled, &skill_paths, &available).context("loading skills")?;
 
     let threads_dir = config
         .threads_dir
@@ -122,11 +139,10 @@ async fn main() -> anyhow::Result<()> {
         None => (Ulid::generate(), false),
     };
     let (log, torn) = ThreadLog::open_with(&threads_dir, thread_id, Repair::TruncateTornTail)?;
-    let instructions = opened.as_ref().and_then(|p| p.instructions.clone());
     let user = Author::User(UserId(config.user_name()));
 
     let mut runtime = Runtime::new(provider, tools, log, AgentId("assistant".into()))
-        .with_instructions(instructions)
+        .with_layers(layers)
         .with_compaction(profile.compaction_settings())
         .with_budget(profile.budget())
         .with_model_label(&profile.model)
@@ -141,12 +157,13 @@ async fn main() -> anyhow::Result<()> {
     );
     match &opened {
         Some(p) => println!(
-            "project {} at {} · {} skills enabled · {} policy rules · {} memory files",
+            "project {} at {} · {} skills enabled · {} policy rules · {} memory files · {} tools visible",
             p.name,
             p.root.display(),
             runtime.skills().len(),
             runtime.policy().rules.len(),
-            p.memory.len()
+            p.memory.len(),
+            runtime.tool_specs().len()
         ),
         None => {
             println!("no aigentic.toml here or above: no skills, default policy, no MCP servers")

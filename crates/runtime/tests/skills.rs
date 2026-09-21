@@ -59,7 +59,7 @@ fn rig(script: Vec<Vec<ProviderEvent>>) -> (Runtime, Seen, tempfile::TempDir) {
         log,
         aigentic_core::AgentId("worker".into()),
     )
-    .with_instructions(Some("Be terse.".into()))
+    .with_layers(aigentic_runtime::Layers::global_instructions("Be terse."))
     .with_skills(skill_set(dir.path()));
     (runtime, seen, dir)
 }

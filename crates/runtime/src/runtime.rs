@@ -7,6 +7,7 @@ use aigentic_skills::SkillSet;
 use aigentic_tools::ToolRegistry;
 
 use crate::approver::{Approver, DenyAll};
+use crate::layers::Layers;
 use crate::seams::SessionGrant;
 
 /// Per-turn defaults. `max_tokens` counts every call's input and output
@@ -51,7 +52,7 @@ pub struct Runtime {
     pub(crate) log: ThreadLog,
     pub(crate) agent: AgentId,
     pub(crate) budget: Budget,
-    pub(crate) instructions: Option<String>,
+    pub(crate) layers: Layers,
     pub(crate) compaction: CompactionSettings,
     /// Label recorded on summaries; the provider trait has no name.
     pub(crate) model_label: String,
@@ -79,7 +80,7 @@ impl Runtime {
             log,
             agent,
             budget: DEFAULT_BUDGET,
-            instructions: None,
+            layers: Layers::default(),
             compaction: DEFAULT_COMPACTION,
             model_label: "unknown".into(),
             measured: None,
@@ -154,11 +155,31 @@ impl Runtime {
         self.budget = budget;
     }
 
-    /// Repository instructions for the stable prefix; see
-    /// [`load_instructions`](crate::load_instructions).
-    pub fn with_instructions(mut self, instructions: Option<String>) -> Self {
-        self.instructions = instructions;
+    /// The global and project layers; their instructions and memory join
+    /// the stable prefix and their denials narrow the tools the model sees.
+    pub fn with_layers(mut self, layers: Layers) -> Self {
+        self.layers = layers;
+        self.measured = None;
         self
+    }
+
+    pub fn layers(&self) -> &Layers {
+        &self.layers
+    }
+
+    pub fn project(&self) -> Option<&crate::Project> {
+        self.layers.project.as_ref()
+    }
+
+    /// The prefix for the next call, from the layers and the skills.
+    pub(crate) fn prefix(&self) -> crate::Prefix<'_> {
+        crate::Prefix {
+            global: self.layers.global.instructions.as_deref(),
+            project: self.layers.project_instructions(),
+            knowledge: None,
+            memory: self.layers.memory_prefix(),
+            skills: self.skills_prefix(),
+        }
     }
 
     pub fn log(&self) -> &ThreadLog {

@@ -77,6 +77,29 @@ struct ConfigFile {
     threads_dir: Option<PathBuf>,
     #[serde(default)]
     bundled_dir: Option<PathBuf>,
+    #[serde(default)]
+    global: GlobalSection,
+    #[serde(default)]
+    tools: DeniedSection,
+    #[serde(default)]
+    skills: DeniedSection,
+}
+
+/// `[global]`: the owner's instructions file.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GlobalSection {
+    /// Defaults to `instructions.md` beside the config file.
+    #[serde(default)]
+    pub instructions: Option<PathBuf>,
+}
+
+/// `[tools] denied` and `[skills] denied`: what no project may offer.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeniedSection {
+    #[serde(default)]
+    pub denied: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -90,6 +113,10 @@ pub struct Config {
     /// The directory holding the bundled `skills/` and `skills.lock.toml`;
     /// defaults to the repository the binary was built from.
     pub bundled_dir: Option<PathBuf>,
+    /// `[global] instructions`, when set.
+    pub global_instructions: Option<PathBuf>,
+    pub denied_tools: Vec<String>,
+    pub denied_skills: Vec<String>,
 }
 
 const EXAMPLE: &str = r#"default_profile = "tensorx"
@@ -183,6 +210,9 @@ impl Config {
             user: file.user,
             threads_dir: file.threads_dir,
             bundled_dir: file.bundled_dir,
+            global_instructions: file.global.instructions,
+            denied_tools: file.tools.denied,
+            denied_skills: file.skills.denied,
         })
     }
 
@@ -412,6 +442,14 @@ keep_turns = 3
         assert!(Config::parse("[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n[profiles.a.compaction]\ntrigger_fraction = 2.0\n").is_err());
         assert!(Config::parse("[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n[profiles.a.compaction]\nnope = 1\n").is_err());
         assert!(Config::parse("[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n[profiles.a.budget]\nnope = 1\n").is_err());
+        let c = Config::parse("[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n[global]\ninstructions = \"/x/i.md\"\n[tools]\ndenied = [\"mcp.*\"]\n[skills]\ndenied = [\"wizard\"]\n").unwrap();
+        assert_eq!(
+            c.global_instructions.as_deref(),
+            Some(std::path::Path::new("/x/i.md"))
+        );
+        assert_eq!(c.denied_tools, vec!["mcp.*"]);
+        assert_eq!(c.denied_skills, vec!["wizard"]);
+        assert!(Config::parse("[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n[tools]\nallow = []\n").is_err());
         let c = Config::parse("[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n[profiles.a.budget]\nmax_tokens = 5\n").unwrap();
         let b = c.profiles["a"].budget();
         assert_eq!(

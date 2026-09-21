@@ -87,11 +87,7 @@ impl Runtime {
                 return Err(e);
             }
             let events = self.log.read_all()?;
-            let context = build_context(
-                self.instructions.as_deref(),
-                self.skills_prefix().as_deref(),
-                &events,
-            )?;
+            let context = build_context(&self.prefix(), &events)?;
             let request = CompletionRequest {
                 messages: &context,
                 tools: &specs,
@@ -179,11 +175,16 @@ impl Runtime {
         call: &ToolCall,
         observe: &mut dyn FnMut(Signal<'_>),
     ) -> Result<(ToolResult, PolicyRecord), RuntimeError> {
-        let class = if is_harness_tool(&call.name) {
-            HARNESS_CLASS
-        } else if let Some(tool) = self.registry.get(&call.name) {
-            tool.risk_class()
+        // A tool the layers hide is unknown to this thread: the same
+        // refusal as a name that was never registered.
+        let class = if !self.tool_visible(&call.name) {
+            None
+        } else if is_harness_tool(&call.name) {
+            Some(HARNESS_CLASS)
         } else {
+            self.registry.get(&call.name).map(|t| t.risk_class())
+        };
+        let Some(class) = class else {
             return Ok((
                 ToolResult {
                     id: call.id.clone(),
@@ -213,11 +214,18 @@ impl Runtime {
         }
     }
 
-    /// Registry specs plus the harness tools, sorted by name.
+    /// Registry specs plus the harness tools, narrowed by the layers and
+    /// sorted by name. What the model sees.
     pub fn tool_specs(&self) -> Vec<ToolSpec> {
         let mut specs = self.registry.specs();
         specs.extend(harness_specs(!self.skills.model_invoked().is_empty()));
+        specs.retain(|s| self.layers.decided_tool(&s.name) == crate::Decided::Allowed);
         specs.sort_by(|a, b| a.name.cmp(&b.name));
         specs
+    }
+
+    /// Whether the layers let the model see this tool.
+    pub fn tool_visible(&self, name: &str) -> bool {
+        self.layers.decided_tool(name) == crate::Decided::Allowed
     }
 }

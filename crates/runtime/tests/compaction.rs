@@ -133,7 +133,7 @@ async fn two_hundred_turns_stay_under_budget() {
     let registry: aigentic_tools::ToolRegistry =
         vec![Box::new(EchoTool(calls)) as Box<dyn aigentic_core::Tool>].into();
     let mut rt = Runtime::new(Box::new(provider), registry, log, AgentId("worker".into()))
-        .with_instructions(Some("Be terse.".into()))
+        .with_layers(aigentic_runtime::Layers::global_instructions("Be terse."))
         .with_compaction(settings)
         .with_model_label("scripted");
     let line = rt.window_line();

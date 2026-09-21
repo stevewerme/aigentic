@@ -522,3 +522,41 @@ async fn ask_human_without_a_human_is_an_error_result() {
 // Keep the unused-import lint quiet for the helper type we re-export.
 #[allow(dead_code)]
 fn _uses(_: ScriptedProvider) {}
+
+#[tokio::test]
+async fn a_tool_the_layers_hide_is_not_offered_and_is_refused_as_unknown() {
+    use aigentic_runtime::{GlobalLayer, Layers};
+    let mut r = rig(
+        vec![
+            vec![touch("c1", "a"), done("tool_use")],
+            vec![text("done"), done("stop")],
+        ],
+        vec![Answer::Allow],
+        Policy::defaults(),
+    );
+    // Rig has no Drop, so the runtime can move out and back.
+    r.runtime = r.runtime.with_layers(Layers {
+        global: GlobalLayer {
+            instructions: None,
+            denied_tools: vec!["touch".into(), "mcp.*".into()],
+            denied_skills: vec![],
+        },
+        project: None,
+    });
+    let names: Vec<String> = r.runtime.tool_specs().into_iter().map(|s| s.name).collect();
+    assert!(!names.contains(&"touch".to_owned()), "{names:?}");
+    assert!(names.contains(&"bash".to_owned()));
+    r.runtime
+        .run_turn(steve(), vec![ContentBlock::Text("go".into())], &mut |_| {})
+        .await
+        .unwrap();
+    let p = result_at(&r, 2);
+    assert!(p.result.is_error && p.result.content.contains("unknown tool: touch"));
+    assert_eq!(p.policy, Some(PolicyRecord::rule("unknown tool", "deny")));
+    assert!(
+        r.asked.lock().unwrap().is_empty(),
+        "never reached the approver"
+    );
+    assert!(r.touched.lock().unwrap().is_empty());
+    audit(&r);
+}
