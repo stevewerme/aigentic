@@ -12,7 +12,7 @@ with every event attributed. **Projects:** a scoping layer that carries
 instructions, knowledge and memory across threads.
 
 The design is in [docs/PRD.md](docs/PRD.md); the current phase's plan is in
-[docs/PLAN-phase3.md](docs/PLAN-phase3.md); conventions for contributors
+[docs/PLAN-phase4.md](docs/PLAN-phase4.md); conventions for contributors
 and agents are in [AGENTS.md](AGENTS.md).
 
 ## Status
