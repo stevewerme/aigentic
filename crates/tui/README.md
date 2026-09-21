@@ -134,7 +134,7 @@ pending again.
 
 Thread logs are JSONL files, one per thread, under `threads_dir`. The
 working directory at launch is the tools' working directory and the source
-of repository instructions (`AGENTS.md`, falling back to `CLAUDE.md`).
+of repository instructions (`.aigentic/instructions.md`, else `AGENTS.md`).
 
 Compaction runs before each model call when the window is past
 `trigger_fraction`: old tool results are truncated first, then everything

@@ -271,7 +271,7 @@ pub struct Project {
     /// Where `aigentic.toml` is.
     pub root: PathBuf,
     pub file: ProjectFile,
-    /// `.aigentic/instructions.md`, else `AGENTS.md`, else `CLAUDE.md`.
+    /// `.aigentic/instructions.md`, else `AGENTS.md`.
     pub instructions: Option<String>,
     /// `.aigentic/memory/*.md` as `(file name, contents)`, sorted by name.
     pub memory: Vec<(String, String)>,
@@ -359,12 +359,12 @@ pub fn find_root(cwd: &Path) -> Option<PathBuf> {
     None
 }
 
-/// `.aigentic/instructions.md` at `root`, else `AGENTS.md`, else `CLAUDE.md`.
+/// `.aigentic/instructions.md` at `root`, else `AGENTS.md`, the
+/// vendor-neutral convention. No tool-specific file is read.
 pub fn load_instructions(root: &Path) -> Result<Option<String>, ProjectError> {
     let candidates = [
         root.join(DOT_DIR).join(INSTRUCTIONS_FILE),
         root.join("AGENTS.md"),
-        root.join("CLAUDE.md"),
     ];
     for path in candidates {
         match std::fs::read_to_string(&path) {
@@ -547,10 +547,11 @@ enabled = ["implement"]
         let root = dir.path();
         std::fs::write(root.join(FILE_NAME), "").unwrap();
         assert_eq!(Project::open_root(root).unwrap().instructions, None);
-        std::fs::write(root.join("CLAUDE.md"), "claude").unwrap();
+        std::fs::write(root.join("CLAUDE.md"), "vendor file").unwrap();
         assert_eq!(
-            Project::open_root(root).unwrap().instructions.as_deref(),
-            Some("claude")
+            Project::open_root(root).unwrap().instructions,
+            None,
+            "no tool-specific file is read"
         );
         std::fs::write(root.join("AGENTS.md"), "agents").unwrap();
         assert_eq!(

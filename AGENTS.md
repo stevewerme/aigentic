@@ -88,3 +88,7 @@ expected variables.
 - `thiserror` enums in `core` (`ProviderError`, `ToolError`); `anyhow` only in the `tui` binary.
 - Serde wire shapes: enums are `snake_case`; `Author` is tagged by `kind`, `ContentBlock` by `type`; `Event.created_at` is RFC 3339.
 - Skills and tools are data, not code: a skill is a versioned folder loaded at runtime.
+- No vendor-specific scaffolding. The harness reads its own files
+  (`aigentic.toml`, `.aigentic/`) and vendor-neutral conventions
+  (`AGENTS.md`, `SKILL.md`, MCP). It never reads a file because another
+  agent product does (`CLAUDE.md`, `.cursorrules`, `.claude/`).

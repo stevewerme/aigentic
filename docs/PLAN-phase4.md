@@ -53,7 +53,7 @@ turn queue, since both are per-thread state a client sets), embeddings
 aigentic.toml                    the project file: [project], [model], [budget], [compaction],
                                  [tools], [skills], [policy], [[mcp_servers]], [pocock]
 .aigentic/                       the project's folders, in the repository, human-edited
-  instructions.md                standing instructions (falls back to AGENTS.md, then CLAUDE.md)
+  instructions.md                standing instructions (falls back to AGENTS.md)
   knowledge/                     markdown loaded or indexed into the prefix
   memory/                        decisions.md, constraints.md, facts.md, written by extraction
 ~/.config/aigentic/
@@ -99,7 +99,7 @@ pub struct Project {
     pub name: String,                 // [project] name; the threads directory
     pub root: PathBuf,                // where aigentic.toml is
     pub file: ProjectFile,            // the parsed toml, phase 3's struct plus the new sections
-    pub instructions: Option<String>, // .aigentic/instructions.md, AGENTS.md or CLAUDE.md
+    pub instructions: Option<String>, // .aigentic/instructions.md or AGENTS.md
     pub knowledge: Knowledge,
     pub memory: Vec<(String, String)>,// (file name, contents), sorted by name
 }
@@ -186,8 +186,10 @@ present; a phase 3 file without it takes the directory name. The name
 selects the threads directory and shows in the banner.
 
 **Instructions.** `.aigentic/instructions.md` if present, else `AGENTS.md`,
-else `CLAUDE.md`, as phase 0's loader does today. The project layer holds
-what this venture is, its conventions and priorities.
+the vendor-neutral convention. No tool-specific file (`CLAUDE.md`,
+`.cursorrules` and the like) is read: the harness must not depend on
+another product's layout (decision 10). The project layer holds what
+this venture is, its conventions and priorities.
 
 **Model, budget, compaction.** `[model] profile = "tensorx"` names a
 profile from `config.toml`; `--profile` on the command line still wins.
@@ -443,6 +445,11 @@ and `cargo test` before its commit.
 9. **Thread-level tool narrowing waits.** The PRD's thread layer is
    pinned facts and a temporary narrowing; the narrowing is per-thread
    state a client sets and belongs with the turn queue in phase 5.
+
+10. **No vendor-specific scaffolding.** Files and folders the harness
+    reads are its own (`aigentic.toml`, `.aigentic/`) or vendor-neutral
+    (`AGENTS.md`, `SKILL.md`, MCP). Nothing is read because another
+    agent product reads it; the phase 0 `CLAUDE.md` fallback is removed.
 
 ## 12. Open items
 
