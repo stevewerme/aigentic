@@ -1,149 +1,17 @@
 //! Drives the loop with a scripted provider and a recording tool, then
 //! asserts the exact event sequence in the log.
 
-use std::collections::VecDeque;
-use std::pin::Pin;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aigentic_core::{
-    AgentId, Author, BoxFuture, Budget, Capabilities, CompletionRequest, ContentBlock, EventKind,
-    Message, Provider, ProviderError, ProviderEvent, RiskClass, Role, Tool, ToolCall, ToolError,
-    ToolOutput, UserId,
+    AgentId, Author, Budget, ContentBlock, EventKind, ProviderError, ProviderEvent, Role, ToolCall,
 };
-use aigentic_log::{AssistantMessagePayload, ThreadLog, ToolResultPayload, TurnEndedPayload};
-use aigentic_runtime::{Runtime, RuntimeError, Signal};
-use futures_core::Stream;
+use aigentic_log::{AssistantMessagePayload, ToolResultPayload, TurnEndedPayload};
+use aigentic_runtime::{RuntimeError, Signal};
 use serde_json::json;
 
-/// Every request's messages, as the provider saw them.
-type Seen = Arc<Mutex<Vec<Vec<Message>>>>;
-
-/// Replays scripted responses in order and records every request's messages.
-struct ScriptedProvider {
-    script: Mutex<VecDeque<Vec<ProviderEvent>>>,
-    seen: Seen,
-}
-
-fn scripted(script: Vec<Vec<ProviderEvent>>) -> (Box<dyn Provider>, Seen) {
-    let seen: Seen = Arc::new(Mutex::new(Vec::new()));
-    let p = ScriptedProvider {
-        script: Mutex::new(script.into()),
-        seen: seen.clone(),
-    };
-    (Box::new(p), seen)
-}
-
-impl Provider for ScriptedProvider {
-    fn complete(
-        &self,
-        request: &CompletionRequest<'_>,
-    ) -> Pin<Box<dyn Stream<Item = ProviderEvent> + Send + '_>> {
-        self.seen.lock().unwrap().push(request.messages.to_vec());
-        let events = self
-            .script
-            .lock()
-            .unwrap()
-            .pop_front()
-            .expect("script exhausted");
-        Box::pin(futures_util::stream::iter(events))
-    }
-    fn count_tokens(&self, _: &[Message]) -> u64 {
-        7
-    }
-    fn capabilities(&self) -> Capabilities {
-        Capabilities {
-            supports_tools: true,
-            supports_images: false,
-            supports_caching: false,
-            supports_structured_output: false,
-            max_context_tokens: 1000,
-        }
-    }
-}
-
-/// Echoes its `msg` argument and records every call.
-struct EchoTool(Arc<Mutex<Vec<serde_json::Value>>>);
-
-impl Tool for EchoTool {
-    fn name(&self) -> &str {
-        "echo"
-    }
-    fn description(&self) -> &str {
-        "echo"
-    }
-    fn schema(&self) -> schemars::schema::RootSchema {
-        schemars::schema_for!(String)
-    }
-    fn risk_class(&self) -> RiskClass {
-        RiskClass::Safe
-    }
-    fn call(&self, args: serde_json::Value) -> BoxFuture<'_, Result<ToolOutput, ToolError>> {
-        self.0.lock().unwrap().push(args.clone());
-        Box::pin(async move {
-            match args["msg"].as_str() {
-                Some(m) => Ok(ToolOutput {
-                    content: format!("echo: {m}"),
-                    is_error: false,
-                }),
-                None => Err(ToolError::InvalidArgs("msg missing".into())),
-            }
-        })
-    }
-}
-
-fn call(id: &str, msg: &str) -> ToolCall {
-    ToolCall {
-        id: id.into(),
-        name: "echo".into(),
-        args: json!({"msg": msg}),
-    }
-}
-
-fn done(reason: &str) -> ProviderEvent {
-    ProviderEvent::Done {
-        finish_reason: reason.into(),
-    }
-}
-
-fn usage(i: u64, o: u64) -> ProviderEvent {
-    ProviderEvent::Usage(aigentic_core::Usage {
-        input_tokens: i,
-        output_tokens: o,
-        ..Default::default()
-    })
-}
-
-struct Harness {
-    runtime: Runtime,
-    seen: Seen,
-    calls: Arc<Mutex<Vec<serde_json::Value>>>,
-    _dir: tempfile::TempDir,
-}
-
-fn harness(script: Vec<Vec<ProviderEvent>>, instructions: Option<&str>) -> Harness {
-    let dir = tempfile::tempdir().unwrap();
-    let (provider, seen) = scripted(script);
-    let calls = Arc::new(Mutex::new(Vec::new()));
-    let log = ThreadLog::open(dir.path(), ulid::Ulid::generate()).unwrap();
-    let runtime = Runtime::new(
-        provider,
-        vec![Box::new(EchoTool(calls.clone()))],
-        log,
-        AgentId("worker".into()),
-    )
-    .with_instructions(instructions.map(str::to_owned));
-    Harness {
-        runtime,
-        seen,
-        calls,
-        _dir: dir,
-    }
-}
-
-fn steve() -> Author {
-    Author::User(UserId("steve".into()))
-}
+mod common;
+use common::*;
 
 #[tokio::test]
 async fn tool_call_round_trip_produces_the_exact_event_sequence() {

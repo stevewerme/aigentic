@@ -24,13 +24,22 @@ impl Runtime {
         blocks: Vec<ContentBlock>,
         observe: &mut dyn FnMut(Signal<'_>),
     ) -> Result<TurnOutcome, RuntimeError> {
+        let payload = serde_json::to_value(UserMessagePayload { blocks }).expect("serialisable");
+        self.append(EventKind::UserMessage, author, payload, None, observe)?;
+        self.continue_turn(observe).await
+    }
+
+    /// The loop without a new user message: what `run_turn` does after the
+    /// append, and what resume uses to finish an interrupted turn.
+    pub async fn continue_turn(
+        &mut self,
+        observe: &mut dyn FnMut(Signal<'_>),
+    ) -> Result<TurnOutcome, RuntimeError> {
         let mut spent = Spent {
             started: Instant::now(),
             iterations: 0,
             tokens: 0,
         };
-        let payload = serde_json::to_value(UserMessagePayload { blocks }).expect("serialisable");
-        self.append(EventKind::UserMessage, author, payload, None, observe)?;
         let specs: Vec<ToolSpec> = self
             .tools
             .iter()
