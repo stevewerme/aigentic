@@ -66,7 +66,8 @@ fn every_vendored_skill_loads_against_the_lock() {
         user: None,
         bundled: Some(repo.join("skills/pocock")),
     };
-    let set = SkillSet::load(&names, &roots, &lock, &[]).unwrap();
+    let tools: Vec<String> = ["bash", "grep", "pin"].map(String::from).to_vec();
+    let set = SkillSet::load(&names, &roots, &lock, &tools).unwrap();
     assert_eq!(set.len(), 38);
     assert!(set.get("tdd").is_some() && set.get("implement").is_some());
     assert_eq!(set.user_invoked().len(), 22);

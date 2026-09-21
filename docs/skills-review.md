@@ -19,7 +19,7 @@ Tool references:
 
 ## code-review
 
-model-invoked · review pending · `skills/pocock/engineering/code-review`
+model-invoked · accepted by steve on 2026-09-21 · `skills/pocock/engineering/code-review`
 
 Tools referenced: pin
 
@@ -29,7 +29,7 @@ Tool references:
 
 ## diagnosing-bugs
 
-model-invoked · review pending · `skills/pocock/engineering/diagnosing-bugs`
+model-invoked · accepted by steve on 2026-09-21 · `skills/pocock/engineering/diagnosing-bugs`
 
 Tools referenced: bash, grep, pin
 
