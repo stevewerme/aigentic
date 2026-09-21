@@ -314,8 +314,11 @@ item 20.
     memory. Resume one pre-phase-4 thread by id and expect the
     "pre-project layout" note.
 17. Layers: put `[tools] denied = ["write_file"]` in `config.toml` and
-    `allow = ["read_file", "write_file", "bash"]` in a project's
-    `[tools]`. `aigentic project show` and `/project` must list
+    `allow = ["read_file", "write_file", "bash", "grep", "list_dir",
+    "search_knowledge", "load_skill", "pin", "ask_human"]` in a
+    project's `[tools]` (an allow list hides every tool it does not
+    name, and a skill whose `requires` names a hidden tool refuses to
+    start). `aigentic project show` and `/project` must list
     `write_file` as `denied by global`, `edit_file` as `not in project
     allow`; ask the model to write a file and expect it not to see the
     tool (an `unknown tool` refusal if it tries). Send two turns and
@@ -361,5 +364,25 @@ fourteen docs under `.aigentic/knowledge/` and `threshold_fraction =
   (`01M32HYAAG3YS9YM1A4YYYH3Q2`). Two notes: the model read the docs
   with `read_file` rather than `search_knowledge`, since the knowledge
   files are copies of files it can name from `AGENTS.md`; and a thread
-  appears in the listing only after its first event. The pre-phase-4
-  resume and the Anthropic pass are still to run.
+  appears in the listing only after its first event. `--thread
+  01M3288192XFT8GWBR5K0CFJCM` (a phase 3 log, flat in `threads_dir`)
+  printed the pre-project-layout note and resumed with 42 events. A
+  baseline thread here on Anthropic (`01M32J4HJDCTQ1S7WH5APW3D25`)
+  wrote `scratch.txt` with `write_file` behind a permission prompt and
+  read 8.8k tokens from cache on its second call.
+- Item 17 on Anthropic (`claude-opus-5`), 2026-09-21, in Vendela with
+  `denied = ["write_file"]` globally and an allow list naming
+  `write_file` but not `edit_file`: `project show` printed `write_file
+  denied by global` and `edit_file not in project allow`, the banner
+  said 8 tools visible, and thread `01M32JD2R0KT6MWP2NSVE78CNV` listed
+  its tools without either. Two findings. First, an allow list that
+  left out `pin` refused to start with "skill `code-review` requires
+  tool `pin`, which is not available", so the list must name the
+  harness tools and `search_knowledge`; the checklist now says so.
+  Second, asked to create `scratch.txt`, the model wrote it through
+  `bash` (`echo hello > scratch.txt`), which policy prompted as an exec
+  call: hiding `write_file` is not a write ban while `bash` is allowed,
+  which is section 5's split (narrowing decides what the model sees,
+  policy what runs) and is worth remembering when an allow list is
+  meant as a guard. The second call read 18.8k tokens from cache, so
+  the prefix was byte-stable across turns.
