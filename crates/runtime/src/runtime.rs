@@ -230,6 +230,21 @@ impl Runtime {
         Ok(())
     }
 
+    /// Re-read the memory files at the start of a turn, so a hand edit
+    /// between turns reaches the next prefix (done-when 4). A change
+    /// resets the window measure like any other prefix change.
+    pub(crate) fn refresh_memory(&mut self) -> Result<(), crate::ProjectError> {
+        let Some(project) = self.layers.project.as_mut() else {
+            return Ok(());
+        };
+        let before = project.memory.clone();
+        project.reload_memory()?;
+        if project.memory != before {
+            self.measured = None;
+        }
+        Ok(())
+    }
+
     pub fn knowledge(&self) -> &Knowledge {
         &self.knowledge
     }

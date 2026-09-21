@@ -190,7 +190,7 @@ async fn a_hand_edited_file_changes_the_next_prefix() {
     rt.extract_memory(&mut |_| {}).await.unwrap();
     let path = dir.path().join(".aigentic/memory/decisions.md");
     std::fs::write(&path, "- Use Finnish in the UI.\n").unwrap();
-    rt.project_mut().unwrap().reload_memory().unwrap();
+    // No explicit reload: the next turn re-reads the files itself.
     rt.run_turn(
         steve(),
         vec![ContentBlock::Text("next".into())],

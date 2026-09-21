@@ -65,6 +65,7 @@ impl Runtime {
             tokens: 0,
         };
         self.refresh_knowledge()?;
+        self.refresh_memory()?;
         let specs: Vec<ToolSpec> = self.tool_specs();
 
         loop {
