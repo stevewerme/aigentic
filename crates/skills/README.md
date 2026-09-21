@@ -22,3 +22,15 @@ Skill discovery, lockfile verification and the static check. Phase 3 of
 
 Fixtures for every finding kind, the planted injection, and project and
 user overrides live in `tests/fixtures`.
+
+## The vendored set
+
+`skills/pocock/` is upstream's `skills/` directory at commit
+`c55ee46073ed923f86ce59a5eb3b6d895095d1b7`, byte-identical, plus its
+`LICENSE`. `skills.lock.toml` has one `Pending` entry per skill (38);
+`docs/skills-review.md` is the static check's output. Both are snapshots
+kept by `tests/vendored.rs`: an upstream change or a pattern change fails
+the test, and `AIGENTIC_REGEN=1 cargo test -p aigentic-skills --test
+vendored` rewrites them. Existing `review` and `requires` survive a
+regeneration when the hashes are unchanged. Nothing in `in-progress/` is
+enabled by the acceptance config.

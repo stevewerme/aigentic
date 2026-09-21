@@ -30,10 +30,12 @@ pub const TOOL_NAMES: &[&str] = &[
     "ask_human",
 ];
 
-/// Shell invocations worth a look, in a script or in prose.
-pub const SHELL_PATTERNS: &[&str] = &[
-    "curl ", "wget ", "sh -c", "bash -c", "eval ", "| sh", "| bash", "|sh", "|bash",
-];
+/// Shell commands worth a look, matched as whole words in a script or in
+/// prose.
+pub const SHELL_COMMANDS: &[&str] = &["curl", "wget", "eval"];
+
+/// Shell fragments matched as substrings: `sh -c` and pipe-to-shell.
+pub const SHELL_PATTERNS: &[&str] = &["sh -c", "bash -c", "| sh", "| bash", "|sh", "|bash"];
 
 pub const PERMISSION_WIDENING: &[&str] = &[
     "you may run any command",
@@ -125,6 +127,11 @@ pub fn check_text(skill: &str, file: &Path, text: &str) -> Vec<Finding> {
     let mut out = Vec::new();
     for (i, line) in text.lines().enumerate() {
         let n = i + 1;
+        // The frontmatter key that makes a skill user-invoked is structure,
+        // not prose; without this every slash skill would flag `disable`.
+        if line.starts_with("disable-model-invocation:") {
+            continue;
+        }
         let lower = line.to_ascii_lowercase();
         let mut push = |kind, text: String| {
             out.push(Finding {
@@ -143,11 +150,10 @@ pub fn check_text(skill: &str, file: &Path, text: &str) -> Vec<Finding> {
         for url in urls(line) {
             push(FindingKind::Url, url);
         }
-        for pat in SHELL_PATTERNS {
-            if lower.contains(pat) {
-                push(FindingKind::ShellInScript, line.trim().to_owned());
-                break;
-            }
+        if SHELL_COMMANDS.iter().any(|c| contains_word(&lower, c))
+            || SHELL_PATTERNS.iter().any(|p| lower.contains(p))
+        {
+            push(FindingKind::ShellInScript, line.trim().to_owned());
         }
         for pat in PERMISSION_WIDENING {
             if contains_word(&lower, pat) {
@@ -215,6 +221,8 @@ mod tests {
         assert!(!contains_word("subgrep", "grep"));
         assert!(!contains_word("pinned", "pin"));
         assert!(!contains_word("read_files", "read_file"));
+        assert!(!contains_word("retrieval practice", "eval"));
+        assert!(contains_word("eval \"$x\"", "eval"));
     }
 
     #[test]

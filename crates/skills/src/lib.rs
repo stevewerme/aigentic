@@ -11,17 +11,19 @@ mod check;
 mod discover;
 mod lock;
 mod manifest;
+mod vendor;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 pub use check::{
-    Finding, FindingKind, IGNORE_RULES, PATTERN_VERSION, PERMISSION_WIDENING, SHELL_PATTERNS,
-    TOOL_NAMES, check, check_text, tools_referenced,
+    Finding, FindingKind, IGNORE_RULES, PATTERN_VERSION, PERMISSION_WIDENING, SHELL_COMMANDS,
+    SHELL_PATTERNS, TOOL_NAMES, check, check_text, tools_referenced,
 };
 pub use discover::{Roots, discover, discover_roots, walk_root};
 pub use lock::{LockEntry, Lockfile, Review, hash_bytes, hash_file, hash_manifest};
 pub use manifest::{Invocation, Manifest, Origin};
+pub use vendor::{blocking, lock_root, render_review};
 
 /// Heading of the prefix line that lists enabled skills.
 pub const PREFIX_HEADING: &str = "# Skills";

@@ -91,6 +91,22 @@ fn a_bad_frontmatter_fails_loudly() {
     .unwrap();
     let err = Manifest::parse(dir.path(), Origin::Project).unwrap_err();
     assert!(err.to_string().contains("missing `name`"), "{err}");
+
+    std::fs::write(
+        dir.path().join("SKILL.md"),
+        "---\nname: x\ndescription:\n  multi\n---\nbody\n",
+    )
+    .unwrap();
+    let err = Manifest::parse(dir.path(), Origin::Project).unwrap_err();
+    assert!(err.to_string().contains("single-line"), "{err}");
+
+    std::fs::write(
+        dir.path().join("SKILL.md"),
+        "---\nname: x\ndescription: d\nmetadata:\n  credits:\n    author: someone\n---\nbody\n",
+    )
+    .unwrap();
+    let m = Manifest::parse(dir.path(), Origin::Project).unwrap();
+    assert_eq!((m.name.as_str(), m.description.as_str()), ("x", "d"));
 }
 
 // Discovery

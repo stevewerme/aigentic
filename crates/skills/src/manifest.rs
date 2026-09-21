@@ -1,6 +1,7 @@
 //! `SKILL.md`: a flat YAML-style frontmatter between `---` lines, then the
-//! body. Upstream uses only single-line `key: value` pairs, so no YAML
-//! library is needed; a multi-line value is rejected loudly.
+//! body. The keys read here are single-line `key: value` pairs, so no YAML
+//! library is needed; nested blocks under other keys are skipped and a
+//! multi-line `name` or `description` is rejected loudly.
 
 use std::path::{Path, PathBuf};
 
@@ -71,22 +72,29 @@ impl Manifest {
             if line.trim().is_empty() || line.trim_start().starts_with('#') {
                 continue;
             }
+            // An indented line belongs to a nested block (upstream's `pr`
+            // skill has `metadata: credits: ...`); the keys we read are all
+            // top-level scalars, so nested lines are skipped.
+            if line.starts_with(char::is_whitespace) {
+                continue;
+            }
             let Some((key, value)) = line.split_once(':') else {
                 return Err(SkillError::Frontmatter {
                     path: skill_md,
                     message: format!("line {}: expected `key: value`, got {line:?}", n + 2),
                 });
             };
-            if line.starts_with(char::is_whitespace) {
+            let value = unquote(value.trim());
+            if value.is_empty() && matches!(key.trim(), "name" | "description") {
                 return Err(SkillError::Frontmatter {
                     path: skill_md,
                     message: format!(
-                        "line {}: multi-line values are not supported ({line:?})",
-                        n + 2
+                        "line {}: `{}` must be a single-line value",
+                        n + 2,
+                        key.trim()
                     ),
                 });
             }
-            let value = unquote(value.trim());
             match key.trim() {
                 "name" => name = Some(value),
                 "description" => description = Some(value),
