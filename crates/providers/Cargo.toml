@@ -4,6 +4,16 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Aigentic providers crate (not yet implemented)"
+description = "Provider adapters for Aigentic: OpenAI-compatible chat completions first"
 
 [dependencies]
+aigentic-core.workspace = true
+bytes.workspace = true
+futures-core.workspace = true
+futures-util.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

@@ -1,0 +1,88 @@
+# aigentic-providers
+
+Provider adapters for the Aigentic harness. One adapter so far:
+`OpenAiCompat`, which speaks the OpenAI chat completions API with streaming
+SSE and tool calls. That covers vLLM, llama.cpp, Mistral and most EU hosts.
+Written against raw HTTP with `reqwest` and `serde`; no vendor SDK.
+
+## Configuration
+
+```rust
+use aigentic_providers::{OpenAiCompat, OpenAiCompatConfig, ToolDefinition};
+
+let provider = OpenAiCompat::new(
+    OpenAiCompatConfig::new("http://127.0.0.1:8080/v1", "qwen2.5-coder")
+        .with_api_key("sk-...")            // optional
+        .with_max_context_tokens(32_768)   // advertised via Capabilities
+        .with_images(false),
+)
+.with_tools(tools.iter().map(|t| ToolDefinition::from_tool(t.as_ref())).collect());
+```
+
+`Provider::complete` takes only the context, per the core signature, so the
+tool list is adapter configuration rather than a per-call argument.
+
+## What leaks through the abstraction, and where it goes
+
+| Concern | Handling |
+| --- | --- |
+| Tool call shape | Separate `tool_calls` field on the assistant message; arguments are a JSON string on the wire and a `serde_json::Value` in canonical form. Ids are preserved verbatim; a server that omits them gets `call_<index>`. |
+| Tool result placement | One `tool` role message per `ToolResult` block, linked by `tool_call_id`. `is_error` is not representable on the wire and reads back `false`. |
+| Images | `image_url` parts with `data:<media_type>;base64,<data>` URLs. |
+| Thinking / reasoning | `reasoning_content` deltas are collected into one `ProviderBlob` (provider `openai_compat`) emitted before `Done`. On replay, blobs with that name are flattened into the assistant message; other adapters' blobs are dropped. |
+| Attribution | Author ids ride on the optional `name` field. |
+| Token counting | Heuristic (about four bytes per token). Compaction thresholds are fractions of the window, so this is enough for phase 0. |
+| Usage | `stream_options.include_usage` is requested; usage is emitted whenever the server sends it (a trailing chunk on OpenAI and vLLM, on the finish chunk on llama.cpp). |
+
+## Stream handling
+
+`SseParser` is an incremental SSE decoder (chunk boundaries anywhere, CRLF,
+comments, multi-line data). `Translator` turns each chunk into
+`ProviderEvent`s: text is forwarded as it arrives, tool calls are assembled
+by index and emitted whole when the choice finishes, `Done` carries the
+finish reason and is emitted on `[DONE]` or EOF. A non-2xx response, a
+transport failure or an `error` object in the stream becomes a single
+`ProviderEvent::Error` and closes the stream.
+
+Tests run the parser and translator over the fixtures in `fixtures/` (text
+deltas, tool call deltas, a llama.cpp-style finish without `[DONE]`) and
+check the wire translation round-trips. No test touches the network.
+
+## Manual check against llama.cpp
+
+Not automated; run it when touching the adapter or upgrading `reqwest`.
+
+1. Start a server with a tool-capable model and the Jinja chat template
+   (needed for tool calls):
+
+   ```bash
+   llama-server -hf Qwen/Qwen2.5-Coder-7B-Instruct-GGUF --port 8080 --jinja
+   ```
+
+2. Confirm it answers:
+
+   ```bash
+   curl -s http://127.0.0.1:8080/v1/models
+   ```
+
+3. Stream a plain completion. Expect text deltas, then `Usage`, then
+   `Done { finish_reason: "stop" }`:
+
+   ```bash
+   cargo run -p aigentic-providers --example stream -- "Say hello in five words."
+   ```
+
+4. Trigger a tool call. Expect a `ToolCall` with a non-empty id and parsed
+   JSON args, then `Done { finish_reason: "tool_calls" }`:
+
+   ```bash
+   cargo run -p aigentic-providers --example stream -- "What time is it in Stockholm? Use the tool."
+   ```
+
+5. Point at a hosted OpenAI-compatible provider with
+   `AIGENTIC_BASE_URL`, `AIGENTIC_MODEL` and `AIGENTIC_API_KEY` and repeat
+   steps 3 and 4.
+
+Status: steps 1 to 5 have not yet been run on this machine (no local
+llama.cpp install at the time of writing). The fixtures follow the
+documented chunk format from OpenAI, vLLM and llama.cpp.

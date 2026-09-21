@@ -1,1 +1,8 @@
-//! Placeholder. Implemented in a later step of phase 0 (or a later phase).
+//! Provider adapters. Each adapter translates canonical messages to one
+//! backend's wire format and its streamed reply back into
+//! [`ProviderEvent`](aigentic_core::ProviderEvent)s, and nothing else. Written
+//! against raw HTTP with `reqwest` and `serde`; no vendor SDKs.
+
+pub mod openai_compat;
+
+pub use openai_compat::{OpenAiCompat, OpenAiCompatConfig, ToolDefinition};
