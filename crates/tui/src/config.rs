@@ -1,11 +1,11 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use aigentic_runtime::aigentic_core::Budget;
-use aigentic_runtime::aigentic_core::Provider;
+use aigentic_runtime::aigentic_core::{Budget, Provider};
 use aigentic_runtime::aigentic_providers::{
     Anthropic, AnthropicConfig, OpenAiCompat, OpenAiCompatConfig, Thinking,
 };
+use aigentic_runtime::project::{BudgetConfig, CompactionConfig};
 use aigentic_runtime::{CompactionSettings, DEFAULT_BUDGET, DEFAULT_COMPACTION};
 use anyhow::{Context, anyhow, bail};
 use serde::Deserialize;
@@ -52,61 +52,6 @@ pub struct Profile {
     /// Per-turn budget; every field optional.
     #[serde(default)]
     pub budget: Option<BudgetConfig>,
-}
-
-/// `[profiles.<name>.budget]`. Missing fields take the runtime defaults.
-#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BudgetConfig {
-    #[serde(default)]
-    pub max_iterations: Option<u32>,
-    #[serde(default)]
-    pub max_tokens: Option<u64>,
-    #[serde(default)]
-    pub max_wall_time_secs: Option<u64>,
-}
-
-impl BudgetConfig {
-    pub fn budget(&self) -> Budget {
-        Budget {
-            max_iterations: self.max_iterations.unwrap_or(DEFAULT_BUDGET.max_iterations),
-            max_tokens: self.max_tokens.unwrap_or(DEFAULT_BUDGET.max_tokens),
-            max_wall_time: self
-                .max_wall_time_secs
-                .map_or(DEFAULT_BUDGET.max_wall_time, std::time::Duration::from_secs),
-        }
-    }
-}
-
-/// `[profiles.<name>.compaction]`. Missing fields take the runtime defaults.
-#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CompactionConfig {
-    #[serde(default)]
-    pub trigger_fraction: Option<f32>,
-    #[serde(default)]
-    pub keep_turns: Option<usize>,
-    #[serde(default)]
-    pub max_result_bytes: Option<usize>,
-    #[serde(default)]
-    pub summary_max_output_tokens: Option<u64>,
-}
-
-impl CompactionConfig {
-    pub fn settings(&self) -> CompactionSettings {
-        CompactionSettings {
-            trigger_fraction: self
-                .trigger_fraction
-                .unwrap_or(DEFAULT_COMPACTION.trigger_fraction),
-            keep_turns: self.keep_turns.unwrap_or(DEFAULT_COMPACTION.keep_turns),
-            max_result_bytes: self
-                .max_result_bytes
-                .unwrap_or(DEFAULT_COMPACTION.max_result_bytes),
-            summary_max_output_tokens: self
-                .summary_max_output_tokens
-                .unwrap_or(DEFAULT_COMPACTION.summary_max_output_tokens),
-        }
-    }
 }
 
 /// The file on disk. Either the phase 0 flat form (top-level `base_url`,

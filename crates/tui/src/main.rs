@@ -4,7 +4,6 @@
 mod approve;
 mod config;
 mod cost;
-mod project;
 mod repl;
 mod skills_cmd;
 
@@ -13,14 +12,13 @@ use std::path::PathBuf;
 use aigentic_runtime::aigentic_core::{AgentId, Author, UserId};
 use aigentic_runtime::aigentic_log::{Repair, ThreadLog};
 use aigentic_runtime::aigentic_tools::{ToolRegistry, Workdir};
-use aigentic_runtime::{Runtime, load_instructions};
+use aigentic_runtime::{Project, ProjectFile, Runtime};
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use ulid::Ulid;
 
 use crate::approve::InlineApprover;
 use crate::config::Config;
-use crate::project::ProjectFile;
 use crate::skills_cmd::{SkillPaths, SkillsCommand};
 
 #[derive(Debug, Parser)]
@@ -65,7 +63,13 @@ async fn main() -> anyhow::Result<()> {
         .parent()
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
-    let skill_paths = SkillPaths::new(&cwd, &config_dir, config.bundled_dir.as_deref());
+    // The nearest aigentic.toml at or above the working directory; the
+    // tools still work where the user launched.
+    let opened = Project::open(&cwd)?;
+    let project_root = opened
+        .as_ref()
+        .map_or_else(|| cwd.clone(), |p| p.root.clone());
+    let skill_paths = SkillPaths::new(&project_root, &config_dir, config.bundled_dir.as_deref());
 
     if let Some(Command::Skills { command }) = cli.command {
         let code = skills_cmd::run(command, &skill_paths)?;
@@ -75,7 +79,9 @@ async fn main() -> anyhow::Result<()> {
     let (profile_name, profile) = config.select(cli.profile.as_deref())?;
     let api_key = profile.api_key()?;
     let provider = profile.build_provider(api_key);
-    let (project, project_path) = ProjectFile::load(&cwd)?;
+    let project: ProjectFile = opened
+        .as_ref()
+        .map_or_else(ProjectFile::default, |p| p.file.clone());
 
     // Tools: built-ins, then every MCP server in aigentic.toml. A server
     // that fails to connect is reported and skipped; the thread still runs.
@@ -116,7 +122,7 @@ async fn main() -> anyhow::Result<()> {
         None => (Ulid::generate(), false),
     };
     let (log, torn) = ThreadLog::open_with(&threads_dir, thread_id, Repair::TruncateTornTail)?;
-    let instructions = load_instructions(&cwd).context("reading repository instructions")?;
+    let instructions = opened.as_ref().and_then(|p| p.instructions.clone());
     let user = Author::User(UserId(config.user_name()));
 
     let mut runtime = Runtime::new(provider, tools, log, AgentId("assistant".into()))
@@ -133,14 +139,18 @@ async fn main() -> anyhow::Result<()> {
         profile.model,
         profile.endpoint()
     );
-    match project_path {
+    match &opened {
         Some(p) => println!(
-            "project file {} · {} skills enabled · {} policy rules",
-            p.display(),
+            "project {} at {} · {} skills enabled · {} policy rules · {} memory files",
+            p.name,
+            p.root.display(),
             runtime.skills().len(),
-            runtime.policy().rules.len()
+            runtime.policy().rules.len(),
+            p.memory.len()
         ),
-        None => println!("no aigentic.toml here: no skills, default policy, no MCP servers"),
+        None => {
+            println!("no aigentic.toml here or above: no skills, default policy, no MCP servers")
+        }
     }
     if resumed {
         println!(

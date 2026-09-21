@@ -23,6 +23,7 @@ mod context;
 mod error;
 pub mod harness_tools;
 mod instructions;
+pub mod project;
 mod resume;
 mod runtime;
 pub mod seams;
@@ -35,6 +36,7 @@ pub use compaction::SUMMARY_PROMPT;
 pub use context::build_context;
 pub use error::RuntimeError;
 pub use instructions::load_instructions;
+pub use project::{Project, ProjectError, ProjectFile};
 pub use resume::{INTERRUPTED_RESULT, Resumed};
 pub use runtime::{
     CompactionSettings, DEFAULT_BUDGET, DEFAULT_COMPACTION, Runtime, Signal, TurnOutcome,
