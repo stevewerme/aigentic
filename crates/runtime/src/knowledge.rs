@@ -1,7 +1,9 @@
 //! A project's knowledge folder: every `*.md` under `.aigentic/knowledge/`,
 //! inlined in the prefix when small, indexed with a `search_knowledge`
 //! tool when over a fraction of the model's window. Decided at startup
-//! and when the folder changes, never mid-turn.
+//! and when the folder changes, never mid-turn. Symlinks are followed,
+//! so a folder can point at docs elsewhere in the repository instead of
+//! copying them; a dangling link or a loop is an error.
 
 use std::path::{Path, PathBuf};
 
@@ -40,9 +42,11 @@ impl Knowledge {
         let mut files = Vec::new();
         let mut fingerprint = Vec::new();
         if dir.is_dir() {
-            for entry in WalkDir::new(dir).sort_by_file_name() {
+            for entry in WalkDir::new(dir).follow_links(true).sort_by_file_name() {
                 let entry = entry.map_err(|e| ProjectError::Io {
-                    path: dir.to_path_buf(),
+                    path: e
+                        .path()
+                        .map_or_else(|| dir.to_path_buf(), Path::to_path_buf),
                     source: e.into(),
                 })?;
                 if !entry.file_type().is_file()
@@ -89,7 +93,12 @@ impl Knowledge {
     pub fn changed(&self, dir: &Path) -> bool {
         let mut now = Vec::new();
         if dir.is_dir() {
-            for entry in WalkDir::new(dir).sort_by_file_name().into_iter().flatten() {
+            for entry in WalkDir::new(dir)
+                .follow_links(true)
+                .sort_by_file_name()
+                .into_iter()
+                .flatten()
+            {
                 if !entry.file_type().is_file()
                     || entry.path().extension().and_then(|e| e.to_str()) != Some("md")
                 {
@@ -206,6 +215,34 @@ mod tests {
         let empty = Knowledge::load(&dir.path().join("nope"), &|_| 1).unwrap();
         assert!(empty.is_empty());
         assert_eq!(empty.prefix(KnowledgeMode::Inline), None);
+    }
+
+    #[test]
+    fn symlinks_are_followed_and_a_bad_link_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs = dir.path().join("docs");
+        std::fs::create_dir_all(docs.join("adr")).unwrap();
+        std::fs::write(docs.join("adr/0001.md"), "# One\n\nfirst\n").unwrap();
+        std::fs::write(docs.join("map.md"), "# Map\n\nhere\n").unwrap();
+        let kd = dir.path().join(".aigentic/knowledge");
+        std::fs::create_dir_all(&kd).unwrap();
+        std::os::unix::fs::symlink("../../docs/adr", kd.join("adr")).unwrap();
+        std::os::unix::fs::symlink("../../docs/map.md", kd.join("map.md")).unwrap();
+        let k = Knowledge::load(&kd, &|t| t.len() as u64).unwrap();
+        assert_eq!(
+            k.paths(),
+            vec![PathBuf::from("adr/0001.md"), PathBuf::from("map.md")]
+        );
+        assert_eq!(k.tokens, 13 + 12);
+        assert!(!k.changed(&kd));
+        std::fs::write(docs.join("map.md"), "# Map\n\nhere, edited\n").unwrap();
+        assert!(k.changed(&kd), "a change behind the link is seen");
+        std::os::unix::fs::symlink("../../docs/nope.md", kd.join("gone.md")).unwrap();
+        let err = Knowledge::load(&kd, &|_| 1).unwrap_err();
+        assert!(err.to_string().contains("gone.md"), "{err}");
+        std::fs::remove_file(kd.join("gone.md")).unwrap();
+        std::os::unix::fs::symlink(".", kd.join("loop")).unwrap();
+        assert!(Knowledge::load(&kd, &|_| 1).is_err(), "a loop is refused");
     }
 
     #[test]
