@@ -48,5 +48,6 @@ sha2 = "0.10"
 walkdir = "2"
 regex = "1"
 ignore = "0.4"
+rmcp = { version = "3.4", default-features = false, features = ["client", "server", "macros", "transport-child-process", "transport-io", "transport-streamable-http-client-reqwest"] }
 nix = { version = "0.31", features = ["signal"] }
 tokio = { version = "1", features = ["rt", "process", "fs", "io-util", "time", "macros"] }

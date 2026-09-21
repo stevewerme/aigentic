@@ -18,7 +18,23 @@ schemars-derived argument schema and a risk class.
 `ToolRegistry::builtin(workdir)` holds the six; `register` adds more and
 refuses a duplicate name; `specs()` is sorted by name so the request the
 model sees is byte-stable; `names()` is what a skill's `requires` is
-checked against. MCP-backed tools join the registry in phase 3 step 6.
+checked against.
+
+## MCP
+
+`ToolRegistry::connect_mcp(&McpServerConfig)` connects over stdio (a
+child process) or streamable HTTP with `rmcp`, lists the server's tools
+and registers each as `mcp.<server>.<tool>` with the server's risk class,
+`network` unless the config downgrades it. It returns the new specs so a
+client can show the descriptions, which are untrusted text and reach the
+model unchanged. The registry keeps the session alive; `close_mcp` shuts
+child processes down. A server that fails to start or connect is an
+`McpError`, never a panic.
+
+`mcp::test_server::EchoServer` is a tools-only server (`echo`, `add`,
+`fail`) used by the tests over an in-process duplex and, through the
+`mcp_echo_server` example, over real stdio. Run it by hand with
+`cargo run -p aigentic-tools --example mcp_echo_server`.
 
 ## Shared working directory
 

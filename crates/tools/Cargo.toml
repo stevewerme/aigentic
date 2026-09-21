@@ -14,6 +14,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 regex.workspace = true
 ignore.workspace = true
+rmcp.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 
@@ -21,3 +22,4 @@ tokio.workspace = true
 nix.workspace = true
 
 [dev-dependencies]
+toml.workspace = true

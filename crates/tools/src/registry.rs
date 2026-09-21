@@ -1,12 +1,13 @@
-//! The tool registry: built-ins now, MCP-backed tools in the next step.
-//! The runtime looks tools up here by name and sends `specs()` to the
-//! model; the harness tools it answers itself are added by the runtime.
+//! The tool registry: built-ins and MCP-backed tools. The runtime looks
+//! tools up here by name and sends `specs()` to the model; the harness
+//! tools it answers itself are added by the runtime.
 
 use aigentic_core::{Tool, ToolSpec};
 
 use crate::bash::BashTool;
 use crate::files::{ReadFileTool, WriteFileTool};
 use crate::fs::{EditFileTool, GrepTool, ListDirTool};
+use crate::mcp::{McpError, McpServer, McpServerConfig};
 use crate::workdir::Workdir;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -17,6 +18,8 @@ pub enum RegistryError {
 
 pub struct ToolRegistry {
     tools: Vec<Box<dyn Tool>>,
+    /// Connected servers, kept alive while their tools are registered.
+    servers: Vec<McpServer>,
 }
 
 impl std::fmt::Debug for ToolRegistry {
@@ -35,7 +38,57 @@ impl Default for ToolRegistry {
 
 impl ToolRegistry {
     pub fn empty() -> Self {
-        Self { tools: Vec::new() }
+        Self {
+            tools: Vec::new(),
+            servers: Vec::new(),
+        }
+    }
+
+    /// Connect to an MCP server and register every tool it offers as
+    /// `mcp.<server>.<tool>` with the server's class. Returns the specs of
+    /// the tools added so a client can show their descriptions. A server
+    /// whose name is already connected is refused.
+    pub async fn connect_mcp(
+        &mut self,
+        config: &McpServerConfig,
+    ) -> Result<Vec<ToolSpec>, McpError> {
+        if self.servers.iter().any(|s| s.name() == config.name) {
+            return Err(McpError::Connect {
+                server: config.name.clone(),
+                message: "a server with this name is already connected".into(),
+            });
+        }
+        let server = McpServer::connect(config).await?;
+        self.register_mcp(server).await
+    }
+
+    /// Register an already-connected server's tools.
+    pub async fn register_mcp(&mut self, server: McpServer) -> Result<Vec<ToolSpec>, McpError> {
+        let mut specs = Vec::new();
+        for tool in server.tools().await? {
+            let spec = ToolSpec::from(&tool as &dyn Tool);
+            self.register(Box::new(tool))
+                .map_err(|e| McpError::Protocol {
+                    server: server.name().to_owned(),
+                    message: e.to_string(),
+                })?;
+            specs.push(spec);
+        }
+        specs.sort_by(|a, b| a.name.cmp(&b.name));
+        self.servers.push(server);
+        Ok(specs)
+    }
+
+    /// Names of the connected servers.
+    pub fn mcp_servers(&self) -> Vec<&str> {
+        self.servers.iter().map(McpServer::name).collect()
+    }
+
+    /// Close every MCP session; child processes are shut down.
+    pub async fn close_mcp(&mut self) {
+        for server in &mut self.servers {
+            server.close().await;
+        }
     }
 
     /// `read_file`, `write_file`, `edit_file`, `list_dir`, `grep` and
