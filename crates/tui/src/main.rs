@@ -232,7 +232,7 @@ async fn main() -> anyhow::Result<()> {
         .with_compaction(profile.compaction_settings())
         .with_budget(profile.budget())
         .with_model_label(&profile.model)
-        .with_policy(project.policy())
+        .with_policy(project.policy().with_root(&project_root, &cwd))
         .with_skills(skills)
         .with_approver(Box::new(InlineApprover::new(user.clone())));
 

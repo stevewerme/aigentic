@@ -95,6 +95,13 @@ enables skills by name, prepends policy rules or replaces the bash allow
 patterns, and declares MCP servers. Without it: no skills, the default
 policy (`docs/PLAN-phase3.md` section 4), no servers.
 
+Two default rows refuse `write_file` and `edit_file` under
+`.aigentic/memory/` with "memory is written by extraction; edit it
+outside the thread"; a `[policy] rules` entry may carry its own
+`path_prefix`, matched against the call's `path` argument relative to
+the project root. `bash` is not covered: narrowing and policy decide
+what the model sees and what runs, not what a shell can reach.
+
 A call the policy asks about prints the tool, its class, the reason and
 the arguments, then prompts: `y` runs it once, `a` runs it and every
 identical call (same tool; for `bash`, the same command) until the process

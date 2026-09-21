@@ -4,10 +4,12 @@
 
 mod rules;
 
+use std::path::{Component, Path, PathBuf};
+
 use aigentic_core::{RiskClass, ToolCall};
 use serde::{Deserialize, Serialize};
 
-pub use rules::{Decision, Rule, default_bash_allow, default_rules};
+pub use rules::{Decision, MEMORY_PREFIX, MEMORY_REASON, Rule, default_bash_allow, default_rules};
 
 /// Shell operators that make a command compound. A compound command never
 /// matches an allow pattern; the check is syntactic and conservative.
@@ -31,6 +33,14 @@ pub struct Policy {
     pub rules: Vec<Rule>,
     /// Word-prefix patterns for `bash` commands, e.g. `cargo test`, `ls`.
     pub bash_allow: Vec<String>,
+    /// The project root that `path_prefix` rules are relative to, and
+    /// the tools' working directory that relative `path` arguments are
+    /// resolved from. Set by the client; unset, a `path` argument is
+    /// compared as given.
+    #[serde(skip)]
+    pub root: Option<PathBuf>,
+    #[serde(skip)]
+    pub cwd: Option<PathBuf>,
 }
 
 impl Default for Policy {
@@ -45,7 +55,39 @@ impl Policy {
         Self {
             rules: default_rules(),
             bash_allow: default_bash_allow(),
+            root: None,
+            cwd: None,
         }
+    }
+
+    /// Where `path_prefix` rules are anchored and relative paths resolve.
+    pub fn with_root(mut self, root: &Path, cwd: &Path) -> Self {
+        self.root = Some(root.to_path_buf());
+        self.cwd = Some(cwd.to_path_buf());
+        self
+    }
+
+    /// The call's `path` argument relative to the project root with `/`
+    /// separators, or `None` when there is no such argument or the path
+    /// lies outside the root. Lexical only: nothing is touched on disk.
+    pub fn project_path(&self, call: &ToolCall) -> Option<String> {
+        let raw = call.args.get("path")?.as_str()?;
+        let (Some(root), Some(cwd)) = (&self.root, &self.cwd) else {
+            return Some(raw.replace('\\', "/"));
+        };
+        let joined = if Path::new(raw).is_absolute() {
+            PathBuf::from(raw)
+        } else {
+            cwd.join(raw)
+        };
+        let abs = normalise(&joined);
+        let rel = abs.strip_prefix(normalise(root)).ok()?;
+        Some(
+            rel.components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("/"),
+        )
     }
 
     /// The defaults with `prepend` evaluated first and, when given,
@@ -71,6 +113,16 @@ impl Policy {
             }
             if rule.class.is_some_and(|c| c != class) {
                 continue;
+            }
+            if let Some(prefix) = &rule.path_prefix {
+                let Some(path) = self.project_path(call) else {
+                    continue;
+                };
+                let prefix = prefix.trim_start_matches("./");
+                let under = path == prefix.trim_end_matches('/') || path.starts_with(prefix);
+                if !under {
+                    continue;
+                }
             }
             let mut name = rule.name();
             if rule.command_allowed {
@@ -111,6 +163,21 @@ impl Policy {
             .find(|p| command_matches(command, p))
             .map(String::as_str)
     }
+}
+
+/// Resolve `.` and `..` lexically.
+fn normalise(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 /// `command`'s leading words equal `pattern`'s words and the command holds
@@ -299,6 +366,8 @@ mod tests {
         let p = Policy {
             rules: vec![],
             bash_allow: vec![],
+            root: None,
+            cwd: None,
         };
         assert!(matches!(
             p.decide(&call("x", json!({})), RiskClass::Safe),
@@ -320,6 +389,7 @@ mod tests {
             Rule {
                 tool: None,
                 class: Some(RiskClass::Write),
+                path_prefix: None,
                 command_allowed: false,
                 decision: Decision::Allow,
                 reason: String::new()
@@ -329,5 +399,74 @@ mod tests {
         assert_eq!(rules[1].decision, Decision::Deny);
         let err = toml::from_str::<Rule>("decision = \"allow\"\nbogus = 1\n").unwrap_err();
         assert!(err.to_string().contains("bogus"));
+    }
+    #[test]
+    fn the_memory_folder_refuses_model_writes_and_nothing_else_does() {
+        let root = Path::new("/repo");
+        let p = Policy::defaults().with_root(root, &root.join("packages/verify"));
+        for tool in ["write_file", "edit_file"] {
+            for path in [
+                "/repo/.aigentic/memory/facts.md",
+                "../../.aigentic/memory/decisions.md",
+                "../../.aigentic/./memory/x.md",
+            ] {
+                assert_eq!(
+                    p.decide(&call(tool, json!({"path": path})), RiskClass::Write),
+                    Outcome::Deny {
+                        rule: format!("tool {tool} path .aigentic/memory/")
+                    },
+                    "{tool} {path}"
+                );
+            }
+            for path in [
+                "/repo/.aigentic/knowledge/x.md",
+                "../../docs/memory.md",
+                "/elsewhere/.aigentic/memory/facts.md",
+                "../../.aigentic/memory-notes.md",
+            ] {
+                assert!(
+                    matches!(
+                        p.decide(&call(tool, json!({"path": path})), RiskClass::Write),
+                        Outcome::Ask { .. }
+                    ),
+                    "{tool} {path}"
+                );
+            }
+        }
+        assert!(matches!(
+            p.decide(
+                &call(
+                    "read_file",
+                    json!({"path": "/repo/.aigentic/memory/facts.md"})
+                ),
+                RiskClass::Read
+            ),
+            Outcome::Allow { .. }
+        ));
+        // Without a root the argument is compared as given.
+        let bare = Policy::defaults();
+        assert!(matches!(
+            bare.decide(
+                &call("write_file", json!({"path": ".aigentic/memory/facts.md"})),
+                RiskClass::Write
+            ),
+            Outcome::Deny { .. }
+        ));
+        assert!(matches!(
+            bare.decide(
+                &call(
+                    "write_file",
+                    json!({"path": "/x/.aigentic/memory/facts.md"})
+                ),
+                RiskClass::Write
+            ),
+            Outcome::Ask { .. }
+        ));
+        let rule: Rule = toml::from_str(
+            "tool = \"write_file\"\npath_prefix = \"secrets/\"\ndecision = \"deny\"\n",
+        )
+        .unwrap();
+        assert_eq!(rule.path_prefix.as_deref(), Some("secrets/"));
+        assert_eq!(rule.name(), "tool write_file path secrets/");
     }
 }

@@ -17,6 +17,10 @@ pub const DOT_DIR: &str = ".aigentic";
 pub const INSTRUCTIONS_FILE: &str = "instructions.md";
 pub const KNOWLEDGE_DIR: &str = "knowledge";
 pub const MEMORY_DIR: &str = "memory";
+/// The memory block's heading; says who writes the files so the model
+/// does not (phase 4 step 9).
+pub const MEMORY_HEADING: &str = "# Project memory\n\nWritten by the harness after each turn from what participants \
+stated. Edit these files outside the thread; a tool call that writes them is refused.\n";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProjectError {
@@ -343,7 +347,7 @@ impl Project {
         if self.memory.iter().all(|(_, text)| text.trim().is_empty()) {
             return None;
         }
-        let mut out = String::from("# Project memory\n");
+        let mut out = String::from(MEMORY_HEADING);
         for (name, text) in &self.memory {
             if text.trim().is_empty() {
                 continue;
@@ -595,7 +599,9 @@ enabled = ["implement"]
         );
         assert_eq!(
             p.memory_prefix().unwrap(),
-            "# Project memory\n\n## decisions.md\n\n- Use Swedish.\n\n## facts.md\n\n- The repo is aigentic."
+            format!(
+                "{MEMORY_HEADING}\n## decisions.md\n\n- Use Swedish.\n\n## facts.md\n\n- The repo is aigentic."
+            )
         );
         std::fs::write(mem.join("decisions.md"), "- Use Swedish.\n- Ship Friday.\n").unwrap();
         p.reload_memory().unwrap();

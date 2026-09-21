@@ -14,8 +14,10 @@ pub enum Decision {
 
 /// One rule. A rule matches a call when every set field matches: `tool`
 /// by exact name or a trailing `*` prefix (`mcp.*`), `class` by the tool's
-/// risk class, and `command_allowed` only for a `bash` call whose command
-/// matches an allow pattern. A rule with nothing set matches everything.
+/// risk class, `path_prefix` by the call's `path` argument made relative
+/// to the project root, and `command_allowed` only for a `bash` call
+/// whose command matches an allow pattern. A rule with nothing set
+/// matches everything.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Rule {
@@ -23,6 +25,11 @@ pub struct Rule {
     pub tool: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub class: Option<RiskClass>,
+    /// A path prefix under the project root, `/` separators, such as
+    /// `.aigentic/memory/`; matches a call whose `path` argument resolves
+    /// under it. A call without a `path` never matches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_prefix: Option<String>,
     /// The bash allow-pattern row of the default table; not for config.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub command_allowed: bool,
@@ -36,6 +43,7 @@ impl Rule {
         Self {
             tool: None,
             class: Some(class),
+            path_prefix: None,
             command_allowed: false,
             decision,
             reason: reason.into(),
@@ -46,6 +54,19 @@ impl Rule {
         Self {
             tool: Some(tool.into()),
             class: None,
+            path_prefix: None,
+            command_allowed: false,
+            decision,
+            reason: reason.into(),
+        }
+    }
+
+    /// A rule on one tool's `path` argument under a project-relative prefix.
+    pub fn tool_path(tool: &str, path_prefix: &str, decision: Decision, reason: &str) -> Self {
+        Self {
+            tool: Some(tool.into()),
+            class: None,
+            path_prefix: Some(path_prefix.into()),
             command_allowed: false,
             decision,
             reason: reason.into(),
@@ -59,11 +80,15 @@ impl Rule {
         if self.command_allowed {
             return "bash allow-pattern".into();
         }
-        match (&self.tool, self.class) {
+        let base = match (&self.tool, self.class) {
             (Some(tool), Some(class)) => format!("tool {tool} class {}", class_name(class)),
             (Some(tool), None) => format!("tool {tool}"),
             (None, Some(class)) => format!("class {}", class_name(class)),
             (None, None) => "any".into(),
+        };
+        match &self.path_prefix {
+            Some(prefix) => format!("{base} path {prefix}"),
+            None => base,
         }
     }
 
@@ -88,7 +113,13 @@ pub(crate) fn class_name(class: RiskClass) -> &'static str {
     }
 }
 
-/// The default table from `docs/PLAN-phase3.md` section 4, in order.
+/// The project's memory folder, relative to its root; extraction writes
+/// it after a turn and the model may not (phase 4 step 9).
+pub const MEMORY_PREFIX: &str = ".aigentic/memory/";
+pub const MEMORY_REASON: &str = "memory is written by extraction; edit it outside the thread";
+
+/// The default table from `docs/PLAN-phase3.md` section 4, in order,
+/// plus the phase 4 memory rows before the write-ask row.
 pub fn default_rules() -> Vec<Rule> {
     vec![
         Rule::class(RiskClass::Safe, Decision::Allow, "harness self-management"),
@@ -96,11 +127,14 @@ pub fn default_rules() -> Vec<Rule> {
         Rule {
             tool: Some("bash".into()),
             class: None,
+            path_prefix: None,
             command_allowed: true,
             decision: Decision::Allow,
             reason: "the common case must not prompt".into(),
         },
         Rule::class(RiskClass::Exec, Decision::Ask, "anything else in a shell"),
+        Rule::tool_path("write_file", MEMORY_PREFIX, Decision::Deny, MEMORY_REASON),
+        Rule::tool_path("edit_file", MEMORY_PREFIX, Decision::Deny, MEMORY_REASON),
         Rule::class(RiskClass::Write, Decision::Ask, "changes the workspace"),
         Rule::class(
             RiskClass::Network,
