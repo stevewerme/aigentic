@@ -386,3 +386,26 @@ fourteen docs under `.aigentic/knowledge/` and `threshold_fraction =
   policy what runs) and is worth remembering when an allow list is
   meant as a guard. The second call read 18.8k tokens from cache, so
   the prefix was byte-stable across turns.
+- Item 18 on TensorX, 2026-09-21. In Vendela (index, 14 files, 39.9k
+  tokens under `threshold_fraction = 0.02`), thread
+  `01M32JXXZWBKDT3VZ53H003MJ4`: asked why a rewriting step needs an
+  omission guard, the model answered correctly but read
+  `docs/adr/0005-...md` with `read_file`, since the index names the
+  file and the same file sits in `docs/`; told to use
+  `search_knowledge`, it made four calls whose results were
+  `path#heading` blocks and answered from `FOUNDATION.md#Invariants`
+  with the invariant's text. A line appended to
+  `.aigentic/knowledge/accolm-sequence.md` mid-thread came back from
+  the first search of the next turn, so the folder is re-read at the
+  turn boundary. Here, with one 33-token file, the banner said
+  `knowledge (inline, 1 files)` and `/project` listed no
+  `search_knowledge` (`01M32K55320P515A0SEFS14477`). Two findings.
+  First, the scorer ranked the long `adr/0006#Context` section above
+  `FOUNDATION.md#Invariants` for three phrasings of the question:
+  term counts without length normalisation favour long sections, which
+  decision 6 said a small folder would not need; an open item. Second,
+  when knowledge holds one thin line the model keeps searching and then
+  speculates from neighbouring sections, and a question sent to the
+  wrong project (aigentic, no knowledge) got twenty tool calls and an
+  invented answer rather than "not here"; model behaviour, noted for
+  the memory filter's sake.
