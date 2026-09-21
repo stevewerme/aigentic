@@ -134,6 +134,8 @@ impl Translator {
                     self.stop_reason = Some(reason.to_owned());
                 }
                 self.usage.output_tokens = u64_of(&v["usage"], "output_tokens");
+                self.usage.reasoning_tokens =
+                    v["usage"]["output_tokens_details"]["thinking_tokens"].as_u64();
                 vec![ProviderEvent::Usage(self.usage)]
             }
             "message_stop" => self.finish(),
@@ -265,9 +267,8 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    // HAND-WRITTEN to the documented Messages API event shapes; replaced by
-    // `record.sh anthropic <model>` recordings as the first act of the phase 1
-    // acceptance run. That replacement must not change any test below.
+    // Recorded from the Messages API (claude-opus-5) by `record.sh anthropic`.
+    // tool_calls is the second of two identical requests, so it reads cache.
     const TEXT: &str = include_str!("../../fixtures/anthropic/text.sse");
     const TOOL_CALLS: &str = include_str!("../../fixtures/anthropic/tool_calls.sse");
     const MAX_TOKENS: &str = include_str!("../../fixtures/anthropic/max_tokens.sse");
@@ -286,76 +287,106 @@ mod tests {
         out
     }
 
-    #[test]
-    fn text_reply_with_thinking_first_turn() {
-        let events = translate(TEXT);
-        assert_eq!(
-            events,
-            vec![
-                ProviderEvent::Blob(ProviderBlob {
-                    provider: PROVIDER_NAME.into(),
-                    data: json!({"type": "thinking", "thinking": "", "signature": "EqQBCgIYAhIM"}),
-                }),
-                ProviderEvent::TextDelta("Hello".into()),
-                ProviderEvent::TextDelta(", world.".into()),
-                ProviderEvent::Usage(Usage {
-                    input_tokens: 12,
-                    output_tokens: 9,
-                    cache_read_tokens: 0,
-                    cache_write_tokens: 640,
-                    reasoning_tokens: None,
-                }),
-                ProviderEvent::Done {
-                    finish_reason: "end_turn".into()
-                },
-            ]
-        );
+    fn usage_of(events: &[ProviderEvent]) -> Usage {
+        events
+            .iter()
+            .find_map(|e| match e {
+                ProviderEvent::Usage(u) => Some(*u),
+                _ => None,
+            })
+            .expect("a Usage event")
     }
 
     #[test]
-    fn two_tool_calls_second_turn_reads_cache() {
-        let events = translate(TOOL_CALLS);
-        assert_eq!(events.len(), 5, "{events:#?}");
-        assert!(matches!(&events[0], ProviderEvent::Blob(_)));
-        assert_eq!(
-            events[1],
-            ProviderEvent::ToolCall(ToolCall {
-                id: "toolu_01A".into(),
-                name: "read_file".into(),
-                args: json!({"path": "Cargo.toml"}),
-            })
-        );
+    fn recorded_text_reply() {
+        // Adaptive thinking chose not to think: no thinking block at all.
+        // The 2299-token system prefix is either written (cold) or read
+        // (re-recorded within the 5-minute TTL); the sum is the prefix.
+        let events = translate(TEXT);
+        assert_eq!(events.len(), 3, "{events:#?}");
+        assert_eq!(events[0], ProviderEvent::TextDelta("Hello, world.".into()));
+        let usage = usage_of(&events);
+        assert_eq!((usage.input_tokens, usage.output_tokens), (2, 8));
+        assert_eq!(usage.cache_read_tokens + usage.cache_write_tokens, 2299);
+        assert_eq!(usage.reasoning_tokens, Some(0));
         assert_eq!(
             events[2],
-            ProviderEvent::ToolCall(ToolCall {
-                id: "toolu_01B".into(),
-                name: "bash".into(),
-                args: json!({"command": "ls -la"}),
-            })
-        );
-        assert_eq!(
-            events[3],
-            ProviderEvent::Usage(Usage {
-                input_tokens: 31,
-                output_tokens: 84,
-                cache_read_tokens: 640,
-                cache_write_tokens: 0,
-                reasoning_tokens: None,
-            })
-        );
-        assert_eq!(
-            events[4],
             ProviderEvent::Done {
-                finish_reason: "tool_use".into()
+                finish_reason: "end_turn".into()
             }
         );
     }
 
     #[test]
-    fn max_tokens_stop_keeps_partial_text() {
+    fn recorded_tool_calls_second_turn_reads_cache() {
+        let events = translate(TOOL_CALLS);
+        let calls: Vec<&ToolCall> = events
+            .iter()
+            .filter_map(|e| match e {
+                ProviderEvent::ToolCall(c) => Some(c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls.len(), 2, "{events:#?}");
+        assert!(calls[0].id.starts_with("toolu_"), "{}", calls[0].id);
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].args, json!({"path": "Cargo.toml"}));
+        assert!(calls[1].id.starts_with("toolu_"), "{}", calls[1].id);
+        assert_eq!(calls[1].name, "bash");
+        assert_eq!(calls[1].args, json!({"command": "ls -la"}));
+        assert_ne!(calls[0].id, calls[1].id);
+
+        let usage = usage_of(&events);
+        assert!(
+            usage.cache_read_tokens > 512,
+            "second identical request reads cache: {usage:?}"
+        );
+        assert_eq!(usage.cache_write_tokens, 0, "{usage:?}");
+        assert_eq!(usage.reasoning_tokens, Some(0));
+
+        assert_eq!(
+            events.last(),
+            Some(&ProviderEvent::Done {
+                finish_reason: "tool_use".into()
+            })
+        );
+        // Text, if any, comes before the tool calls.
+        let first_call = events
+            .iter()
+            .position(|e| matches!(e, ProviderEvent::ToolCall(_)))
+            .unwrap();
+        assert!(
+            events[..first_call]
+                .iter()
+                .all(|e| matches!(e, ProviderEvent::TextDelta(_)))
+        );
+    }
+
+    #[test]
+    fn recorded_max_tokens_stop_spent_on_thinking() {
+        // Eight output tokens, all thinking: a signed block with empty text,
+        // then usage and the stop reason. No visible text at all.
         let events = translate(MAX_TOKENS);
-        assert_eq!(events[0], ProviderEvent::TextDelta("The sea".into()));
-        assert!(matches!(events[1], ProviderEvent::Usage(_)));
+        assert_eq!(events.len(), 3, "{events:#?}");
+        match &events[0] {
+            ProviderEvent::Blob(b) => {
+                assert_eq!(b.provider, PROVIDER_NAME);
+                assert_eq!(b.data["type"], "thinking");
+                assert_eq!(b.data["thinking"], "");
+                assert!(b.data["signature"].as_str().unwrap().len() > 100);
+            }
+            other => panic!("expected a thinking blob, got {other:?}"),
+        }
+        assert_eq!(
+            events[1],
+            ProviderEvent::Usage(Usage {
+                input_tokens: 19,
+                output_tokens: 8,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                reasoning_tokens: Some(8),
+            })
+        );
         assert_eq!(
             events[2],
             ProviderEvent::Done {

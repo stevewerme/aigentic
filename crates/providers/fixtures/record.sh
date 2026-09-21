@@ -17,8 +17,9 @@ if [ "$target" = "anthropic" ]; then
   key="${!key_env:?environment variable $key_env is not set}"
   dir="$here/anthropic"
   mkdir -p "$dir"
-  # A system prompt above the 512-token cache minimum, so the second request
-  # of each pair reads what the first wrote. tool_calls is recorded second.
+  # A system prompt above the 512-token cache minimum. Tools render before
+  # system, so the tool_calls request has its own prefix: it is sent twice
+  # and the second response, which reads the cache, is the one kept.
   sys="$(printf 'You are a terse coding agent. Rule %d: answer precisely, prefer tools over memory, never guess file contents. ' $(seq 1 60))"
   post_a() { # name, json body
     curl -sS -N --fail-with-body \
@@ -34,12 +35,14 @@ if [ "$target" = "anthropic" ]; then
  "messages":[{"role":"user","content":[{"type":"text","text":"Reply with exactly: Hello, world.","cache_control":{"type":"ephemeral"}}]}]}
 JSON
 )"
-  post_a tool_calls "$(cat <<JSON
+  tool_body="$(cat <<JSON
 {"model":"$model","max_tokens":4096,"stream":true,"thinking":{"type":"adaptive"},"tools":$atools,
  "system":[{"type":"text","text":"$sys","cache_control":{"type":"ephemeral"}}],
  "messages":[{"role":"user","content":[{"type":"text","text":"Read Cargo.toml and then list the current directory with ls -la. Call both tools now.","cache_control":{"type":"ephemeral"}}]}]}
 JSON
 )"
+  post_a tool_calls "$tool_body" > /dev/null   # warms the cache
+  post_a tool_calls "$tool_body"               # this one reads it
   post_a max_tokens "$(cat <<JSON
 {"model":"$model","max_tokens":8,"stream":true,
  "messages":[{"role":"user","content":"Write three paragraphs about the sea."}]}
