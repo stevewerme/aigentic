@@ -59,6 +59,19 @@ cargo clippy -- -D warnings
 cargo test
 ```
 
+## Tool behaviour
+
+- **Background processes never outlive a bash call.** The shell runs in its
+  own process group, and the group is torn down (SIGTERM, then SIGKILL) when
+  the call ends, whether the command finished or timed out. The order on
+  normal exit is: wait for the shell to exit, kill the group, then drain
+  stdout and stderr to EOF. A `detach` mechanism for long-running processes
+  is a phase 3 addition alongside policy, not something to bolt on earlier.
+- Every tool caps what it returns, keeping the head and the tail of long
+  output and stating how many bytes were omitted.
+- The working directory is shared by the built-in tools and persists across
+  bash calls; a `cd` in a call that times out is discarded.
+
 ## Conventions
 
 - `thiserror` enums in `core` (`ProviderError`, `ToolError`); `anyhow` only in the `tui` binary.

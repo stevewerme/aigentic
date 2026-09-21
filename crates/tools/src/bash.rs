@@ -446,6 +446,40 @@ mod tests {
         assert!(!alive(pid), "backgrounded sleep {pid} survived the call");
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn background_job_returns_promptly_with_all_output_and_no_survivor() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("sleep.pid");
+        let t = tool(dir.path());
+        let start = Instant::now();
+        let out = t
+            .call(json!({"command": format!(
+                "echo start; sleep 60 & echo $! > {}; echo done",
+                pid_file.display()
+            )}))
+            .await
+            .unwrap();
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            start.elapsed()
+        );
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(out.content, "start\ndone\n");
+
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while alive(pid) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!alive(pid), "backgrounded sleep {pid} survived the call");
+    }
+
     #[tokio::test]
     async fn large_output_is_truncated_head_and_tail() {
         let dir = tempfile::tempdir().unwrap();
