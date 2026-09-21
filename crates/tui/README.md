@@ -36,6 +36,7 @@ api_key_env = "ANTHROPIC_API_KEY"
 
 # user = "steve"                          # author id on your messages ($USER by default)
 # threads_dir = "/path/to/threads"        # default ~/.local/share/aigentic/threads
+# bundled_dir = "/path/to/aigentic"       # holds skills/ and skills.lock.toml; default: the build repo
 ```
 
 The phase 0 flat form (top-level `base_url`, `model`, `api_key_env`) still
@@ -60,13 +61,72 @@ Slash commands: `/cost` (input and output tokens for the thread, reported and
 estimated shown separately, plus cache reads and writes, the reasoning share
 and compactions), `/pin <text>` (a fact for the stable prefix, never
 summarised), `/compact` (run compaction now and report what it did),
-`/quit`. Anything else starting with `/` prints
-`unknown command`. Ctrl-D quits; Ctrl-C clears the line.
+`/skills` (the enabled set), `/<skill> [args]` for every enabled
+user-invoked skill, `/help`, `/quit`. Anything else starting with `/`
+prints `unknown command`. Ctrl-D quits; Ctrl-C clears the line.
 
 Assistant text streams as it arrives. Tool calls print as `→ name {args}`
 and their output follows, truncated to twelve lines or 1200 bytes with a
-note of what was omitted. There are no permission prompts in phase 0; the
-policy seam allows everything.
+note of what was omitted.
+
+## Project file, policy, skills and MCP
+
+`aigentic.toml` in the working directory (see the one at the repo root)
+enables skills by name, prepends policy rules or replaces the bash allow
+patterns, and declares MCP servers. Without it: no skills, the default
+policy (`docs/PLAN-phase3.md` section 4), no servers.
+
+A call the policy asks about prints the tool, its class, the reason and
+the arguments, then prompts: `y` runs it once, `a` runs it and every
+identical call (same tool; for `bash`, the same command) until the process
+exits, `n`, Ctrl-C or Ctrl-D denies. Every answer is a `permission_decided`
+event with your user id; a session grant is still an event each time it
+is used. Rule decisions are recorded on the tool result. With stdin not a
+terminal every prompt is denied and `ask_human` returns "no human
+available".
+
+Skills resolve from `./skills`, then `~/.config/aigentic/skills`, then
+the bundled `skills/` in `bundled_dir`; each root has its own
+`skills.lock.toml`, merged closer-wins. The enabled set is hash-verified
+at startup: a changed file or a missing lock entry refuses to start,
+naming the skill. A user-invoked skill is a slash command; a model-invoked
+one is loaded through the `load_skill` tool. Both print
+`[skill <name> loaded]`.
+
+MCP servers connect at startup; each server's tools print with their
+descriptions (the server's own text, shown so you see what the model
+sees) and register as `mcp.<server>.<tool>` with the server's class,
+`network` unless set. A server that fails to connect is reported and
+skipped.
+
+## Skills CLI
+
+```bash
+aigentic skills list
+```
+
+```bash
+aigentic skills check
+```
+
+```bash
+aigentic skills vendor https://github.com/mattpocock/skills@c55ee46 --into user
+```
+
+```bash
+aigentic skills update
+```
+
+`list` shows name, invocation, origin, review state and source. `check`
+verifies every hash and runs the static check; it exits non-zero on a
+mismatch or while a skill with findings is still `pending`, and a human
+clears it by setting `review = { by = "...", on = "..." }` in the lock.
+`vendor` clones at the commit (the one place, with `update`, that touches
+the network), copies the repository's `skills/` under `skills/<repo>/`,
+writes pending lock entries and prints the findings. `update` re-fetches
+each recorded source at its head, shows `diff -ru` per changed skill with
+the new findings, and applies only what you accept; an applied skill is
+pending again.
 
 Thread logs are JSONL files, one per thread, under `threads_dir`. The
 working directory at launch is the tools' working directory and the source
@@ -126,6 +186,22 @@ adapter change.
     then ask about something from before the summary. Check `/cost` lists
     the compaction and, on Anthropic, that the following turn's cache
     write is roughly the summary plus the tail and the one after reads it.
+
+12. Phase 3, tampering: append a newline to a vendored `SKILL.md` that is
+    enabled and start the REPL. Expect a refusal naming the skill and the
+    hash mismatch; `aigentic skills check` reports the same. Restore the
+    file.
+13. Phase 3, policy: ask for an edit and expect a `[permission]` prompt
+    for `edit_file`; answer `a`, then ask for a second edit and expect
+    `[allowed for this session by <you>]` with no prompt. Ask it to run
+    `cargo test` and expect no prompt. Ask it to run `rm -rf target` and
+    answer `n`; expect the model to see the denial.
+14. Phase 3, skills: `/implement <a small ticket>`. Expect
+    `[skill implement loaded]`, a `→ load_skill {"name":"tdd"}` call,
+    `[skill tdd loaded]`, a failing test, a passing one, `cargo test`.
+15. Phase 3, MCP: declare the echo server from `aigentic.toml`'s comment,
+    start the REPL, expect the three tools and descriptions printed, ask
+    it to echo something, expect a prompt (class network) and the result.
 
 Status: steps 1 to 7 passed on 2026-09-21 against TensorX
 (`https://api.tensorx.ai/v1`, model `z-ai/glm-5.3`). Step 8 passed the same

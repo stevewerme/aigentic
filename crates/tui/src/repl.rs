@@ -2,7 +2,10 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use aigentic_runtime::aigentic_core::{Author, ContentBlock, EventKind, ToolCall};
-use aigentic_runtime::aigentic_log::{CompactedPayload, CompactionStrategy, ToolResultPayload};
+use aigentic_runtime::aigentic_log::{
+    CompactedPayload, CompactionStrategy, DecisionScope, PermissionDecidedPayload,
+    SkillLoadedPayload, ToolResultPayload,
+};
 use aigentic_runtime::{Resumed, Runtime, Signal};
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
@@ -24,14 +27,20 @@ pub struct Repl {
 pub enum Command<'a> {
     Cost,
     Quit,
+    Help,
+    Skills,
     Pin(&'a str),
     Compact,
+    /// A user-invoked skill: its name and the rest of the line.
+    Skill(&'a str, &'a str),
     Unknown(&'a str),
     Chat(&'a str),
     Empty,
 }
 
-pub fn parse_line(line: &str) -> Command<'_> {
+/// Dispatch a line. `skills` are the slash commands the enabled
+/// user-invoked skills add; built-in commands win on a name clash.
+pub fn parse_line<'a>(line: &'a str, skills: &[String]) -> Command<'a> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return Command::Empty;
@@ -43,11 +52,24 @@ pub fn parse_line(line: &str) -> Command<'_> {
     match (head, tail.trim()) {
         ("cost", _) => Command::Cost,
         ("quit" | "exit", _) => Command::Quit,
+        ("help", _) => Command::Help,
+        ("skills", _) => Command::Skills,
         ("compact", _) => Command::Compact,
         ("pin", text) if !text.is_empty() => Command::Pin(text),
+        (name, args) if skills.iter().any(|s| s == name) => Command::Skill(name, args),
         _ => Command::Unknown(trimmed),
     }
 }
+
+const HELP: &str = "\
+/cost            tokens for the thread, reported and estimated separately
+/pin <text>      pin a fact to the stable prefix
+/compact         run compaction now
+/skills          list enabled skills; user-invoked ones are slash commands
+/<skill> [args]  run a user-invoked skill
+/help            this list
+/quit            exit (Ctrl-D too)
+Permission prompts: y once, a for the session, n or Ctrl-C to deny.";
 
 impl Repl {
     pub fn new(runtime: Runtime, user: Author, history: PathBuf) -> Self {
@@ -81,9 +103,36 @@ impl Repl {
                 Err(ReadlineError::Eof) => break,
                 Err(e) => return Err(e.into()),
             };
-            match parse_line(&line) {
+            let slash: Vec<String> = self
+                .runtime
+                .skills()
+                .user_invoked()
+                .iter()
+                .map(|m| m.name.clone())
+                .collect();
+            match parse_line(&line, &slash) {
                 Command::Empty => continue,
                 Command::Quit => break,
+                Command::Help => println!("{HELP}"),
+                Command::Skills => {
+                    let set = self.runtime.skills();
+                    if set.is_empty() {
+                        println!("no skills enabled; list them under [skills] in aigentic.toml");
+                    }
+                    for m in set.user_invoked() {
+                        let hint = m.argument_hint.as_deref().unwrap_or("");
+                        println!("/{:<24} {}  {}", m.name, m.description, hint);
+                    }
+                    for m in set.model_invoked() {
+                        println!(" {:<24} {}  (model-invoked)", m.name, m.description);
+                    }
+                }
+                Command::Skill(name, args) => {
+                    let _ = editor.add_history_entry(line.trim());
+                    let name = name.to_owned();
+                    let args = args.to_owned();
+                    self.run_skill(&name, &args).await;
+                }
                 Command::Cost => {
                     let events = self.runtime.log().read_all()?;
                     println!("{}", cost_of(&events));
@@ -119,6 +168,24 @@ impl Repl {
         }
         let _ = editor.save_history(&self.history);
         Ok(())
+    }
+
+    async fn run_skill(&mut self, name: &str, args: &str) {
+        let mut at_line_start = true;
+        let outcome = self
+            .runtime
+            .invoke_skill(self.user.clone(), name, args, &mut |signal| {
+                render(signal, &mut at_line_start)
+            })
+            .await;
+        if !at_line_start {
+            println!();
+        }
+        match outcome {
+            Ok(o) if o.reason != "done" => println!("[turn ended: {}]", o.reason),
+            Ok(_) => {}
+            Err(e) => println!("[error: {e}]"),
+        }
     }
 
     /// A new turn for `text`, or the continuation of an interrupted one.
@@ -196,6 +263,37 @@ fn render(signal: Signal<'_>, at_line_start: &mut bool) {
             }
             *at_line_start = true;
         }
+        Signal::Event(event) if event.kind == EventKind::PermissionDecided => {
+            if let Ok(p) = serde_json::from_value::<PermissionDecidedPayload>(event.payload.clone())
+            {
+                let who = match &event.author {
+                    Author::User(u) => u.0.as_str(),
+                    Author::Agent(a) => a.0.as_str(),
+                    Author::System => "system",
+                };
+                let what = match (p.allow, p.scope) {
+                    (true, DecisionScope::Once) => "allowed",
+                    (true, DecisionScope::Session) => "allowed for this session",
+                    (false, _) => "denied",
+                };
+                println!("  [{what} by {who}]");
+            }
+            *at_line_start = true;
+        }
+        Signal::Event(event) if event.kind == EventKind::SkillLoaded => {
+            if !*at_line_start {
+                println!();
+            }
+            if let Ok(p) = serde_json::from_value::<SkillLoadedPayload>(event.payload.clone()) {
+                println!(
+                    "[skill {} loaded ({} bytes, {})]",
+                    p.name,
+                    p.body.len(),
+                    p.source
+                );
+            }
+            *at_line_start = true;
+        }
         Signal::Event(_) => {}
     }
 }
@@ -239,18 +337,46 @@ mod tests {
 
     #[test]
     fn slash_commands_dispatch() {
-        assert_eq!(parse_line("/cost"), Command::Cost);
-        assert_eq!(parse_line("  /quit  "), Command::Quit);
-        assert_eq!(parse_line("/exit"), Command::Quit);
-        assert_eq!(parse_line("/compact"), Command::Compact);
+        let none: Vec<String> = vec![];
+        assert_eq!(parse_line("/cost", &none), Command::Cost);
+        assert_eq!(parse_line("  /quit  ", &none), Command::Quit);
+        assert_eq!(parse_line("/exit", &none), Command::Quit);
+        assert_eq!(parse_line("/help", &none), Command::Help);
+        assert_eq!(parse_line("/skills", &none), Command::Skills);
+        assert_eq!(parse_line("/compact", &none), Command::Compact);
         assert_eq!(
-            parse_line("/pin  Answer in Swedish. "),
+            parse_line("/pin  Answer in Swedish. ", &none),
             Command::Pin("Answer in Swedish.")
         );
-        assert_eq!(parse_line("/pin"), Command::Unknown("/pin"));
-        assert_eq!(parse_line("/nope arg"), Command::Unknown("/nope arg"));
-        assert_eq!(parse_line("hello /cost"), Command::Chat("hello /cost"));
-        assert_eq!(parse_line("   "), Command::Empty);
+        assert_eq!(parse_line("/pin", &none), Command::Unknown("/pin"));
+        assert_eq!(
+            parse_line("/nope arg", &none),
+            Command::Unknown("/nope arg")
+        );
+        assert_eq!(
+            parse_line("hello /cost", &none),
+            Command::Chat("hello /cost")
+        );
+        assert_eq!(parse_line("   ", &none), Command::Empty);
+    }
+
+    #[test]
+    fn skill_commands_come_from_the_enabled_set() {
+        let skills = vec!["implement".to_owned(), "cost".to_owned()];
+        assert_eq!(
+            parse_line("/implement fix the off-by-one in cost.rs", &skills),
+            Command::Skill("implement", "fix the off-by-one in cost.rs")
+        );
+        assert_eq!(
+            parse_line("/implement", &skills),
+            Command::Skill("implement", "")
+        );
+        assert_eq!(parse_line("/tdd x", &skills), Command::Unknown("/tdd x"));
+        assert_eq!(
+            parse_line("/cost", &skills),
+            Command::Cost,
+            "a built-in wins over a skill of the same name"
+        );
     }
 
     #[test]

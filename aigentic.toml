@@ -1,0 +1,15 @@
+# Per-repository proto-project file (phase 3, decision 2); becomes
+# project.toml in phase 4. Optional: without it no skills are enabled, the
+# default policy applies and no MCP servers connect.
+
+[skills]
+enabled = ["implement", "tdd", "code-review", "diagnosing-bugs", "grilling"]
+
+[policy]
+# rules = [{ class = "write", decision = "allow" }]   # prepended to the defaults
+# bash_allow = ["cargo", "git status", "git diff"]     # replaces the default patterns
+
+# [[mcp_servers]]
+# name = "echo"
+# transport = { stdio = { command = "target/debug/examples/mcp_echo_server" } }
+# class = "network"                                    # read | write | exec | network | safe

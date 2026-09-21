@@ -102,6 +102,8 @@ struct ConfigFile {
     user: Option<String>,
     #[serde(default)]
     threads_dir: Option<PathBuf>,
+    #[serde(default)]
+    bundled_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -112,6 +114,9 @@ pub struct Config {
     pub user: Option<String>,
     /// Where thread logs live; defaults to `~/.local/share/aigentic/threads`.
     pub threads_dir: Option<PathBuf>,
+    /// The directory holding the bundled `skills/` and `skills.lock.toml`;
+    /// defaults to the repository the binary was built from.
+    pub bundled_dir: Option<PathBuf>,
 }
 
 const EXAMPLE: &str = r#"default_profile = "tensorx"
@@ -203,6 +208,7 @@ impl Config {
             default_profile,
             user: file.user,
             threads_dir: file.threads_dir,
+            bundled_dir: file.bundled_dir,
         })
     }
 
