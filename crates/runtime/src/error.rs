@@ -1,0 +1,12 @@
+use aigentic_core::ProviderError;
+use aigentic_log::LogError;
+
+#[derive(Debug, thiserror::Error)]
+pub enum RuntimeError {
+    #[error(transparent)]
+    Log(#[from] LogError),
+    /// The provider stream failed. A `turn_ended` event with reason
+    /// `provider_error` has already been appended when this is returned.
+    #[error("provider: {0}")]
+    Provider(#[from] ProviderError),
+}

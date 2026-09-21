@@ -49,6 +49,22 @@ dependencies = [
 [[package]]
 name = "aigentic-runtime"
 version = "0.1.0"
+dependencies = [
+ "aigentic-core",
+ "aigentic-log",
+ "aigentic-policy",
+ "aigentic-providers",
+ "aigentic-skills",
+ "aigentic-tools",
+ "futures-core",
+ "futures-util",
+ "schemars",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "ulid",
+]
 
 [[package]]
 name = "aigentic-skills"

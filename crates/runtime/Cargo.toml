@@ -4,6 +4,22 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Aigentic runtime crate (not yet implemented)"
+description = "Aigentic agent loop, turn scheduler seam, context builder"
 
 [dependencies]
+aigentic-core.workspace = true
+aigentic-log.workspace = true
+aigentic-policy.workspace = true
+aigentic-providers.workspace = true
+aigentic-skills.workspace = true
+aigentic-tools.workspace = true
+futures-util.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+ulid.workspace = true
+
+[dev-dependencies]
+futures-core.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+schemars.workspace = true
