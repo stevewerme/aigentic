@@ -487,6 +487,62 @@ there, no skills, knowledge if `.aigentic/knowledge/` exists.
 `aigentic project init` there writes a file with `kind = "notes"`,
 which only changes what `doctor` expects (no repository, no GitHub).
 
+## 9b. Workspaces
+
+A workspace groups the projects that belong together: often a brand
+(the harness, its website, its marketing folder), sometimes a client
+or anything else. One level only; a project is in at most one
+workspace, and a project in none works as before.
+
+**On disk.** One file per workspace in the config directory, per
+machine, since paths differ between the Mac and the VM:
+
+```toml
+# ~/.config/aigentic/workspaces/aigentic.toml
+name = "aigentic"
+# The workspace's own layer: instructions.md, knowledge/, memory/,
+# brief.md. Any folder; the marketing folder is a natural home.
+shared = "~/Projects/aigentic-marketing"
+projects = [
+  "~/Projects/aigentic",
+  "~/Projects/aigentic-site",
+  "~/Projects/aigentic-marketing",
+]
+```
+
+Project names come from each project's `aigentic.toml` (a folder's
+name when it has none), so a name means the same project on every
+machine. Each project can be its own repository, or none. The daemon
+reads every workspace file, so it knows every project's root: that is
+what lets a thread switch to `site` from anywhere, embedded or remote
+(`server.toml`'s `[[projects]]` still works and is merged in).
+
+**The layers.** Global, then workspace (instructions, knowledge,
+memory, brief), then project (instructions, knowledge, memory, brief,
+policy, skills, MCP servers). Policy and skills stay per project: a
+website repository and a notes folder need different rules.
+
+**Siblings.** Projects in one workspace understand each other with no
+declaration (step 12); `related` remains for the rare link across
+workspaces.
+
+**Switching.** Every switch is proposed and confirmed as section 9
+says, and every proposal is logged. A switch across workspaces is
+worded as the larger move it is (`leave aigentic for vendela?`).
+
+**Managing.** `aigentic project init` asks which workspace a folder
+joins (the existing ones, or a new one, which asks for its name and
+shared folder); `aigentic workspace new|add <path>|remove
+<project>|list`; or edit the file. Removing a project only drops it
+from the list: its folder, files and threads are untouched.
+
+**Starting.** `aigentic -w vendela` resumes the latest thread whose
+current project is in `vendela`, or starts one there;
+`-w aigentic/site` names a project. Inside a project's folder no flag
+is needed. With nothing to go on (outside any project, no recent
+thread, no flag) the shell shows a picker of workspaces and their
+projects, the same one a bare `/project use` opens.
+
 ## 10. Steps, one commit each
 
 1. `tools, api, server: diffs in edit results and usage pushes` —
@@ -535,23 +591,38 @@ which only changes what `doctor` expects (no repository, no GitHub).
    in config, `Runtime::utility`, `title.rs`, `thread_renamed`,
    `/rename`, `Push::Titled`; memory extraction moved to the utility
    provider.
-10. `core, log, runtime, server: project_switched` — the kinds and
-    payloads, `ProjectContext` and `apply_project` split out of
-    `build_thread`, `Runtime::set_project`, `Mail::SwitchProject`,
-    `Request::SwitchProject` with the role check, the projection note;
-    actor tests that switch between two temp projects and check the
-    prefix, workdir, policy root and skills.
+10. `core, log, runtime, server: workspaces and project_switched` — the
+    workspace files (section 9b) loaded by the daemon, embedded or not,
+    so it knows every project's root; the workspace layer between the
+    global and project layers (instructions, knowledge, memory); the
+    kinds and payloads, `ProjectContext` and `apply_project` split out
+    of `build_thread`, `Runtime::set_project` swapping the workspace and
+    project layers together, `Mail::SwitchProject`,
+    `Request::SwitchProject` with the role check, the projection note,
+    `/project use <name>`; actor tests that switch between two temp
+    projects in one workspace and one outside it and check the prefix,
+    workdir, policy root and skills.
 11. `tools, server, tui: the proposal` — `suggest_project`,
     `project_proposed`, `AwaitingSwitch`, `AnswerSwitch`, the block,
     the projects list in the prefix; `exec` declines.
-12. `runtime: related projects and memory` — `related`, briefs inline,
-    related knowledge and memory in `search_knowledge` marked by
-    project, brief updates, the person-level memory rule.
-13. `server, tui: one threads directory and start-is-resume` — flat
-    layout, `project_of` and `title_of` from the log, `migrate.rs`,
-    `Latest`, `--new`, `/new`, `/threads` across projects, the
-    directory prompt in the banner, `kind = "notes"` in `project init`
-    and `doctor`; old fixtures still list.
+12. `runtime: siblings, briefs and memory` — the workspace's projects
+    understand each other with no declaration: their briefs inline,
+    their knowledge and memory in `search_knowledge` marked by project;
+    `related` kept only for links across workspaces; the workspace's
+    own brief; brief updates; the memory rule (a fact about the person
+    to person-level memory, about the workspace to the workspace's,
+    else the project's).
+13. `server, tui: one threads directory, start-is-resume, workspace
+    commands` — flat layout, `project_of` and `title_of` from the log,
+    `migrate.rs`, `Latest`, `--new`, `/new`, `/threads` across projects
+    grouped by workspace, the directory prompt in the banner; `-w
+    <workspace>` or `-w <workspace>/<project>` to scope where a start
+    resumes; the picker when nothing says where (outside a project, no
+    recent thread, no flag), also behind a bare `/project use`;
+    `aigentic workspace new|add|remove|list`; `project init` asks which
+    workspace the folder joins and writes `kind = "notes"` where there
+    is no repository; `doctor` checks the workspace files; old fixtures
+    still list.
 13b. **The working set** (section 13; grilled before it is built, after
     step 13): the context is kept near a token target whatever the
     window, used tool results become stubs with a handle, a `recall`
@@ -645,6 +716,12 @@ Settled in the grilling of 2026-09-22 (Q1 to Q18) and in the draft.
 19. **The client stays a subscriber.** Nothing in `app/` holds state the
     daemon does not; the cells are a projection of pushes, and a second
     client attached to the same thread renders the same transcript.
+
+20. **Workspaces, one level.** (Settled after the grilling, 2026-09-22.)
+    The common case is a brand with three or four projects; a tree
+    would bring back "which ancestor wins". Defined in per-machine
+    files because paths differ; names come from the projects so they
+    travel. Policy and skills stay per project.
 
 ## 12. Open items
 
