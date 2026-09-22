@@ -343,7 +343,6 @@ async fn run_shell(
         mode: engine.mode().to_owned(),
         ..Status::default()
     };
-    let mut running_since: Option<Instant> = None;
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(TICK);
     // Ctrl-C and Esc arm on an empty idle composer; the second press
@@ -366,12 +365,17 @@ async fn run_shell(
         status.apply_state(&state);
         status.mode = engine.mode().to_owned();
         status.usage = engine.usage();
-        running_since = match (&state, running_since) {
-            (ThreadState::Idle, _) => None,
-            (_, Some(t)) => Some(t),
-            (_, None) => Some(Instant::now()),
-        };
-        status.elapsed = running_since.map(|t| t.elapsed());
+        // The turn line carries the clock while a turn runs.
+        status.elapsed = None;
+        let activity = engine.turn().map(|t| {
+            let width = out.shell.width();
+            let text = format!("{} · {} · esc interrupts", t.activity(), t.figures());
+            let line = Line::from(vec![
+                Span::styled("◦ ", Style::default().fg(Color::Yellow)),
+                Span::styled(text, Style::default().add_modifier(Modifier::DIM)),
+            ]);
+            wrap_line(&line, width).into_iter().next().unwrap_or(line)
+        });
         if let Some((_, at)) = armed
             && at.elapsed() > ARM_WINDOW
         {
@@ -434,6 +438,7 @@ async fn run_shell(
             hint: hint.as_deref(),
             block: &block,
             popup: &popup_lines,
+            activity,
         };
         out.shell
             .fit(needed_rows(&pane), matches!(state, ThreadState::Idle))?;

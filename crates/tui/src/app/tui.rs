@@ -36,6 +36,7 @@ pub fn needed_rows(pane: &Pane<'_>) -> u16 {
         + pane.block.len()
         + pane.popup.len()
         + usize::from(pane.hint.is_some())
+        + usize::from(pane.activity.is_some())
         + composer
         + 1;
     u16::try_from(rows).unwrap_or(u16::MAX)
@@ -55,6 +56,8 @@ pub struct Pane<'a> {
     pub block: &'a [Line<'static>],
     /// The completion popup, between the hint and the composer.
     pub popup: &'a [Line<'static>],
+    /// The turn line while a turn runs, right above the hint.
+    pub activity: Option<Line<'static>>,
 }
 
 /// The crossterm backend, remembering where it last put the cursor.
@@ -379,8 +382,12 @@ pub fn layout(pane: &Pane<'_>, area: Rect) -> (Vec<Line<'static>>, Option<(u16, 
     });
 
     // Rows left for the tail after the composer, the hint and the status.
-    let fixed =
-        composer_rows.len() + usize::from(hint.is_some()) + 1 + pane.block.len() + pane.popup.len();
+    let fixed = composer_rows.len()
+        + usize::from(hint.is_some())
+        + usize::from(pane.activity.is_some())
+        + 1
+        + pane.block.len()
+        + pane.popup.len();
     let tail_rows_avail = height.saturating_sub(fixed);
     let skip = pane.active.len().saturating_sub(tail_rows_avail);
     let tail_rows: Vec<Line<'static>> = if tail_rows_avail == 0 {
@@ -397,6 +404,9 @@ pub fn layout(pane: &Pane<'_>, area: Rect) -> (Vec<Line<'static>>, Option<(u16, 
     }
     rows.extend(tail_rows);
     rows.extend(pane.block.iter().cloned());
+    if let Some(a) = &pane.activity {
+        rows.push(a.clone());
+    }
     let composer_top = rows.len();
     if let Some(h) = hint {
         rows.push(h);
@@ -532,6 +542,7 @@ mod tests {
             hint: None,
             block: &[],
             popup: &[],
+            activity: None,
         };
         let (rows, cursor) = render(&pane, 40, 5);
         assert_eq!(rows[0], "");
@@ -556,6 +567,7 @@ mod tests {
             hint: Some("queued 1 · ! sends now"),
             block: &[],
             popup: &[],
+            activity: None,
         };
         // 4 rows: one tail row fits above hint, composer and status.
         let (rows, cursor) = render(&pane, 10, 4);
@@ -579,6 +591,7 @@ mod tests {
             hint: None,
             block: &[],
             popup: &[],
+            activity: None,
         };
         let (rows, cursor) = render(&pane, 20, 4);
         assert_eq!(rows[1], "> one");
@@ -596,6 +609,7 @@ mod tests {
             hint: None,
             block: &[],
             popup: &[],
+            activity: None,
         };
         assert_eq!(needed_rows(&idle), 2);
         let active: Vec<Line<'static>> = (0..30).map(|i| Line::raw(i.to_string())).collect();
@@ -607,6 +621,7 @@ mod tests {
             hint: Some("h"),
             block: &block,
             popup: &[],
+            activity: None,
         };
         assert_eq!(needed_rows(&busy) as usize, MAX_ACTIVE_ROWS + 2 + 1 + 1 + 1);
     }

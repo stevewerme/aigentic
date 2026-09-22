@@ -88,7 +88,11 @@ interrupts it (nothing is posted; `!text` interrupts and posts) and Enter
 queues the message for the next turn. Idle, Ctrl-C or Esc clears the draft;
 on an empty composer a second Ctrl-C within a second quits and a second Esc
 recalls the last message sent, as Alt-Up does at any time. Ctrl-D quits.
-`/keys` prints the table. `@` opens a fuzzy file picker over the project
+`/keys` prints the table. While a turn runs, a line above the composer says
+what it is doing (the running tool, writing, or thinking), its clock, the
+tools called, the last prompt's size and cached share, and the output so
+far; when it ends, the same figures stay in the transcript as one dim line.
+`@` opens a fuzzy file picker over the project
 root (gitignored files skipped), `/` at the line's start the command list
 with descriptions; Up and Down move, Tab or Enter accepts, Esc closes. A
 permission request is a block above the

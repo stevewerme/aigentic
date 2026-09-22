@@ -47,6 +47,8 @@ pub enum Cell {
     Edit(diff::Edit),
     /// A `[bracketed]` notice, a report line, anything else.
     Note(String),
+    /// A turn's figures when it ends, dim.
+    Summary(String),
 }
 
 /// Tools whose consecutive calls fold into `Explored`.
@@ -165,6 +167,10 @@ impl Cell {
                 }
                 lines
             }
+            Cell::Summary(text) => vec![Line::from(Span::styled(
+                text.clone(),
+                Style::default().add_modifier(Modifier::DIM),
+            ))],
             Cell::Note(text) => text
                 .lines()
                 .map(|l| {

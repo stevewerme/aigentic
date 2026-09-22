@@ -16,9 +16,9 @@ use aigentic_api::client::Client;
 use aigentic_api::{Notice, ReportKind, Request, Response, ThreadState};
 use aigentic_runtime::aigentic_core::{Author, ContentBlock, EventKind, ToolCall};
 use aigentic_runtime::aigentic_log::{
-    CompactedPayload, CompactionStrategy, DecisionScope, InterruptedPayload,
-    MemoryExtractedPayload, PermissionDecidedPayload, SkillLoadedPayload, ToolResultPayload,
-    TurnEndedPayload, UserMessagePayload,
+    AssistantMessagePayload, CompactedPayload, CompactionStrategy, DecisionScope,
+    InterruptedPayload, MemoryExtractedPayload, PermissionDecidedPayload, SkillLoadedPayload,
+    ToolResultPayload, TurnEndedPayload, UserMessagePayload,
 };
 use aigentic_runtime::{ASKED_HUMAN, INTERRUPTED};
 use tokio::sync::mpsc;
@@ -73,6 +73,82 @@ impl PromptBlock {
                 vec![format!("[question] {question}"), "  type the answer".into()]
             }
         }
+    }
+}
+
+/// A running turn's figures, from the provider's reported usage on the
+/// events, never counted here (plan step 8b).
+#[derive(Debug, Clone)]
+pub struct TurnStats {
+    pub started: std::time::Instant,
+    pub tools: u32,
+    /// The last call's prompt: input plus cache reads and writes.
+    pub prompt: u64,
+    /// Of that, read from the cache.
+    pub cached: u64,
+    /// Output across the turn's calls, reasoning included.
+    pub output: u64,
+    /// The running tool, `name argument`.
+    pub current: Option<String>,
+    /// Text is streaming.
+    pub writing: bool,
+}
+
+impl TurnStats {
+    fn new() -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            tools: 0,
+            prompt: 0,
+            cached: 0,
+            output: 0,
+            current: None,
+            writing: false,
+        }
+    }
+
+    /// `1m 12s · 4 tools · ↑ 42k (38k cached) · ↓ 1.8k`
+    pub fn figures(&self) -> String {
+        let mut parts = vec![crate::app::status::elapsed_short(self.started.elapsed())];
+        match self.tools {
+            0 => {}
+            1 => parts.push("1 tool".into()),
+            n => parts.push(format!("{n} tools")),
+        }
+        if self.prompt > 0 {
+            let cached = if self.cached > 0 {
+                format!(" ({} cached)", count_short(self.cached))
+            } else {
+                String::new()
+            };
+            parts.push(format!("↑ {}{cached}", count_short(self.prompt)));
+        }
+        if self.output > 0 {
+            parts.push(format!("↓ {}", count_short(self.output)));
+        }
+        parts.join(" · ")
+    }
+
+    /// What the turn is doing now.
+    pub fn activity(&self) -> String {
+        match (&self.current, self.writing) {
+            (Some(tool), _) => format!("running {tool}"),
+            (None, true) => "writing".into(),
+            (None, false) => "thinking".into(),
+        }
+    }
+}
+
+/// `950`, `1.8k`, `42k`, `1.3M`: token counts, decimal.
+pub fn count_short(n: u64) -> String {
+    if n < 1000 {
+        n.to_string()
+    } else if n < 10_000 {
+        format!("{:.1}k", n as f64 / 1000.0)
+    } else if n < 1_000_000 {
+        format!("{}k", n / 1000)
+    } else {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
     }
 }
 
@@ -142,6 +218,8 @@ pub struct ClientRepl {
     prompted: Option<String>,
     /// What the prompt is about, while `prompted`.
     block: Option<PromptBlock>,
+    /// The running turn's figures; `None` while idle.
+    turn: Option<TurnStats>,
     quit: bool,
     /// The last `Notice::Usage`: window fill and window, for the
     /// status line (phase 6 step 3); kept, not yet shown.
@@ -172,6 +250,7 @@ impl ClientRepl {
             partial: String::new(),
             prompted: None,
             block: None,
+            turn: None,
             usage: None,
             awaiting_turn: false,
             quit: false,
@@ -480,6 +559,11 @@ impl ClientRepl {
         self.answered(r, out);
     }
 
+    /// The running turn's figures, for the turn line.
+    pub fn turn(&self) -> Option<&TurnStats> {
+        self.turn.as_ref()
+    }
+
     /// The block the shell draws while this client is prompted.
     pub fn prompt_block(&self) -> Option<&PromptBlock> {
         self.prompted.as_ref().and(self.block.as_ref())
@@ -565,6 +649,9 @@ impl ClientRepl {
     pub fn render(&mut self, notice: Notice, out: &mut dyn Printer) {
         match notice {
             Notice::TextDelta { text, .. } => {
+                if let Some(t) = self.turn.as_mut() {
+                    t.writing = true;
+                }
                 self.partial.push_str(&text);
                 while let Some(pos) = self.partial.find('\n') {
                     let line: String = self.partial.drain(..=pos).collect();
@@ -581,6 +668,11 @@ impl ClientRepl {
             Notice::ToolCallStarted { call, .. } => {
                 self.flush_partial(out);
                 let summary = summarise_args(&call);
+                if let Some(t) = self.turn.as_mut() {
+                    t.tools += 1;
+                    t.writing = false;
+                    t.current = Some(format!("{} {summary}", call.name));
+                }
                 self.calls
                     .insert(call.id.clone(), (call.name.clone(), summary.clone()));
                 out.cell(
@@ -602,6 +694,9 @@ impl ClientRepl {
                 self.show_state(&state, out);
                 if !matches!(state, ThreadState::Idle) {
                     self.awaiting_turn = false;
+                    if self.turn.is_none() {
+                        self.turn = Some(TurnStats::new());
+                    }
                 }
                 self.state = state;
             }
@@ -686,7 +781,19 @@ impl ClientRepl {
         out: &mut dyn Printer,
     ) {
         match event.kind {
-            EventKind::AssistantMessage => self.flush_partial(out),
+            EventKind::AssistantMessage => {
+                self.flush_partial(out);
+                if let Some(t) = self.turn.as_mut() {
+                    t.writing = false;
+                    if let Ok(AssistantMessagePayload { usage: Some(u), .. }) =
+                        serde_json::from_value(event.payload.clone())
+                    {
+                        t.prompt = u.input_tokens + u.cache_read_tokens + u.cache_write_tokens;
+                        t.cached = u.cache_read_tokens;
+                        t.output += u.output_tokens;
+                    }
+                }
+            }
             EventKind::UserMessage => {
                 // Our own posts echo nothing; others' are named.
                 if event.author
@@ -707,6 +814,9 @@ impl ClientRepl {
                 }
             }
             EventKind::ToolResult => {
+                if let Some(t) = self.turn.as_mut() {
+                    t.current = None;
+                }
                 if let Ok(ToolResultPayload { result: r, .. }) =
                     serde_json::from_value(event.payload.clone())
                 {
@@ -777,6 +887,9 @@ impl ClientRepl {
             }
             EventKind::TurnEnded => {
                 self.flush_partial(out);
+                if let Some(t) = self.turn.take() {
+                    out.cell(Cell::Summary(format!("─ {}", t.figures())), true);
+                }
                 if let Ok(p) = serde_json::from_value::<TurnEndedPayload>(event.payload.clone()) {
                     if p.reason == "done" || p.reason == ASKED_HUMAN || p.reason == INTERRUPTED {
                         return;
@@ -1763,5 +1876,21 @@ mod tests {
         );
         let rules = std::fs::read_to_string(root.join(".aigentic/rules.toml")).unwrap();
         assert!(rules.contains("\"curl -s\""), "{rules}");
+    }
+
+    #[test]
+    fn turn_figures_read_short() {
+        let mut t = TurnStats::new();
+        assert_eq!(t.activity(), "thinking");
+        t.tools = 4;
+        t.prompt = 42_310;
+        t.cached = 38_004;
+        t.output = 1_840;
+        t.current = Some("bash cargo test".into());
+        let f = t.figures();
+        assert!(f.ends_with("4 tools · ↑ 42k (38k cached) · ↓ 1.8k"), "{f}");
+        assert_eq!(t.activity(), "running bash cargo test");
+        assert_eq!(count_short(950), "950");
+        assert_eq!(count_short(1_300_000), "1.3M");
     }
 }
