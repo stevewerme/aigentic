@@ -375,9 +375,11 @@ async fn main() -> anyhow::Result<()> {
     } else {
         println!("new thread {thread_id} (resume with --thread {thread_id})");
     }
-    match &state {
-        ThreadState::Idle => {}
-        other => println!("[thread state: {other:?}]"),
+    if let ThreadState::Running { by, queued } = &state {
+        println!(
+            "[a turn is running for {}; {queued} message(s) queued]",
+            client_repl::author_name(by)
+        );
     }
     println!("/help lists commands; /project shows the layers; /who the participants; /quit exits");
 

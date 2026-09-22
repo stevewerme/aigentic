@@ -117,10 +117,10 @@ starts one in the process for this directory over a private socket, so a
 single user sees what phase 4 showed; with `--server` it talks to a remote
 daemon as a named user and other people's messages arrive live under their
 names. A permission request or an `ask_human` question prints as a state,
-and `y`, `a`, `n` or a plain line answers it; when someone else answers
-first, the decision prints with their name. Streamed text prints as its
-lines complete. `/profile` is gone: the profile is the project's on the
-daemon.
+and `y`, `a`, `n` or a plain line answers it when your role allows; when
+someone else answers first, the prompt is withdrawn with their name and
+the decision prints with it. Streamed text prints as its lines complete.
+`/profile` is gone: the profile is the project's on the daemon.
 
 Slash commands: `/cost` (input and output tokens for the thread, reported and
 estimated shown separately, plus cache reads and writes, the reasoning share,
@@ -180,14 +180,27 @@ outside the thread"; a `[policy] rules` entry may carry its own
 the project root. `bash` is not covered: narrowing and policy decide
 what the model sees and what runs, not what a shell can reach.
 
-A call the policy asks about prints the tool, its class, the reason and
-the arguments, then prompts: `y` runs it once, `a` runs it and every
-identical call (same tool; for `bash`, the same command) until the process
-exits, `n`, Ctrl-C or Ctrl-D denies. Every answer is a `permission_decided`
-event with your user id; a session grant is still an event each time it
-is used. Rule decisions are recorded on the tool result. With stdin not a
-terminal every prompt is denied and `ask_human` returns "no human
-available".
+A call the policy asks about is a thread state, `AwaitingApproval`, that
+every session on the thread sees. A user with `approve` (or `admin`) gets
+the tool, its class, the reason and the arguments, then the prompt: `y`
+runs it once, `a` runs it and every identical call (same tool; for `bash`,
+the same command) while the daemon keeps the thread loaded, `n` denies.
+Anyone else sees `[waiting for an approver: bash rm -rf x]` and cannot
+answer. The answer is a `Decide` request; the first one wins, and a prompt
+answered on another connection first is withdrawn with `[decided by
+magnus]` before the decision prints as `[allowed by magnus]`, `[allowed
+for this session by magnus]` or `[denied by magnus]`. Every decision is
+a `permission_decided` event with the decider's user id; a session grant
+is still an event each time it is used. Rule decisions are recorded on
+the tool result. An `ask_human` question works the same way through
+`AwaitingHuman`: a `write` user gets `[question] ...` and the next plain
+line answers it, a `read` user sees `[waiting for an answer: ...]`, and a
+question answered elsewhere prints `[answered elsewhere]` (the answer is
+a tool result, which names nobody). A thread opened while it waits shows
+the prompt at once. There is no timeout: a request waits until someone
+decides or interrupts, and an interrupt denies it with the interrupter's
+name and the reason `interrupted`. With stdin not a terminal the prompt
+still waits for a line; nothing is denied by default.
 
 Skills resolve from `./skills`, then `~/.config/aigentic/skills`, then
 the bundled `skills/` in `bundled_dir`; each root has its own

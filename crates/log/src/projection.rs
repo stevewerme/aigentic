@@ -173,7 +173,7 @@ pub fn project(events: &[Event]) -> Result<Projection, LogError> {
         match event.kind {
             EventKind::UserMessage => {
                 let p: UserMessagePayload = payload(event)?;
-                if p.mid_turn && !last_turn_end.is_some_and(|end| event.seq < end) {
+                if p.mid_turn && last_turn_end.is_none_or(|end| event.seq >= end) {
                     continue;
                 }
                 push(
