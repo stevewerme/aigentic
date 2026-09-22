@@ -196,8 +196,9 @@ is still an event each time it is used. Rule decisions are recorded on
 the tool result. An `ask_human` question works the same way through
 `AwaitingHuman`: a `write` user gets `[question] ...` and the next plain
 line answers it, a `read` user sees `[waiting for an answer: ...]`, and a
-question answered elsewhere prints `[answered elsewhere]` (the answer is
-a tool result, which names nobody). A thread opened while it waits shows
+question answered elsewhere prints `[answered by magnus]`: the answer is
+the call's `tool_result` event, authored by the person who gave it, as a
+`permission_decided` is. A thread opened while it waits shows
 the prompt at once. There is no timeout: a request waits until someone
 decides or interrupts, and an interrupt denies it with the interrupter's
 name and the reason `interrupted`. With stdin not a terminal the prompt
@@ -805,9 +806,11 @@ decided first while the `read` user saw only `[waiting for an
 approver: bash {"command":"printf ok"}]` and the decision. Three
 findings from writing those tests are in the items above: `echo` is on
 the default allow list; a `[participants]` table must list the owner;
-and `ask_human`'s answering author is not in the log (the tool result
-is authored `system`), so a question answered elsewhere prints
-`[answered elsewhere]` with no name until the runtime records it. A
+and `ask_human`'s answering author was not in the log (the tool result
+was authored `system`), so a question answered elsewhere printed
+`[answered elsewhere]` with no name; fixed after step 11, the answered
+call's `tool_result` is the answerer's event and the client prints
+`[answered by magnus]`. A
 fourth, from writing item 26: `--profile` was a no-op on the REPL path
 between steps 9 and 11, fixed the same day (the flag reaches
 `Server::embed`; a test holds it).

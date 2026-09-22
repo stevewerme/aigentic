@@ -263,13 +263,15 @@ impl Runtime {
             for call in calls.by_ref() {
                 self.drain_inbox(inbox, observe)?;
                 observe(Signal::ToolCallStarted(&call));
-                let (result, record) = self.execute(&call, cancel, inbox, observe).await?;
+                let (result, record, by) = self.execute(&call, cancel, inbox, observe).await?;
                 answered |= call.name == ASK_HUMAN && !result.is_error;
                 let payload = serde_json::to_value(ToolResultPayload::new(result, record))
                     .expect("serialisable");
+                // An answered `ask_human` is the human's event, like a
+                // decision; every other result is the system's.
                 self.append(
                     EventKind::ToolResult,
-                    Author::System,
+                    by,
                     payload,
                     Some(assistant.id),
                     observe,
@@ -383,14 +385,16 @@ impl Runtime {
 
     /// The one call site for tool execution, behind `policy_check`. An
     /// unknown tool is refused with a rule record; a harness tool is
-    /// answered here; anything else runs from the registry.
+    /// answered here; anything else runs from the registry. The author
+    /// is the result event's: the human who answered an `ask_human`,
+    /// else the system.
     async fn execute(
         &mut self,
         call: &ToolCall,
         cancel: &CancelToken,
         inbox: &mut Inbox,
         observe: &mut (dyn FnMut(Signal<'_>) + Send),
-    ) -> Result<(ToolResult, PolicyRecord), RuntimeError> {
+    ) -> Result<(ToolResult, PolicyRecord, Author), RuntimeError> {
         // A tool the layers hide is unknown to this thread: the same
         // refusal as a name that was never registered.
         let class = if !self.tool_visible(&call.name) {
@@ -408,16 +412,20 @@ impl Runtime {
                     is_error: true,
                 },
                 PolicyRecord::rule("unknown tool", "deny"),
+                Author::System,
             ));
         };
         match self.policy_check(call, class, cancel, observe).await? {
             Verdict::Run(record) => {
-                let result = if is_harness_tool(&call.name) {
+                let (result, by) = if is_harness_tool(&call.name) {
                     self.run_harness_tool(call, cancel, observe).await?
                 } else {
-                    self.run_tool_draining(call, inbox, observe).await?
+                    (
+                        self.run_tool_draining(call, inbox, observe).await?,
+                        Author::System,
+                    )
                 };
-                Ok((result, record))
+                Ok((result, record, by))
             }
             Verdict::Refuse(record) => Ok((
                 ToolResult {
@@ -426,6 +434,7 @@ impl Runtime {
                     is_error: true,
                 },
                 record,
+                Author::System,
             )),
             Verdict::RefuseWith { record, text } => Ok((
                 ToolResult {
@@ -434,6 +443,7 @@ impl Runtime {
                     is_error: true,
                 },
                 record,
+                Author::System,
             )),
         }
     }

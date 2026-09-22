@@ -676,13 +676,15 @@ New in this phase:
 
 From steps 10 and 11, before the acceptance run:
 
-- `ask_human`'s answering author is dropped: the harness tool keeps
-  only the text of `Answered::Human`, and the tool result is authored
-  `System`, so the log does not say who answered and a client can
-  print only `[answered elsewhere]`. Section 4's attribution rule
-  should cover it: put the answering author on the tool result's
-  event, or record it in the result's policy record. A runtime change,
-  small; take it when the two-person days show it matters.
+- `ask_human`'s answering author was dropped: the harness tool kept
+  only the text of `Answered::Human`, and the tool result was authored
+  `System`, so the log did not say who answered and a client could
+  print only `[answered elsewhere]`. Fixed after step 11 under section
+  4's attribution rule: an answered `ask_human`'s `tool_result` event
+  is authored by the person who answered (the phase 3 `Approver`'s
+  author in the single-process case), every other tool result stays
+  the system's, and the client prints `[answered by magnus]`. No wire
+  or payload change; old logs read as before.
 - `--profile` was accepted and ignored on the REPL path from step 9:
   `Server::embed` built the thread from the project's `[model] profile`
   and the flag reached only `project show`. Fixed after step 11: the

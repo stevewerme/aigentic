@@ -467,9 +467,9 @@ impl ClientRepl {
                 }
             }
             ThreadState::Running { .. } | ThreadState::Idle => {
-                // A question's answer is a tool result with no author on
-                // the wire, so its withdrawal names nobody; a decision's
-                // event named its author before this state arrived.
+                // A decision's or an answer's event named its author
+                // before this state arrived and closed the prompt; this
+                // is the fallback for a wait that ended some other way.
                 if self.prompted.take().is_some() {
                     out.line("[answered elsewhere]");
                 }
@@ -508,6 +508,15 @@ impl ClientRepl {
                 if let Ok(ToolResultPayload { result: r, .. }) =
                     serde_json::from_value(event.payload.clone())
                 {
+                    // Our question, answered on another connection: the
+                    // result is that person's event.
+                    if self.prompted.as_deref() == Some(r.id.as_str()) {
+                        self.prompted = None;
+                        let who = author_name(&event.author);
+                        if who != self.user {
+                            out.line(&format!("[answered by {who}]"));
+                        }
+                    }
                     let marker = if r.is_error { "✗" } else { "✓" };
                     for line in truncate_for_display(&r.content, lines, bytes).lines() {
                         out.line(&format!("  {marker} {line}"));
@@ -1129,6 +1138,116 @@ mod tests {
         until_state(&mut notices, |s| *s == ThreadState::Idle).await;
         assert_eq!(*factory.1.lock().unwrap(), vec!["b".to_owned()]);
         drop(embedded);
+    }
+
+    /// A question answered on another connection: steve is prompted,
+    /// magnus answers, and steve's prompt is withdrawn with
+    /// `[answered by magnus]`, since the answer is magnus's event.
+    #[tokio::test]
+    async fn a_question_answered_elsewhere_is_withdrawn_with_the_answerers_name() {
+        use aigentic_server::Listener;
+        use aigentic_server::config::{ProjectConfig, UserConfig};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = project(
+            dir.path(),
+            "p",
+            "[participants]\nsteve = \"admin\"\nmagnus = \"write\"\n",
+        );
+        let cfg_dir = dir.path().join("cfg");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        let script = vec![
+            vec![
+                call(
+                    "q1",
+                    "ask_human",
+                    serde_json::json!({"question": "which colour?"}),
+                ),
+                tool_use(),
+            ],
+            vec![text("blue it is"), done()],
+        ];
+        let server_config = aigentic_server::ServerConfig {
+            listen: "unix".into(),
+            idle_unload_secs: 600,
+            users: ["steve", "magnus"]
+                .iter()
+                .map(|n| UserConfig {
+                    name: (*n).to_owned(),
+                    token_env: None,
+                    token: Some(format!("tok-{n}")),
+                })
+                .collect(),
+            projects: vec![ProjectConfig {
+                name: "p".into(),
+                root,
+            }],
+        };
+        let server = Arc::new(Server::new(
+            config(dir.path()),
+            cfg_dir.clone(),
+            server_config,
+            Factory::scripted(script),
+            Arc::new(DefaultReports {
+                global_instructions: cfg_dir.join("instructions.md"),
+            }),
+        ));
+        let socket = dir.path().join("d.sock");
+        let task = tokio::spawn(server.clone().serve(Listener::Unix(socket.clone())));
+        for _ in 0..200 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let addr = Addr::Unix(socket);
+        let (steve, welcome) = Client::connect(&addr, "tok-steve").await.unwrap();
+        let role = welcome.projects[0].role.clone();
+        let (thread, state, mode) = open(&steve, "p", None).await;
+        let notices = steve.take_notices().unwrap();
+        let mut repl = ClientRepl::new(steve, thread, "steve", role, state, mode);
+        let (magnus, _) = Client::connect(&addr, "tok-magnus").await.unwrap();
+        open(&magnus, "p", Some(thread)).await;
+        let mut magnus_notices = magnus.take_notices().unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let driver = async move {
+            tx.send("pick one".into()).unwrap();
+            until_state(
+                &mut magnus_notices,
+                |s| matches!(s, ThreadState::AwaitingHuman { call_id, .. } if call_id == "q1"),
+            )
+            .await;
+            let r = magnus
+                .request(Request::AnswerHuman {
+                    thread,
+                    call_id: "q1".into(),
+                    text: "blue".into(),
+                })
+                .await
+                .unwrap();
+            assert_eq!(r, Response::Ok);
+            until_state(&mut magnus_notices, |s| *s == ThreadState::Idle).await;
+            tx.send("/quit".into()).unwrap();
+        };
+        let mut out = Lines::default();
+        let ((), ()) = tokio::join!(repl.run(rx, notices, &mut out), driver);
+        let lines = out.0;
+        let at = |needle: &str| {
+            lines
+                .iter()
+                .position(|l| l == needle)
+                .unwrap_or_else(|| panic!("no line {needle:?} in {lines:#?}"))
+        };
+        let question = at("[question] which colour?");
+        let answered = at("[answered by magnus]");
+        assert!(question < answered, "{lines:#?}");
+        assert!(lines.contains(&"  ✓ blue".to_owned()), "{lines:#?}");
+        assert!(lines.contains(&"blue it is".to_owned()), "{lines:#?}");
+        assert!(
+            !lines.iter().any(|l| l == "[answered elsewhere]"),
+            "{lines:#?}"
+        );
+        task.abort();
     }
 
     /// Step 10 for two people: steve (admin) is prompted and magnus
