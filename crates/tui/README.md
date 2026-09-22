@@ -575,16 +575,46 @@ Days of use, for done-when 1:
   profile, key, project, GitHub through `gh`, and the scaffolding
   `[pocock]` renders should be one guided command, in the spirit of
   upstream's setup skill, and the `gh` integration should be able to
-  set up issues and labels.
+  set up issues and labels. Those became step 10: `doctor`, the
+  `[display]` cap with `/verbose`, the modes, `init`, and `/profile`,
+  `/policy`, `/memory`, all landed the same day.
+- 2026-09-22, here on TensorX, thread `01M33SJ982MED4WCDE6063DTDD`:
+  "according to our planning, what's next in the pipeline?" read the
+  plan and the git log and answered with the step 9 table and the three
+  next acts, one turn, no edits.
+- 2026-09-22, here on TensorX, thread `01M33XR1N5EYAYJJS0VW6C40BH`:
+  "What's next?" then "Yes" had the harness implement step 10 b itself:
+  it read the config, the REPL and the README, edited all five files
+  including the plan's status line, ran `cargo fmt`, clippy and the
+  tests to green, reviewed its own diff, checked the commit-message
+  convention from `git log`, and wrote the message to a file after a
+  heredoc failed. The turn ended `max_tokens` before `git commit`, with
+  `[turn ended: max_tokens; wrote ...]` naming the six files (step 9's
+  `touched`). Committed by hand as `88bff66` with its message unchanged.
+  Every edit went through a `y` prompt until `a` for the session; that
+  is the noise the modes address.
 
-Done-when 1 to 5 hold on both backends as of 2026-09-21 (items 16 to
-20 above, each on TensorX `z-ai/glm-5.3` and Anthropic `claude-opus-5`),
-with one harness fix along the way (`c437679`, memory re-read at turn
-start) and one checklist correction (item 17's allow list). What
-remains of done-when 1 is the week of daily use in both projects. Open
-items the run produced: length normalisation in the knowledge scorer;
-a memory heading that says the harness writes the files, plus a default
-policy rule refusing writes under `.aigentic/memory/`; knowledge as
-pointers or symlinks so copies do not drift; the banner counting only
-non-empty memory files; `project show` saying that a hidden write tool
-is not a write ban while `bash` is allowed.
+Phase 4 closed on 2026-09-22. Done-when 2 to 5 hold on both backends
+as of 2026-09-21 (items 16 to 20 above, each on TensorX `z-ai/glm-5.3`
+and Anthropic `claude-opus-5`), with one harness fix along the way
+(`c437679`, memory re-read at turn start) and one checklist correction
+(item 17's allow list). Done-when 1, as amended to two days of real
+use: the thread logs under `~/.local/share/aigentic/threads/` hold 5
+threads for this project and 16 for Vendela. Day one (2026-09-21) had
+real tasks in both projects on both backends, apart from this
+repository on Anthropic, where the only thread is item 16's scripted
+baseline: here on TensorX the skills review and `rejected` state
+(`01M32SZ1SVD0MDGYS77H0558TP`); in Vendela on TensorX and on Anthropic
+the code reviews along both axes (`01M32MXNY0SP78PKV482HTEF41`,
+`01M32PY61X42J4P34QFCVEDH9K`) besides the scripted items. Day two
+(2026-09-22) was this repository on TensorX only, the two threads above.
+So the two days are recorded with one gap: no real task here on
+Anthropic, and no second day in Vendela. Both are the first days of
+phase 5 rather than a reason to hold the phase, since every harness
+change the days produced has landed and the remaining question is
+model behaviour, not harness behaviour. Open items the run produced
+landed as step 9 (length normalisation, the memory heading and rule,
+symlinked knowledge, the banner's count, the narrowing note) and step
+10; the two that did not (the flat-layout fallback's missing project,
+`read_file` preferred over `search_knowledge` for files in the
+repository) are phase 5 open items in `docs/PLAN-phase4.md` section 12.

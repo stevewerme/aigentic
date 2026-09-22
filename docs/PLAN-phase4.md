@@ -1,6 +1,6 @@
 # Phase 4 plan
 
-Status: steps 1 to 7 landed and done-when 1 to 5 passed on both backends on 2026-09-21; step 9 landed except its docs close (commit 7); step 10 a to e landed on 2026-09-22; the docs close is next · Follows `docs/PRD.md` (the Projects phase) and the phase 0 to 3 plans
+Status: closed on 2026-09-22. Steps 1 to 10 landed; done-when 2 to 5 passed on both backends on 2026-09-21 and done-when 1 on the two days recorded in the tui README, with one gap named there (no Anthropic task in this repository beyond the scripted baseline, and no second day in Vendela) · Follows `docs/PRD.md` (the Projects phase) and the phase 0 to 3 plans
 
 ## 0. Goal and done-when
 
@@ -480,11 +480,11 @@ scripted provider.
      prints `[turn ended: max_tokens; wrote a.rs, b.rs]` on a budget
      reason. Test: the payload lists the two paths a scripted turn
      wrote, and a turn without writes has an empty list.
-   - `docs: phase 4 acceptance closed` — written after step 10, with the
-     two remaining notes (the flat-layout fallback cannot tell which
-     project a pre-phase-4 thread belonged to; models prefer `read_file`
-     on a known path over `search_knowledge` when the file is in the
-     repository) kept as open items for phase 5.
+   - `docs: phase 4 acceptance closed` — written after step 10 on
+     2026-09-22, with the two remaining notes (the flat-layout fallback
+     cannot tell which project a pre-phase-4 thread belonged to; models
+     prefer `read_file` on a known path over `search_knowledge` when the
+     file is in the repository) kept as open items for phase 5, below.
 
 10. Use follow-ups, from the first days of real use (2026-09-22, tui
     README "Days of use"): tool output floods the terminal, the prompts
@@ -575,10 +575,12 @@ scripted provider.
        a fixture runtime, and `set_provider` flipping the knowledge
        mode between a 1000- and a 100-token window.
 
-    The commits are `tui: aigentic doctor`, `tui: tool output cap and
-    /verbose`, `runtime, tui: modes`, `tui: aigentic init`, `tui:
-    /profile, /policy, /memory`, then step 9's `docs: phase 4
-    acceptance closed`. Folded tool output, routines and plan mode as
+    The commits are `tui: aigentic doctor` (224be81), `tui: tool output
+    cap and /verbose` (88bff66, implemented by the harness itself in
+    thread `01M33XR1N5EYAYJJS0VW6C40BH` and finished by hand after a
+    budget stop), `runtime, tui: modes` (6c69999), `tui: aigentic init`
+    (265bb84), `tui: /profile, /policy, /memory` (0cb5827), then step
+    9's `docs: phase 4 acceptance closed`, all on 2026-09-22. Folded tool output, routines and plan mode as
     thread-level narrowing stay in phase 5 and 6, where sections 0 and
     12 already put them.
 
@@ -657,3 +659,19 @@ and `cargo test` before its commit.
   step 9's turn split the answer at least starts a fresh turn; whether
   the client should offer "answer and pause" is a phase 5 question with
   the turn queue.
+- From the close (2026-09-22), for phase 5: the flat-layout fallback
+  cannot tell which project a pre-phase-4 thread belonged to, so
+  `aigentic threads` never lists one and `--thread` finds it only by
+  id; the daemon's thread table should record the project. Models
+  prefer `read_file` on a known path over `search_knowledge` when the
+  knowledge file also sits in the repository, so a retrieval miss is
+  invisible unless the file is knowledge-only; count `search_knowledge`
+  calls per thread before deciding on embeddings. Two real turns in a
+  row ended on `max_tokens` after reading whole files up front
+  (`01M32SZ1SVD0MDGYS77H0558TP`, `01M33XR1N5EYAYJJS0VW6C40BH`); the
+  2M default is generous, so the fix is in what the model reads, not
+  the budget: a project instruction to read ranges, or a `read_file`
+  that returns a head and an outline past a size. Done-when 1's second
+  day covered this repository on TensorX only; the first real task in
+  this repository on Anthropic, and Vendela's second day, are the first
+  days of phase 5.
