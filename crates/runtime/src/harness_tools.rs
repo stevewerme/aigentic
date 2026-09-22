@@ -84,13 +84,17 @@ pub const HARNESS_CLASS: RiskClass = RiskClass::Safe;
 
 impl Runtime {
     /// Answer a harness tool. Called only after `policy_check` said run.
+    /// The author is who the result's event belongs to: the human who
+    /// answered an `ask_human`, else the system, as for every other
+    /// tool result.
     pub(crate) async fn run_harness_tool(
         &mut self,
         call: &ToolCall,
         cancel: &crate::CancelToken,
         observe: &mut (dyn FnMut(Signal<'_>) + Send),
-    ) -> Result<ToolResult, RuntimeError> {
+    ) -> Result<(ToolResult, Author), RuntimeError> {
         let id = call.id.clone();
+        let mut by = Author::System;
         let ok = |content: String| ToolResult {
             id: id.clone(),
             content,
@@ -101,7 +105,7 @@ impl Runtime {
             content,
             is_error: true,
         };
-        Ok(match call.name.as_str() {
+        let result = match call.name.as_str() {
             PIN => match serde_json::from_value::<PinArgs>(call.args.clone()) {
                 Ok(args) => {
                     let payload = serde_json::to_value(PinnedPayload { text: args.text })
@@ -137,13 +141,19 @@ impl Runtime {
                                 ))
                             }
                             decided = rx => match decided {
-                                Ok(crate::Answered::Human { text, .. }) => ok(text),
+                                Ok(crate::Answered::Human { text, by: who }) => {
+                                    by = who;
+                                    ok(text)
+                                }
                                 _ => err("no human available; treat this as a no".into()),
                             },
                         }
                     }
                     None => match self.approver.ask_human(&args.question) {
-                        Some(answer) => ok(answer),
+                        Some(answer) => {
+                            by = self.approver.author();
+                            ok(answer)
+                        }
                         None => err("no human available; treat this as a no".into()),
                     },
                 },
@@ -172,7 +182,8 @@ impl Runtime {
                 Err(e) => err(format!("invalid arguments: {e}")),
             },
             other => err(format!("unknown harness tool: {other}")),
-        })
+        };
+        Ok((result, by))
     }
 
     /// Append `skill_loaded` for an enabled skill. The author is the agent

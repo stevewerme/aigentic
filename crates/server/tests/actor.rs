@@ -390,6 +390,61 @@ async fn an_interrupt_while_awaiting_approval_denies_with_the_interrupter() {
     ));
 }
 
+fn ask(id: &str) -> ProviderEvent {
+    ProviderEvent::ToolCall(ToolCall {
+        id: id.into(),
+        name: "ask_human".into(),
+        args: json!({"question": "which colour?"}),
+    })
+}
+
+#[tokio::test]
+async fn an_answer_to_ask_human_is_the_answerers_event() {
+    let rig = rig(
+        vec![
+            Some(vec![ask("q1"), tool_use()]),
+            Some(vec![text("blue it is"), done()]),
+        ],
+        false,
+    );
+    let (_, _, mut notices) = rig.subscribe(0).await;
+    rig.post(steve(), "pick one", false).await;
+    Rig::until_state(
+        &mut notices,
+        |s| matches!(s, ThreadState::AwaitingHuman { call_id, .. } if call_id == "q1"),
+    )
+    .await;
+    let r = rig
+        .send(|reply| Mail::Answer {
+            by: magnus(),
+            call_id: "q1".into(),
+            text: "blue".into(),
+            reply,
+        })
+        .await;
+    assert_eq!(r, Response::Ok);
+    Rig::until_state(&mut notices, |s| *s == ThreadState::Idle).await;
+    let events = rig.log();
+    let result = events
+        .iter()
+        .find(|e| e.kind == EventKind::ToolResult)
+        .unwrap();
+    assert_eq!(result.author, magnus(), "the answer is magnus's event");
+    assert_eq!(result.payload["content"], "blue");
+    // The continuation ran and its own results are the system's.
+    assert_eq!(
+        rig.kinds(),
+        vec![
+            EventKind::UserMessage,
+            EventKind::AssistantMessage,
+            EventKind::ToolResult,
+            EventKind::TurnEnded,
+            EventKind::AssistantMessage,
+            EventKind::TurnEnded,
+        ]
+    );
+}
+
 #[tokio::test]
 async fn a_decision_resumes_the_turn_and_a_late_subscriber_catches_up() {
     let rig = rig(
