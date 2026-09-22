@@ -1,6 +1,6 @@
 # Phase 5 plan
 
-Status: steps 1 to 9 landed on 2026-09-22; written the same day after the phase 4 close · Follows `docs/PRD.md` (the Server and multiplayer phase) and the phase 0 to 4 plans
+Status: steps 1 to 10 landed on 2026-09-22 (the last as `e9c1450`); step 11's checklist is in the tui README's phase 5 section and the by-hand run on the VM with a second person is pending; written the same day after the phase 4 close · Follows `docs/PRD.md` (the Server and multiplayer phase) and the phase 0 to 4 plans
 
 ## 0. Goal and done-when
 
@@ -673,3 +673,27 @@ New in this phase:
   the actor must not unload while `AwaitingApproval`; step 7 must test
   it.
 - The `ratatui` client and a web client: after this API has held.
+
+From steps 10 and 11, before the acceptance run:
+
+- `ask_human`'s answering author is dropped: the harness tool keeps
+  only the text of `Answered::Human`, and the tool result is authored
+  `System`, so the log does not say who answered and a client can
+  print only `[answered elsewhere]`. Section 4's attribution rule
+  should cover it: put the answering author on the tool result's
+  event, or record it in the result's policy record. A runtime change,
+  small; take it when the two-person days show it matters.
+- `--profile` is accepted and ignored on the REPL path: `Server::embed`
+  builds the thread from the project's `[model] profile` and the flag
+  reaches only `project show`. Either drop the flag from the REPL or
+  thread it through `embed` as `build_thread`'s override; the README's
+  item 26 says how to swap backends meanwhile.
+- `aigentic threads` and `project show` read local files, not the API,
+  so section 8's "over the API when a server is given" is not yet
+  true; `ListThreads` and `Report { Project }` exist on the wire, so it
+  is a client change.
+- `echo` is on the default bash allow list (phase 3 section 4), so an
+  acceptance item that wants a prompt must pick something off it.
+- A `[participants]` table that names anyone gives the owner no role
+  unless listed, by section 6's rule; the VM's project files must list
+  the owner. Worth a `doctor` line.
