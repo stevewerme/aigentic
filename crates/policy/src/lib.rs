@@ -1,7 +1,10 @@
 //! Policy: what a tool call may do before it runs. Every call passes
 //! [`Policy::decide`]; the outcome names the rule so the tool result can
-//! record it, or says a human must be asked. Depends on `core` only.
+//! record it, or says a human must be asked. `roles` (phase 5) says who
+//! may send which request. Depends on `core` and, for the request
+//! enum, `api`.
 
+mod roles;
 mod rules;
 
 use std::path::{Component, Path, PathBuf};
@@ -9,6 +12,7 @@ use std::path::{Component, Path, PathBuf};
 use aigentic_core::{RiskClass, ToolCall};
 use serde::{Deserialize, Serialize};
 
+pub use roles::{Participants, Role, needs};
 pub use rules::{Decision, MEMORY_PREFIX, MEMORY_REASON, Rule, default_bash_allow, default_rules};
 
 /// Shell operators that make a command compound. A compound command never

@@ -1,6 +1,6 @@
 # Phase 5 plan
 
-Status: steps 1 and 2 landed on 2026-09-22; written the same day after the phase 4 close · Follows `docs/PRD.md` (the Server and multiplayer phase) and the phase 0 to 4 plans
+Status: steps 1 to 3 landed on 2026-09-22; written the same day after the phase 4 close · Follows `docs/PRD.md` (the Server and multiplayer phase) and the phase 0 to 4 plans
 
 ## 0. Goal and done-when
 
@@ -115,9 +115,10 @@ pub struct InterruptedPayload { pub reason: String,  // "process died" (phase 2)
 pub enum Role { Read, Write, Approve, Admin }         // each includes the ones before it
 pub struct Participants(BTreeMap<String, Role>);      // [participants] in aigentic.toml; empty means the owner only
 impl Participants {
-    pub fn role(&self, user: &str) -> Option<Role>;
-    pub fn allows(&self, user: &str, needs: Role) -> bool;
+    pub fn role(&self, user: &str, owner: &str) -> Option<Role>;    // empty table: the owner is admin, nobody else
+    pub fn allows(&self, user: &str, owner: &str, needs: Role) -> bool;
 }
+pub fn needs(request: &Request) -> Option<Role>;   // None for Hello and ListProjects; policy takes an edge to api for this
 
 // crates/api/src/lib.rs — one JSON object per line, both directions
 pub const PROTOCOL_VERSION: u32 = 1;

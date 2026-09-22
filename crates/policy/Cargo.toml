@@ -7,9 +7,11 @@ repository.workspace = true
 description = "Permission rules for Aigentic tool calls: allow, ask or deny by tool and risk class"
 
 [dependencies]
+aigentic-api.workspace = true
 aigentic-core.workspace = true
 serde.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
 toml.workspace = true
+ulid.workspace = true

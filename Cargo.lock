@@ -56,10 +56,12 @@ dependencies = [
 name = "aigentic-policy"
 version = "0.1.0"
 dependencies = [
+ "aigentic-api",
  "aigentic-core",
  "serde",
  "serde_json",
  "toml",
+ "ulid",
 ]
 
 [[package]]

@@ -65,6 +65,10 @@ pub struct ProjectFile {
     pub policy: PolicySection,
     #[serde(default)]
     pub mcp_servers: Vec<McpServerConfig>,
+    /// `[participants]`: user name to role (phase 5). Empty means the
+    /// daemon's owner alone, as `admin`.
+    #[serde(default)]
+    pub participants: aigentic_policy::Participants,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
@@ -271,6 +275,7 @@ impl ProjectFile {
             || self.knowledge != KnowledgeSection::default()
             || self.memory != MemorySection::default()
             || self.pocock.is_some()
+            || !self.participants.is_empty()
     }
 }
 
@@ -606,5 +611,35 @@ enabled = ["implement"]
         std::fs::write(mem.join("decisions.md"), "- Use Swedish.\n- Ship Friday.\n").unwrap();
         p.reload_memory().unwrap();
         assert!(p.memory_prefix().unwrap().contains("Ship Friday"));
+    }
+
+    #[test]
+    fn participants_parse_and_require_a_name() {
+        let f = ProjectFile::parse(
+            "[project]\nname = \"p\"\n[participants]\nsteve = \"admin\"\nmagnus = \"approve\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            f.participants.role("magnus", "steve"),
+            Some(aigentic_policy::Role::Approve)
+        );
+        assert!(f.has_phase4_sections());
+        assert!(ProjectFile::parse("[participants]\nx = \"owner\"\n").is_err());
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(FILE_NAME),
+            "[participants]\nsteve = \"admin\"\n",
+        )
+        .unwrap();
+        assert!(
+            Project::open_root(dir.path()).is_err(),
+            "a phase 5 section needs [project] name"
+        );
+        assert!(
+            ProjectFile::parse("[project]\nname = \"p\"\n")
+                .unwrap()
+                .participants
+                .is_empty()
+        );
     }
 }
