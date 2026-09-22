@@ -90,9 +90,12 @@ recalls the last message sent, as Alt-Up does at any time. Ctrl-D quits.
 `/keys` prints the table. Replies render light markdown (bold, inline code,
 fenced blocks, bullets); a tool call is a bullet line with the command or
 path, its output under it cut to the first three and last two lines with
-`… +N lines`, and consecutive reads fold into one `Explored` line. Ctrl-T
-opens the whole transcript at full length in a pager (`/` searches, `q`
-leaves). Without a terminal (a pipe, a script) the client reads stdin lines
+`… +N lines`, and consecutive reads fold into one `Explored` line. An edit
+is `• Edited path (+a −r)` with the first three diff lines, coloured; the
+whole diff is in the pager. Ctrl-T opens the whole transcript at full
+length in a pager (`/` searches, `q` leaves); `/diff` opens the project's
+working-tree diff there, untracked files included, run by the daemon in the
+project root. Without a terminal (a pipe, a script) the client reads stdin lines
 and prints lines, tool output cut the same way, which is what the acceptance
 items below and `exec` use.
 

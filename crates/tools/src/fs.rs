@@ -329,7 +329,8 @@ impl Tool for EditFileTool {
                 + 1;
             // The diff first, so a client can render the patch and the
             // model sees exactly what changed; the summary line last.
-            let diff = crate::diff::unified(&path, &text, &edited);
+            let shown = path.strip_prefix(self.workdir.current()).unwrap_or(&path);
+            let diff = crate::diff::unified(shown, &text, &edited);
             Ok(ToolOutput {
                 content: truncate_output(
                     &format!("{diff}edited {} at line {line}", path.display()),
@@ -474,16 +475,16 @@ mod tests {
             .call(json!({"path": "src/main.rs", "old_string": "    hello();\n", "new_string": "    hello();\n    bye();\n"}))
             .await
             .unwrap();
-        let shown = d.path().join("src/main.rs").display().to_string();
         assert!(
             out.content
-                .starts_with(&format!("--- a/{shown}\n+++ b/{shown}\n@@")),
+                .starts_with("--- a/src/main.rs\n+++ b/src/main.rs\n@@"),
             "{}",
             out.content
         );
         assert!(out.content.contains("+    bye();\n"), "{}", out.content);
+        let full = d.path().join("src/main.rs").display().to_string();
         assert!(
-            out.content.ends_with(&format!("edited {shown} at line 2")),
+            out.content.ends_with(&format!("edited {full} at line 2")),
             "{}",
             out.content
         );

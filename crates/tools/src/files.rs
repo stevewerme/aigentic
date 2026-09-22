@@ -122,7 +122,8 @@ impl Tool for WriteFileTool {
             tokio::fs::write(&path, args.content.as_bytes())
                 .await
                 .map_err(io)?;
-            let diff = crate::diff::unified(&path, &before, &args.content);
+            let shown = path.strip_prefix(self.workdir.current()).unwrap_or(&path);
+            let diff = crate::diff::unified(shown, &before, &args.content);
             Ok(ToolOutput {
                 content: truncate_output(
                     &format!(
@@ -157,16 +158,15 @@ mod tests {
             .call(json!({"path": "n.txt", "content": "one\n"}))
             .await
             .unwrap();
-        let shown = dir.path().join("n.txt").display().to_string();
+        let full = dir.path().join("n.txt").display().to_string();
         assert!(
-            out.content
-                .starts_with(&format!("--- a/{shown}\n+++ b/{shown}\n@@")),
+            out.content.starts_with("--- a/n.txt\n+++ b/n.txt\n@@"),
             "{}",
             out.content
         );
         assert!(out.content.contains("+one\n"), "{}", out.content);
         assert!(
-            out.content.ends_with(&format!("wrote 4 bytes to {shown}")),
+            out.content.ends_with(&format!("wrote 4 bytes to {full}")),
             "{}",
             out.content
         );
@@ -175,7 +175,7 @@ mod tests {
             .call(json!({"path": "n.txt", "content": "one\n"}))
             .await
             .unwrap();
-        assert_eq!(out.content, format!("wrote 4 bytes to {shown}"));
+        assert_eq!(out.content, format!("wrote 4 bytes to {full}"));
     }
 
     #[tokio::test]
