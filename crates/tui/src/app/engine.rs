@@ -419,6 +419,15 @@ impl ClientRepl {
                     out.line(l);
                 }
             }
+            Command::Rename(title) => {
+                let r = self
+                    .request(Request::Rename {
+                        thread: self.thread,
+                        title: title.to_owned(),
+                    })
+                    .await;
+                self.show(r, "", out);
+            }
             Command::Diff => {
                 let r = self
                     .request(Request::Report {
@@ -994,6 +1003,14 @@ impl ClientRepl {
                     out.line(&format!("[memory: {} lines written]", p.written.len()));
                 }
             }
+            EventKind::ThreadRenamed => {
+                if let Ok(p) = serde_json::from_value::<
+                    aigentic_runtime::aigentic_log::ThreadRenamedPayload,
+                >(event.payload.clone())
+                {
+                    out.line(&format!("[title: {}]", p.title));
+                }
+            }
             EventKind::Pinned | EventKind::PermissionRequested | EventKind::ThreadStarted => {}
         }
     }
@@ -1034,7 +1051,10 @@ pub fn render_thread_infos(threads: &[aigentic_api::ThreadInfo]) -> String {
     for t in threads {
         out.push_str(&format!(
             "{}  {}  {:>5}  {}\n",
-            t.id, t.date, t.events, t.first_line
+            t.id,
+            t.date,
+            t.events,
+            t.title.as_deref().unwrap_or(&t.first_line)
         ));
     }
     out.trim_end().to_owned()
@@ -1846,7 +1866,7 @@ mod tests {
     #[tokio::test]
     async fn p_allows_the_prefix_from_now_on_and_n_with_a_reason_tells_the_model() {
         let dir = tempfile::tempdir().unwrap();
-        let root = project(dir.path(), "proj", "");
+        let root = project(dir.path(), "proj", "[memory]\nenabled = false\n");
         let cfg_dir = dir.path().join("cfg");
         std::fs::create_dir_all(&cfg_dir).unwrap();
         let curl = || {

@@ -35,6 +35,10 @@ pub enum EventKind {
     /// which project it belongs to and the root its tools run in. Older
     /// logs have none and are grouped by their directory instead.
     ThreadStarted,
+    /// The thread's title (phase 6): proposed by the utility model after
+    /// the first turn (author `system`) or set with `/rename` (author the
+    /// person). The last one wins.
+    ThreadRenamed,
 }
 
 /// One line of a thread's append-only log. The log is the source of truth;

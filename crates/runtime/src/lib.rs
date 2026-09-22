@@ -32,6 +32,7 @@ mod resume;
 mod runtime;
 pub mod seams;
 mod support;
+pub mod title;
 mod turn;
 
 pub use approver::{Answer, Approver, DenyAll};

@@ -317,6 +317,10 @@ fn page(shell: &mut Shell, title: &str, lines: Vec<Line<'static>>) -> anyhow::Re
     })
 }
 
+/// A permission prompt ignores single-key answers this long after it
+/// appears, so a `y`, `a` or `n` typed into a sentence does not answer it.
+const PROMPT_GRACE: Duration = Duration::from_millis(500);
+
 /// A second press of Ctrl-C or Esc within this long completes it.
 const ARM_WINDOW: Duration = Duration::from_secs(1);
 
@@ -358,6 +362,9 @@ async fn run_shell(
     // Esc on a permission prompt: the composer takes the reason; the
     // draft it held comes back after.
     let mut reason_draft: Option<String> = None;
+    // When the current prompt block first showed: single-key answers wait
+    // PROMPT_GRACE so a key meant for the draft does not answer it.
+    let mut block_since: Option<Instant> = None;
 
     // A thread opened while it waits: the prompt is shown at once.
     let state = engine.state().clone();
@@ -386,6 +393,11 @@ async fn run_shell(
         {
             armed = None;
         }
+        block_since = match (engine.prompt_block(), block_since) {
+            (None, _) => None,
+            (Some(_), Some(t)) => Some(t),
+            (Some(_), None) => Some(Instant::now()),
+        };
         let mut block: Vec<Line<'static>> = if engine.tasks().is_empty() {
             Vec::new()
         } else {
@@ -499,8 +511,11 @@ async fn run_shell(
                                     _ => {}
                                 }
                             } else {
-                                let plain = key.modifiers.is_empty()
-                                    || key.modifiers == crossterm::event::KeyModifiers::SHIFT;
+                                let settled =
+                                    block_since.is_some_and(|t| t.elapsed() >= PROMPT_GRACE);
+                                let plain = settled
+                                    && (key.modifiers.is_empty()
+                                        || key.modifiers == crossterm::event::KeyModifiers::SHIFT);
                                 let handled = match key.code {
                                     K::Char('y') if plain => Some((true, false, None)),
                                     K::Char('a') if plain => Some((true, true, None)),

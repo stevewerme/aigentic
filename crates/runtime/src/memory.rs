@@ -105,10 +105,11 @@ impl Runtime {
         let request = CompletionRequest {
             messages: &messages,
             tools: &[],
-            max_output_tokens: Some(1024),
+            // Reasoning models spend part of this before the reply.
+            max_output_tokens: Some(2048),
         };
         let (mut text, mut usage) = (String::new(), Usage::default());
-        let mut stream = self.provider.complete(&request);
+        let mut stream = self.utility().complete(&request);
         while let Some(event) = stream.next().await {
             match event {
                 ProviderEvent::TextDelta(t) => text.push_str(&t),

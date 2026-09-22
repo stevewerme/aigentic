@@ -279,7 +279,8 @@ pub fn project(events: &[Event]) -> Result<Projection, LogError> {
             | EventKind::PermissionRequested
             | EventKind::PermissionDecided
             | EventKind::MemoryExtracted
-            | EventKind::ThreadStarted => {}
+            | EventKind::ThreadStarted
+            | EventKind::ThreadRenamed => {}
         }
     }
 

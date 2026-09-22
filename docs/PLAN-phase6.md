@@ -1,6 +1,6 @@
 # Phase 6 plan
 
-Status: grilled and settled on 2026-09-22 (18 questions, section 11 records the answers); steps 1 to 8c landed the same day · Follows `docs/PRD.md` (the Terminal application and Projects sections) and the phase 0 to 5 plans · Renumbers the PRD's build order: the client is phase 6, sandboxing phase 7, the orchestrator phase 8; multiplayer acceptance (phase 5 step 11) waits behind all three
+Status: grilled and settled on 2026-09-22 (18 questions, section 11 records the answers); steps 1 to 9 landed the same day · Follows `docs/PRD.md` (the Terminal application and Projects sections) and the phase 0 to 5 plans · Renumbers the PRD's build order: the client is phase 6, sandboxing phase 7, the orchestrator phase 8; multiplayer acceptance (phase 5 step 11) waits behind all three
 
 ## 0. Goal and done-when
 
@@ -619,9 +619,14 @@ Settled in the grilling of 2026-09-22 (Q1 to Q18) and in the draft.
     vendela thread" stops meaning anything; the utility model names it
     after the first turn and `/rename` overrides.
 13. **A utility model, open-weight.** (Q17, Q18) Side jobs (titles,
-    memory, briefs) run on `utility_profile`, `z-ai/glm-5.3-flash` for
-    the acceptance week: same family as the driver, so structured-
-    output habits match. Anthropic is the reference backend for
+    memory, briefs) run on `utility_profile`. The grilling chose
+    `z-ai/glm-5.3-flash` for being the driver's family; measured at step
+    9 on TensorX it took 6 to 48 s per title with 37 to 112 reasoning
+    tokens, and turning reasoning off had no effect, so the utility
+    profile is `deepseek/deepseek-v4.1-flash` (0.8 to 1.6 s, no
+    reasoning, good titles). Titles run only when a utility profile is
+    set; memory falls back to the thread's profile. Both side jobs are
+    capped at 60 s so a slow model cannot hold a thread's mailbox. Anthropic is the reference backend for
     comparison and never on the product path.
 14. **Ctrl-C interrupts; no revert.** Codex's Esc-Esc reverts the thread
     to before a turn. The log here is append-only by design, so
@@ -655,9 +660,13 @@ Settled in the grilling of 2026-09-22 (Q1 to Q18) and in the draft.
 - Memory across projects: whether facts should be tagged with the
   project they are about rather than the one the thread is in. Watch
   during step 14.
-- Brief quality on the utility model: if `glm-5.3-flash` writes poor
-  briefs, try `qwen/qwen3.8-flash-next`, then fall back to the thread's
-  profile for briefs only.
+- Brief and memory quality on the utility model: if DeepSeek V4.1
+  Flash writes poor briefs or memory lines, fall back to the thread's
+  profile for those only. The Qwen flash models are not candidates on
+  TensorX: 40 s and more per title, or no answer within 512 tokens.
+- Side jobs run in the actor after a turn, so a post made right then
+  waits for them (about a second on the utility model). If that shows,
+  move them off the actor.
 - Whether `exec --json`'s output is the raw `Push` or a simplified
   event schema like Codex's `ThreadItem`. Raw first; a stable schema
   when a second consumer exists.

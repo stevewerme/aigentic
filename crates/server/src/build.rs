@@ -156,6 +156,15 @@ pub async fn build_thread(
         )
         .with_skills(skills)
         .with_harness_instructions();
+    if let Some(utility) = &config.utility_profile
+        && *utility != profile_name
+    {
+        // A missing key for the utility profile is not fatal: the
+        // thread's own model does the side jobs instead.
+        if let Ok((provider, _)) = providers.build(utility) {
+            runtime = runtime.with_utility(provider);
+        }
+    }
     if let Some(p) = profile {
         runtime = runtime
             .with_compaction(p.compaction_settings())

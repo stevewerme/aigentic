@@ -31,6 +31,8 @@ pub enum Command<'a> {
     Keys,
     /// The project's working-tree diff, in the pager.
     Diff,
+    /// Set the thread's title.
+    Rename(&'a str),
     Unknown(&'a str),
     Chat(&'a str),
     Empty,
@@ -53,6 +55,7 @@ pub fn parse_line<'a>(line: &'a str, skills: &[String]) -> Command<'a> {
         ("help", _) => Command::Help,
         ("keys", _) => Command::Keys,
         ("diff", _) => Command::Diff,
+        ("rename", title) if !title.is_empty() => Command::Rename(title),
         ("skills", _) => Command::Skills,
         ("project", _) => Command::Project,
         ("threads", _) => Command::Threads,
@@ -104,6 +107,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ),
     ("threads", "this project's threads, newest first"),
     ("diff", "the project's working-tree diff, in the pager"),
+    ("rename", "set the thread's title: /rename <title>"),
     ("keys", "the key table: interrupt, recall, quit"),
     ("help", "the command list"),
     ("quit", "exit (Ctrl-D too)"),
@@ -124,6 +128,7 @@ pub const HELP: &str = "\
 /threads         this project's threads, newest first
 /<skill> [args]  run a user-invoked skill
 /diff            the project's working-tree diff, untracked files included
+/rename <title>  set the thread's title (one is proposed after the first turn)
 /keys            the key table: interrupt, recall, quit
 /help            this list
 /quit            exit (Ctrl-D too)

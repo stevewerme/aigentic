@@ -78,6 +78,9 @@ pub struct Runtime {
     /// builder asks, so the library's own context stays exactly what its
     /// caller put in.
     pub(crate) harness_instructions: Option<&'static str>,
+    /// The provider for side jobs (titles, memory extraction): the
+    /// config's `utility_profile` when set, else the thread's own.
+    pub(crate) utility: Option<Box<dyn Provider>>,
 }
 
 impl Runtime {
@@ -109,7 +112,71 @@ impl Runtime {
             model_label: "unknown".into(),
             measured: None,
             harness_instructions: None,
+            utility: None,
         }
+    }
+
+    /// A smaller model for side jobs (phase 6 step 9).
+    pub fn with_utility(mut self, provider: Box<dyn Provider>) -> Self {
+        self.utility = Some(provider);
+        self
+    }
+
+    /// The provider side jobs use.
+    pub fn utility(&self) -> &dyn Provider {
+        self.utility.as_deref().unwrap_or(self.provider.as_ref())
+    }
+
+    /// The title from the log's last `thread_renamed`, if any.
+    pub fn title(&self) -> Result<Option<String>, crate::RuntimeError> {
+        Ok(crate::title::title_of(&self.log.read_all()?))
+    }
+
+    /// Set the title: a `thread_renamed` event by `author`.
+    pub fn rename(
+        &mut self,
+        author: aigentic_core::Author,
+        title: &str,
+        observe: &mut (dyn FnMut(Signal<'_>) + Send),
+    ) -> Result<(), crate::RuntimeError> {
+        let title = crate::title::clean(title);
+        if title.is_empty() {
+            return Ok(());
+        }
+        let payload = serde_json::to_value(aigentic_log::ThreadRenamedPayload { title })
+            .expect("serialisable");
+        self.append(
+            aigentic_core::EventKind::ThreadRenamed,
+            author,
+            payload,
+            None,
+            observe,
+        )?;
+        Ok(())
+    }
+
+    /// After a finished first turn and while there is no title: ask the
+    /// utility model for one and record it by `system`. `Ok(None)` when
+    /// there is nothing to do, or no utility model is configured.
+    pub async fn title_if_untitled(
+        &mut self,
+        observe: &mut (dyn FnMut(Signal<'_>) + Send),
+    ) -> Result<Option<String>, crate::RuntimeError> {
+        // Only on a configured utility model: a title is not worth a
+        // call on the thread's large model.
+        let Some(utility) = self.utility.as_deref() else {
+            return Ok(None);
+        };
+        let events = self.log.read_all()?;
+        if crate::title::title_of(&events).is_some() || !crate::title::has_finished_turn(&events) {
+            return Ok(None);
+        }
+        let title = crate::title::propose_title(utility, &events).await?;
+        if title.is_empty() {
+            return Ok(None);
+        }
+        self.rename(aigentic_core::Author::System, &title, observe)?;
+        Ok(Some(title))
     }
 
     /// Put the harness's standing instructions in the prefix (how to use

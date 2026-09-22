@@ -86,6 +86,8 @@ struct ConfigFile {
     #[serde(default)]
     default_profile: Option<String>,
     #[serde(default)]
+    utility_profile: Option<String>,
+    #[serde(default)]
     profiles: BTreeMap<String, Profile>,
     #[serde(default)]
     user: Option<String>,
@@ -153,6 +155,9 @@ fn default_result_bytes() -> usize {
 pub struct Config {
     pub profiles: BTreeMap<String, Profile>,
     pub default_profile: String,
+    /// The profile for side jobs (titles, memory extraction), phase 6
+    /// step 9; unset, each thread's own profile does them.
+    pub utility_profile: Option<String>,
     /// Author id for your messages; defaults to `$USER`.
     pub user: Option<String>,
     /// Where thread logs live; defaults to `~/.local/share/aigentic/threads`.
@@ -265,9 +270,17 @@ impl Config {
             p.validate()
                 .map_err(|e| ConfigError::msg(format!("profile {name:?}: {e}")))?;
         }
+        if let Some(u) = &file.utility_profile
+            && !profiles.contains_key(u)
+        {
+            return Err(ConfigError::msg(format!(
+                "utility_profile {u:?} is not a defined profile"
+            )));
+        }
         Ok(Self {
             profiles,
             default_profile,
+            utility_profile: file.utility_profile,
             user: file.user,
             threads_dir: file.threads_dir,
             bundled_dir: file.bundled_dir,

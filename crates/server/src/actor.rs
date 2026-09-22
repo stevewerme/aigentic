@@ -65,6 +65,11 @@ pub enum Mail {
         text: String,
         reply: oneshot::Sender<Response>,
     },
+    Rename {
+        author: Author,
+        title: String,
+        reply: oneshot::Sender<Response>,
+    },
     Compact {
         reply: oneshot::Sender<Response>,
     },
@@ -104,6 +109,10 @@ impl Reports for NoReports {
         format!("no renderer for the {kind:?} report on this daemon")
     }
 }
+
+/// How long a side job (memory extraction, a title) may hold the actor
+/// after a turn before it is given up.
+const SIDE_JOB_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// What the actor and the turn's observer share: the subscribers, the
 /// mirror of the log, and the state.
@@ -403,6 +412,26 @@ impl ThreadActor {
                 );
                 None
             }
+            Mail::Rename {
+                author,
+                title,
+                reply,
+            } => {
+                let shared = self.shared.clone();
+                let sys = Author::System;
+                let _ = reply.send(
+                    match self
+                        .runtime
+                        .rename(author, &title, &mut |s| shared.observe(s, &sys))
+                    {
+                        Ok(()) => Response::Ok,
+                        Err(e) => Response::Error {
+                            message: e.to_string(),
+                        },
+                    },
+                );
+                None
+            }
             Mail::Interrupt { reply, .. } => {
                 let _ = reply.send(Response::Refused {
                     reason: "no turn is running".into(),
@@ -558,6 +587,37 @@ impl ThreadActor {
             .unwrap_or_else(|e| e.into_inner()) = None;
         self.shared.set_state(ThreadState::Idle);
         self.shared.push_usage();
+        self.side_jobs().await;
+    }
+
+    /// After the turns: memory extraction and a title for an untitled
+    /// thread, on the utility model (phase 6 step 9). Their events reach
+    /// subscribers like any other; a failure is a note, never an error
+    /// for the person, since the turn itself is done. Mail waits in the
+    /// mailbox meanwhile.
+    async fn side_jobs(&mut self) {
+        let shared = self.shared.clone();
+        let sys = Author::System;
+        let mut observe = move |s: Signal<'_>| shared.observe(s, &sys);
+        let note = |shared: &Shared, text: String| {
+            shared.broadcast(Notice::Note {
+                thread: shared.thread,
+                text,
+            })
+        };
+        match tokio::time::timeout(SIDE_JOB_LIMIT, self.runtime.extract_memory(&mut observe)).await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => note(&self.shared, format!("memory extraction failed: {e}")),
+            Err(_) => note(&self.shared, "memory extraction timed out".into()),
+        }
+        match tokio::time::timeout(SIDE_JOB_LIMIT, self.runtime.title_if_untitled(&mut observe))
+            .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => note(&self.shared, format!("titling failed: {e}")),
+            Err(_) => note(&self.shared, "titling timed out".into()),
+        }
     }
 
     /// Mail while a turn runs. Only what needs no runtime is handled
@@ -668,6 +728,7 @@ impl ThreadActor {
                 });
             }
             Mail::Pin { reply, .. }
+            | Mail::Rename { reply, .. }
             | Mail::Compact { reply }
             | Mail::SetMode { reply, .. }
             | Mail::Report { reply, .. } => {

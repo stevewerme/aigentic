@@ -109,12 +109,18 @@ async fn daemon(scripts: Vec<Vec<Option<Vec<ProviderEvent>>>>, idle_secs: u64) -
     std::fs::create_dir_all(&p).unwrap();
     std::fs::write(
         p.join("aigentic.toml"),
-        "[project]\nname = \"p\"\n[participants]\nmagnus = \"approve\"\nreviewer = \"read\"\n",
+        "[project]\nname = \"p\"\n[participants]\nmagnus = \"approve\"\nreviewer = \"read\"\n[memory]\nenabled = false\n",
     )
     .unwrap();
     let q = dir.path().join("q");
     std::fs::create_dir_all(&q).unwrap();
-    std::fs::write(q.join("aigentic.toml"), "[project]\nname = \"q\"\n").unwrap();
+    // Memory off: these tests script every model call, and extraction
+    // after a turn would be one more.
+    std::fs::write(
+        q.join("aigentic.toml"),
+        "[project]\nname = \"q\"\n[memory]\nenabled = false\n",
+    )
+    .unwrap();
     let cfg_dir = dir.path().join("cfg");
     std::fs::create_dir_all(&cfg_dir).unwrap();
     let threads_base = dir.path().join("threads");

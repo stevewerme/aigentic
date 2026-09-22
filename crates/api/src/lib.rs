@@ -127,6 +127,11 @@ pub enum Request {
         thread: Ulid,
         text: String,
     },
+    /// Set the thread's title (phase 6 step 9); refused while a turn runs.
+    Rename {
+        thread: Ulid,
+        title: String,
+    },
     Compact {
         thread: Ulid,
     },
@@ -292,6 +297,9 @@ pub struct ThreadInfo {
     pub events: u64,
     pub first_line: String,
     pub state: ThreadState,
+    /// The last `thread_renamed` title; absent before phase 6.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 /// A line that could not be read.
@@ -425,6 +433,7 @@ mod tests {
             events: 9,
             first_line: "What's next?".into(),
             state: ThreadState::Idle,
+            title: None,
         };
         vec![
             Response::Welcome(Welcome {

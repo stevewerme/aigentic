@@ -321,6 +321,7 @@ fn summarise(dir: &Path, id: Ulid, project: &str) -> ThreadInfo {
             events: 0,
             first_line: String::new(),
             state: ThreadState::Idle,
+            title: None,
         };
     };
     let date = events
@@ -352,6 +353,7 @@ fn summarise(dir: &Path, id: Ulid, project: &str) -> ThreadInfo {
         events: events.len() as u64,
         first_line,
         state: ThreadState::Idle,
+        title: aigentic_runtime::title::title_of(&events),
     }
 }
 

@@ -221,6 +221,7 @@ fn project_for(threads: &ThreadTable, request: &Request) -> Option<String> {
         | Request::Decide { thread, .. }
         | Request::AnswerHuman { thread, .. }
         | Request::Pin { thread, .. }
+        | Request::Rename { thread, .. }
         | Request::Compact { thread }
         | Request::SetMode { thread, .. }
         | Request::Report { thread, .. } => threads.project_of(*thread),
@@ -354,6 +355,15 @@ async fn handle(
             ask_actor(threads, open, thread, |reply| Mail::Pin {
                 author,
                 text,
+                reply,
+            })
+            .await
+        }
+        Request::Rename { thread, title } => {
+            let author = author.clone();
+            ask_actor(threads, open, thread, |reply| Mail::Rename {
+                author,
+                title,
                 reply,
             })
             .await

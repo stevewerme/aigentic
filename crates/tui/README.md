@@ -88,7 +88,10 @@ interrupts it (nothing is posted; `!text` interrupts and posts) and Enter
 queues the message for the next turn. Idle, Ctrl-C or Esc clears the draft;
 on an empty composer a second Ctrl-C within a second quits and a second Esc
 recalls the last message sent, as Alt-Up does at any time. Ctrl-D quits.
-`/keys` prints the table. While a turn runs, a line above the composer says
+`/keys` prints the table. After a thread's first finished turn the utility
+model proposes a title (`[title: …]`), which `/threads` lists; `/rename
+<title>` sets your own. After every turn the same model extracts memory for
+the project. While a turn runs, a line above the composer says
 what it is doing (the running tool, writing, or thinking), its clock, the
 tools called, the last prompt's size and cached share, and the output so
 far; when it ends, the same figures stay in the transcript as one dim line.
@@ -117,6 +120,12 @@ working-tree diff there, untracked files included, run by the daemon in the
 project root. Without a terminal (a pipe, a script) the client reads stdin lines
 and prints lines, tool output cut the same way, which is what the acceptance
 items below and `exec` use.
+
+`utility_profile = "<profile>"` at the top of `config.toml` names a profile
+for side jobs: thread titles and memory extraction. Without it there are no
+titles, and memory runs on each thread's own profile. Pick a fast model that
+does not reason at length: on TensorX `deepseek/deepseek-v4.1-flash` titled
+in about a second where `z-ai/glm-5.3-flash` took 6 to 48.
 
 The daemon reads `server.toml` beside `config.toml`: `listen` (`unix`, `unix:/path`
 or `tcp:host:port`; plain TCP with tokens, so put a reverse proxy or an SSH

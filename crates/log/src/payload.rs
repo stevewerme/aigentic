@@ -28,6 +28,12 @@ impl UserMessagePayload {
     }
 }
 
+/// `thread_renamed`: the thread's title.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThreadRenamedPayload {
+    pub title: String,
+}
+
 /// Payload of a `thread_started` event, the first event of a thread the
 /// daemon created: the project it belongs to (`None` outside any) and
 /// the root its tools run in.

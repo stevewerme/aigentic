@@ -116,6 +116,7 @@ pub fn needs(request: &Request) -> Option<Role> {
         | Request::InvokeSkill { .. }
         | Request::Interrupt { .. }
         | Request::AnswerHuman { .. }
+        | Request::Rename { .. }
         | Request::Pin { .. } => Some(Role::Write),
         Request::Decide { .. } | Request::SetMode { .. } | Request::Compact { .. } => {
             Some(Role::Approve)

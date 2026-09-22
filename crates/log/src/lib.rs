@@ -15,7 +15,8 @@ pub use payload::{
     AssistantMessagePayload, CompactedPayload, CompactionStrategy, DecisionScope,
     InterruptedPayload, Invoker, MemoryExtractedPayload, MemoryLine, PermissionDecidedPayload,
     PermissionRequestedPayload, PinnedPayload, PolicyRecord, SkillLoadedPayload,
-    ThreadStartedPayload, ToolResultPayload, TurnEndedPayload, Usage, UserMessagePayload,
+    ThreadRenamedPayload, ThreadStartedPayload, ToolResultPayload, TurnEndedPayload, Usage,
+    UserMessagePayload,
 };
 pub use projection::{
     Projection, project, project_body, skill_marker, summary_marker, truncate_middle,
