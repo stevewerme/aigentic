@@ -68,7 +68,7 @@ cargo run -p aigentic-tui -- project init                        # aigentic.toml
 cargo run -p aigentic-tui -- project setup                       # render docs/agents/*.md from [pocock]
 cargo run -p aigentic-tui -- project show                        # layers, knowledge mode, every tool's fate; over the API with --server
 cargo run -p aigentic-tui -- threads                             # this project's threads, newest first; over the API with --server
-cargo run -p aigentic-tui -- doctor [--probe]                    # config, keys, threads dir, project, skills, gh; exit 1 on a fail
+cargo run -p aigentic-tui -- doctor [--probe]                    # config, keys, threads dir, project, participants, skills, gh; exit 1 on a fail
 cargo run -p aigentic-tui -- init                                # guided setup: config, project, GitHub, knowledge links
 cargo run -p aigentic-tui -- serve [--listen unix:/path|tcp:host:port]   # the daemon (phase 5): server.toml's users and projects
 cargo run -p aigentic-tui -- serve --new-token magnus            # a fresh token for a user, printed once, never stored
@@ -103,7 +103,11 @@ kept.
 
 `doctor` prints one line per check (`ok`, `fail` or `skip`, then the
 message) and exits 1 when any fails. It names each profile's key variable
-and says whether it is set, never the value. `--probe` adds one
+and says whether it is set, never the value. Its `participants` line
+checks the project file against the daemon's owner (`server.toml`'s first
+user when that file is beside `config.toml`, else the config's `user`):
+an empty table is fine, and a table that names anyone but the owner
+fails, since the owner then has no role. `--probe` adds one
 completion per profile with a one-token cap and reports the model and
 latency; it is the only check that uses the network.
 
@@ -711,7 +715,9 @@ folded into the items so the run does not trip on them.
 5. In each project's `aigentic.toml`, `[participants]` names everyone
    with a role, the owner included: a table that names anyone gives
    the owner nothing unless listed (an absent table is the only case
-   where the owner is admin by default). For done-when 3 the roles
+   where the owner is admin by default); `aigentic doctor` in the
+   checkout on the VM fails its `participants` line when the owner is
+   missing. For done-when 3 the roles
    below assume `steve = "admin"`, `magnus = "approve"` and a third
    name with `"write"`, then `"read"`.
 6. Start the daemon (`aigentic serve`, or the unit) and check its
