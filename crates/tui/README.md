@@ -63,7 +63,14 @@ cargo run -p aigentic-tui -- project init                        # aigentic.toml
 cargo run -p aigentic-tui -- project setup                       # render docs/agents/*.md from [pocock]
 cargo run -p aigentic-tui -- project show                        # layers, knowledge mode, every tool's fate
 cargo run -p aigentic-tui -- threads                             # this project's threads, newest first
+cargo run -p aigentic-tui -- doctor [--probe]                    # config, keys, threads dir, project, skills, gh; exit 1 on a fail
 ```
+
+`doctor` prints one line per check (`ok`, `fail` or `skip`, then the
+message) and exits 1 when any fails. It names each profile's key variable
+and says whether it is set, never the value. `--probe` adds one
+completion per profile with a one-token cap and reports the model and
+latency; it is the only check that uses the network.
 
 The profile is `--profile`, else the project's `[model] profile`, else the
 config's `default_profile`. The banner names the project, the layers it

@@ -2,8 +2,10 @@
 //! subcommands. No full-screen mode; the terminal keeps its scrollback.
 
 mod approve;
+mod checks;
 mod config;
 mod cost;
+mod doctor;
 mod pocock;
 mod pocock_templates;
 mod project_cmd;
@@ -60,6 +62,13 @@ enum Command {
     },
     /// List this project's threads, newest first.
     Threads,
+    /// Check the config, keys, threads directory, project, skills and
+    /// GitHub setup; exit 1 on any failure.
+    Doctor {
+        /// Also send one tiny completion per profile (the only network use).
+        #[arg(long)]
+        probe: bool,
+    },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -69,8 +78,13 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     let config_path = cli.config.unwrap_or_else(config::default_config_path);
-    let config = Config::load(&config_path)?;
     let cwd = std::env::current_dir().context("current directory")?;
+    // The doctor reports what the loading below would refuse on.
+    if let Some(Command::Doctor { probe }) = cli.command {
+        let code = doctor::run(&config_path, &cwd, probe).await?;
+        std::process::exit(code);
+    }
+    let config = Config::load(&config_path)?;
     let config_dir = config_path
         .parent()
         .map(std::path::Path::to_path_buf)
@@ -155,7 +169,7 @@ async fn main() -> anyhow::Result<()> {
             }
             std::process::exit(0);
         }
-        None => {}
+        Some(Command::Doctor { .. }) | None => {}
     }
 
     let (profile_name, profile) = config.select(profile_arg)?;
