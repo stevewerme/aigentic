@@ -108,6 +108,41 @@ enum Command {
     },
 }
 
+/// Connect to `--server` as the token's user. The token comes from
+/// `--token-env`, never an argument, and is never printed.
+async fn connect_server(
+    server: &str,
+    token_env: &str,
+) -> anyhow::Result<(Client, aigentic_api::Welcome)> {
+    let addr: Addr = server
+        .parse()
+        .map_err(|e: String| anyhow::anyhow!("--server: {e}"))?;
+    let token = std::env::var(token_env).with_context(|| {
+        format!(
+            "{token_env} is not set (the token for {addr}; `aigentic serve --new-token` mints one)"
+        )
+    })?;
+    Ok(Client::connect(&addr, &token).await?)
+}
+
+/// `connect_server` plus the project a subcommand is about: `--project`,
+/// else this directory's `aigentic.toml` name, else the first project
+/// the user has a role in.
+async fn connect_remote(
+    server: &str,
+    token_env: &str,
+    project: Option<&str>,
+    opened: Option<&Project>,
+) -> anyhow::Result<(Client, String)> {
+    let (client, welcome) = connect_server(server, token_env).await?;
+    let project = project
+        .map(str::to_owned)
+        .or_else(|| opened.map(|p| p.name.clone()))
+        .or_else(|| welcome.projects.first().map(|p| p.name.clone()))
+        .context("no project: pass --project, or run in a checkout with aigentic.toml")?;
+    Ok((client, project))
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     // `.env` in the current directory, if present. Never printed.
@@ -210,9 +245,39 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Project {
             command: ProjectCommand::Setup,
         }) => std::process::exit(pocock::run(opened.as_ref())?),
+        Some(Command::Threads) if cli.server.is_some() => {
+            let (client, project) = connect_remote(
+                cli.server.as_deref().expect("checked"),
+                &cli.token_env,
+                cli.project.as_deref(),
+                opened.as_ref(),
+            )
+            .await?;
+            println!(
+                "{}",
+                client_repl::list_threads_over(&client, &project).await?
+            );
+            std::process::exit(0);
+        }
         Some(Command::Threads) => {
             let threads = project_cmd::list_threads(&threads_dir)?;
             println!("{}", project_cmd::render_threads(&threads, &threads_dir));
+            std::process::exit(0);
+        }
+        Some(Command::Project {
+            command: ProjectCommand::Show,
+        }) if cli.server.is_some() => {
+            let (client, project) = connect_remote(
+                cli.server.as_deref().expect("checked"),
+                &cli.token_env,
+                cli.project.as_deref(),
+                opened.as_ref(),
+            )
+            .await?;
+            println!(
+                "{}",
+                client_repl::project_report_over(&client, &project).await?
+            );
             std::process::exit(0);
         }
         Some(Command::Project {
@@ -265,22 +330,13 @@ async fn main() -> anyhow::Result<()> {
     let display = config.display;
     let history = config_path.with_file_name("history");
     let (client, welcome, embedded) = match &cli.server {
-        Some(addr) => {
+        Some(server) => {
             if cli.profile.is_some() {
                 bail!(
                     "--profile does not apply with --server: the daemon builds each thread from its project's [model] profile"
                 );
             }
-            let addr: Addr = addr
-                .parse()
-                .map_err(|e: String| anyhow::anyhow!("--server: {e}"))?;
-            let token = std::env::var(&cli.token_env).with_context(|| {
-                format!(
-                    "{} is not set (the token for {addr}; `aigentic serve --new-token` mints one)",
-                    cli.token_env
-                )
-            })?;
-            let (client, welcome) = Client::connect(&addr, &token).await?;
+            let (client, welcome) = connect_server(server, &cli.token_env).await?;
             (client, welcome, None)
         }
         None => {
