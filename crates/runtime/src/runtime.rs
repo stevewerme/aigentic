@@ -330,10 +330,18 @@ impl Runtime {
         crate::Prefix {
             global: self.layers.global.instructions.as_deref(),
             project: self.layers.project_instructions(),
+            participants: self.participants_line(),
             knowledge: self.knowledge.prefix(self.knowledge_mode),
             memory: self.layers.memory_prefix(),
             skills: self.skills_prefix(),
         }
+    }
+
+    /// `Participants in this project: magnus (approve), steve (admin)`,
+    /// or nothing when the project names nobody.
+    fn participants_line(&self) -> Option<String> {
+        let listed = self.layers.project.as_ref()?.file.participants.describe();
+        (!listed.is_empty()).then(|| format!("Participants in this project: {}", listed.join(", ")))
     }
 
     pub fn log(&self) -> &ThreadLog {

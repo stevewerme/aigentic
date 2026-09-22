@@ -119,7 +119,7 @@ impl Runtime {
         }
         drop(stream);
 
-        let kept = filter_stated(parse_reply(&text), &since);
+        let kept = filter_stated(parse_reply(&text), &since, &self.agent);
         let date = time::OffsetDateTime::now_utc()
             .format(&Rfc3339)
             .unwrap_or_default();
@@ -285,18 +285,25 @@ pub(crate) fn parse_reply(text: &str) -> Vec<Proposed> {
 }
 
 /// Keep only lines whose seq, within the events considered, is a
-/// `user_message` or a `skill_loaded` authored by a user. Everything else
-/// is inference and is dropped.
-pub(crate) fn filter_stated(proposed: Vec<Proposed>, events: &[&Event]) -> Vec<MemoryLine> {
+/// `user_message` or a `skill_loaded` authored by a user, or (phase 5)
+/// an `assistant_message` by an agent other than this thread's own,
+/// since that is a participant stating something. Everything else is
+/// inference and is dropped.
+pub(crate) fn filter_stated(
+    proposed: Vec<Proposed>,
+    events: &[&Event],
+    own: &aigentic_core::AgentId,
+) -> Vec<MemoryLine> {
     proposed
         .into_iter()
         .filter_map(|p| {
             let e = events.iter().find(|e| e.seq == p.at_seq)?;
-            let stated = matches!(
-                (&e.kind, &e.author),
+            let stated = match (&e.kind, &e.author) {
                 (EventKind::UserMessage, Author::User(_))
-                    | (EventKind::SkillLoaded, Author::User(_))
-            );
+                | (EventKind::SkillLoaded, Author::User(_)) => true,
+                (EventKind::AssistantMessage, Author::Agent(a)) => a != own,
+                _ => false,
+            };
             stated.then(|| MemoryLine {
                 file: p.file,
                 text: p.text,
@@ -472,21 +479,32 @@ mod tests {
                 Author::Agent(AgentId("worker".into())),
                 json!({"name": "tdd", "hash": "", "source": "", "body": "", "invoked_by": "model"}),
             ),
+            // Another agent posting into the thread is a participant.
+            event(
+                5,
+                EventKind::AssistantMessage,
+                Author::Agent(AgentId("orchestrator".into())),
+                json!({"blocks": []}),
+            ),
         ];
         let refs: Vec<&Event> = events.iter().collect();
-        let proposed = (0..6)
+        let proposed = (0..7)
             .map(|s| Proposed {
                 file: "facts.md".into(),
                 at_seq: s,
                 text: format!("line {s}"),
             })
             .collect();
-        let kept = filter_stated(proposed, &refs);
+        let kept = filter_stated(proposed, &refs, &AgentId("worker".into()));
         assert_eq!(
             kept.iter().map(|l| l.at_seq).collect::<Vec<_>>(),
-            vec![0, 3]
+            vec![0, 3, 5]
         );
         assert_eq!(kept[0].stated_by, steve());
+        assert_eq!(
+            kept[2].stated_by,
+            Author::Agent(AgentId("orchestrator".into()))
+        );
     }
 
     #[test]
