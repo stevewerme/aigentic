@@ -42,6 +42,10 @@ pub struct ThreadTable {
     providers: Arc<dyn ProviderFactory>,
     reports: Arc<dyn Reports>,
     threads_base: PathBuf,
+    /// A profile name that wins over every project's `[model] profile`:
+    /// the client's `--profile` on an embedded daemon. `None` on a
+    /// served daemon, where the profile is the project's.
+    profile_override: Option<String>,
     entries: Mutex<HashMap<Ulid, Entry>>,
 }
 
@@ -77,8 +81,16 @@ impl ThreadTable {
             providers,
             reports,
             threads_base,
+            profile_override: None,
             entries: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Build every thread from `profile` instead of its project's
+    /// `[model] profile`; the embedded daemon's `--profile`.
+    pub fn with_profile(mut self, profile: Option<String>) -> Self {
+        self.profile_override = profile;
+        self
     }
 
     fn root_of(&self, project: &str) -> Result<Root, ThreadError> {
@@ -217,7 +229,7 @@ impl ThreadTable {
             &*self.providers,
             &root,
             thread,
-            None,
+            self.profile_override.as_deref(),
         )
         .await?;
         let (actor, mailbox) = ThreadActor::new(built.runtime, built.torn, self.reports.clone())?;

@@ -784,10 +784,19 @@ mod tests {
         }
     }
 
-    struct Factory(Mutex<Option<Vec<Vec<ProviderEvent>>>>);
+    /// Builds one scripted provider and records the profile names it
+    /// was asked for.
+    struct Factory(Mutex<Option<Vec<Vec<ProviderEvent>>>>, Mutex<Vec<String>>);
+
+    impl Factory {
+        fn scripted(script: Vec<Vec<ProviderEvent>>) -> Arc<Self> {
+            Arc::new(Self(Mutex::new(Some(script)), Mutex::new(Vec::new())))
+        }
+    }
 
     impl ProviderFactory for Factory {
-        fn build(&self, _: &str) -> Result<(Box<dyn Provider>, String), BuildError> {
+        fn build(&self, profile: &str) -> Result<(Box<dyn Provider>, String), BuildError> {
+            self.1.lock().unwrap().push(profile.to_owned());
             let script = self.0.lock().unwrap().take().unwrap_or_default();
             Ok((
                 Box::new(Scripted(Mutex::new(script.into()))),
@@ -820,7 +829,7 @@ mod tests {
     /// A config with a scripted profile, threads and skills under `dir`.
     fn config(dir: &std::path::Path) -> Config {
         Config::parse(&format!(
-            "threads_dir = {:?}\nbundled_dir = {:?}\n[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n",
+            "default_profile = \"a\"\nthreads_dir = {:?}\nbundled_dir = {:?}\n[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n[profiles.b]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n",
             dir.join("threads").display(),
             dir.display()
         ))
@@ -903,7 +912,8 @@ mod tests {
             cfg_dir.clone(),
             root,
             "steve",
-            Arc::new(Factory(Mutex::new(Some(script)))),
+            None,
+            Factory::scripted(script),
             Arc::new(DefaultReports {
                 global_instructions: cfg_dir.join("instructions.md"),
             }),
@@ -1007,7 +1017,8 @@ mod tests {
             cfg_dir.clone(),
             root,
             "steve",
-            Arc::new(Factory(Mutex::new(Some(script)))),
+            None,
+            Factory::scripted(script),
             Arc::new(DefaultReports {
                 global_instructions: cfg_dir.join("instructions.md"),
             }),
@@ -1078,6 +1089,48 @@ mod tests {
         drop(embedded);
     }
 
+    /// `--profile` reaches the embedded daemon: every thread it builds
+    /// uses that profile over the project's `[model] profile`, so item 8
+    /// of the acceptance list can swap backends with the flag again.
+    #[tokio::test]
+    async fn the_profile_flag_wins_over_the_project_file_on_an_embedded_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = project(dir.path(), "proj", "[model]\nprofile = \"a\"\n");
+        let cfg_dir = dir.path().join("cfg");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        let factory = Factory::scripted(vec![vec![text("hi"), done()]]);
+        let embedded = Server::embed_with(
+            config(dir.path()),
+            cfg_dir.clone(),
+            root,
+            "steve",
+            Some("b"),
+            factory.clone(),
+            Arc::new(DefaultReports {
+                global_instructions: cfg_dir.join("instructions.md"),
+            }),
+        )
+        .await
+        .unwrap();
+        let (client, _) = Client::connect(&Addr::Unix(embedded.socket.clone()), &embedded.token)
+            .await
+            .unwrap();
+        let (thread, _, _) = open(&client, "proj", None).await;
+        let mut notices = client.take_notices().unwrap();
+        let r = client
+            .request(Request::Post {
+                thread,
+                blocks: vec![ContentBlock::Text("hello".into())],
+                interrupt: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(r, Response::Ok);
+        until_state(&mut notices, |s| *s == ThreadState::Idle).await;
+        assert_eq!(*factory.1.lock().unwrap(), vec!["b".to_owned()]);
+        drop(embedded);
+    }
+
     /// Step 10 for two people: steve (admin) is prompted and magnus
     /// (approve) decides first on another connection, so steve's prompt
     /// is withdrawn with `[decided by magnus]` and the decision prints
@@ -1123,7 +1176,7 @@ mod tests {
             config(dir.path()),
             cfg_dir.clone(),
             server_config,
-            Arc::new(Factory(Mutex::new(Some(script)))),
+            Factory::scripted(script),
             Arc::new(DefaultReports {
                 global_instructions: cfg_dir.join("instructions.md"),
             }),
