@@ -8,6 +8,7 @@
 pub mod cells;
 pub mod commands;
 pub mod composer;
+pub mod diff;
 pub mod engine;
 pub mod keymap;
 pub mod markdown;
@@ -96,6 +97,8 @@ struct ShellOut {
     tail: String,
     /// Inside a code fence in the assistant's text.
     fenced: bool,
+    /// A text to page through as soon as the loop gets to it.
+    page: Option<(String, String)>,
 }
 
 impl ShellOut {
@@ -108,6 +111,7 @@ impl ShellOut {
             running: None,
             tail: String::new(),
             fenced: false,
+            page: None,
         }
     }
 
@@ -157,6 +161,12 @@ impl Printer for ShellOut {
         self.commit(Cell::Note(text.to_owned()));
     }
 
+    fn pager(&mut self, title: &str, text: &str) {
+        // Drawn by the loop after this step.
+        self.flush_explored();
+        self.page = Some((title.to_owned(), text.to_owned()));
+    }
+
     fn tail(&mut self, text: &str) {
         self.tail = text.to_owned();
     }
@@ -204,6 +214,29 @@ impl Printer for ShellOut {
             }
         }
     }
+}
+
+/// The pager over `lines` in the alternate screen until it is closed.
+fn page(shell: &mut Shell, title: &str, lines: Vec<Line<'static>>) -> anyhow::Result<()> {
+    let mut pager = Pager::new(title, lines);
+    shell.alternate(|term| {
+        term.draw(|f| {
+            let area = f.area();
+            let rows = pager.view(area);
+            for (i, line) in rows.into_iter().enumerate() {
+                let y = area.y + i as u16;
+                if y >= area.bottom() {
+                    break;
+                }
+                f.render_widget(line, ratatui::layout::Rect::new(area.x, y, area.width, 1));
+            }
+        })?;
+        let height = term.size()?.height as usize;
+        match crossterm::event::read()? {
+            Event::Key(k) if k.kind != KeyEventKind::Release => Ok(pager.key(k.code, height)),
+            _ => Ok(false),
+        }
+    })
 }
 
 /// A second press of Ctrl-C or Esc within this long completes it.
@@ -272,6 +305,14 @@ async fn run_shell(
             hint: hint.as_deref(),
         };
         out.shell.draw(&pane)?;
+        if let Some((title, text)) = out.page.take() {
+            let lines = if title == "diff" {
+                diff::lines(&text)
+            } else {
+                text.lines().map(|l| Line::raw(l.to_owned())).collect()
+            };
+            page(&mut out.shell, &title, lines)?;
+        }
         if engine.quit_requested() {
             break;
         }
@@ -335,30 +376,9 @@ async fn run_shell(
                             }
                             Action::Quit => break,
                             Action::Transcript => {
-                                let mut pager = Pager::new(&out.transcript);
-                                out.shell.alternate(|term| {
-                                    term.draw(|f| {
-                                        let area = f.area();
-                                        let rows = pager.view(area);
-                                        for (i, line) in rows.into_iter().enumerate() {
-                                            let y = area.y + i as u16;
-                                            if y >= area.bottom() {
-                                                break;
-                                            }
-                                            f.render_widget(
-                                                line,
-                                                ratatui::layout::Rect::new(area.x, y, area.width, 1),
-                                            );
-                                        }
-                                    })?;
-                                    let height = term.size()?.height as usize;
-                                    match crossterm::event::read()? {
-                                        Event::Key(k) if k.kind != KeyEventKind::Release => {
-                                            Ok(pager.key(k.code, height))
-                                        }
-                                        _ => Ok(false),
-                                    }
-                                })?;
+                                let lines: Vec<Line<'static>> =
+                                    out.transcript.iter().flat_map(Cell::full).collect();
+                                page(&mut out.shell, "transcript", lines)?;
                             }
                             Action::None => {}
                         }

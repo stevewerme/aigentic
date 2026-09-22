@@ -32,6 +32,7 @@ impl Reports for DefaultReports {
             ReportKind::Memory => memory_report(runtime, events),
             ReportKind::Skills => skills_report(runtime),
             ReportKind::Who => who_report(runtime),
+            ReportKind::Diff => diff_report(runtime),
         }
     }
 }
@@ -551,5 +552,87 @@ mod cost_tests {
         );
         assert!(text.contains("reasoning             6"), "{text}");
         assert!(text.contains("total      in      1717"), "{text}");
+    }
+}
+
+/// `/diff`: `git diff` in the project root, then every untracked file as
+/// a diff against nothing, so a new file reads as additions. A root
+/// without a repository says so.
+pub fn diff_report(runtime: &Runtime) -> String {
+    let Some(project) = runtime.project() else {
+        return "no project: nothing to diff".into();
+    };
+    diff_in(&project.root)
+}
+
+pub fn diff_in(root: &std::path::Path) -> String {
+    use std::process::Command;
+    let git = |args: &[&str]| -> Option<String> {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    if git(&["rev-parse", "--is-inside-work-tree"]).is_none() {
+        return "no repository".into();
+    }
+    let mut text = git(&["diff"]).unwrap_or_default();
+    let untracked = git(&["ls-files", "--others", "--exclude-standard"]).unwrap_or_default();
+    for file in untracked.lines().filter(|l| !l.is_empty()) {
+        // `--no-index` exits 1 when the files differ, so the status is
+        // not the signal here.
+        if let Ok(out) = Command::new("git")
+            .args(["diff", "--no-index", "--", "/dev/null", file])
+            .current_dir(root)
+            .output()
+        {
+            text.push_str(&String::from_utf8_lossy(&out.stdout));
+        }
+    }
+    if text.trim().is_empty() {
+        "clean: nothing changed".into()
+    } else {
+        text
+    }
+}
+
+#[cfg(test)]
+mod diff_tests {
+    use super::diff_in;
+
+    fn git(root: &std::path::Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "git {args:?}");
+    }
+
+    #[test]
+    fn tracked_changes_and_untracked_files_both_show() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-q"]);
+        git(root, &["config", "user.email", "t@t"]);
+        git(root, &["config", "user.name", "t"]);
+        std::fs::write(root.join("a.txt"), "one\n").unwrap();
+        git(root, &["add", "a.txt"]);
+        git(root, &["commit", "-q", "-m", "a"]);
+        assert_eq!(diff_in(root), "clean: nothing changed");
+        std::fs::write(root.join("a.txt"), "two\n").unwrap();
+        std::fs::write(root.join("b.txt"), "new\n").unwrap();
+        let d = diff_in(root);
+        assert!(d.contains("-one\n+two\n"), "{d}");
+        assert!(d.contains("+new\n"), "{d}");
+        assert!(d.contains("b.txt"), "{d}");
+        let plain = tempfile::tempdir().unwrap();
+        assert_eq!(diff_in(plain.path()), "no repository");
     }
 }

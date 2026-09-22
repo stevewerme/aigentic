@@ -145,6 +145,9 @@ pub enum ReportKind {
     Skills,
     /// The project's participants and their roles.
     Who,
+    /// The project's working-tree diff, untracked files included, run
+    /// by the daemon in the project root (phase 6 step 6).
+    Diff,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

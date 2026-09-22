@@ -29,6 +29,8 @@ pub enum Command<'a> {
     Skill(&'a str, &'a str),
     /// The key table.
     Keys,
+    /// The project's working-tree diff, in the pager.
+    Diff,
     Unknown(&'a str),
     Chat(&'a str),
     Empty,
@@ -50,6 +52,7 @@ pub fn parse_line<'a>(line: &'a str, skills: &[String]) -> Command<'a> {
         ("quit" | "exit", _) => Command::Quit,
         ("help", _) => Command::Help,
         ("keys", _) => Command::Keys,
+        ("diff", _) => Command::Diff,
         ("skills", _) => Command::Skills,
         ("project", _) => Command::Project,
         ("threads", _) => Command::Threads,
@@ -82,6 +85,7 @@ pub const HELP: &str = "\
 /project         the layers, the knowledge mode and every tool's fate
 /threads         this project's threads, newest first
 /<skill> [args]  run a user-invoked skill
+/diff            the project's working-tree diff, untracked files included
 /keys            the key table: interrupt, recall, quit
 /help            this list
 /quit            exit (Ctrl-D too)

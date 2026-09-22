@@ -8,13 +8,15 @@ use aigentic_runtime::aigentic_core::ToolCall;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::app::markdown;
+use crate::app::{diff, markdown};
 
 /// Head and tail rows a tool result shows before `… +N lines`.
 pub const RESULT_HEAD: usize = 3;
 pub const RESULT_TAIL: usize = 2;
 /// How many characters of a call's arguments the bullet line shows.
 const ARGS_WIDTH: usize = 120;
+/// Diff lines an edit cell previews (hunk lines, headers skipped).
+pub const EDIT_PREVIEW: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolState {
@@ -40,6 +42,9 @@ pub enum Cell {
     },
     /// Folded reads: the tool name and what it looked at, in order.
     Explored(Vec<String>),
+    /// An edit_file or write_file result: the diff, previewed at a few
+    /// lines, whole in the pager.
+    Edit(diff::Edit),
     /// A `[bracketed]` notice, a report line, anything else.
     Note(String),
 }
@@ -146,6 +151,20 @@ impl Cell {
                 }
                 lines
             }
+            Cell::Edit(edit) => {
+                let mut lines = vec![edit_head(edit)];
+                let body: Vec<&str> = hunk_lines(&edit.diff);
+                for l in body.iter().take(EDIT_PREVIEW) {
+                    lines.push(diff::line(l));
+                }
+                if body.len() > EDIT_PREVIEW {
+                    lines.push(Line::from(Span::styled(
+                        format!("  … +{} lines (ctrl-t for all)", body.len() - EDIT_PREVIEW),
+                        Style::default().add_modifier(Modifier::DIM),
+                    )));
+                }
+                lines
+            }
             Cell::Note(text) => text
                 .lines()
                 .map(|l| {
@@ -174,9 +193,33 @@ impl Cell {
                 }
                 lines
             }
+            Cell::Edit(edit) => {
+                let mut lines = vec![edit_head(edit)];
+                lines.extend(diff::lines(&edit.diff));
+                lines
+            }
             other => other.styled(usize::MAX),
         }
     }
+}
+
+/// The diff's hunk lines: everything after the `+++` header.
+fn hunk_lines(diff: &str) -> Vec<&str> {
+    diff.lines()
+        .skip_while(|l| l.starts_with("--- ") || l.starts_with("+++ "))
+        .collect()
+}
+
+fn edit_head(edit: &diff::Edit) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("• ", Style::default().fg(Color::Green)),
+        Span::styled("Edited ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(edit.path.clone()),
+        Span::styled(
+            format!(" (+{} −{})", edit.added, edit.removed),
+            Style::default().add_modifier(Modifier::DIM),
+        ),
+    ])
 }
 
 fn tool_head(name: &str, summary: &str, state: &ToolState) -> Line<'static> {
@@ -256,6 +299,21 @@ mod tests {
             output: "a\nb".into(),
         };
         assert_eq!(short.plain(), vec!["• Failed bash x", "  └ a", "  └ b"]);
+    }
+
+    #[test]
+    fn an_edit_cell_previews_then_shows_all() {
+        let edit = diff::parse_edit_result(
+            "--- a/f.rs\n+++ b/f.rs\n@@ -1,4 +1,4 @@\n a\n-b\n+B\n c\n d\nedited f.rs at line 2",
+        )
+        .unwrap();
+        let cell = Cell::Edit(edit);
+        let plain = cell.plain();
+        assert_eq!(plain[0], "• Edited f.rs (+1 −1)");
+        assert_eq!(plain[1], "@@ -1,4 +1,4 @@");
+        assert_eq!(plain[3], "-b");
+        assert_eq!(plain[4], "  … +3 lines (ctrl-t for all)");
+        assert_eq!(cell.full().len(), 9);
     }
 
     #[test]

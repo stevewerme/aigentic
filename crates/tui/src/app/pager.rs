@@ -7,9 +7,8 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::app::cells::Cell;
-
 pub struct Pager {
+    title: String,
     lines: Vec<Line<'static>>,
     /// The first line shown.
     top: usize,
@@ -20,9 +19,9 @@ pub struct Pager {
 
 impl Pager {
     /// Open at the end, where the newest lines are.
-    pub fn new(cells: &[Cell]) -> Self {
-        let lines: Vec<Line<'static>> = cells.iter().flat_map(Cell::full).collect();
+    pub fn new(title: &str, lines: Vec<Line<'static>>) -> Self {
         Self {
+            title: title.to_owned(),
             top: lines.len(),
             lines,
             query: String::new(),
@@ -119,7 +118,8 @@ impl Pager {
             format!("/{}", self.query)
         } else {
             format!(
-                "transcript · line {} of {} · q leaves · / searches · g G top bottom",
+                "{} · line {} of {} · q leaves · / searches · g G top bottom",
+                self.title,
                 (self.top + 1).min(self.lines.len().max(1)),
                 self.lines.len()
             )
@@ -137,8 +137,8 @@ mod tests {
     use super::*;
     use crossterm::event::KeyCode;
 
-    fn notes(n: usize) -> Vec<Cell> {
-        (1..=n).map(|i| Cell::Note(format!("note {i}"))).collect()
+    fn notes(n: usize) -> Vec<Line<'static>> {
+        (1..=n).map(|i| Line::raw(format!("note {i}"))).collect()
     }
 
     fn top_text(p: &mut Pager, h: u16) -> String {
@@ -148,7 +148,7 @@ mod tests {
 
     #[test]
     fn opens_at_the_end_and_scrolls() {
-        let mut p = Pager::new(&notes(20));
+        let mut p = Pager::new("t", notes(20));
         assert_eq!(top_text(&mut p, 5), "note 17");
         p.key(KeyCode::Up, 5);
         assert_eq!(top_text(&mut p, 5), "note 16");
@@ -161,7 +161,7 @@ mod tests {
 
     #[test]
     fn search_finds_forward_and_wraps() {
-        let mut p = Pager::new(&notes(20));
+        let mut p = Pager::new("t", notes(20));
         p.key(KeyCode::Char('g'), 5);
         p.key(KeyCode::Char('/'), 5);
         for c in "note 7".chars() {

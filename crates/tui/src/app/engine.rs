@@ -37,6 +37,12 @@ pub trait Printer {
     /// A cell; `done` false means it still changes (a running tool). The
     /// default prints its head while running and the whole cell when
     /// done, which is what a pipe wants.
+    /// A long text to page through (`/diff`); a pipe prints it.
+    fn pager(&mut self, _title: &str, text: &str) {
+        for l in text.lines() {
+            self.line(l);
+        }
+    }
     fn cell(&mut self, cell: Cell, done: bool) {
         let lines = cell.plain();
         if done {
@@ -258,6 +264,18 @@ impl ClientRepl {
             Command::Keys => {
                 for l in crate::app::keymap::KEYS.lines() {
                     out.line(l);
+                }
+            }
+            Command::Diff => {
+                let r = self
+                    .request(Request::Report {
+                        thread: self.thread,
+                        report: ReportKind::Diff,
+                    })
+                    .await;
+                match r {
+                    Response::Text { text } => out.pager("diff", &text),
+                    other => self.show(other, "", out),
                 }
             }
             Command::Chat(text) => self.post(text, false, out).await,
@@ -594,6 +612,13 @@ impl ClientRepl {
                         .calls
                         .remove(&r.id)
                         .unwrap_or_else(|| ("tool".to_owned(), String::new()));
+                    if matches!(name.as_str(), "edit_file" | "write_file")
+                        && !r.is_error
+                        && let Some(edit) = crate::app::diff::parse_edit_result(&r.content)
+                    {
+                        out.cell(Cell::Edit(edit), true);
+                        return;
+                    }
                     out.cell(
                         Cell::Tool {
                             name,
