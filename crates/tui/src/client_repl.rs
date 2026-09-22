@@ -173,14 +173,8 @@ impl ClientRepl {
             Response::Refused { reason } => out.line(&format!("[refused: {reason}]")),
             Response::Error { message } => out.line(&format!("[error: {message}]")),
             Response::Threads { threads } => {
-                if threads.is_empty() {
-                    out.line("no threads");
-                }
-                for t in threads {
-                    out.line(&format!(
-                        "{}  {}  {:>5}  {}",
-                        t.id, t.date, t.events, t.first_line
-                    ));
+                for l in render_thread_infos(&threads).lines() {
+                    out.line(l);
                 }
             }
             other => out.line(&format!("[{other:?}]")),
@@ -635,6 +629,69 @@ fn describe_call(call: &ToolCall) -> String {
     let args = call.args.to_string();
     let args = truncate_for_display(&args, 1, 200);
     format!("{} {}", call.name, args)
+}
+
+/// The daemon's thread listing as `aigentic threads` and `/threads`
+/// print it: id, date, event count, first line; newest first as listed.
+pub fn render_thread_infos(threads: &[aigentic_api::ThreadInfo]) -> String {
+    if threads.is_empty() {
+        return "no threads".into();
+    }
+    let mut out = String::new();
+    for t in threads {
+        out.push_str(&format!(
+            "{}  {}  {:>5}  {}\n",
+            t.id, t.date, t.events, t.first_line
+        ));
+    }
+    out.trim_end().to_owned()
+}
+
+/// `aigentic threads --server ...`: the project's threads over the API.
+pub async fn list_threads_over(client: &Client, project: &str) -> anyhow::Result<String> {
+    match client
+        .request(Request::ListThreads {
+            project: project.to_owned(),
+        })
+        .await?
+    {
+        Response::Threads { threads } => Ok(render_thread_infos(&threads)),
+        Response::Refused { reason } => anyhow::bail!("cannot list {project}: {reason}"),
+        other => anyhow::bail!("unexpected reply listing {project}: {other:?}"),
+    }
+}
+
+/// `aigentic project show --server ...`: the project report over the
+/// API. The daemon renders it from a thread's runtime (the report is
+/// the project's, the same for every thread of it), so the newest
+/// thread is asked; a project with no thread yet has none to ask.
+pub async fn project_report_over(client: &Client, project: &str) -> anyhow::Result<String> {
+    let newest = match client
+        .request(Request::ListThreads {
+            project: project.to_owned(),
+        })
+        .await?
+    {
+        Response::Threads { threads } => threads.into_iter().next().map(|t| t.id),
+        Response::Refused { reason } => anyhow::bail!("cannot list {project}: {reason}"),
+        other => anyhow::bail!("unexpected reply listing {project}: {other:?}"),
+    };
+    let Some(thread) = newest else {
+        anyhow::bail!(
+            "no thread in {project} on the daemon yet: the report is rendered from a thread's runtime, so start one first"
+        );
+    };
+    match client
+        .request(Request::Report {
+            thread,
+            report: ReportKind::Project,
+        })
+        .await?
+    {
+        Response::Text { text } => Ok(text),
+        Response::Refused { reason } => anyhow::bail!("cannot report on {project}: {reason}"),
+        other => anyhow::bail!("unexpected reply reporting on {project}: {other:?}"),
+    }
 }
 
 /// Lines typed at a terminal, read by rustyline on its own thread so the
@@ -1248,6 +1305,66 @@ mod tests {
             "{lines:#?}"
         );
         task.abort();
+    }
+
+    /// `aigentic threads` and `project show` over the API: the listing
+    /// is the daemon's, newest first with the first line; the project
+    /// report comes from the newest thread's runtime, and a project
+    /// without a thread says so.
+    #[tokio::test]
+    async fn threads_and_the_project_report_come_over_the_api() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = project(dir.path(), "proj", "");
+        let cfg_dir = dir.path().join("cfg");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        let embedded = Server::embed_with(
+            config(dir.path()),
+            cfg_dir.clone(),
+            root,
+            "steve",
+            None,
+            Factory::scripted(vec![vec![text("hi"), done()]]),
+            Arc::new(DefaultReports {
+                global_instructions: cfg_dir.join("instructions.md"),
+            }),
+        )
+        .await
+        .unwrap();
+        let (client, _) = Client::connect(&Addr::Unix(embedded.socket.clone()), &embedded.token)
+            .await
+            .unwrap();
+        assert_eq!(
+            list_threads_over(&client, "proj").await.unwrap(),
+            "no threads"
+        );
+        let err = project_report_over(&client, "proj").await.unwrap_err();
+        assert!(err.to_string().contains("no thread in proj"), "{err}");
+        assert!(
+            list_threads_over(&client, "nope")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("cannot list nope"),
+        );
+        let (thread, _, _) = open(&client, "proj", None).await;
+        let mut notices = client.take_notices().unwrap();
+        client
+            .request(Request::Post {
+                thread,
+                blocks: vec![ContentBlock::Text("first words".into())],
+                interrupt: false,
+            })
+            .await
+            .unwrap();
+        until_state(&mut notices, |s| *s == ThreadState::Idle).await;
+        let listing = list_threads_over(&client, "proj").await.unwrap();
+        assert!(
+            listing.starts_with(&thread.to_string()) && listing.ends_with("first words"),
+            "{listing}"
+        );
+        let report = project_report_over(&client, "proj").await.unwrap();
+        assert!(report.starts_with("project proj at "), "{report}");
+        drop(embedded);
     }
 
     /// Step 10 for two people: steve (admin) is prompted and magnus

@@ -693,10 +693,14 @@ From steps 10 and 11, before the acceptance run:
   a served daemon picks each thread's profile from its project
   (section 3). `embed` gains the parameter; section 2's signature is
   out of date by that one argument.
-- `aigentic threads` and `project show` read local files, not the API,
-  so section 8's "over the API when a server is given" is not yet
-  true; `ListThreads` and `Report { Project }` exist on the wire, so it
-  is a client change.
+- `aigentic threads` and `project show` read local files and ignored
+  `--server`, so section 8's "over the API when a server is given" was
+  not true until after step 11. Now with `--server` they go over
+  `ListThreads` and `Report { Project }`; the report is rendered from
+  the project's newest thread, since the daemon renders reports from a
+  thread's runtime and the project report is the same for every thread
+  of a project, and a project with no thread yet says so. Without
+  `--server` both read local files as before.
 - `echo` is on the default bash allow list (phase 3 section 4), so an
   acceptance item that wants a prompt must pick something off it.
 - A `[participants]` table that names anyone gives the owner no role

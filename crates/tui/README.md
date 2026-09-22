@@ -66,8 +66,8 @@ cargo run -p aigentic-tui -- --thread <ULID>                     # resume by rep
 cargo run -p aigentic-tui -- --thread <ULID> --profile anthropic # same thread, other backend (embedded daemon only)
 cargo run -p aigentic-tui -- project init                        # aigentic.toml + .aigentic/{knowledge,memory}
 cargo run -p aigentic-tui -- project setup                       # render docs/agents/*.md from [pocock]
-cargo run -p aigentic-tui -- project show                        # layers, knowledge mode, every tool's fate
-cargo run -p aigentic-tui -- threads                             # this project's threads, newest first
+cargo run -p aigentic-tui -- project show                        # layers, knowledge mode, every tool's fate; over the API with --server
+cargo run -p aigentic-tui -- threads                             # this project's threads, newest first; over the API with --server
 cargo run -p aigentic-tui -- doctor [--probe]                    # config, keys, threads dir, project, skills, gh; exit 1 on a fail
 cargo run -p aigentic-tui -- init                                # guided setup: config, project, GitHub, knowledge links
 cargo run -p aigentic-tui -- serve [--listen unix:/path|tcp:host:port]   # the daemon (phase 5): server.toml's users and projects
@@ -768,9 +768,10 @@ folded into the items so the run does not trip on them.
     `[allowed by <you>]`. Item 26 is the rest of this done-when.
 25. Done-when 5, thread project. From a client machine with no
     checkout, `aigentic --server ... --project vendela` creates a
-    thread; on the VM `aigentic threads` in `/srv/vendela` lists it
-    (that command reads the log directory, so it runs where the logs
-    are: it is not over the API yet), and the log's first line is
+    thread; `aigentic threads --server ... --project vendela` from the
+    same machine lists it (over the API; without `--server` the command
+    reads the local log directory), `project show --server ...` prints
+    the daemon's report for it, and the log's first line is
     `thread_started` with the project name, the root the daemon used
     and `created_by`. Resume one pre-phase-5 thread by id (a flat
     phase 3 log and a phase 4 directory log) through the embedded
