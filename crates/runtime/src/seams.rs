@@ -76,7 +76,7 @@ impl Runtime {
         call: &ToolCall,
         class: RiskClass,
         cancel: &CancelToken,
-        observe: &mut dyn FnMut(Signal<'_>),
+        observe: &mut (dyn FnMut(Signal<'_>) + Send),
     ) -> Result<Verdict, RuntimeError> {
         let reason = match self.policy.decide(call, class) {
             Outcome::Allow { rule } => {
@@ -221,7 +221,7 @@ impl Runtime {
         scope: DecisionScope,
         author: Author,
         parent: Option<Ulid>,
-        observe: &mut dyn FnMut(Signal<'_>),
+        observe: &mut (dyn FnMut(Signal<'_>) + Send),
     ) -> Result<Ulid, RuntimeError> {
         self.append_decided_with(call_id, allow, scope, author, parent, None, observe)
     }
@@ -235,7 +235,7 @@ impl Runtime {
         author: Author,
         parent: Option<Ulid>,
         reason: Option<String>,
-        observe: &mut dyn FnMut(Signal<'_>),
+        observe: &mut (dyn FnMut(Signal<'_>) + Send),
     ) -> Result<Ulid, RuntimeError> {
         let payload = serde_json::to_value(PermissionDecidedPayload {
             call_id: call_id.to_owned(),

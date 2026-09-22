@@ -21,6 +21,7 @@ crate.
 | `crates/skills` | `aigentic-skills` | Skill discovery and loading (phase 3, empty until then) |
 | `crates/policy` | `aigentic-policy` | Permission rules and prompts; roles per user per project (phase 5) |
 | `crates/api` | `aigentic-api` | The daemon's wire types and JSON lines codec; a `tokio` client behind the `client` feature (phase 5) |
+| `crates/server` | `aigentic-server` | The daemon: one actor per thread, sessions over a socket, roles enforced (phase 5) |
 
 ## The dependency rule
 
@@ -36,7 +37,9 @@ as they are, and mirrors the two small log shapes it needs (a permission
 request, a decision's scope) rather than take an edge to `log`; roles
 cross the wire as strings so it takes none to `policy` either; `policy`
 takes an edge to `api` for the request enum, since which role a request
-needs is a policy question. Never add an edge that breaks this: the
+needs is a policy question; `server` depends on `runtime` and `api`, and
+`tui` will depend on `api` and `server` (to embed a daemon) rather than
+construct a `Runtime` once phase 5 step 9 lands. Never add an edge that breaks this: the
 model is a function behind the `Provider` trait, and `core` must never import
 a provider SDK.
 

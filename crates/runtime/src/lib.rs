@@ -38,7 +38,9 @@ pub use approver::{Answer, Approver, DenyAll};
 pub use audit::audit_tool_results;
 pub use compaction::SUMMARY_PROMPT;
 pub use context::{Prefix, build_context};
-pub use decisions::{Answered, CancelToken, DecisionError, Decisions, Pending};
+pub use decisions::{
+    Answered, CancelToken, DecisionError, Decisions, Inbox, Outbox, Pending, Queued, inbox,
+};
 pub use error::RuntimeError;
 pub use knowledge::{Knowledge, KnowledgeMode};
 pub use layers::{Decided, GlobalLayer, Layers};

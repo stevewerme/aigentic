@@ -15,7 +15,7 @@ pub enum Answer {
     Deny,
 }
 
-pub trait Approver: Send {
+pub trait Approver: Send + Sync {
     /// Who the answers are attributed to; the `permission_decided` author.
     fn author(&self) -> Author;
 

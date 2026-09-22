@@ -26,7 +26,7 @@ impl Runtime {
     /// anything was appended.
     pub async fn compact(
         &mut self,
-        observe: &mut dyn FnMut(Signal<'_>),
+        observe: &mut (dyn FnMut(Signal<'_>) + Send),
     ) -> Result<bool, RuntimeError> {
         let events = self.log.read_all()?;
         let context = build_context(&self.prefix(), &events)?;
@@ -40,7 +40,7 @@ impl Runtime {
     /// Manual compaction (`/compact`): run the rules regardless of pressure.
     pub async fn compact_now(
         &mut self,
-        observe: &mut dyn FnMut(Signal<'_>),
+        observe: &mut (dyn FnMut(Signal<'_>) + Send),
     ) -> Result<Vec<CompactionStrategy>, RuntimeError> {
         let events = self.log.read_all()?;
         self.run_rules(&events, true, observe).await
@@ -51,7 +51,7 @@ impl Runtime {
         &mut self,
         author: Author,
         text: String,
-        observe: &mut dyn FnMut(Signal<'_>),
+        observe: &mut (dyn FnMut(Signal<'_>) + Send),
     ) -> Result<Event, RuntimeError> {
         let payload = serde_json::to_value(PinnedPayload { text }).expect("serialisable");
         self.measured = None;
@@ -82,7 +82,7 @@ impl Runtime {
         &mut self,
         events: &[Event],
         force: bool,
-        observe: &mut dyn FnMut(Signal<'_>),
+        observe: &mut (dyn FnMut(Signal<'_>) + Send),
     ) -> Result<Vec<CompactionStrategy>, RuntimeError> {
         let mut done = Vec::new();
         let Some((from, to)) = self.compactable_range(events) else {
@@ -132,7 +132,7 @@ impl Runtime {
         events: &[Event],
         from: u64,
         to: u64,
-        observe: &mut dyn FnMut(Signal<'_>),
+        observe: &mut (dyn FnMut(Signal<'_>) + Send),
     ) -> Result<Option<CompactionStrategy>, RuntimeError> {
         let max = self.compaction.max_result_bytes;
         let already: Vec<(u64, u64, usize)> = events
@@ -169,7 +169,7 @@ impl Runtime {
         events: &[Event],
         from: u64,
         to: u64,
-        observe: &mut dyn FnMut(Signal<'_>),
+        observe: &mut (dyn FnMut(Signal<'_>) + Send),
     ) -> Result<Option<CompactionStrategy>, RuntimeError> {
         // The range as the model would see it, with earlier compactions applied.
         let in_range: Vec<Event> = events
@@ -229,7 +229,7 @@ impl Runtime {
         from: u64,
         to: u64,
         strategy: CompactionStrategy,
-        observe: &mut dyn FnMut(Signal<'_>),
+        observe: &mut (dyn FnMut(Signal<'_>) + Send),
     ) -> Result<(), RuntimeError> {
         let payload = serde_json::to_value(CompactedPayload {
             from_seq: from,

@@ -2,7 +2,7 @@
 
 use std::time::Instant;
 
-use aigentic_core::{Author, ContentBlock, Event, EventKind, Message, Role, ToolCall, ToolResult};
+use aigentic_core::{Author, ContentBlock, Event, EventKind, Message, Role};
 use aigentic_log::{NewEvent, TurnEndedPayload, Usage};
 
 use crate::{Runtime, RuntimeError, Signal, TurnOutcome};
@@ -36,29 +36,6 @@ impl Runtime {
         })
     }
 
-    pub(crate) async fn run_tool(&self, call: &ToolCall) -> ToolResult {
-        let id = call.id.clone();
-        let Some(tool) = self.registry.get(&call.name) else {
-            return ToolResult {
-                id,
-                content: format!("unknown tool: {}", call.name),
-                is_error: true,
-            };
-        };
-        match tool.call(call.args.clone()).await {
-            Ok(out) => ToolResult {
-                id,
-                content: out.content,
-                is_error: out.is_error,
-            },
-            Err(e) => ToolResult {
-                id,
-                content: e.to_string(),
-                is_error: true,
-            },
-        }
-    }
-
     pub(crate) fn budget_reason(&self, spent: &Spent) -> Option<&'static str> {
         if spent.iterations >= self.budget.max_iterations {
             Some("max_iterations")
@@ -75,7 +52,7 @@ impl Runtime {
         &mut self,
         reason: &str,
         spent: &Spent,
-        observe: &mut dyn FnMut(Signal<'_>),
+        observe: &mut (dyn FnMut(Signal<'_>) + Send),
     ) -> Result<TurnOutcome, RuntimeError> {
         let touched = self.touched_this_turn()?;
         let payload = serde_json::to_value(TurnEndedPayload {
@@ -154,7 +131,7 @@ impl Runtime {
         author: Author,
         payload: serde_json::Value,
         parent_event: Option<ulid::Ulid>,
-        observe: &mut dyn FnMut(Signal<'_>),
+        observe: &mut (dyn FnMut(Signal<'_>) + Send),
     ) -> Result<Event, RuntimeError> {
         let event = self.log.append(NewEvent {
             kind,

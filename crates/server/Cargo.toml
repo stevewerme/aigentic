@@ -1,0 +1,22 @@
+[package]
+name = "aigentic-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Aigentic daemon: one actor per thread, sessions over a socket"
+
+[dependencies]
+aigentic-api.workspace = true
+aigentic-runtime.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync", "macros", "rt", "time"] }
+ulid.workspace = true
+
+[dev-dependencies]
+futures-core.workspace = true
+futures-util.workspace = true
+schemars.workspace = true
+serde.workspace = true
+tempfile.workspace = true

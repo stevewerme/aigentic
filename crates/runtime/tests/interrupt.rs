@@ -21,8 +21,8 @@ use aigentic_log::{
 };
 use aigentic_policy::{Decision, Policy, Rule};
 use aigentic_runtime::{
-    ASKED_HUMAN, Answered, CancelToken, DecisionError, Decisions, INTERRUPTED, Pending, Runtime,
-    Signal,
+    ASKED_HUMAN, Answered, CancelToken, DecisionError, Decisions, INTERRUPTED, Inbox, Pending,
+    Runtime, Signal,
 };
 use aigentic_tools::ToolRegistry;
 use common::{done, steve};
@@ -198,6 +198,7 @@ async fn start(rig: &mut Rig, cancel: &CancelToken) -> aigentic_runtime::TurnOut
             steve(),
             vec![ContentBlock::Text("go".into())],
             cancel,
+            &mut Inbox::none(),
             &mut |s| {
                 if let Signal::Waiting(p) = s {
                     waited.lock().unwrap().push(p.clone());

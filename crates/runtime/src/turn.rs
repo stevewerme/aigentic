@@ -14,7 +14,7 @@ use futures_util::StreamExt;
 
 use aigentic_log::{Invoker, PolicyRecord};
 
-use crate::decisions::CancelToken;
+use crate::decisions::{CancelToken, Inbox, Queued};
 use crate::harness_tools::{ASK_HUMAN, HARNESS_CLASS, harness_specs, is_harness_tool};
 use crate::runtime::{ASKED_HUMAN, INTERRUPTED};
 use crate::seams::{Verdict, denial_text};
@@ -29,24 +29,45 @@ impl Runtime {
         &mut self,
         author: Author,
         blocks: Vec<ContentBlock>,
-        observe: &mut dyn FnMut(Signal<'_>),
+        observe: &mut (dyn FnMut(Signal<'_>) + Send),
     ) -> Result<TurnOutcome, RuntimeError> {
-        self.run_turn_until(author, blocks, &CancelToken::never(), observe)
-            .await
+        self.run_turn_until(
+            author,
+            blocks,
+            &CancelToken::never(),
+            &mut Inbox::none(),
+            observe,
+        )
+        .await
     }
 
-    /// `run_turn` with an interrupt token (phase 5): the daemon's actor
-    /// calls this so a `Post { interrupt: true }` can end the turn.
+    /// `run_turn` with an interrupt token and an inbox (phase 5): the
+    /// daemon's actor calls this so a `Post` mid-turn is appended at once
+    /// and a `Post { interrupt: true }` can end the turn.
     pub async fn run_turn_until(
         &mut self,
         author: Author,
         blocks: Vec<ContentBlock>,
         cancel: &CancelToken,
-        observe: &mut dyn FnMut(Signal<'_>),
+        inbox: &mut Inbox,
+        observe: &mut (dyn FnMut(Signal<'_>) + Send),
     ) -> Result<TurnOutcome, RuntimeError> {
         let payload = serde_json::to_value(UserMessagePayload::new(blocks)).expect("serialisable");
         self.append(EventKind::UserMessage, author, payload, None, observe)?;
-        self.continue_turn_until(cancel, observe).await
+        self.continue_turn_until(cancel, inbox, observe).await
+    }
+
+    /// Append what arrived mid-turn as `mid_turn` user messages: in the
+    /// log at once, in context from the next turn.
+    fn drain_inbox(
+        &mut self,
+        inbox: &mut Inbox,
+        observe: &mut (dyn FnMut(Signal<'_>) + Send),
+    ) -> Result<(), RuntimeError> {
+        for queued in inbox.drain() {
+            append_queued(&mut self.log, queued, observe)?;
+        }
+        Ok(())
     }
 
     /// A user-invoked skill (`/implement fix the off-by-one`): appends
@@ -58,7 +79,28 @@ impl Runtime {
         author: Author,
         name: &str,
         args: &str,
-        observe: &mut dyn FnMut(Signal<'_>),
+        observe: &mut (dyn FnMut(Signal<'_>) + Send),
+    ) -> Result<TurnOutcome, RuntimeError> {
+        self.invoke_skill_until(
+            author,
+            name,
+            args,
+            &CancelToken::never(),
+            &mut Inbox::none(),
+            observe,
+        )
+        .await
+    }
+
+    /// `invoke_skill` with an interrupt token and an inbox (phase 5).
+    pub async fn invoke_skill_until(
+        &mut self,
+        author: Author,
+        name: &str,
+        args: &str,
+        cancel: &CancelToken,
+        inbox: &mut Inbox,
+        observe: &mut (dyn FnMut(Signal<'_>) + Send),
     ) -> Result<TurnOutcome, RuntimeError> {
         self.append_skill_loaded_as(name, Invoker::User, author.clone(), observe)?;
         let text = if args.trim().is_empty() {
@@ -66,17 +108,23 @@ impl Runtime {
         } else {
             args.trim().to_owned()
         };
-        self.run_turn(author, vec![ContentBlock::Text(text)], observe)
-            .await
+        self.run_turn_until(
+            author,
+            vec![ContentBlock::Text(text)],
+            cancel,
+            inbox,
+            observe,
+        )
+        .await
     }
 
     /// The loop without a new user message: what `run_turn` does after the
     /// append, and what resume uses to finish an interrupted turn.
     pub async fn continue_turn(
         &mut self,
-        observe: &mut dyn FnMut(Signal<'_>),
+        observe: &mut (dyn FnMut(Signal<'_>) + Send),
     ) -> Result<TurnOutcome, RuntimeError> {
-        self.continue_turn_until(&CancelToken::never(), observe)
+        self.continue_turn_until(&CancelToken::never(), &mut Inbox::none(), observe)
             .await
     }
 
@@ -89,7 +137,8 @@ impl Runtime {
     pub async fn continue_turn_until(
         &mut self,
         cancel: &CancelToken,
-        observe: &mut dyn FnMut(Signal<'_>),
+        inbox: &mut Inbox,
+        observe: &mut (dyn FnMut(Signal<'_>) + Send),
     ) -> Result<TurnOutcome, RuntimeError> {
         let mut spent = Spent {
             started: Instant::now(),
@@ -101,6 +150,7 @@ impl Runtime {
         let specs: Vec<ToolSpec> = self.tool_specs();
 
         loop {
+            self.drain_inbox(inbox, observe)?;
             if let Some(by) = cancel.cancelled_by() {
                 return self.interrupt_turn(by, Vec::new(), &spent, observe);
             }
@@ -140,6 +190,12 @@ impl Runtime {
                         interrupted_by = Some(by);
                         break;
                     }
+                    // A message posted mid-call lands in the log now; the
+                    // stream borrows the provider, the log is another field.
+                    queued = inbox.recv() => {
+                        append_queued(&mut self.log, queued, observe)?;
+                        continue;
+                    }
                     event = stream.next() => event,
                 };
                 let Some(event) = event else { break };
@@ -162,6 +218,7 @@ impl Runtime {
                 }
             }
             drop(stream);
+            self.drain_inbox(inbox, observe)?;
             if let Some(by) = interrupted_by {
                 // Dropped mid-call: no partial message, as a crash would
                 // leave none.
@@ -204,8 +261,9 @@ impl Runtime {
             let mut answered = false;
             let mut calls = calls.into_iter();
             for call in calls.by_ref() {
+                self.drain_inbox(inbox, observe)?;
                 observe(Signal::ToolCallStarted(&call));
-                let (result, record) = self.execute(&call, cancel, observe).await?;
+                let (result, record) = self.execute(&call, cancel, inbox, observe).await?;
                 answered |= call.name == ASK_HUMAN && !result.is_error;
                 let payload = serde_json::to_value(ToolResultPayload::new(result, record))
                     .expect("serialisable");
@@ -220,6 +278,7 @@ impl Runtime {
                     break;
                 }
             }
+            self.drain_inbox(inbox, observe)?;
             if let Some(by) = cancel.cancelled_by() {
                 // Every call must have a result before the turn ends, or
                 // the log could not be projected; the rest get synthetic
@@ -258,6 +317,43 @@ impl Runtime {
         }
     }
 
+    /// `run_tool`, appending what arrives in the inbox while the tool
+    /// runs: the tool borrows the registry, the log is another field.
+    async fn run_tool_draining(
+        &mut self,
+        call: &ToolCall,
+        inbox: &mut Inbox,
+        observe: &mut (dyn FnMut(Signal<'_>) + Send),
+    ) -> Result<ToolResult, RuntimeError> {
+        let id = call.id.clone();
+        let Some(tool) = self.registry.get(&call.name) else {
+            return Ok(ToolResult {
+                id,
+                content: format!("unknown tool: {}", call.name),
+                is_error: true,
+            });
+        };
+        let mut fut = tool.call(call.args.clone());
+        let out = loop {
+            tokio::select! {
+                out = &mut fut => break out,
+                queued = inbox.recv() => append_queued(&mut self.log, queued, observe)?,
+            }
+        };
+        Ok(match out {
+            Ok(out) => ToolResult {
+                id,
+                content: out.content,
+                is_error: out.is_error,
+            },
+            Err(e) => ToolResult {
+                id,
+                content: e.to_string(),
+                is_error: true,
+            },
+        })
+    }
+
     /// `interrupted` naming who, then `turn_ended` with reason
     /// `interrupted`. `unanswered` lists the calls given synthetic results.
     fn interrupt_turn(
@@ -265,7 +361,7 @@ impl Runtime {
         by: Author,
         unanswered: Vec<String>,
         spent: &Spent,
-        observe: &mut dyn FnMut(Signal<'_>),
+        observe: &mut (dyn FnMut(Signal<'_>) + Send),
     ) -> Result<TurnOutcome, RuntimeError> {
         let after_seq = self.log.len().saturating_sub(1);
         let payload = serde_json::to_value(InterruptedPayload {
@@ -292,7 +388,8 @@ impl Runtime {
         &mut self,
         call: &ToolCall,
         cancel: &CancelToken,
-        observe: &mut dyn FnMut(Signal<'_>),
+        inbox: &mut Inbox,
+        observe: &mut (dyn FnMut(Signal<'_>) + Send),
     ) -> Result<(ToolResult, PolicyRecord), RuntimeError> {
         // A tool the layers hide is unknown to this thread: the same
         // refusal as a name that was never registered.
@@ -318,7 +415,7 @@ impl Runtime {
                 let result = if is_harness_tool(&call.name) {
                     self.run_harness_tool(call, cancel, observe).await?
                 } else {
-                    self.run_tool(call).await
+                    self.run_tool_draining(call, inbox, observe).await?
                 };
                 Ok((result, record))
             }
@@ -355,4 +452,25 @@ impl Runtime {
     pub fn tool_visible(&self, name: &str) -> bool {
         self.layers.decided_tool(name) == crate::Decided::Allowed
     }
+}
+
+/// One queued message into the log, as `append` would but on the log
+/// alone, so it can run while a stream borrows the provider.
+fn append_queued(
+    log: &mut aigentic_log::ThreadLog,
+    queued: Queued,
+    observe: &mut (dyn FnMut(Signal<'_>) + Send),
+) -> Result<(), RuntimeError> {
+    let payload = UserMessagePayload {
+        blocks: queued.blocks,
+        mid_turn: true,
+    };
+    let event = log.append(aigentic_log::NewEvent {
+        kind: EventKind::UserMessage,
+        author: queued.author,
+        payload: serde_json::to_value(payload).expect("serialisable"),
+        parent_event: None,
+    })?;
+    observe(Signal::Event(&event));
+    Ok(())
 }

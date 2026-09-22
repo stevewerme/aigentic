@@ -64,7 +64,7 @@ impl Runtime {
     /// model found nothing new (the cursor still moves).
     pub async fn extract_memory(
         &mut self,
-        observe: &mut dyn FnMut(Signal<'_>),
+        observe: &mut (dyn FnMut(Signal<'_>) + Send),
     ) -> Result<Option<MemoryExtractedPayload>, RuntimeError> {
         let Some(project) = self.layers.project.as_ref() else {
             return Ok(None);

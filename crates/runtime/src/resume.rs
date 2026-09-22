@@ -45,7 +45,7 @@ impl Runtime {
     pub fn resume(
         &mut self,
         torn_bytes: Option<u64>,
-        observe: &mut dyn FnMut(Signal<'_>),
+        observe: &mut (dyn FnMut(Signal<'_>) + Send),
     ) -> Result<Resumed, RuntimeError> {
         let events = self.log.read_all()?;
         let Some(open) = ThreadLog::open_turn(&events) else {

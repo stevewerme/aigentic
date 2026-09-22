@@ -1,6 +1,6 @@
 # Phase 5 plan
 
-Status: steps 1 to 5 landed on 2026-09-22; written the same day after the phase 4 close · Follows `docs/PRD.md` (the Server and multiplayer phase) and the phase 0 to 4 plans
+Status: steps 1 to 6 landed on 2026-09-22; written the same day after the phase 4 close · Follows `docs/PRD.md` (the Server and multiplayer phase) and the phase 0 to 4 plans
 
 ## 0. Goal and done-when
 
@@ -185,9 +185,16 @@ impl Runtime {
     /// A turn that can be cancelled: the in-flight model call is dropped, a running tool
     /// is awaited (its timeout bounds it), the rest of its batch gets synthetic results,
     /// `interrupted` is appended with `by`, then `turn_ended` with reason `interrupted`.
-    pub async fn run_turn_until(&mut self, author, blocks, cancel: &CancelToken, observe) -> Result<TurnOutcome, RuntimeError>;
-    pub async fn continue_turn_until(&mut self, cancel: &CancelToken, observe) -> Result<TurnOutcome, RuntimeError>;
+    pub async fn run_turn_until(&mut self, author, blocks, cancel: &CancelToken, inbox: &mut Inbox, observe) -> Result<TurnOutcome, RuntimeError>;
+    pub async fn continue_turn_until(&mut self, cancel: &CancelToken, inbox: &mut Inbox, observe) -> Result<TurnOutcome, RuntimeError>;
+    pub async fn invoke_skill_until(&mut self, author, name, args, cancel, inbox, observe) -> Result<TurnOutcome, RuntimeError>;
 }
+// The queue's log side lives in the runtime, because the turn owns the log writer: the actor hands a
+// `Queued { author, blocks }` to the turn's `Inbox` through its `Outbox`, and the turn appends it as a
+// `mid_turn` user message at its next safe point, including while the model streams or a tool runs
+// (disjoint field borrows: the stream or the tool borrows the provider or the registry, the log is another field).
+pub struct Queued { pub author: Author, pub blocks: Vec<ContentBlock> }
+pub fn inbox() -> (Outbox, Inbox);   Inbox::none() for the single-user REPL
 pub enum Signal<'a> { /* phase 0-4 */ Waiting(&'a Pending) }   // the turn parked; a client shows what it waits for
 // crates/log/src/payload.rs: PermissionDecidedPayload gains `reason: Option<String>` (`interrupted` on the deny an interrupt writes)
 
@@ -198,11 +205,18 @@ pub enum Signal<'a> { /* phase 0-4 */ Waiting(&'a Pending) }   // the turn parke
 // Message text for a user_message is prefixed `<name>: ` when the log's human authors number more than one.
 
 // crates/server/src/actor.rs
-pub struct ThreadActor { /* Runtime, mailbox rx, subscribers, cancel token, state */ }
-pub enum Mail { Post { author, blocks, interrupt, reply }, Invoke {..}, Decide {..}, Answer {..}, Pin {..}, Compact {..}, SetMode {..}, Report {..}, Subscribe { tx }, Unsubscribe {..} }
+pub struct ThreadActor { /* Runtime, mailbox rx, the shared subscribers, log mirror and state */ }
+pub enum Mail { Post { author, blocks, interrupt, reply }, InvokeSkill {..}, Decide {..}, Answer {..}, Pin {..}, Compact {..}, SetMode {..}, Report {..},
+                Subscribe { from_seq, notices, reply: (ThreadState, Vec<Event>) } }   // a dropped receiver unsubscribes
+pub trait Reports { fn render(&self, runtime: &Runtime, events: &[Event], kind: ReportKind) -> String; }   // step 9 wires the tui's renderers; NoReports until then
 impl ThreadActor {
-    pub async fn run(self);          // the loop: drain mail; while a turn runs, Post queues or interrupts; approvals park the turn
+    pub fn new(runtime, torn: Option<u64>, reports: Arc<dyn Reports>) -> Result<(Self, Mailbox), RuntimeError>;   // installs Decisions, runs phase 2's resume
+    pub async fn run(self);   // the loop: mail while idle; while a turn runs, Post goes to the inbox (and cancels on interrupt), Decide and Answer
+                              // to Decisions, Subscribe is answered from the mirror; Pin, Compact, SetMode, Report and InvokeSkill are refused
+                              // with a reason until the turn ends. An answered question or queued messages start the next turn at once.
 }
+// The observer counts a queued message when its event lands, so a subscriber sees the event before the state that counts it.
+// The actor's future is Send: the runtime's observer closures are `FnMut(Signal) + Send` and `Approver: Send + Sync`.
 
 // crates/server/src/lib.rs
 pub struct Server { /* config, ThreadTable, the three provider profiles built once */ }

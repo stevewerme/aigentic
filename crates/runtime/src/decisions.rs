@@ -7,9 +7,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
-use aigentic_core::Author;
+use aigentic_core::{Author, ContentBlock};
 use aigentic_log::PermissionRequestedPayload;
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 
 /// What a turn is waiting for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,6 +192,70 @@ impl CancelToken {
                 std::future::pending::<()>().await;
             }
         }
+    }
+}
+
+/// A message that arrived while a turn ran (phase 5's queue). The turn
+/// appends it at once as a `user_message` with `mid_turn` set, so every
+/// subscriber sees it; the projection's horizon rule keeps it out of the
+/// model's context until the next turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Queued {
+    pub author: Author,
+    pub blocks: Vec<ContentBlock>,
+}
+
+/// The sending side, held by the daemon's actor. Cloned freely.
+#[derive(Debug, Clone)]
+pub struct Outbox(mpsc::UnboundedSender<Queued>);
+
+impl Outbox {
+    /// Hand a message to the running turn. `false` when no turn holds
+    /// the inbox any more.
+    pub fn send(&self, queued: Queued) -> bool {
+        self.0.send(queued).is_ok()
+    }
+}
+
+/// The receiving side, held by the turn. `Inbox::none()` never yields.
+#[derive(Debug)]
+pub struct Inbox {
+    rx: mpsc::UnboundedReceiver<Queued>,
+    /// Keeps `none()` pending rather than closed.
+    _keep: Option<Outbox>,
+}
+
+/// A connected pair.
+pub fn inbox() -> (Outbox, Inbox) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    (Outbox(tx), Inbox { rx, _keep: None })
+}
+
+impl Inbox {
+    /// An inbox nothing is ever posted to: the single-user REPL's.
+    pub fn none() -> Self {
+        let (tx, rx) = mpsc::unbounded_channel();
+        Self {
+            rx,
+            _keep: Some(Outbox(tx)),
+        }
+    }
+
+    /// Pends until a message arrives; never resolves for `none()`.
+    pub(crate) async fn recv(&mut self) -> Queued {
+        match self.rx.recv().await {
+            Some(q) => q,
+            None => std::future::pending().await,
+        }
+    }
+
+    /// What has arrived so far, without waiting.
+    pub(crate) fn drain(&mut self) -> Vec<Queued> {
+        let mut out = Vec::new();
+        while let Ok(q) = self.rx.try_recv() {
+            out.push(q);
+        }
+        out
     }
 }
 

@@ -103,6 +103,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "aigentic-server"
+version = "0.1.0"
+dependencies = [
+ "aigentic-api",
+ "aigentic-runtime",
+ "futures-core",
+ "futures-util",
+ "schemars 0.8.22",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "ulid",
+]
+
+[[package]]
 name = "aigentic-skills"
 version = "0.1.0"
 dependencies = [

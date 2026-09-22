@@ -88,7 +88,7 @@ impl Runtime {
         &mut self,
         call: &ToolCall,
         cancel: &crate::CancelToken,
-        observe: &mut dyn FnMut(Signal<'_>),
+        observe: &mut (dyn FnMut(Signal<'_>) + Send),
     ) -> Result<ToolResult, RuntimeError> {
         let id = call.id.clone();
         let ok = |content: String| ToolResult {
@@ -181,7 +181,7 @@ impl Runtime {
         &mut self,
         name: &str,
         invoked_by: Invoker,
-        observe: &mut dyn FnMut(Signal<'_>),
+        observe: &mut (dyn FnMut(Signal<'_>) + Send),
     ) -> Result<(), RuntimeError> {
         self.append_skill_loaded_as(name, invoked_by, Author::Agent(self.agent.clone()), observe)
     }
@@ -191,7 +191,7 @@ impl Runtime {
         name: &str,
         invoked_by: Invoker,
         author: Author,
-        observe: &mut dyn FnMut(Signal<'_>),
+        observe: &mut (dyn FnMut(Signal<'_>) + Send),
     ) -> Result<(), RuntimeError> {
         let manifest = self
             .skills
