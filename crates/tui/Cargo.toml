@@ -11,6 +11,7 @@ name = "aigentic"
 path = "src/main.rs"
 
 [dependencies]
+aigentic-api = { workspace = true, features = ["client"] }
 aigentic-runtime.workspace = true
 aigentic-server.workspace = true
 anyhow.workspace = true

@@ -77,7 +77,8 @@ pub enum Mail {
     Subscribe {
         from_seq: u64,
         notices: mpsc::UnboundedSender<Notice>,
-        reply: oneshot::Sender<(ThreadState, Vec<Event>)>,
+        /// The state, the events since `from_seq`, the mode's name.
+        reply: oneshot::Sender<(ThreadState, Vec<Event>, String)>,
     },
 }
 
@@ -107,6 +108,8 @@ struct Shared {
     queued: Mutex<u32>,
     /// Who posted last during the turn: the next turn is "by" them.
     last_queued_by: Mutex<Option<Author>>,
+    /// The permission mode's name, for `Opened`.
+    mode: Mutex<String>,
 }
 
 impl Shared {
@@ -239,6 +242,7 @@ impl ThreadActor {
             state: Mutex::new(ThreadState::Idle),
             queued: Mutex::new(0),
             last_queued_by: Mutex::new(None),
+            mode: Mutex::new(runtime.mode().name().to_owned()),
         });
         let (tx, rx) = mpsc::unbounded_channel();
         let mut actor = Self {
@@ -365,6 +369,12 @@ impl ThreadActor {
             }
             Mail::SetMode { mode, reply } => {
                 self.runtime.set_mode(mode);
+                *self.shared.mode.lock().unwrap_or_else(|e| e.into_inner()) =
+                    mode.name().to_owned();
+                self.shared.broadcast(Notice::Mode {
+                    thread: self.shared.thread,
+                    mode: mode.name().to_owned(),
+                });
                 let _ = reply.send(Response::Ok);
                 None
             }
@@ -398,7 +408,7 @@ impl ThreadActor {
         &self,
         from_seq: u64,
         notices: mpsc::UnboundedSender<Notice>,
-        reply: oneshot::Sender<(ThreadState, Vec<Event>)>,
+        reply: oneshot::Sender<(ThreadState, Vec<Event>, String)>,
     ) {
         // Snapshot and register under one lock, so no event is both
         // missed and unsent.
@@ -418,7 +428,13 @@ impl ThreadActor {
             .collect();
         subs.push(notices);
         drop(subs);
-        let _ = reply.send((self.shared.state(), events));
+        let mode = self
+            .shared
+            .mode
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let _ = reply.send((self.shared.state(), events, mode));
     }
 
     /// Run one turn, taking mail throughout, then any turns the mail
@@ -563,7 +579,12 @@ impl ThreadActor {
                     .collect();
                 subs.push(notices);
                 drop(subs);
-                let _ = reply.send((shared.state(), events));
+                let mode = shared
+                    .mode
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                let _ = reply.send((shared.state(), events, mode));
             }
             Mail::Status { reply } => {
                 let _ = reply.send(shared.state());

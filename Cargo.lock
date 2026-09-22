@@ -156,6 +156,7 @@ dependencies = [
 name = "aigentic-tui"
 version = "0.1.0"
 dependencies = [
+ "aigentic-api",
  "aigentic-runtime",
  "aigentic-server",
  "anyhow",

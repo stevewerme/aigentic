@@ -60,7 +60,8 @@ any non-empty value.
 ## Usage
 
 ```bash
-cargo run -p aigentic-tui --                                     # new thread; prints its id
+cargo run -p aigentic-tui --                                     # new thread over a daemon embedded for this directory
+cargo run -p aigentic-tui -- --server tcp:vm:7420 --project vendela   # the same client against a remote daemon; token in AIGENTIC_TOKEN
 cargo run -p aigentic-tui -- --thread <ULID>                     # resume by replaying the log
 cargo run -p aigentic-tui -- --thread <ULID> --profile anthropic # same thread, other backend
 cargo run -p aigentic-tui -- project init                        # aigentic.toml + .aigentic/{knowledge,memory}
@@ -111,16 +112,26 @@ config's `default_profile`. The banner names the project, the layers it
 loaded (global, project, knowledge with its mode, memory), the skill and
 tool counts and how many threads the project has.
 
+Since phase 5 the REPL is a client of the daemon: with no `--server` it
+starts one in the process for this directory over a private socket, so a
+single user sees what phase 4 showed; with `--server` it talks to a remote
+daemon as a named user and other people's messages arrive live under their
+names. A permission request or an `ask_human` question prints as a state,
+and `y`, `a`, `n` or a plain line answers it; when someone else answers
+first, the decision prints with their name. Streamed text prints as its
+lines complete. `/profile` is gone: the profile is the project's on the
+daemon.
+
 Slash commands: `/cost` (input and output tokens for the thread, reported and
 estimated shown separately, plus cache reads and writes, the reasoning share,
 compactions and memory extractions), `/pin <text>` (a fact for the stable
 prefix, never summarised), `/compact` (run compaction now and report what it
 did), `/verbose` (toggle the session between the configured cap and 40 lines
 / 8000 bytes; it prints which is on), `/mode [name]` (show or set the
-permission mode, below), `/profile <name>` (swap the provider to that
-profile from the config for the next turn on; the knowledge mode is
-re-decided for the new window and the banner line is printed again;
-budget and compaction settings stay), `/policy` (the rule table in order
+permission mode, below), `/who` (the participants and their roles, and who
+you are), `/queue` (what the thread is doing and what is queued),
+`/interrupt <text>` or a line starting with `!` (end the running turn and
+start one with this), `/policy` (the rule table in order
 with each rule's name, decision and reason, the bash allow patterns, the
 mode, and the session grants with who gave them), `/memory` (the memory
 files with line counts, the `through_seq` of the last extraction, and

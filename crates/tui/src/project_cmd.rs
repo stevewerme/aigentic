@@ -1,13 +1,14 @@
-//! `aigentic project init | setup | show`, `aigentic threads`, the threads
-//! directory per project, and the report `/project` and `project show`
-//! share. See `docs/PLAN-phase4.md` sections 5, 7 and 8.
+//! `aigentic project init | setup`, `aigentic threads` and the threads
+//! directory per project. The `project show` report lives in the daemon
+//! crate's `reports` since phase 5 step 9. See `docs/PLAN-phase4.md`
+//! sections 5, 7 and 8.
 
 use std::path::{Path, PathBuf};
 
+use aigentic_runtime::Project;
 use aigentic_runtime::aigentic_core::{ContentBlock, EventKind};
 use aigentic_runtime::aigentic_log::{ThreadLog, UserMessagePayload};
 use aigentic_runtime::project::{DOT_DIR, FILE_NAME, INSTRUCTIONS_FILE, KNOWLEDGE_DIR, MEMORY_DIR};
-use aigentic_runtime::{Decided, KnowledgeMode, Layers, Project, Runtime};
 use anyhow::{Context, bail};
 use time::format_description::well_known::Rfc3339;
 use ulid::Ulid;
@@ -190,149 +191,12 @@ pub fn render_threads(threads: &[ThreadSummary], dir: &Path) -> String {
     out.trim_end().to_owned()
 }
 
-/// What `/project` and `project show` print: the layers, the knowledge
-/// mode, memory and skills, then every tool the registry and the harness
-/// offer with the layer that decided it.
-pub fn report(runtime: &Runtime, global_instructions: &Path) -> String {
-    let layers = runtime.layers();
-    let mut out = String::new();
-    match &layers.project {
-        Some(p) => out.push_str(&format!("project {} at {}\n", p.name, p.root.display())),
-        None => out.push_str("no project (no aigentic.toml here or above)\n"),
-    }
-    out.push_str(&format!(
-        "  global instructions   {}{}\n",
-        global_instructions.display(),
-        if layers.global.instructions.is_some() {
-            ""
-        } else {
-            " (absent)"
-        }
-    ));
-    if let Some(p) = &layers.project {
-        out.push_str(&format!(
-            "  project instructions  {}\n",
-            instructions_source(p)
-        ));
-        let k = runtime.knowledge();
-        let mode = match runtime.knowledge_mode() {
-            KnowledgeMode::Inline => "inline",
-            KnowledgeMode::Index => "index + search_knowledge",
-        };
-        out.push_str(&format!(
-            "  knowledge             {} files, {} tokens, {mode}\n",
-            k.files.len(),
-            k.tokens
-        ));
-        let memory: Vec<String> = p
-            .memory
-            .iter()
-            .map(|(name, text)| format!("{name} ({} lines)", text.lines().count()))
-            .collect();
-        out.push_str(&format!(
-            "  memory                {}\n",
-            if memory.is_empty() {
-                "none".to_owned()
-            } else {
-                memory.join(", ")
-            }
-        ));
-        let skills: Vec<String> = p
-            .file
-            .skills
-            .enabled
-            .iter()
-            .map(|s| match layers.decided_skill(s) {
-                Decided::Allowed => s.clone(),
-                _ => format!("{s} (denied by global)"),
-            })
-            .collect();
-        out.push_str(&format!(
-            "  skills                {}\n",
-            if skills.is_empty() {
-                "none".to_owned()
-            } else {
-                skills.join(", ")
-            }
-        ));
-    }
-    let mut names = runtime.registry().names();
-    names.extend(aigentic_runtime::harness_tools::harness_names());
-    names.sort();
-    names.dedup();
-    out.push_str("tools\n");
-    let width = names.iter().map(String::len).max().unwrap_or(0);
-    let bash_visible = layers.decided_tool("bash") == Decided::Allowed;
-    for name in &names {
-        let fate = fate(layers, name);
-        // Narrowing hides; it does not forbid. A hidden write tool with
-        // the shell still visible is not a write ban (plan section 5).
-        let note = if bash_visible
-            && (name == "write_file" || name == "edit_file")
-            && layers.decided_tool(name) != Decided::Allowed
-        {
-            "  (hidden, not a ban: bash is allowed)"
-        } else {
-            ""
-        };
-        out.push_str(&format!("  {name:<width$}  {fate}{note}\n"));
-    }
-    out.trim_end().to_owned()
-}
-
-fn fate(layers: &Layers, name: &str) -> &'static str {
-    match layers.decided_tool(name) {
-        Decided::Allowed => "allowed",
-        Decided::DeniedByGlobal => "denied by global",
-        Decided::NotInProjectAllow => "not in project allow",
-    }
-}
-
-fn instructions_source(p: &Project) -> String {
-    let ours = p.dot_dir().join(INSTRUCTIONS_FILE);
-    if ours.is_file() {
-        format!("{DOT_DIR}/{INSTRUCTIONS_FILE}")
-    } else if p.root.join("AGENTS.md").is_file() {
-        "AGENTS.md".into()
-    } else {
-        "none".into()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aigentic_runtime::aigentic_core::{
-        AgentId, Author, Capabilities, CompletionRequest, Message, Provider, ProviderEvent, UserId,
-    };
+    use aigentic_runtime::aigentic_core::{AgentId, Author, UserId};
     use aigentic_runtime::aigentic_log::NewEvent;
-    use aigentic_runtime::aigentic_tools::ToolRegistry;
-    use aigentic_runtime::{GlobalLayer, Layers};
-    use futures_core::Stream;
     use serde_json::json;
-    use std::pin::Pin;
-
-    struct Silent;
-    impl Provider for Silent {
-        fn complete(
-            &self,
-            _: &CompletionRequest<'_>,
-        ) -> Pin<Box<dyn Stream<Item = ProviderEvent> + Send + '_>> {
-            Box::pin(futures_util::stream::empty())
-        }
-        fn count_tokens(&self, _: &[Message]) -> u64 {
-            1
-        }
-        fn capabilities(&self) -> Capabilities {
-            Capabilities {
-                supports_tools: true,
-                supports_images: false,
-                supports_caching: false,
-                supports_structured_output: false,
-                max_context_tokens: 1000,
-            }
-        }
-    }
 
     fn user_message(text: &str) -> NewEvent {
         NewEvent {
@@ -416,68 +280,5 @@ mod tests {
                 .is_empty()
         );
         assert!(render_threads(&[], dir.path()).starts_with("no threads under"));
-    }
-
-    #[test]
-    fn the_report_names_the_layers_and_every_tools_fate() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join(FILE_NAME),
-            "[project]\nname = \"p\"\n[tools]\nallow = [\"bash\", \"read_file\", \"mcp.*\"]\n[skills]\nenabled = [\"tdd\", \"wizard\"]\n",
-        )
-        .unwrap();
-        std::fs::write(dir.path().join("AGENTS.md"), "# rules").unwrap();
-        let mem = dir.path().join(".aigentic/memory");
-        std::fs::create_dir_all(&mem).unwrap();
-        std::fs::write(mem.join("decisions.md"), "- a\n- b\n").unwrap();
-        let project = Project::open_root(dir.path()).unwrap();
-        let layers = Layers {
-            global: GlobalLayer {
-                instructions: None,
-                denied_tools: vec!["mcp.*".into(), "pin".into()],
-                denied_skills: vec!["wizard".into()],
-            },
-            project: Some(project),
-        };
-        let log = ThreadLog::open(dir.path(), Ulid::generate()).unwrap();
-        let registry =
-            ToolRegistry::builtin(aigentic_runtime::aigentic_tools::Workdir::new(dir.path()));
-        let runtime =
-            Runtime::new(Box::new(Silent), registry, log, AgentId("a".into())).with_layers(layers);
-        let text = report(&runtime, Path::new("/cfg/instructions.md"));
-        assert!(
-            text.starts_with(&format!("project p at {}\n", dir.path().display())),
-            "{text}"
-        );
-        assert!(
-            text.contains("global instructions   /cfg/instructions.md (absent)"),
-            "{text}"
-        );
-        assert!(text.contains("project instructions  AGENTS.md"), "{text}");
-        assert!(
-            text.contains("knowledge             0 files, 0 tokens, inline"),
-            "{text}"
-        );
-        assert!(
-            text.contains("memory                decisions.md (2 lines)"),
-            "{text}"
-        );
-        assert!(
-            text.contains("skills                tdd, wizard (denied by global)"),
-            "{text}"
-        );
-        let fate_of = |name: &str| {
-            text.lines()
-                .find(|l| l.trim_start().starts_with(&format!("{name} ")))
-                .map(|l| l.trim_start()[name.len()..].trim().to_owned())
-                .unwrap_or_else(|| panic!("{name} missing in {text}"))
-        };
-        assert_eq!(fate_of("bash"), "allowed");
-        assert_eq!(
-            fate_of("edit_file"),
-            "not in project allow  (hidden, not a ban: bash is allowed)"
-        );
-        assert_eq!(fate_of("pin"), "denied by global");
-        assert_eq!(fate_of("load_skill"), "not in project allow");
     }
 }

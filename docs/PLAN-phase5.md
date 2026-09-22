@@ -1,6 +1,6 @@
 # Phase 5 plan
 
-Status: steps 1 to 8 landed on 2026-09-22; written the same day after the phase 4 close · Follows `docs/PRD.md` (the Server and multiplayer phase) and the phase 0 to 4 plans
+Status: steps 1 to 9 landed on 2026-09-22; written the same day after the phase 4 close · Follows `docs/PRD.md` (the Server and multiplayer phase) and the phase 0 to 4 plans
 
 ## 0. Goal and done-when
 
@@ -81,7 +81,9 @@ crates/log/src/payload.rs        ThreadStartedPayload, UserMessagePayload.mid_tu
 crates/policy/src/roles.rs       Role, Participants, what a request needs
 crates/tui/src/
   main.rs                        `aigentic serve`; the REPL connects (or embeds) instead of building a Runtime
-  client_repl.rs                 the REPL over Client: frames in, lines out; /who, /queue, /interrupt
+  client_repl.rs                 the REPL over Client: frames in, lines out; /who, /queue, /interrupt; y/a/n and answers while waiting
+  repl.rs                        only the pure parts remain: the command grammar and display truncation
+crates/server/src/reports.rs     the text reports (/cost, /project, /policy, /memory, /skills, /who), moved from the tui; `DefaultReports`
   approve.rs                     prompts from awaiting_approval notices; answers are requests
 ~/.config/aigentic/server.toml   the daemon's config (section 8)
 aigentic.toml                    gains [participants]

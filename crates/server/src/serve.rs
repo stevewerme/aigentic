@@ -9,9 +9,10 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, UnixListener};
 
-use crate::actor::{NoReports, Reports};
+use crate::actor::Reports;
 use crate::build::{Profiles, ProviderFactory};
 use crate::config::{Config, ProjectConfig, ServerConfig, UserConfig, default_socket_path};
+use crate::reports::DefaultReports;
 use crate::session;
 use crate::threads::{ThreadTable, project_name_at};
 
@@ -201,10 +202,17 @@ impl Server {
         }
     }
 
-    /// Production wiring: providers from the config's profiles.
+    /// Production wiring: providers from the config's profiles, every
+    /// report rendered.
     pub fn from_configs(config: Config, config_dir: PathBuf, server: ServerConfig) -> Self {
         let providers: Arc<dyn ProviderFactory> = Arc::new(Profiles(Arc::new(config.clone())));
-        Self::new(config, config_dir, server, providers, Arc::new(NoReports))
+        let reports = Arc::new(DefaultReports {
+            global_instructions: config
+                .global_instructions
+                .clone()
+                .unwrap_or_else(|| config_dir.join("instructions.md")),
+        });
+        Self::new(config, config_dir, server, providers, reports)
     }
 
     /// Bind. A stale Unix socket file from a dead daemon is removed
@@ -269,6 +277,25 @@ impl Server {
         root: PathBuf,
         user: &str,
     ) -> Result<Embedded, ServerError> {
+        let providers: Arc<dyn ProviderFactory> = Arc::new(Profiles(Arc::new(config.clone())));
+        let reports = Arc::new(DefaultReports {
+            global_instructions: config
+                .global_instructions
+                .clone()
+                .unwrap_or_else(|| config_dir.join("instructions.md")),
+        });
+        Self::embed_with(config, config_dir, root, user, providers, reports).await
+    }
+
+    /// `embed` with the seams a test scripts.
+    pub async fn embed_with(
+        config: Config,
+        config_dir: PathBuf,
+        root: PathBuf,
+        user: &str,
+        providers: Arc<dyn ProviderFactory>,
+        reports: Arc<dyn Reports>,
+    ) -> Result<Embedded, ServerError> {
         let dir = tempfile_dir()?;
         let socket = dir.join("aigentic.sock");
         let token = random_token();
@@ -286,7 +313,7 @@ impl Server {
                 root,
             }],
         };
-        let server = Arc::new(Self::from_configs(config, config_dir, server));
+        let server = Arc::new(Self::new(config, config_dir, server, providers, reports));
         let listener = Listener::Unix(socket.clone());
         let task = tokio::spawn(server.clone().serve(listener));
         // Wait for the socket to appear.

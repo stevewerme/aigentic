@@ -384,7 +384,7 @@ async fn two_sessions_see_every_notice_in_order_and_a_reconnect_catches_up() {
             .await
             .unwrap();
         assert!(
-            matches!(&r, Response::Opened { state: ThreadState::Idle, events } if events.len() == 1),
+            matches!(&r, Response::Opened { state: ThreadState::Idle, events, .. } if events.len() == 1),
             "{r:?}"
         );
     }
@@ -435,7 +435,7 @@ async fn two_sessions_see_every_notice_in_order_and_a_reconnect_catches_up() {
     // A third session reconnects from seq 4: exactly the events after
     // the permission request.
     let (late, _) = d.connect("steve").await;
-    let Response::Opened { state, events } = late
+    let Response::Opened { state, events, .. } = late
         .request(Request::Open {
             thread: thread.id,
             from_seq: 4,

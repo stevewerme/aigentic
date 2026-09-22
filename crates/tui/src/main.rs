@@ -1,10 +1,9 @@
 //! `aigentic`: a plain streaming REPL over the runtime, and the `skills`
 //! subcommands. No full-screen mode; the terminal keeps its scrollback.
 
-mod approve;
 mod checks;
+mod client_repl;
 mod config;
-mod cost;
 mod doctor;
 mod init_cmd;
 mod pocock;
@@ -15,15 +14,17 @@ mod skills_cmd;
 
 use std::path::PathBuf;
 
-use aigentic_runtime::aigentic_core::{AgentId, Author, UserId};
-use aigentic_runtime::aigentic_log::{Repair, ThreadLog};
+use aigentic_api::client::{Addr, Client};
+use aigentic_api::{Request, Response, ThreadState};
+use aigentic_runtime::aigentic_core::AgentId;
+use aigentic_runtime::aigentic_log::ThreadLog;
 use aigentic_runtime::aigentic_tools::{ToolRegistry, Workdir};
 use aigentic_runtime::{GlobalLayer, Layers, Mode, Project, ProjectFile, Runtime};
-use anyhow::Context;
+use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use ulid::Ulid;
 
-use crate::approve::InlineApprover;
+use crate::client_repl::{ClientRepl, TerminalInput};
 use crate::config::Config;
 use crate::project_cmd::ProjectCommand;
 use crate::skills_cmd::{SkillPaths, SkillsCommand};
@@ -49,6 +50,17 @@ struct Cli {
     /// state; `/mode` changes it later.
     #[arg(long, default_value = "manual")]
     mode: Mode,
+    /// A daemon to connect to (`unix:/path` or `tcp:host:port`). Without
+    /// it, a daemon is started in this process for this directory.
+    #[arg(long)]
+    server: Option<String>,
+    /// The environment variable holding your token for `--server`.
+    #[arg(long, default_value = "AIGENTIC_TOKEN")]
+    token_env: String,
+    /// The project on the daemon to work in (default: this directory's
+    /// `aigentic.toml` name, else the first project you have a role in).
+    #[arg(long)]
+    project: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -226,7 +238,10 @@ async fn main() -> anyhow::Result<()> {
                 global,
                 project: opened.clone(),
             });
-            println!("{}", project_cmd::report(&runtime, &global_instructions));
+            println!(
+                "{}",
+                aigentic_server::reports::project_report(&runtime, &global_instructions)
+            );
             if !project.mcp_servers.is_empty() {
                 println!(
                     "mcp servers (connected at thread start, not here): {}",
@@ -243,158 +258,155 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Doctor { .. } | Command::Init | Command::Serve { .. }) | None => {}
     }
 
-    let (profile_name, profile) = config.select(profile_arg)?;
-    let api_key = profile.api_key()?;
-    let provider = profile.build_provider(api_key);
-
-    // Tools: built-ins, then every MCP server in aigentic.toml. A server
-    // that fails to connect is reported and skipped; the thread still runs.
-    let mut tools = ToolRegistry::builtin(Workdir::new(&cwd));
-    for server in &project.mcp_servers {
-        match tools.connect_mcp(server).await {
-            Ok(specs) => {
-                println!(
-                    "mcp server {} connected: {} tools (class {:?}; descriptions below are the server's own text)",
-                    server.name,
-                    specs.len(),
-                    server.class
-                );
-                for spec in specs {
-                    let desc = repl::truncate_for_display(&spec.description, 2, 200);
-                    println!("  {}: {}", spec.name, desc.replace('\n', " "));
-                }
-            }
-            Err(e) => println!("[mcp server {} skipped: {e}]", server.name),
-        }
-    }
-
-    // Layers: the owner's instructions and denials, then the project.
-    let global = GlobalLayer::load(
-        &global_instructions,
-        config.denied_tools.clone(),
-        config.denied_skills.clone(),
-    )?;
-    let layers = Layers {
-        global,
-        project: opened.clone(),
-    };
-
-    // Skills: the enabled set minus global denials, hash-verified against
-    // the tools the model will see. A tampered or unlocked skill refuses
-    // to start with its name; nothing loads silently.
-    let mut available = tools.names();
-    available.extend(aigentic_runtime::harness_tools::harness_names());
-    let available = layers.allowed_tools(&available);
-    let enabled = layers.allowed_skills(&project.skills.enabled);
-    let skills =
-        skills_cmd::load_enabled(&enabled, &skill_paths, &available).context("loading skills")?;
-
-    std::fs::create_dir_all(&threads_dir)
-        .with_context(|| format!("creating {}", threads_dir.display()))?;
-    let (thread_id, resumed) = match cli.thread {
-        Some(id) => (id, true),
-        None => (Ulid::generate(), false),
-    };
-    // A thread from before the per-project layout lives flat in the base
-    // directory; resume it where it is rather than start an empty one.
-    let log_dir = if resumed
-        && !threads_dir.join(format!("{thread_id}.jsonl")).exists()
-        && threads_base.join(format!("{thread_id}.jsonl")).exists()
-    {
-        println!(
-            "[thread {thread_id} found in {} (pre-project layout)]",
-            threads_base.display()
-        );
-        threads_base.clone()
-    } else {
-        threads_dir.clone()
-    };
-    let (log, torn) = ThreadLog::open_with(&log_dir, thread_id, Repair::TruncateTornTail)?;
-    let user = Author::User(UserId(config.user_name()));
-
-    let mut runtime = Runtime::new(provider, tools, log, AgentId("assistant".into()))
-        .with_layers(layers)
-        .with_compaction(profile.compaction_settings())
-        .with_budget(profile.budget())
-        .with_model_label(&profile.model)
-        .with_policy(project.policy().with_root(&project_root, &cwd))
-        .with_skills(skills)
-        .with_approver(Box::new(InlineApprover::new(user.clone())));
-    runtime.set_mode(cli.mode);
-
-    println!("{}", repl::banner_line(profile_name, profile, cli.mode));
-    match &opened {
-        Some(p) => {
-            let mut layers_loaded = Vec::new();
-            if runtime.layers().global.instructions.is_some() {
-                layers_loaded.push("global".to_owned());
-            }
-            if p.instructions.is_some() {
-                layers_loaded.push("project".to_owned());
-            }
-            if !runtime.knowledge().is_empty() {
-                let mode = match runtime.knowledge_mode() {
-                    aigentic_runtime::KnowledgeMode::Inline => "inline",
-                    aigentic_runtime::KnowledgeMode::Index => "index",
-                };
-                layers_loaded.push(format!(
-                    "knowledge ({mode}, {} files)",
-                    runtime.knowledge().files.len()
-                ));
-            }
-            let memory_files = p
-                .memory
-                .iter()
-                .filter(|(_, text)| !text.trim().is_empty())
-                .count();
-            if memory_files > 0 {
-                layers_loaded.push(format!("memory ({memory_files} files)"));
-            }
-            let thread_count = project_cmd::list_threads(&threads_dir)
-                .map(|t| t.len())
-                .unwrap_or(0);
-            println!(
-                "project {} at {} · layers: {} · {} skills · {} policy rules · {} tools visible · {} threads",
-                p.name,
-                p.root.display(),
-                if layers_loaded.is_empty() {
-                    "none".to_owned()
-                } else {
-                    layers_loaded.join(", ")
-                },
-                runtime.skills().len(),
-                runtime.policy().rules.len(),
-                runtime.tool_specs().len(),
-                thread_count
-            );
+    // The REPL over the daemon's client: connect to `--server`, or start a
+    // daemon in this process for this directory over a private socket.
+    let user = config.user_name();
+    let display = config.display;
+    let history = config_path.with_file_name("history");
+    let (client, welcome, embedded) = match &cli.server {
+        Some(addr) => {
+            let addr: Addr = addr
+                .parse()
+                .map_err(|e: String| anyhow::anyhow!("--server: {e}"))?;
+            let token = std::env::var(&cli.token_env).with_context(|| {
+                format!(
+                    "{} is not set (the token for {addr}; `aigentic serve --new-token` mints one)",
+                    cli.token_env
+                )
+            })?;
+            let (client, welcome) = Client::connect(&addr, &token).await?;
+            (client, welcome, None)
         }
         None => {
-            println!("no aigentic.toml here or above: no skills, default policy, no MCP servers")
+            let embedded = aigentic_server::Server::embed(
+                config.clone(),
+                config_dir.clone(),
+                project_root.clone(),
+                &user,
+            )
+            .await?;
+            let (client, welcome) =
+                Client::connect(&Addr::Unix(embedded.socket.clone()), &embedded.token).await?;
+            (client, welcome, Some(embedded))
         }
-    }
-    if resumed {
-        println!(
-            "thread {thread_id} resumed with {} events from {}",
-            runtime.log().len(),
-            runtime.log().path().display()
+    };
+    let project_name = cli
+        .project
+        .clone()
+        .or_else(|| opened.as_ref().map(|p| p.name.clone()))
+        .or_else(|| embedded.as_ref().map(|e| e.project.clone()))
+        .or_else(|| welcome.projects.first().map(|p| p.name.clone()));
+    let Some(project_name) = project_name else {
+        bail!(
+            "no project to work in: {} has no role anywhere on {}",
+            welcome.user,
+            welcome.server
         );
+    };
+    let role = welcome
+        .projects
+        .iter()
+        .find(|p| p.name == project_name)
+        .and_then(|p| p.role.clone());
+    let thread_id = match cli.thread {
+        Some(id) => id,
+        None => match client
+            .request(Request::CreateThread {
+                project: project_name.clone(),
+            })
+            .await?
+        {
+            Response::Thread { thread } => thread.id,
+            Response::Refused { reason } => {
+                bail!("cannot start a thread in {project_name}: {reason}")
+            }
+            other => bail!("unexpected reply creating a thread: {other:?}"),
+        },
+    };
+    let (state, events, mode) = match client
+        .request(Request::Open {
+            thread: thread_id,
+            from_seq: 0,
+        })
+        .await?
+    {
+        Response::Opened {
+            state,
+            events,
+            mode,
+        } => (state, events, mode),
+        Response::Refused { reason } => bail!("cannot open thread {thread_id}: {reason}"),
+        other => bail!("unexpected reply opening the thread: {other:?}"),
+    };
+    if cli.mode != Mode::Manual {
+        client
+            .request(Request::SetMode {
+                thread: thread_id,
+                mode: cli.mode.name().to_owned(),
+            })
+            .await?;
+    }
+    let mode = if cli.mode != Mode::Manual {
+        cli.mode.name().to_owned()
+    } else {
+        mode
+    };
+
+    println!(
+        "aigentic · {} · {} as {} ({}) · project {project_name}{}",
+        welcome.server,
+        embedded.as_ref().map_or_else(
+            || cli.server.clone().unwrap_or_default(),
+            |_| "embedded daemon".into()
+        ),
+        welcome.user,
+        role.as_deref().unwrap_or("no role"),
+        if mode == "manual" {
+            String::new()
+        } else {
+            format!(" · mode {mode}")
+        }
+    );
+    if cli.thread.is_some() {
+        println!("thread {thread_id} resumed with {} events", events.len());
+        for line in client_repl::recent_lines(&events, 3) {
+            println!("  {line}");
+        }
     } else {
         println!("new thread {thread_id} (resume with --thread {thread_id})");
     }
-    if let Some(bytes) = torn {
-        println!("[repaired torn tail: {bytes} bytes of an unfinished event were cut]");
+    match &state {
+        ThreadState::Idle => {}
+        other => println!("[thread state: {other:?}]"),
     }
-    println!(
-        "/help lists commands; /project shows the layers; /threads lists threads; /quit exits"
-    );
+    println!("/help lists commands; /project shows the layers; /who the participants; /quit exits");
 
-    let resumed = runtime.resume(torn, &mut |_| {})?;
-    let history = config_path.with_file_name("history");
-    let profile_name = profile_name.to_owned();
-    repl::Repl::new(runtime, user, history)
-        .with_project_paths(threads_dir, global_instructions)
-        .with_display(config.display)
-        .with_config(config, &profile_name)
-        .run(resumed)
-        .await
+    // User-invoked skills for slash dispatch: the daemon's skills report
+    // lists them; the client keeps the names.
+    let skills = match client
+        .request(Request::Report {
+            thread: thread_id,
+            report: aigentic_api::ReportKind::Skills,
+        })
+        .await?
+    {
+        Response::Text { text } => text
+            .lines()
+            .filter_map(|l| l.strip_prefix('/'))
+            .filter_map(|l| l.split_whitespace().next())
+            .map(str::to_owned)
+            .collect(),
+        _ => Vec::new(),
+    };
+
+    let notices = client.take_notices().context("notice stream")?;
+    let mut input = TerminalInput::start(history)?;
+    let mut repl = ClientRepl::new(client, thread_id, &welcome.user, role, state, mode)
+        .with_display(display)
+        .with_skills(skills);
+    let lines = std::mem::replace(&mut input.lines, tokio::sync::mpsc::unbounded_channel().1);
+    repl.run(lines, notices, &mut *input.printer).await;
+    input.printer.line("bye");
+    drop(embedded);
+    Ok(())
 }

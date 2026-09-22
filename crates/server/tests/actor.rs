@@ -181,7 +181,7 @@ impl Rig {
                 reply,
             })
             .unwrap();
-        let (state, events) = reply_rx.await.unwrap();
+        let (state, events, _mode) = reply_rx.await.unwrap();
         (state, events.iter().map(|e| e.kind).collect(), rx)
     }
 
@@ -461,6 +461,11 @@ async fn a_decision_resumes_the_turn_and_a_late_subscriber_catches_up() {
         Response::Ok
     );
     assert_eq!(rig.kinds().last(), Some(&EventKind::Pinned));
+    // The mode change was broadcast before the pin landed.
+    assert!(matches!(
+        late.recv().await,
+        Some(Notice::Mode { mode, .. }) if mode == "auto"
+    ));
     assert!(matches!(
         late.recv().await,
         Some(Notice::Event { event, .. }) if event.kind == EventKind::Pinned
@@ -516,7 +521,7 @@ async fn a_resumed_open_turn_is_continued_before_the_first_mail() {
             reply,
         })
         .unwrap();
-    let (state, events) = reply_rx.await.unwrap();
+    let (state, events, _mode) = reply_rx.await.unwrap();
     assert_eq!(state, ThreadState::Idle);
     assert_eq!(
         events.iter().map(|e| e.kind).collect::<Vec<_>>(),

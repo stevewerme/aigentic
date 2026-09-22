@@ -137,6 +137,8 @@ pub enum ReportKind {
     Policy,
     Memory,
     Skills,
+    /// The project's participants and their roles.
+    Who,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -152,10 +154,13 @@ pub enum Response {
     Thread {
         thread: ThreadInfo,
     },
-    /// The reply to `Open`: the state now and the events since `from_seq`.
+    /// The reply to `Open`: the state now, the events since `from_seq`,
+    /// and the thread's permission mode.
     Opened {
         state: ThreadState,
         events: Vec<Event>,
+        #[serde(default)]
+        mode: String,
     },
     Ok,
     /// A rendered report, for the client to print as is.
@@ -204,6 +209,11 @@ pub enum Notice {
     State {
         thread: Ulid,
         state: ThreadState,
+    },
+    /// The permission mode changed (`SetMode`).
+    Mode {
+        thread: Ulid,
+        mode: String,
     },
 }
 
@@ -403,6 +413,7 @@ mod tests {
                     queued: 1,
                 },
                 events: vec![event()],
+                mode: "manual".into(),
             },
             Response::Ok,
             Response::Text {
@@ -446,6 +457,10 @@ mod tests {
                     call_id: "c2".into(),
                     question: "Ship it?".into(),
                 },
+            },
+            Notice::Mode {
+                thread: thread(),
+                mode: "auto".into(),
             },
         ]
     }

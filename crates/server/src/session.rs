@@ -402,7 +402,7 @@ async fn subscribe(
             message: "the thread's actor is gone".into(),
         };
     }
-    let Ok((state, events)) = rx.await else {
+    let Ok((state, events, mode)) = rx.await else {
         return Response::Error {
             message: "the thread's actor is gone".into(),
         };
@@ -418,7 +418,11 @@ async fn subscribe(
     if let Some((_, old)) = open.insert(thread, (mailbox.clone(), forward)) {
         old.abort();
     }
-    Response::Opened { state, events }
+    Response::Opened {
+        state,
+        events,
+        mode,
+    }
 }
 
 /// Send mail to a thread this session has open (or opens on the fly,
