@@ -193,6 +193,11 @@ impl Server {
         reports: Arc<dyn Reports>,
         profile: Option<String>,
     ) -> Self {
+        // Workspace files name more projects; server.toml wins on a clash.
+        // A broken workspace file leaves the daemon on server.toml alone.
+        let workspaces = crate::workspaces::load_all(&config_dir).unwrap_or_default();
+        let mut server = server;
+        server.projects = crate::workspaces::merge(server.projects, &workspaces);
         let config = Arc::new(config);
         let server = Arc::new(server);
         let threads_base = config
@@ -208,7 +213,8 @@ impl Server {
                 reports,
                 threads_base,
             )
-            .with_profile(profile),
+            .with_profile(profile)
+            .with_workspaces(workspaces),
         );
         Self {
             config,

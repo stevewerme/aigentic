@@ -282,6 +282,7 @@ pub fn check_skills(
     };
     let layers = Layers {
         global,
+        workspace: None,
         project: Some(project.clone()),
     };
     let mut available = ToolRegistry::builtin(Workdir::new(cwd)).names();

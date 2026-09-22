@@ -44,13 +44,13 @@ pub use decisions::{
 };
 pub use error::RuntimeError;
 pub use knowledge::{Knowledge, KnowledgeMode};
-pub use layers::{Decided, GlobalLayer, Layers};
+pub use layers::{Decided, GlobalLayer, Layers, WorkspaceLayer};
 pub use memory::{MEMORY_FILES, MEMORY_PROMPT};
 pub use mode::Mode;
 pub use project::{Project, ProjectError, ProjectFile};
 pub use resume::{INTERRUPTED_RESULT, Resumed};
 pub use runtime::{
-    ASKED_HUMAN, CompactionSettings, DEFAULT_BUDGET, DEFAULT_COMPACTION, INTERRUPTED, Runtime,
-    Signal, TurnOutcome, WindowUsage,
+    ASKED_HUMAN, CompactionSettings, DEFAULT_BUDGET, DEFAULT_COMPACTION, INTERRUPTED,
+    ProjectContext, Runtime, Signal, TurnOutcome, WindowUsage,
 };
 pub use seams::{SessionGrant, Verdict};

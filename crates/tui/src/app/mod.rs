@@ -376,6 +376,9 @@ async fn run_shell(
         let state = engine.state().clone();
         status.apply_state(&state);
         status.mode = engine.mode().to_owned();
+        if let Some(p) = engine.project() {
+            status.project = p.to_owned();
+        }
         status.usage = engine.usage();
         // The turn line carries the clock while a turn runs.
         status.elapsed = None;

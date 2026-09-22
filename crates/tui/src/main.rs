@@ -315,6 +315,7 @@ async fn main() -> anyhow::Result<()> {
             )
             .with_layers(Layers {
                 global,
+                workspace: None,
                 project: opened.clone(),
             });
             println!(

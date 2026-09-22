@@ -9,11 +9,14 @@ use std::sync::Arc;
 use aigentic_runtime::aigentic_core::{AgentId, Provider};
 use aigentic_runtime::aigentic_log::{Repair, ThreadLog};
 use aigentic_runtime::aigentic_tools::{ToolRegistry, Workdir};
-use aigentic_runtime::{GlobalLayer, Layers, Project, ProjectFile, Runtime};
+use aigentic_runtime::{
+    GlobalLayer, Layers, Project, ProjectContext, ProjectFile, Runtime, WorkspaceLayer,
+};
 use ulid::Ulid;
 
 use crate::config::{Config, ConfigError, Profile};
 use crate::skills::{SkillPaths, load_enabled};
+use crate::workspaces::{self, Workspace};
 
 /// Where a thread's provider comes from. The daemon builds it from the
 /// profile with the key from its own environment; tests script one.
@@ -77,17 +80,27 @@ pub struct Root {
     pub threads_dir: PathBuf,
 }
 
-/// Open or create a thread's log under `root` and build its runtime.
-pub async fn build_thread(
+/// Everything a thread takes from the project at `root`: the layers
+/// (global, the workspace's when the root is in one, the project's), the
+/// profile's provider, tools rooted there with its MCP servers, the
+/// skills and the policy. For a new or reloaded thread (`build_thread`)
+/// and for a switch (`Runtime::set_project`).
+pub struct Context {
+    pub ctx: ProjectContext,
+    pub profile: String,
+    pub mcp_skipped: Vec<(String, String)>,
+}
+
+pub async fn project_context(
     config: &Config,
     config_dir: &Path,
     providers: &dyn ProviderFactory,
     root: &Root,
-    thread: Ulid,
+    workspaces: &[Workspace],
     profile_override: Option<&str>,
-) -> Result<Built, BuildError> {
+) -> Result<Context, BuildError> {
     // The project, when the root holds an aigentic.toml; else a bare
-    // working directory with no layers, as the REPL outside a project.
+    // working directory with no project layer.
     let opened: Option<Project> = if root
         .root
         .join(aigentic_runtime::project::FILE_NAME)
@@ -105,7 +118,6 @@ pub async fn build_thread(
         .or_else(|| file.model.as_ref().map(|m| m.profile.clone()))
         .unwrap_or_else(|| config.default_profile.clone());
     let (provider, model) = providers.build(&profile_name)?;
-    let profile: Option<&Profile> = config.profiles.get(&profile_name);
 
     let mut tools = ToolRegistry::builtin(Workdir::new(&root.root));
     let mut mcp_skipped = Vec::new();
@@ -124,8 +136,13 @@ pub async fn build_thread(
         config.denied_tools.clone(),
         config.denied_skills.clone(),
     )?;
+    let workspace = match workspaces::workspace_of(workspaces, &root.root) {
+        Some(w) => Some(WorkspaceLayer::load(&w.name, w.shared.as_deref())?),
+        None => None,
+    };
     let layers = Layers {
         global,
+        workspace: workspace.clone(),
         project: opened.clone(),
     };
 
@@ -142,19 +159,61 @@ pub async fn build_thread(
     let available = layers.allowed_tools(&available);
     let enabled = layers.allowed_skills(&file.skills.enabled);
     let skills = load_enabled(&enabled, &skill_paths, &available)?;
+    let policy = file
+        .policy()
+        .with_root(&root.root, &root.root)
+        .with_rules_file(&rules_file);
+    Ok(Context {
+        ctx: ProjectContext {
+            name: opened.as_ref().map(|p| p.name.clone()),
+            workspace: workspace.map(|w| w.name),
+            root: root.root.clone(),
+            layers,
+            policy,
+            skills,
+            registry: tools,
+            provider,
+            model_label: model,
+        },
+        profile: profile_name,
+        mcp_skipped,
+    })
+}
+
+/// Open or create a thread's log in `root.threads_dir` and build its
+/// runtime from the project at `root.root`.
+pub async fn build_thread(
+    config: &Config,
+    config_dir: &Path,
+    providers: &dyn ProviderFactory,
+    root: &Root,
+    workspaces: &[Workspace],
+    thread: Ulid,
+    profile_override: Option<&str>,
+) -> Result<Built, BuildError> {
+    let Context {
+        ctx,
+        profile: profile_name,
+        mcp_skipped,
+    } = project_context(
+        config,
+        config_dir,
+        providers,
+        root,
+        workspaces,
+        profile_override,
+    )
+    .await?;
+    let profile: Option<&Profile> = config.profiles.get(&profile_name);
 
     std::fs::create_dir_all(&root.threads_dir)?;
     let (log, torn) = ThreadLog::open_with(&root.threads_dir, thread, Repair::TruncateTornTail)?;
 
-    let mut runtime = Runtime::new(provider, tools, log, AgentId("assistant".into()))
-        .with_layers(layers)
-        .with_model_label(&model)
-        .with_policy(
-            file.policy()
-                .with_root(&root.root, &root.root)
-                .with_rules_file(&rules_file),
-        )
-        .with_skills(skills)
+    let mut runtime = Runtime::new(ctx.provider, ctx.registry, log, AgentId("assistant".into()))
+        .with_layers(ctx.layers)
+        .with_model_label(&ctx.model_label)
+        .with_policy(ctx.policy)
+        .with_skills(ctx.skills)
         .with_harness_instructions();
     if let Some(utility) = &config.utility_profile
         && *utility != profile_name

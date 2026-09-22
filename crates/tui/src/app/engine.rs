@@ -227,6 +227,9 @@ pub struct ClientRepl {
     block: Option<PromptBlock>,
     /// The running turn's figures; `None` while idle.
     turn: Option<TurnStats>,
+    /// The project the thread moved to, once it has; the shell's status
+    /// line shows it over the one it started in.
+    project: Option<String>,
     /// The model's checklist from its last `update_tasks`, until it is all
     /// done or the turn ends.
     tasks: Vec<aigentic_runtime::harness_tools::Task>,
@@ -263,6 +266,7 @@ impl ClientRepl {
             prompted: None,
             block: None,
             turn: None,
+            project: None,
             tasks: Vec::new(),
             task_calls: std::collections::HashSet::new(),
             usage: None,
@@ -418,6 +422,15 @@ impl ClientRepl {
                 for l in crate::app::keymap::KEYS.lines() {
                     out.line(l);
                 }
+            }
+            Command::ProjectUse(name) => {
+                let r = self
+                    .request(Request::SwitchProject {
+                        thread: self.thread,
+                        project: name.to_owned(),
+                    })
+                    .await;
+                self.show(r, "", out);
             }
             Command::Rename(title) => {
                 let r = self
@@ -580,6 +593,11 @@ impl ClientRepl {
             })
             .await;
         self.answered(r, out);
+    }
+
+    /// The project the thread last moved to, if it has.
+    pub fn project(&self) -> Option<&str> {
+        self.project.as_deref()
     }
 
     /// The checklist the shell draws above the turn line.
@@ -1001,6 +1019,28 @@ impl ClientRepl {
                     && !p.written.is_empty()
                 {
                     out.line(&format!("[memory: {} lines written]", p.written.len()));
+                }
+            }
+            EventKind::ProjectSwitched => {
+                self.flush_partial(out);
+                if let Ok(p) = serde_json::from_value::<
+                    aigentic_runtime::aigentic_log::ProjectSwitchedPayload,
+                >(event.payload.clone())
+                {
+                    let name =
+                        |n: &Option<String>| n.clone().unwrap_or_else(|| "no project".into());
+                    let ws = p
+                        .workspace
+                        .as_ref()
+                        .map(|w| format!(" ({w})"))
+                        .unwrap_or_default();
+                    out.line(&format!(
+                        "[project: {} → {}{ws} · {}]",
+                        name(&p.from),
+                        name(&p.to),
+                        p.root.display()
+                    ));
+                    self.project = p.to;
                 }
             }
             EventKind::ThreadRenamed => {

@@ -12,6 +12,9 @@ pub struct Prefix<'a> {
     /// The harness's own standing instructions (phase 6 step 8c): how to
     /// use its tools. Fixed text, after the person's global block.
     pub harness: Option<&'a str>,
+    /// The workspace's instructions (phase 6 step 10), before the
+    /// project's.
+    pub workspace: Option<String>,
     pub project: Option<&'a str>,
     /// One line under the project instructions when the project names
     /// participants (phase 5): who is in it and their roles, so the
@@ -60,6 +63,9 @@ pub fn build_context(prefix: &Prefix<'_>, events: &[Event]) -> Result<Vec<Messag
     }
     if let Some(text) = prefix.harness {
         context.push(system(text.to_owned()));
+    }
+    if let Some(text) = &prefix.workspace {
+        context.push(system(text.clone()));
     }
     if let Some(text) = prefix.project {
         context.push(system(text.to_owned()));
@@ -164,6 +170,7 @@ mod tests {
         let prefix = Prefix {
             global: Some("You are terse."),
             harness: Some("Keep a checklist."),
+            workspace: None,
             project: Some("This is Vendela."),
             participants: None,
             knowledge: Some("# Knowledge\n\n...".into()),

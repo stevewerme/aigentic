@@ -12,6 +12,7 @@ pub mod serve;
 pub mod session;
 pub mod skills;
 pub mod threads;
+pub mod workspaces;
 
 pub use actor::{Mail, Mailbox, NoReports, Reports, ThreadActor};
 pub use build::{Profiles, ProviderFactory};

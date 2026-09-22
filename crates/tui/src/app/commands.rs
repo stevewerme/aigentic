@@ -33,6 +33,8 @@ pub enum Command<'a> {
     Diff,
     /// Set the thread's title.
     Rename(&'a str),
+    /// Move the thread to another project.
+    ProjectUse(&'a str),
     Unknown(&'a str),
     Chat(&'a str),
     Empty,
@@ -57,6 +59,9 @@ pub fn parse_line<'a>(line: &'a str, skills: &[String]) -> Command<'a> {
         ("diff", _) => Command::Diff,
         ("rename", title) if !title.is_empty() => Command::Rename(title),
         ("skills", _) => Command::Skills,
+        ("project", rest) if rest.starts_with("use ") && !rest[4..].trim().is_empty() => {
+            Command::ProjectUse(rest[4..].trim())
+        }
         ("project", _) => Command::Project,
         ("threads", _) => Command::Threads,
         ("compact", _) => Command::Compact,
@@ -125,6 +130,7 @@ pub const HELP: &str = "\
 /memory          the memory files as the prefix carries them, and the last extraction
 /skills          list enabled skills; user-invoked ones are slash commands
 /project         the layers, the knowledge mode and every tool's fate
+/project use <n> move this thread to project <n>, keeping the conversation
 /threads         this project's threads, newest first
 /<skill> [args]  run a user-invoked skill
 /diff            the project's working-tree diff, untracked files included

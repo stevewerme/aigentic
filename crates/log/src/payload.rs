@@ -28,6 +28,18 @@ impl UserMessagePayload {
     }
 }
 
+/// `project_switched`: the thread's project changed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectSwitchedPayload {
+    pub from: Option<String>,
+    pub to: Option<String>,
+    /// The new working root.
+    pub root: std::path::PathBuf,
+    /// The workspace the new project is in, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+}
+
 /// `thread_renamed`: the thread's title.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThreadRenamedPayload {

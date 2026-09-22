@@ -116,6 +116,46 @@ impl Runtime {
         }
     }
 
+    /// Move the thread to another project: every project-derived part is
+    /// replaced (layers, policy, skills, tools and their working root,
+    /// provider), session grants end, knowledge reloads, and a
+    /// `project_switched` event by `by` records it. Pins, compaction and
+    /// the transcript stay: they are the thread's, in the log.
+    pub fn set_project(
+        &mut self,
+        ctx: ProjectContext,
+        by: aigentic_core::Author,
+        observe: &mut (dyn FnMut(Signal<'_>) + Send),
+    ) -> Result<(), crate::RuntimeError> {
+        let from = self.layers.project.as_ref().map(|p| p.name.clone());
+        let payload = aigentic_log::ProjectSwitchedPayload {
+            from,
+            to: ctx.name.clone(),
+            root: ctx.root.clone(),
+            workspace: ctx.workspace.clone(),
+        };
+        self.layers = ctx.layers;
+        self.policy = ctx.policy;
+        self.skills = ctx.skills;
+        self.registry = ctx.registry;
+        self.provider = ctx.provider;
+        self.model_label = ctx.model_label;
+        self.session_grants.clear();
+        self.measured = None;
+        if self.layers.project.is_none() {
+            self.knowledge = Knowledge::default();
+        }
+        self.reload_knowledge()?;
+        self.append(
+            aigentic_core::EventKind::ProjectSwitched,
+            by,
+            serde_json::to_value(payload).expect("serialisable"),
+            None,
+            observe,
+        )?;
+        Ok(())
+    }
+
     /// A smaller model for side jobs (phase 6 step 9).
     pub fn with_utility(mut self, provider: Box<dyn Provider>) -> Self {
         self.utility = Some(provider);
@@ -418,6 +458,7 @@ impl Runtime {
         crate::Prefix {
             global: self.layers.global.instructions.as_deref(),
             harness: self.harness_instructions,
+            workspace: self.layers.workspace_instructions(),
             project: self.layers.project_instructions(),
             participants: self.participants_line(),
             knowledge: self.knowledge.prefix(self.knowledge_mode),
@@ -470,6 +511,32 @@ pub enum Signal<'a> {
     /// The turn parked on a decision (phase 5); a client shows what is
     /// waited for.
     Waiting(&'a Pending),
+}
+
+/// What a thread takes from its project, built by the daemon and swapped
+/// in whole by `Runtime::set_project` (phase 6 step 10).
+pub struct ProjectContext {
+    pub name: Option<String>,
+    pub workspace: Option<String>,
+    pub root: std::path::PathBuf,
+    pub layers: Layers,
+    pub policy: Policy,
+    pub skills: SkillSet,
+    /// Built-in tools rooted at the new root, and its MCP servers.
+    pub registry: ToolRegistry,
+    pub provider: Box<dyn Provider>,
+    pub model_label: String,
+}
+
+impl std::fmt::Debug for ProjectContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProjectContext")
+            .field("name", &self.name)
+            .field("workspace", &self.workspace)
+            .field("root", &self.root)
+            .field("model_label", &self.model_label)
+            .finish_non_exhaustive()
+    }
 }
 
 /// How full the model's window is: the last call's reported prompt size

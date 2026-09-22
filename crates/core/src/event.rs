@@ -39,6 +39,10 @@ pub enum EventKind {
     /// the first turn (author `system`) or set with `/rename` (author the
     /// person). The last one wins.
     ThreadRenamed,
+    /// The thread moved to another project (phase 6 step 10): from where
+    /// to where, the new working root, and the workspace. The projection
+    /// tells the model; a reload builds the thread in the last one.
+    ProjectSwitched,
 }
 
 /// One line of a thread's append-only log. The log is the source of truth;

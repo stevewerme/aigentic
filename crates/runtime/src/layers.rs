@@ -43,6 +43,86 @@ impl GlobalLayer {
     }
 }
 
+/// A workspace's layer (phase 6 step 10): what every project in it
+/// shares. Its files live in `<shared>/workspace/`: `instructions.md`
+/// and `memory/*.md` now, knowledge and a brief in step 12.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct WorkspaceLayer {
+    pub name: String,
+    pub instructions: Option<String>,
+    /// Memory files, name and text, in name order.
+    pub memory: Vec<(String, String)>,
+}
+
+impl WorkspaceLayer {
+    /// The folder under `shared` that holds the workspace's own files.
+    pub fn dir(shared: &Path) -> std::path::PathBuf {
+        shared.join("workspace")
+    }
+
+    /// Read the layer; missing files are an empty layer.
+    pub fn load(name: &str, shared: Option<&Path>) -> Result<Self, ProjectError> {
+        let mut layer = Self {
+            name: name.to_owned(),
+            ..Self::default()
+        };
+        let Some(shared) = shared else {
+            return Ok(layer);
+        };
+        let dir = Self::dir(shared);
+        let read = |path: &Path| match std::fs::read_to_string(path) {
+            Ok(t) => Ok(Some(t)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(source) => Err(ProjectError::Io {
+                path: path.to_path_buf(),
+                source,
+            }),
+        };
+        layer.instructions = read(&dir.join("instructions.md"))?.filter(|t| !t.trim().is_empty());
+        if let Ok(entries) = std::fs::read_dir(dir.join("memory")) {
+            let mut files: Vec<_> = entries
+                .filter_map(Result::ok)
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|x| x == "md"))
+                .collect();
+            files.sort();
+            for f in files {
+                if let Some(text) = read(&f)? {
+                    let name = f
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    layer.memory.push((name, text));
+                }
+            }
+        }
+        Ok(layer)
+    }
+
+    /// The block the prefix carries after the global one.
+    pub fn instructions_block(&self) -> Option<String> {
+        let text = self.instructions.as_deref()?;
+        Some(format!("# Workspace {}\n\n{}", self.name, text.trim_end()))
+    }
+
+    fn memory_block(&self) -> Option<String> {
+        let parts: Vec<String> = self
+            .memory
+            .iter()
+            .filter(|(_, t)| !t.trim().is_empty())
+            .map(|(n, t)| format!("## {n}\n\n{}", t.trim_end()))
+            .collect();
+        if parts.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "# Workspace memory ({})\n\n{}",
+            self.name,
+            parts.join("\n\n")
+        ))
+    }
+}
+
 /// Which layer settled a tool's or skill's fate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decided {
@@ -57,6 +137,8 @@ pub enum Decided {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Layers {
     pub global: GlobalLayer,
+    /// Between the global and project layers (phase 6 step 10).
+    pub workspace: Option<WorkspaceLayer>,
     pub project: Option<Project>,
 }
 
@@ -69,6 +151,7 @@ impl Layers {
                 instructions: Some(text.into()),
                 ..GlobalLayer::default()
             },
+            workspace: None,
             project: None,
         }
     }
@@ -121,8 +204,22 @@ impl Layers {
         self.project.as_ref()?.instructions.as_deref()
     }
 
+    pub fn workspace_instructions(&self) -> Option<String> {
+        self.workspace.as_ref()?.instructions_block()
+    }
+
+    /// The workspace's memory, then the project's, as one block.
     pub fn memory_prefix(&self) -> Option<String> {
-        self.project.as_ref()?.memory_prefix()
+        let parts: Vec<String> = [
+            self.workspace
+                .as_ref()
+                .and_then(WorkspaceLayer::memory_block),
+            self.project.as_ref().and_then(Project::memory_prefix),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        (!parts.is_empty()).then(|| parts.join("\n\n"))
     }
 }
 
@@ -172,6 +269,7 @@ mod tests {
                 denied_skills: names(&["wizard"]),
             },
             project: Some(project(&["bash", "mcp.docs.search", "read_file"])),
+            workspace: None,
         };
         assert_eq!(layers.allowed_tools(&registry), names(&["read_file"]));
         assert_eq!(layers.decided_tool("bash"), Decided::DeniedByGlobal);

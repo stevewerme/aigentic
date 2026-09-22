@@ -121,6 +121,23 @@ project root. Without a terminal (a pipe, a script) the client reads stdin lines
 and prints lines, tool output cut the same way, which is what the acceptance
 items below and `exec` use.
 
+Workspaces group projects that belong together (a brand, a client). Each
+is a file in `~/.config/aigentic/workspaces/`, per machine since paths are:
+
+```toml
+name = "aigentic"
+shared = "~/Projects/aigentic-marketing"   # its workspace/ folder: instructions.md, memory/
+projects = ["~/Projects/aigentic", "~/Projects/aigentic-site", "~/Projects/aigentic-marketing"]
+```
+
+The daemon reads them all, so it knows every project's root; a project's
+name is its `aigentic.toml`'s, or its folder's. Every project in a workspace
+gets the workspace's instructions and memory between the global and project
+layers. `/project use <name>` moves the thread to another project: the
+conversation stays, the instructions, knowledge, memory, skills, policy,
+tools and working directory become the new project's, the model is told,
+and a restart resumes the thread there.
+
 `utility_profile = "<profile>"` at the top of `config.toml` names a profile
 for side jobs: thread titles and memory extraction. Without it there are no
 titles, and memory runs on each thread's own profile. Pick a fast model that

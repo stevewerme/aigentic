@@ -1,6 +1,6 @@
 # Phase 6 plan
 
-Status: grilled and settled on 2026-09-22 (18 questions, section 11 records the answers); steps 1 to 9 landed the same day · Follows `docs/PRD.md` (the Terminal application and Projects sections) and the phase 0 to 5 plans · Renumbers the PRD's build order: the client is phase 6, sandboxing phase 7, the orchestrator phase 8; multiplayer acceptance (phase 5 step 11) waits behind all three
+Status: grilled and settled on 2026-09-22 (18 questions, section 11 records the answers); steps 1 to 10 landed the same day · Follows `docs/PRD.md` (the Terminal application and Projects sections) and the phase 0 to 5 plans · Renumbers the PRD's build order: the client is phase 6, sandboxing phase 7, the orchestrator phase 8; multiplayer acceptance (phase 5 step 11) waits behind all three
 
 ## 0. Goal and done-when
 
@@ -741,6 +741,16 @@ Settled in the grilling of 2026-09-22 (Q1 to Q18) and in the draft.
   Flash writes poor briefs or memory lines, fall back to the thread's
   profile for those only. The Qwen flash models are not candidates on
   TensorX: 40 s and more per title, or no answer within 512 tokens.
+- Memory extraction's judgement: in step 10's live run it filed "Steve
+  is in the Aigentic project" from a test question. Watch what it keeps
+  during the acceptance week; tighten `MEMORY_PROMPT` if it files chatter.
+- As landed in step 10: the workspace layer carries instructions and
+  memory; its knowledge and brief come with step 12. A switch keeps the
+  thread's compaction settings and budget (the profile's) and swaps the
+  provider; the thread's log stays under the project it was created in
+  until step 13's flat directory. `project_of` for an unloaded thread
+  still answers from that directory, so a role check before reopening
+  uses the first project; step 13 reads the log instead.
 - Side jobs run in the actor after a turn, so a post made right then
   waits for them (about a second on the utility model). If that shows,
   move them off the actor.

@@ -127,6 +127,13 @@ pub enum Request {
         thread: Ulid,
         text: String,
     },
+    /// Move the thread to another project (phase 6 step 10): needs
+    /// `write` in both the thread's project and the target; refused while
+    /// a turn runs.
+    SwitchProject {
+        thread: Ulid,
+        project: String,
+    },
     /// Set the thread's title (phase 6 step 9); refused while a turn runs.
     Rename {
         thread: Ulid,

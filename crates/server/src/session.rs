@@ -222,6 +222,7 @@ fn project_for(threads: &ThreadTable, request: &Request) -> Option<String> {
         | Request::AnswerHuman { thread, .. }
         | Request::Pin { thread, .. }
         | Request::Rename { thread, .. }
+        | Request::SwitchProject { thread, .. }
         | Request::Compact { thread }
         | Request::SetMode { thread, .. }
         | Request::Report { thread, .. } => threads.project_of(*thread),
@@ -253,6 +254,18 @@ async fn handle(
             return Response::Refused {
                 reason: denied.reason,
             };
+        }
+        // A switch needs the same role in the project it goes to.
+        if let Request::SwitchProject { project: to, .. } = &request {
+            let target = match threads.participants(to) {
+                Ok(p) => p,
+                Err(e) => return thread_error(e),
+            };
+            if let Err(denied) = auth::allowed(user, config.owner(), &target, &request) {
+                return Response::Refused {
+                    reason: format!("in {to}: {}", denied.reason),
+                };
+            }
         }
     }
 
@@ -358,6 +371,17 @@ async fn handle(
                 reply,
             })
             .await
+        }
+        Request::SwitchProject { thread, project } => {
+            if !open.contains_key(&thread) {
+                return Response::Refused {
+                    reason: "open the thread first".into(),
+                };
+            }
+            match threads.switch(thread, &project, author.clone()).await {
+                Ok(()) => Response::Ok,
+                Err(e) => thread_error(e),
+            }
         }
         Request::Rename { thread, title } => {
             let author = author.clone();

@@ -227,6 +227,31 @@ pub fn project(events: &[Event]) -> Result<Projection, LogError> {
                     },
                 );
             }
+            EventKind::ProjectSwitched => {
+                let p: crate::ProjectSwitchedPayload = payload(event)?;
+                let name = |n: &Option<String>| n.clone().unwrap_or_else(|| "no project".into());
+                let workspace = p
+                    .workspace
+                    .as_ref()
+                    .map(|w| format!(" in workspace {w}"))
+                    .unwrap_or_default();
+                push(
+                    &mut body,
+                    &mut pending_calls,
+                    &mut held,
+                    Message {
+                        role: Role::User,
+                        author: Author::System,
+                        blocks: vec![ContentBlock::Text(format!(
+                            "[The thread moved from project {} to project {}{workspace}. {}'s instructions, knowledge and files no longer apply; the working directory is now {}.]",
+                            name(&p.from),
+                            name(&p.to),
+                            name(&p.from),
+                            p.root.display()
+                        ))],
+                    },
+                );
+            }
             EventKind::Interrupted => {
                 let p: InterruptedPayload = payload(event)?;
                 let who = match &p.by {

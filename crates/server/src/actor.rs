@@ -70,6 +70,12 @@ pub enum Mail {
         title: String,
         reply: oneshot::Sender<Response>,
     },
+    /// Swap in another project's context (built by the table); idle only.
+    SwitchProject {
+        ctx: Box<aigentic_runtime::ProjectContext>,
+        by: Author,
+        reply: oneshot::Sender<Response>,
+    },
     Compact {
         reply: oneshot::Sender<Response>,
     },
@@ -432,6 +438,22 @@ impl ThreadActor {
                 );
                 None
             }
+            Mail::SwitchProject { ctx, by, reply } => {
+                let shared = self.shared.clone();
+                let sys = Author::System;
+                let _ = reply.send(
+                    match self
+                        .runtime
+                        .set_project(*ctx, by, &mut |s| shared.observe(s, &sys))
+                    {
+                        Ok(()) => Response::Ok,
+                        Err(e) => Response::Error {
+                            message: e.to_string(),
+                        },
+                    },
+                );
+                None
+            }
             Mail::Interrupt { reply, .. } => {
                 let _ = reply.send(Response::Refused {
                     reason: "no turn is running".into(),
@@ -729,6 +751,7 @@ impl ThreadActor {
             }
             Mail::Pin { reply, .. }
             | Mail::Rename { reply, .. }
+            | Mail::SwitchProject { reply, .. }
             | Mail::Compact { reply }
             | Mail::SetMode { reply, .. }
             | Mail::Report { reply, .. } => {

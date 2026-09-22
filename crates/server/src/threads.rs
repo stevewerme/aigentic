@@ -19,8 +19,9 @@ use tokio::sync::oneshot;
 use ulid::Ulid;
 
 use crate::actor::{Mail, Mailbox, Reports, ThreadActor};
-use crate::build::{BuildError, ProviderFactory, Root, build_thread};
+use crate::build::{BuildError, ProviderFactory, Root, build_thread, project_context};
 use crate::config::{Config, ServerConfig};
+use crate::workspaces::Workspace;
 
 /// Threads of a root without a project file.
 pub const NO_PROJECT_DIR: &str = "_none";
@@ -46,6 +47,9 @@ pub struct ThreadTable {
     /// the client's `--profile` on an embedded daemon. `None` on a
     /// served daemon, where the profile is the project's.
     profile_override: Option<String>,
+    /// Workspace files (phase 6 section 9b); their projects are already
+    /// merged into `server.projects`.
+    workspaces: Vec<Workspace>,
     entries: Mutex<HashMap<Ulid, Entry>>,
 }
 
@@ -63,6 +67,8 @@ pub enum ThreadError {
     Runtime(#[from] aigentic_runtime::RuntimeError),
     #[error("the thread's actor is gone")]
     Gone,
+    #[error("{0}")]
+    Refused(String),
 }
 
 impl ThreadTable {
@@ -82,6 +88,7 @@ impl ThreadTable {
             reports,
             threads_base,
             profile_override: None,
+            workspaces: Vec::new(),
             entries: Mutex::new(HashMap::new()),
         }
     }
@@ -91,6 +98,54 @@ impl ThreadTable {
     pub fn with_profile(mut self, profile: Option<String>) -> Self {
         self.profile_override = profile;
         self
+    }
+
+    pub fn with_workspaces(mut self, workspaces: Vec<Workspace>) -> Self {
+        self.workspaces = workspaces;
+        self
+    }
+
+    pub fn workspaces(&self) -> &[Workspace] {
+        &self.workspaces
+    }
+
+    /// Move an open thread to `project`: its context is built here, the
+    /// actor swaps it in while idle and records `project_switched`.
+    pub async fn switch(&self, thread: Ulid, project: &str, by: Author) -> Result<(), ThreadError> {
+        let mailbox = self.mailbox(thread).ok_or(ThreadError::NoThread(thread))?;
+        let root = self.root_of(project)?;
+        let built = project_context(
+            &self.config,
+            &self.config_dir,
+            &*self.providers,
+            &root,
+            &self.workspaces,
+            self.profile_override.as_deref(),
+        )
+        .await?;
+        let (reply, rx) = oneshot::channel();
+        mailbox
+            .send(Mail::SwitchProject {
+                ctx: Box::new(built.ctx),
+                by,
+                reply,
+            })
+            .map_err(|_| ThreadError::Gone)?;
+        match rx.await.map_err(|_| ThreadError::Gone)? {
+            aigentic_api::Response::Ok => {
+                if let Some(e) = self
+                    .entries
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get_mut(&thread)
+                {
+                    e.project = project.to_owned();
+                }
+                Ok(())
+            }
+            aigentic_api::Response::Refused { reason } => Err(ThreadError::Refused(reason)),
+            other => Err(ThreadError::Refused(format!("{other:?}"))),
+        }
     }
 
     fn root_of(&self, project: &str) -> Result<Root, ThreadError> {
@@ -219,15 +274,25 @@ impl ThreadTable {
                 return Ok((e.mailbox.clone(), e.project.clone()));
             }
         }
-        let project = self
+        // The log lives under the project it was created in; the thread
+        // is built in the project it last switched to.
+        let home = self
             .project_of(thread)
             .ok_or(ThreadError::NoThread(thread))?;
-        let root = self.root_of(&project)?;
+        let home_root = self.root_of(&home)?;
+        let project = last_switch(&home_root.threads_dir, thread)
+            .filter(|p| self.server.project(p).is_some())
+            .unwrap_or_else(|| home.clone());
+        let root = Root {
+            threads_dir: home_root.threads_dir,
+            ..self.root_of(&project)?
+        };
         let built = build_thread(
             &self.config,
             &self.config_dir,
             &*self.providers,
             &root,
+            &self.workspaces,
             thread,
             self.profile_override.as_deref(),
         )
@@ -355,6 +420,22 @@ fn summarise(dir: &Path, id: Ulid, project: &str) -> ThreadInfo {
         state: ThreadState::Idle,
         title: aigentic_runtime::title::title_of(&events),
     }
+}
+
+/// The project a thread last switched to, from its log.
+fn last_switch(dir: &Path, id: Ulid) -> Option<String> {
+    let events = ThreadLog::open(dir, id).ok()?.read_all().ok()?;
+    events
+        .iter()
+        .rev()
+        .filter(|e| e.kind == EventKind::ProjectSwitched)
+        .find_map(|e| {
+            serde_json::from_value::<aigentic_runtime::aigentic_log::ProjectSwitchedPayload>(
+                e.payload.clone(),
+            )
+            .ok()
+        })
+        .and_then(|p| p.to)
 }
 
 const FIRST_LINE_CHARS: usize = 72;
