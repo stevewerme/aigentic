@@ -20,6 +20,7 @@ crate.
 | `crates/tui` | `aigentic-tui` (binary `aigentic`) | Terminal client: streaming REPL first, ratatui later |
 | `crates/skills` | `aigentic-skills` | Skill discovery and loading (phase 3, empty until then) |
 | `crates/policy` | `aigentic-policy` | Permission rules and prompts (phase 3, empty until then) |
+| `crates/api` | `aigentic-api` | The daemon's wire types and JSON lines codec; a `tokio` client behind the `client` feature (phase 5) |
 
 ## The dependency rule
 
@@ -29,7 +30,11 @@ use only `serde`, `serde_json`, `schemars`, `ulid`, `futures-core`, `time` and
 that knows about `log`, `providers`, `tools`, `skills` and `policy`. `tui`
 depends on the runtime API only; `runtime` re-exports `aigentic_core`,
 `aigentic_log`, `aigentic_providers` and `aigentic_tools` so a client can
-construct a `Runtime` without adding Cargo edges of its own. Never add an edge that breaks this: the
+construct a `Runtime` without adding Cargo edges of its own. `api` depends
+on `core` only: the wire carries `Event`, `ContentBlock` and `ToolCall`
+as they are, and mirrors the two small log shapes it needs (a permission
+request, a decision's scope) rather than take an edge to `log`; roles
+cross the wire as strings so it takes none to `policy` either. Never add an edge that breaks this: the
 model is a function behind the `Provider` trait, and `core` must never import
 a provider SDK.
 

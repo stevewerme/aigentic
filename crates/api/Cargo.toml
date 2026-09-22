@@ -1,0 +1,29 @@
+[package]
+name = "aigentic-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Aigentic wire types: the daemon's JSON lines protocol, and a client"
+
+[features]
+default = []
+# The tokio client. Off by default so the types compile without an
+# async runtime, as `core` does.
+client = ["dep:tokio"]
+
+[dependencies]
+aigentic-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+ulid.workspace = true
+tokio = { workspace = true, features = ["net", "sync", "io-util", "rt"], optional = true }
+
+[dev-dependencies]
+# The crate's own tests run with the client on, so plain `cargo test`
+# covers it while the feature stays off for dependents by default.
+aigentic-api = { path = ".", features = ["client"] }
+tokio = { workspace = true, features = ["net", "sync", "io-util", "rt", "macros"] }
+tempfile.workspace = true
+time.workspace = true

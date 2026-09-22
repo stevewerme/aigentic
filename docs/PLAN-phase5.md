@@ -1,6 +1,6 @@
 # Phase 5 plan
 
-Status: step 1 landed on 2026-09-22; written the same day after the phase 4 close · Follows `docs/PRD.md` (the Server and multiplayer phase) and the phase 0 to 4 plans
+Status: steps 1 and 2 landed on 2026-09-22; written the same day after the phase 4 close · Follows `docs/PRD.md` (the Server and multiplayer phase) and the phase 0 to 4 plans
 
 ## 0. Goal and done-when
 
@@ -132,18 +132,18 @@ pub enum Request {
     Close { thread: Ulid },
     Post { thread: Ulid, blocks: Vec<ContentBlock>, interrupt: bool },
     InvokeSkill { thread: Ulid, name: String, args: String },
-    Decide { thread: Ulid, call_id: String, allow: bool, scope: DecisionScope },
+    Decide { thread: Ulid, call_id: String, allow: bool, session: bool },   // session: a standing grant (log's DecisionScope, mirrored so api needs no edge to log)
     AnswerHuman { thread: Ulid, call_id: String, text: String },
     Pin { thread: Ulid, text: String },
     Compact { thread: Ulid },
     SetMode { thread: Ulid, mode: String },
-    Report { thread: Ulid, kind: ReportKind },                       // Cost | Project | Policy | Memory | Skills
+    Report { thread: Ulid, report: ReportKind },                     // Cost | Project | Policy | Memory | Skills
 }
-pub enum Response {
-    Welcome { user: String, projects: Vec<ProjectInfo>, server: String },
-    Projects(Vec<ProjectInfo>), Threads(Vec<ThreadInfo>), Thread(ThreadInfo),
+pub enum Response {                                                  // internally tagged, so every variant is a struct
+    Welcome(Welcome),                                                // Welcome { user, projects, server }
+    Projects { projects: Vec<ProjectInfo> }, Threads { threads: Vec<ThreadInfo> }, Thread { thread: ThreadInfo },
     Opened { state: ThreadState, events: Vec<Event> },
-    Ok, Text(String),
+    Ok, Text { text: String },
     Refused { reason: String },                                      // a role or a rule said no; nothing was appended
     Error { message: String },
 }
@@ -153,9 +153,10 @@ pub enum Notice {                                                    // pushed t
     ToolCallStarted { thread: Ulid, call: ToolCall },
     State { thread: Ulid, state: ThreadState },
 }
-pub enum ThreadState { Idle, Running { by: Author, queued: u32 }, AwaitingApproval { call_id: String, request: PermissionRequestedPayload },
+pub enum ThreadState { Idle, Running { by: Author, queued: u32 },
+                       AwaitingApproval { call_id: String, call: ToolCall, class: RiskClass, reason: String },   // the log's request, mirrored
                        AwaitingHuman { call_id: String, question: String } }
-pub struct ProjectInfo { pub name: String, pub root: PathBuf, pub role: Option<Role>, pub threads: u64 }
+pub struct ProjectInfo { pub name: String, pub root: PathBuf, pub role: Option<String>, pub threads: u64 }   // role as its name: no edge to policy
 pub struct ThreadInfo { pub id: Ulid, pub project: Option<String>, pub date: String, pub events: u64, pub first_line: String, pub state: ThreadState }
 
 // crates/api/src/client.rs (feature "client")
@@ -163,7 +164,7 @@ pub struct Client { /* framed stream, pending responses by id, notice channel */
 impl Client {
     pub async fn connect(addr: &Addr, token: &str) -> Result<(Self, Welcome), ClientError>;   // Addr::Unix(path) | Addr::Tcp(host, port)
     pub async fn request(&self, request: Request) -> Result<Response, ClientError>;
-    pub fn notices(&self) -> Receiver<Notice>;
+    pub fn take_notices(&self) -> Option<Receiver<Notice>>;         // once; the client is Clone and every clone shares the connection
 }
 
 // crates/runtime/src/decisions.rs

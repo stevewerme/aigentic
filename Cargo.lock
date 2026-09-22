@@ -12,6 +12,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "aigentic-api"
+version = "0.1.0"
+dependencies = [
+ "aigentic-api",
+ "aigentic-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "time",
+ "tokio",
+ "ulid",
+]
+
+[[package]]
 name = "aigentic-core"
 version = "0.1.0"
 dependencies = [

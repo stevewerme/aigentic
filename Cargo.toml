@@ -9,6 +9,7 @@ members = [
     "crates/tui",
     "crates/skills",
     "crates/policy",
+    "crates/api",
 ]
 
 [workspace.package]
@@ -25,6 +26,7 @@ aigentic-tools = { path = "crates/tools" }
 aigentic-runtime = { path = "crates/runtime" }
 aigentic-skills = { path = "crates/skills" }
 aigentic-policy = { path = "crates/policy" }
+aigentic-api = { path = "crates/api" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
