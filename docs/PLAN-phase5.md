@@ -1,6 +1,6 @@
 # Phase 5 plan
 
-Status: steps 1 to 6 landed on 2026-09-22; written the same day after the phase 4 close · Follows `docs/PRD.md` (the Server and multiplayer phase) and the phase 0 to 4 plans
+Status: steps 1 to 7 landed on 2026-09-22; written the same day after the phase 4 close · Follows `docs/PRD.md` (the Server and multiplayer phase) and the phase 0 to 4 plans
 
 ## 0. Goal and done-when
 
@@ -218,12 +218,18 @@ impl ThreadActor {
 // The observer counts a queued message when its event lands, so a subscriber sees the event before the state that counts it.
 // The actor's future is Send: the runtime's observer closures are `FnMut(Signal) + Send` and `Approver: Send + Sync`.
 
-// crates/server/src/lib.rs
-pub struct Server { /* config, ThreadTable, the three provider profiles built once */ }
+// crates/server/src/serve.rs
+pub struct Server { config: Arc<Config>, config_dir, server: Arc<ServerConfig>, threads: Arc<ThreadTable> }
 impl Server {
-    pub async fn serve(config: ServerConfig, listener: Listener) -> Result<(), ServerError>;   // Listener::Unix | Listener::Tcp
-    pub async fn embed(config: ServerConfig) -> Result<Embedded, ServerError>;                // a Unix socket in a temp dir, for `aigentic` alone
+    pub fn new(config: Config, config_dir, server: ServerConfig, providers: Arc<dyn ProviderFactory>, reports: Arc<dyn Reports>) -> Self;
+    pub fn from_configs(config, config_dir, server) -> Self;                         // providers from config.toml's profiles
+    pub async fn serve(self: Arc<Self>, listener: Listener) -> Result<(), ServerError>;   // Listener::Unix now, Tcp in step 8; sweeps idle threads
+    pub async fn embed(config, config_dir, root, user) -> Result<Embedded, ServerError>;   // a private Unix socket and an in-memory token
 }
+// crates/server/src/build.rs: `build_thread` is what the tui's main did through phase 4 (project, provider, layers, skills, policy, log);
+// `ProviderFactory` (default `Profiles`) is the seam tests script. config.toml's types moved here (`config::Config`, `Profile`)
+// and `SkillPaths` too, since the daemon builds every thread; the tui re-exports them. `ThreadTable::sweep` unloads a thread only
+// when no session has it open, it is idle, and the clock passed; the session checks roles before any mailbox is touched.
 ```
 
 Changed phase 0 to 4 signatures: `Runtime::continue_turn` becomes a

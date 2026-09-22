@@ -6,74 +6,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use aigentic_runtime::aigentic_skills::{
-    Invocation, LockEntry, Lockfile, Manifest, Origin, Review, Roots, SkillError, blocking, check,
-    discover_roots, hash_manifest, lock_root, render_review, walk_root,
+    Invocation, LockEntry, Lockfile, Manifest, Origin, Review, blocking, check, discover_roots,
+    hash_manifest, lock_root, render_review, walk_root,
 };
 use anyhow::{Context, bail};
 
-pub const LOCK_FILE: &str = "skills.lock.toml";
-
-/// Where skills and their locks live for one run.
-#[derive(Debug, Clone)]
-pub struct SkillPaths {
-    /// The working directory: `./skills` and `./skills.lock.toml`.
-    pub project: PathBuf,
-    /// `~/.config/aigentic`: `skills/` and `skills.lock.toml` there.
-    pub user: PathBuf,
-    /// The repository the binary was built from, or `bundled_dir` in the
-    /// config: `skills/` and `skills.lock.toml` there.
-    pub bundled: PathBuf,
-}
-
-impl SkillPaths {
-    pub fn new(cwd: &Path, config_dir: &Path, bundled: Option<&Path>) -> Self {
-        Self {
-            project: cwd.to_path_buf(),
-            user: config_dir.to_path_buf(),
-            bundled: bundled.map_or_else(default_bundled_dir, Path::to_path_buf),
-        }
-    }
-
-    pub fn roots(&self) -> Roots {
-        Roots {
-            project: Some(self.project.join("skills")),
-            user: Some(self.user.join("skills")),
-            bundled: Some(self.bundled.join("skills")),
-        }
-    }
-
-    /// The three lockfiles merged, closer winning by name. A missing file
-    /// is empty.
-    pub fn lock(&self) -> anyhow::Result<Lockfile> {
-        let mut merged = Lockfile::default();
-        for dir in [&self.bundled, &self.user, &self.project] {
-            let path = dir.join(LOCK_FILE);
-            if path.exists() {
-                let lock = Lockfile::load(&path)?;
-                for entry in lock.skills {
-                    merged.upsert(entry);
-                }
-            }
-        }
-        Ok(merged)
-    }
-
-    fn dir_for(&self, origin: Origin) -> &Path {
-        match origin {
-            Origin::Project => &self.project,
-            Origin::User => &self.user,
-            Origin::Bundled => &self.bundled,
-        }
-    }
-}
-
-/// The repository this binary was built from.
-pub fn default_bundled_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .unwrap_or_else(|_| Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))
-}
+#[cfg(test)]
+use aigentic_server::skills::default_bundled_dir;
+pub use aigentic_server::skills::{LOCK_FILE, SkillPaths, load_enabled};
 
 #[derive(Debug, clap::Subcommand)]
 pub enum SkillsCommand {
@@ -438,18 +378,6 @@ fn confirm(question: &str) -> anyhow::Result<bool> {
         line.trim().to_ascii_lowercase().as_str(),
         "y" | "yes"
     ))
-}
-
-/// Load the enabled set for the REPL. A hash mismatch or an unlocked
-/// skill refuses, naming the skill.
-pub fn load_enabled(
-    enabled: &[String],
-    paths: &SkillPaths,
-    tools: &[String],
-) -> Result<aigentic_runtime::aigentic_skills::SkillSet, anyhow::Error> {
-    let lock = paths.lock()?;
-    aigentic_runtime::aigentic_skills::SkillSet::load(enabled, &paths.roots(), &lock, tools)
-        .map_err(|e: SkillError| anyhow::anyhow!("{e}"))
 }
 
 #[cfg(test)]

@@ -4,5 +4,16 @@
 //! `api`. See `docs/PLAN-phase5.md` section 3.
 
 pub mod actor;
+pub mod auth;
+pub mod build;
+pub mod config;
+pub mod serve;
+pub mod session;
+pub mod skills;
+pub mod threads;
 
 pub use actor::{Mail, Mailbox, NoReports, Reports, ThreadActor};
+pub use build::{Profiles, ProviderFactory};
+pub use config::{ConfigError, ServerConfig};
+pub use serve::{Embedded, Listener, Server, ServerError};
+pub use threads::ThreadTable;

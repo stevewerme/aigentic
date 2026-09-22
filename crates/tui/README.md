@@ -69,6 +69,7 @@ cargo run -p aigentic-tui -- project show                        # layers, knowl
 cargo run -p aigentic-tui -- threads                             # this project's threads, newest first
 cargo run -p aigentic-tui -- doctor [--probe]                    # config, keys, threads dir, project, skills, gh; exit 1 on a fail
 cargo run -p aigentic-tui -- init                                # guided setup: config, project, GitHub, knowledge links
+cargo run -p aigentic-tui -- serve [--listen unix:/path]         # the daemon (phase 5): server.toml's users and projects over a socket
 ```
 
 `init` is the guided setup, in the spirit of upstream's

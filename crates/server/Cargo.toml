@@ -9,14 +9,17 @@ description = "Aigentic daemon: one actor per thread, sessions over a socket"
 [dependencies]
 aigentic-api.workspace = true
 aigentic-runtime.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["sync", "macros", "rt", "time"] }
+time.workspace = true
+tokio = { workspace = true, features = ["sync", "macros", "rt", "time", "net", "io-util"] }
+toml.workspace = true
 ulid.workspace = true
 
 [dev-dependencies]
+aigentic-api = { workspace = true, features = ["client"] }
 futures-core.workspace = true
 futures-util.workspace = true
 schemars.workspace = true
-serde.workspace = true
 tempfile.workspace = true

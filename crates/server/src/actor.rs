@@ -68,6 +68,10 @@ pub enum Mail {
         kind: ReportKind,
         reply: oneshot::Sender<Response>,
     },
+    /// The state now, for the table's idle sweep.
+    Status {
+        reply: oneshot::Sender<ThreadState>,
+    },
     /// Events from `from_seq`, the state now, and every notice from
     /// here on.
     Subscribe {
@@ -383,6 +387,10 @@ impl ThreadActor {
                 self.subscribe(from_seq, notices, reply);
                 None
             }
+            Mail::Status { reply } => {
+                let _ = reply.send(self.shared.state());
+                None
+            }
         }
     }
 
@@ -556,6 +564,9 @@ impl ThreadActor {
                 subs.push(notices);
                 drop(subs);
                 let _ = reply.send((shared.state(), events));
+            }
+            Mail::Status { reply } => {
+                let _ = reply.send(shared.state());
             }
             Mail::InvokeSkill { reply, .. } => {
                 let _ = reply.send(Response::Refused {

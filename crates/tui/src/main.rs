@@ -70,6 +70,17 @@ enum Command {
     /// Guided setup: config, project file and AGENTS.md, GitHub issues
     /// and labels through `gh`, knowledge links. Shows every file first.
     Init,
+    /// Run the daemon: threads for the projects in server.toml, sessions
+    /// over a Unix socket.
+    Serve {
+        /// `unix` (the default socket path) or `unix:/path`; overrides
+        /// server.toml's `listen`.
+        #[arg(long)]
+        listen: Option<String>,
+        /// The daemon's own config (default: server.toml beside config.toml).
+        #[arg(long)]
+        server_config: Option<PathBuf>,
+    },
     /// Check the config, keys, threads directory, project, skills and
     /// GitHub setup; exit 1 on any failure.
     Doctor {
@@ -94,6 +105,34 @@ async fn main() -> anyhow::Result<()> {
     }
     if let Some(Command::Init) = cli.command {
         std::process::exit(init_cmd::run(&config_path, &cwd)?);
+    }
+    if let Some(Command::Serve {
+        listen,
+        server_config,
+    }) = cli.command
+    {
+        let config = Config::load(&config_path)?;
+        let config_dir = config_path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let server_path =
+            server_config.unwrap_or_else(aigentic_server::config::default_server_config_path);
+        let server = aigentic_server::ServerConfig::load(&server_path)?;
+        let listener =
+            aigentic_server::Listener::parse(listen.as_deref().unwrap_or(&server.listen))?;
+        println!(
+            "aigentic serve · {} · {} users · {} projects · config {}",
+            listener.addr(),
+            server.users.len(),
+            server.projects.len(),
+            server_path.display()
+        );
+        let daemon = std::sync::Arc::new(aigentic_server::Server::from_configs(
+            config, config_dir, server,
+        ));
+        daemon.serve(listener).await?;
+        return Ok(());
     }
     let config = Config::load(&config_path)?;
     let config_dir = config_path
@@ -180,7 +219,7 @@ async fn main() -> anyhow::Result<()> {
             }
             std::process::exit(0);
         }
-        Some(Command::Doctor { .. } | Command::Init) | None => {}
+        Some(Command::Doctor { .. } | Command::Init | Command::Serve { .. }) | None => {}
     }
 
     let (profile_name, profile) = config.select(profile_arg)?;

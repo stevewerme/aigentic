@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 aigentic-runtime.workspace = true
+aigentic-server.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 dotenvy.workspace = true
