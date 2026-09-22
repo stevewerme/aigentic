@@ -38,3 +38,7 @@ enabled = ["implement", "tdd", "code-review", "diagnosing-bugs", "grilling"]
 # name = "echo"
 # transport = { stdio = { command = "target/debug/examples/mcp_echo_server" } }
 # class = "network"                                    # read | write | exec | network | safe
+
+[participants]
+steve = "admin"
+magnus = "approve"

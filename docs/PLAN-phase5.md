@@ -1,6 +1,6 @@
 # Phase 5 plan
 
-Status: steps 1 to 10 landed on 2026-09-22 (the last as `e9c1450`); step 11's checklist is in the tui README's phase 5 section and the by-hand run on the VM with a second person is pending; written the same day after the phase 4 close · Follows `docs/PRD.md` (the Server and multiplayer phase) and the phase 0 to 4 plans
+Status: parked on 2026-09-22 with steps 1 to 10 landed (the last as `e9c1450`) and the daemon deployed on a VM the same day (Ubuntu 24.04, `aigentic serve` under systemd, two users and two projects, both doctors green, the client banner `as steve (admin)` over an SSH tunnel). Step 11 is deferred: multiplayer acceptance with a second person waits until the single-player experience is solid (v1 first, multiplayer after); its checklist stays in the tui README's phase 5 section. Follows `docs/PRD.md` (the Server and multiplayer phase) and the phase 0 to 4 plans
 
 ## 0. Goal and done-when
 
