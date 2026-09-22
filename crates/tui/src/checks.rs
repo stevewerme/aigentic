@@ -16,7 +16,7 @@ use aigentic_runtime::project::{DOT_DIR, FILE_NAME, INSTRUCTIONS_FILE};
 use aigentic_runtime::{GlobalLayer, Knowledge, KnowledgeMode, Layers, Project};
 use futures_util::StreamExt;
 
-use crate::config::{Config, Profile};
+use crate::config::{Config, Profile, ProviderKind};
 use crate::skills_cmd::{SkillPaths, load_enabled};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,6 +24,8 @@ pub enum Status {
     Ok,
     Fail,
     Skip,
+    /// Works, but likely not as meant; never fails the doctor.
+    Warn,
 }
 
 impl Status {
@@ -32,6 +34,7 @@ impl Status {
             Status::Ok => "ok",
             Status::Fail => "fail",
             Status::Skip => "skip",
+            Status::Warn => "warn",
         }
     }
 }
@@ -134,6 +137,22 @@ pub fn check_api_key_env(name: &str, profile: &Profile) -> Check {
             &check_name,
             format!("{var} is not set (put it in .env or export it)"),
         ),
+    }
+}
+
+/// An OpenAI-compatible profile states its context window; without it
+/// the provider assumes 32 768 tokens, which compaction, the knowledge
+/// switch and the status line all measure against.
+pub fn check_window(name: &str, profile: &Profile) -> Check {
+    let check_name = format!("window {name}");
+    match (profile.provider, profile.max_context_tokens) {
+        (_, Some(n)) => Check::ok(&check_name, format!("{n} tokens")),
+        (ProviderKind::OpenaiCompat, None) => Check::new(
+            &check_name,
+            Status::Warn,
+            "max_context_tokens is not set, so 32768 is assumed; set it to the model's window (the provider's docs say)",
+        ),
+        (_, None) => Check::ok(&check_name, "the provider's default"),
     }
 }
 
@@ -692,5 +711,19 @@ mod tests {
         let c = check_probe("a", &config.profiles["a"]).await;
         assert_eq!(c.status, Status::Skip);
         assert!(c.message.contains("AIGENTIC_DOCTOR_TEST_KEY"));
+    }
+
+    #[test]
+    fn a_compat_profile_without_a_window_warns() {
+        let c = Config::parse(
+            "default_profile = \"a\"\n[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n[profiles.b]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\nmax_context_tokens = 1048576\n",
+        )
+        .unwrap();
+        let a = check_window("a", &c.profiles["a"]);
+        assert_eq!(a.status, Status::Warn);
+        assert!(a.message.contains("32768"), "{}", a.message);
+        let b = check_window("b", &c.profiles["b"]);
+        assert_eq!(b.status, Status::Ok);
+        assert_eq!(b.message, "1048576 tokens");
     }
 }

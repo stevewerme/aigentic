@@ -35,9 +35,11 @@ impl Status {
     /// `manual · vendela · 31% context · 12s · queued 1`
     pub fn line(&self) -> String {
         let mut parts = vec![self.mode.clone(), self.project.clone()];
-        match self.context_percent() {
-            Some(p) => parts.push(format!("{p}% context")),
-            None => parts.push("context ?".into()),
+        match (self.context_percent(), self.usage) {
+            (Some(p), Some((_, window))) => {
+                parts.push(format!("{p}% of {} context", tokens_short(window)))
+            }
+            _ => parts.push("context ?".into()),
         }
         if let Some(elapsed) = self.elapsed {
             parts.push(elapsed_short(elapsed));
@@ -68,6 +70,17 @@ impl Status {
     }
 }
 
+/// `33k`, `1.0M`: the window size, so a defaulted window shows.
+pub fn tokens_short(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_048_576.0)
+    } else if n >= 1000 {
+        format!("{}k", (n + 512) / 1024)
+    } else {
+        n.to_string()
+    }
+}
+
 /// `12s`, `1m 05s`, `1h 02m`.
 pub fn elapsed_short(d: Duration) -> String {
     let s = d.as_secs();
@@ -94,13 +107,24 @@ mod tests {
             queued: 1,
             waiting: None,
         };
-        assert_eq!(s.line(), "manual · vendela · 31% context · 12s · queued 1");
+        assert_eq!(
+            s.line(),
+            "manual · vendela · 31% of 98k context · 12s · queued 1"
+        );
         s.elapsed = None;
         s.queued = 0;
         s.usage = None;
         assert_eq!(s.line(), "manual · vendela · context ?");
         s.usage = Some((250_000, 100_000));
         assert_eq!(s.context_percent(), Some(100));
+    }
+
+    #[test]
+    fn window_sizes_read_short() {
+        assert_eq!(tokens_short(32_768), "32k");
+        assert_eq!(tokens_short(1_048_576), "1.0M");
+        assert_eq!(tokens_short(200_000), "195k");
+        assert_eq!(tokens_short(512), "512");
     }
 
     #[test]

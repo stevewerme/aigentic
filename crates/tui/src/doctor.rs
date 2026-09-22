@@ -7,7 +7,7 @@ use std::path::Path;
 
 use crate::checks::{
     Check, GhCli, Status, check_api_key_env, check_config, check_github, check_participants,
-    check_probe, check_project, check_skills, check_threads_dir, origin_url,
+    check_probe, check_project, check_skills, check_threads_dir, check_window, origin_url,
 };
 use crate::config;
 use crate::skills_cmd::SkillPaths;
@@ -22,6 +22,7 @@ pub async fn run(config_path: &Path, cwd: &Path, probe: bool) -> anyhow::Result<
     };
     for (name, profile) in &config.profiles {
         checks.push(check_api_key_env(name, profile));
+        checks.push(check_window(name, profile));
     }
     let threads_base = config
         .threads_dir

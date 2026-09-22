@@ -634,5 +634,11 @@ Settled in the grilling of 2026-09-22 (Q1 to Q18) and in the draft.
 - Whether `exec --json`'s output is the raw `Push` or a simplified
   event schema like Codex's `ThreadItem`. Raw first; a stable schema
   when a second consumer exists.
+- A token ceiling for compaction and inline knowledge. Both are fractions
+  of the window, and GLM 5.3 on TensorX has a 1 048 576-token window, so a
+  thread compacts only near 734k tokens and knowledge stays inline up to
+  about 315k: correct, but every call then carries a very long prompt.
+  Candidate: the lower of the fraction and a fixed ceiling (150k?). Decide
+  from the acceptance week's cost and latency.
 - The PRD's build-order table still lists the orchestrator as phase 6;
   update it when phase 6 closes, with the renumbering in section 0.
