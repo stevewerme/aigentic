@@ -683,11 +683,14 @@ From steps 10 and 11, before the acceptance run:
   should cover it: put the answering author on the tool result's
   event, or record it in the result's policy record. A runtime change,
   small; take it when the two-person days show it matters.
-- `--profile` is accepted and ignored on the REPL path: `Server::embed`
-  builds the thread from the project's `[model] profile` and the flag
-  reaches only `project show`. Either drop the flag from the REPL or
-  thread it through `embed` as `build_thread`'s override; the README's
-  item 26 says how to swap backends meanwhile.
+- `--profile` was accepted and ignored on the REPL path from step 9:
+  `Server::embed` built the thread from the project's `[model] profile`
+  and the flag reached only `project show`. Fixed after step 11: the
+  flag is `embed`'s profile, which `ThreadTable` passes to
+  `build_thread` as its override; with `--server` it is refused, since
+  a served daemon picks each thread's profile from its project
+  (section 3). `embed` gains the parameter; section 2's signature is
+  out of date by that one argument.
 - `aigentic threads` and `project show` read local files, not the API,
   so section 8's "over the API when a server is given" is not yet
   true; `ListThreads` and `Report { Project }` exist on the wire, so it

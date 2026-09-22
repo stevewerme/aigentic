@@ -180,20 +180,36 @@ impl Server {
         providers: Arc<dyn ProviderFactory>,
         reports: Arc<dyn Reports>,
     ) -> Self {
+        Self::build(config, config_dir, server, providers, reports, None)
+    }
+
+    /// `new` with a profile that wins over every project's `[model]
+    /// profile`: the embedded daemon's `--profile`.
+    fn build(
+        config: Config,
+        config_dir: PathBuf,
+        server: ServerConfig,
+        providers: Arc<dyn ProviderFactory>,
+        reports: Arc<dyn Reports>,
+        profile: Option<String>,
+    ) -> Self {
         let config = Arc::new(config);
         let server = Arc::new(server);
         let threads_base = config
             .threads_dir
             .clone()
             .unwrap_or_else(crate::config::default_threads_dir);
-        let threads = Arc::new(ThreadTable::new(
-            config.clone(),
-            config_dir.clone(),
-            server.clone(),
-            providers,
-            reports,
-            threads_base,
-        ));
+        let threads = Arc::new(
+            ThreadTable::new(
+                config.clone(),
+                config_dir.clone(),
+                server.clone(),
+                providers,
+                reports,
+                threads_base,
+            )
+            .with_profile(profile),
+        );
         Self {
             config,
             config_dir,
@@ -270,12 +286,15 @@ impl Server {
     /// A daemon in this process for one user over a private socket:
     /// what `aigentic` does when nothing listens. `root` becomes the one
     /// project (named by its file, else `_none`); the token is random and
-    /// lives only in memory.
+    /// lives only in memory. `profile` is the client's `--profile`,
+    /// which wins over the project's `[model] profile` for every thread
+    /// this daemon builds.
     pub async fn embed(
         config: Config,
         config_dir: PathBuf,
         root: PathBuf,
         user: &str,
+        profile: Option<&str>,
     ) -> Result<Embedded, ServerError> {
         let providers: Arc<dyn ProviderFactory> = Arc::new(Profiles(Arc::new(config.clone())));
         let reports = Arc::new(DefaultReports {
@@ -284,7 +303,7 @@ impl Server {
                 .clone()
                 .unwrap_or_else(|| config_dir.join("instructions.md")),
         });
-        Self::embed_with(config, config_dir, root, user, providers, reports).await
+        Self::embed_with(config, config_dir, root, user, profile, providers, reports).await
     }
 
     /// `embed` with the seams a test scripts.
@@ -293,6 +312,7 @@ impl Server {
         config_dir: PathBuf,
         root: PathBuf,
         user: &str,
+        profile: Option<&str>,
         providers: Arc<dyn ProviderFactory>,
         reports: Arc<dyn Reports>,
     ) -> Result<Embedded, ServerError> {
@@ -313,7 +333,14 @@ impl Server {
                 root,
             }],
         };
-        let server = Arc::new(Self::new(config, config_dir, server, providers, reports));
+        let server = Arc::new(Self::build(
+            config,
+            config_dir,
+            server,
+            providers,
+            reports,
+            profile.map(str::to_owned),
+        ));
         let listener = Listener::Unix(socket.clone());
         let task = tokio::spawn(server.clone().serve(listener));
         // Wait for the socket to appear.

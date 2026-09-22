@@ -43,7 +43,8 @@ struct Cli {
     #[arg(long)]
     thread: Option<Ulid>,
     /// Profile from the config file (default: the project's `[model]
-    /// profile`, else the config's default_profile).
+    /// profile`, else the config's default_profile). For the embedded
+    /// daemon and `project show`; a remote daemon uses the project's.
     #[arg(long)]
     profile: Option<String>,
     /// Permission mode: manual (default), accept-edits or auto. Session
@@ -265,6 +266,11 @@ async fn main() -> anyhow::Result<()> {
     let history = config_path.with_file_name("history");
     let (client, welcome, embedded) = match &cli.server {
         Some(addr) => {
+            if cli.profile.is_some() {
+                bail!(
+                    "--profile does not apply with --server: the daemon builds each thread from its project's [model] profile"
+                );
+            }
             let addr: Addr = addr
                 .parse()
                 .map_err(|e: String| anyhow::anyhow!("--server: {e}"))?;
@@ -278,11 +284,16 @@ async fn main() -> anyhow::Result<()> {
             (client, welcome, None)
         }
         None => {
+            // A wrong name fails here, not at the first turn.
+            if let Some(name) = cli.profile.as_deref() {
+                config.select(Some(name))?;
+            }
             let embedded = aigentic_server::Server::embed(
                 config.clone(),
                 config_dir.clone(),
                 project_root.clone(),
                 &user,
+                cli.profile.as_deref(),
             )
             .await?;
             let (client, welcome) =

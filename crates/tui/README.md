@@ -63,7 +63,7 @@ any non-empty value.
 cargo run -p aigentic-tui --                                     # new thread over a daemon embedded for this directory
 cargo run -p aigentic-tui -- --server tcp:vm:7420 --project vendela   # the same client against a remote daemon; token in AIGENTIC_TOKEN
 cargo run -p aigentic-tui -- --thread <ULID>                     # resume by replaying the log
-cargo run -p aigentic-tui -- --thread <ULID>                     # the backend is the project's [model] profile (see phase 5 item 26)
+cargo run -p aigentic-tui -- --thread <ULID> --profile anthropic # same thread, other backend (embedded daemon only)
 cargo run -p aigentic-tui -- project init                        # aigentic.toml + .aigentic/{knowledge,memory}
 cargo run -p aigentic-tui -- project setup                       # render docs/agents/*.md from [pocock]
 cargo run -p aigentic-tui -- project show                        # layers, knowledge mode, every tool's fate
@@ -108,7 +108,8 @@ completion per profile with a one-token cap and reports the model and
 latency; it is the only check that uses the network.
 
 The profile is `--profile`, else the project's `[model] profile`, else the
-config's `default_profile`. The banner names the project, the layers it
+config's `default_profile`; with `--server` the flag is refused, since the
+daemon picks each thread's profile from its project. The banner names the project, the layers it
 loaded (global, project, knowledge with its mode, memory), the skill and
 tool counts and how many threads the project has.
 
@@ -776,11 +777,10 @@ folded into the items so the run does not trip on them.
 26. Items 1 to 20 through the socket, on the VM and embedded. The
     outcomes are the same; the mechanics differ in four places. Item
     2's thread is created over the API and the banner says `embedded
-    daemon`. Item 8's backend swap has no flag: `--profile` is
-    accepted and ignored on the REPL path since step 9 (the embedded
-    daemon builds the thread from the project's `[model] profile`), so
-    set that line in `aigentic.toml` between resumes; the flag still
-    selects for `project show`. Items 9 and 10 kill the daemon rather
+    daemon`. Item 8's `--profile` swap works on the embedded daemon
+    (the flag wins over the project's `[model] profile` for every
+    thread it builds) and is refused with `--server`, where the
+    profile is the project's on the daemon. Items 9 and 10 kill the daemon rather
     than the client: with the embedded daemon that is the same
     process, so they read as before; on the VM they are item 22's last
     step. Item 13's `a` grant lasts while the daemon keeps the thread
@@ -808,4 +808,6 @@ the default allow list; a `[participants]` table must list the owner;
 and `ask_human`'s answering author is not in the log (the tool result
 is authored `system`), so a question answered elsewhere prints
 `[answered elsewhere]` with no name until the runtime records it. A
-fourth, from writing item 26: `--profile` is a no-op on the REPL path.
+fourth, from writing item 26: `--profile` was a no-op on the REPL path
+between steps 9 and 11, fixed the same day (the flag reaches
+`Server::embed`; a test holds it).
