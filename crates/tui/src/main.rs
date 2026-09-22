@@ -324,6 +324,7 @@ async fn main() -> anyhow::Result<()> {
     let history = config_path.with_file_name("history");
     repl::Repl::new(runtime, user, history)
         .with_project_paths(threads_dir, global_instructions)
+        .with_display(config.display)
         .run(resumed)
         .await
 }

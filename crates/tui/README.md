@@ -41,6 +41,10 @@ api_key_env = "ANTHROPIC_API_KEY"
 # user = "steve"                          # author id on your messages ($USER by default)
 # threads_dir = "/path/to/threads"        # default ~/.local/share/aigentic/threads
 # bundled_dir = "/path/to/aigentic"       # holds skills/ and skills.lock.toml; default: the build repo
+
+# [display]                               # how much of a tool result the terminal shows
+# result_lines = 3                        # lines before truncating
+# result_bytes = 600                      # bytes before truncating
 ```
 
 The phase 0 flat form (top-level `base_url`, `model`, `api_key_env`) still
@@ -81,11 +85,12 @@ Slash commands: `/cost` (input and output tokens for the thread, reported and
 estimated shown separately, plus cache reads and writes, the reasoning share,
 compactions and memory extractions), `/pin <text>` (a fact for the stable
 prefix, never summarised), `/compact` (run compaction now and report what it
-did), `/skills` (the enabled set), `/project` (the same report as `project
-show`, over the live registry so MCP tools are included), `/threads`,
-`/<skill> [args]` for every enabled user-invoked skill, `/help`, `/quit`.
-Anything else starting with `/` prints `unknown command`. Ctrl-D quits;
-Ctrl-C clears the line.
+did), `/verbose` (toggle the session between the configured cap and 40 lines
+/ 8000 bytes; it prints which is on), `/skills` (the enabled set), `/project`
+(the same report as `project show`, over the live registry so MCP tools are
+included), `/threads`, `/<skill> [args]` for every enabled user-invoked
+skill, `/help`, `/quit`. Anything else starting with `/` prints `unknown
+command`. Ctrl-D quits; Ctrl-C clears the line.
 
 An answered `ask_human` ends the turn with reason `asked_human` and the
 REPL continues at once: what follows the answer is a new turn with its
@@ -98,8 +103,9 @@ model and prints `[memory: N lines written]` when anything new landed in
 `.aigentic/memory/`; `[memory] enabled = false` turns it off.
 
 Assistant text streams as it arrives. Tool calls print as `→ name {args}`
-and their output follows, truncated to twelve lines or 1200 bytes with a
-note of what was omitted.
+and their output follows, truncated to `[display]`'s `result_lines` or
+`result_bytes` (3 lines / 600 bytes by default) with a note of what was
+omitted; `/verbose` widens the session to 40 lines / 8000 bytes.
 
 ## Project file, policy, skills and MCP
 

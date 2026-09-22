@@ -83,6 +83,8 @@ struct ConfigFile {
     tools: DeniedSection,
     #[serde(default)]
     skills: DeniedSection,
+    #[serde(default)]
+    display: DisplaySection,
 }
 
 /// `[global]`: the owner's instructions file.
@@ -102,6 +104,35 @@ pub struct DeniedSection {
     pub denied: Vec<String>,
 }
 
+/// `[display]`: how much of a tool result the terminal shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DisplaySection {
+    /// Lines of tool output shown before truncating.
+    #[serde(default = "default_result_lines")]
+    pub result_lines: usize,
+    /// Bytes of tool output shown before truncating.
+    #[serde(default = "default_result_bytes")]
+    pub result_bytes: usize,
+}
+
+impl Default for DisplaySection {
+    fn default() -> Self {
+        Self {
+            result_lines: default_result_lines(),
+            result_bytes: default_result_bytes(),
+        }
+    }
+}
+
+fn default_result_lines() -> usize {
+    3
+}
+
+fn default_result_bytes() -> usize {
+    600
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     pub profiles: BTreeMap<String, Profile>,
@@ -117,6 +148,8 @@ pub struct Config {
     pub global_instructions: Option<PathBuf>,
     pub denied_tools: Vec<String>,
     pub denied_skills: Vec<String>,
+    /// `[display]`: the tool-result caps; defaults when absent.
+    pub display: DisplaySection,
 }
 
 const EXAMPLE: &str = r#"default_profile = "tensorx"
@@ -213,6 +246,7 @@ impl Config {
             global_instructions: file.global.instructions,
             denied_tools: file.tools.denied,
             denied_skills: file.skills.denied,
+            display: file.display,
         })
     }
 
@@ -457,6 +491,26 @@ keep_turns = 3
             (DEFAULT_BUDGET.max_iterations, 5)
         );
         assert_eq!(b.max_wall_time, DEFAULT_BUDGET.max_wall_time);
+    }
+
+    #[test]
+    fn display_caps_default_override_and_reject_the_unknown() {
+        let c = Config::parse(FLAT).unwrap();
+        assert_eq!(
+            (c.display.result_lines, c.display.result_bytes),
+            (3, 600),
+            "an absent [display] keeps the defaults"
+        );
+        let c = Config::parse(
+            "[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n\
+             [display]\nresult_lines = 10\nresult_bytes = 2000\n",
+        )
+        .unwrap();
+        assert_eq!((c.display.result_lines, c.display.result_bytes), (10, 2000));
+        assert!(Config::parse(
+            "[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n[display]\nnope = 1\n"
+        )
+        .is_err());
     }
 
     #[test]

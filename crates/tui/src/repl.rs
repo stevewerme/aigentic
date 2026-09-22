@@ -10,13 +10,13 @@ use aigentic_runtime::{ASKED_HUMAN, Resumed, Runtime, Signal};
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 
+use crate::config::DisplaySection;
 use crate::cost::cost_of;
 use crate::project_cmd::{list_threads, render_threads, report};
 
-/// Lines of tool output shown before truncating.
-const RESULT_LINES: usize = 12;
-/// Bytes of tool output shown before truncating.
-const RESULT_BYTES: usize = 1200;
+/// What `/verbose` shows of a tool result: lines and bytes.
+const VERBOSE_RESULT_LINES: usize = 40;
+const VERBOSE_RESULT_BYTES: usize = 8000;
 
 pub struct Repl {
     runtime: Runtime,
@@ -26,6 +26,17 @@ pub struct Repl {
     threads_dir: PathBuf,
     /// The global layer's file, named in `/project`.
     global_instructions: PathBuf,
+    /// The `[display]` caps for tool results.
+    display: DisplaySection,
+    /// Whether `/verbose` widened the caps for this session.
+    verbose: bool,
+}
+
+/// The caps the terminal shows of a tool result right now.
+#[derive(Clone, Copy)]
+struct Caps {
+    lines: usize,
+    bytes: usize,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -38,6 +49,9 @@ pub enum Command<'a> {
     Threads,
     Pin(&'a str),
     Compact,
+    /// Toggle the session between the configured tool-output cap and a
+    /// larger one.
+    Verbose,
     /// A user-invoked skill: its name and the rest of the line.
     Skill(&'a str, &'a str),
     Unknown(&'a str),
@@ -64,6 +78,7 @@ pub fn parse_line<'a>(line: &'a str, skills: &[String]) -> Command<'a> {
         ("project", _) => Command::Project,
         ("threads", _) => Command::Threads,
         ("compact", _) => Command::Compact,
+        ("verbose", _) => Command::Verbose,
         ("pin", text) if !text.is_empty() => Command::Pin(text),
         (name, args) if skills.iter().any(|s| s == name) => Command::Skill(name, args),
         _ => Command::Unknown(trimmed),
@@ -74,6 +89,7 @@ const HELP: &str = "\
 /cost            tokens for the thread, reported and estimated separately
 /pin <text>      pin a fact to the stable prefix
 /compact         run compaction now
+/verbose         toggle tool output between the configured cap and 40 lines / 8000 bytes
 /skills          list enabled skills; user-invoked ones are slash commands
 /project         the layers, the knowledge mode and every tool's fate
 /threads         this project's threads, newest first
@@ -90,6 +106,8 @@ impl Repl {
             history,
             threads_dir: PathBuf::new(),
             global_instructions: PathBuf::new(),
+            display: DisplaySection::default(),
+            verbose: false,
         }
     }
 
@@ -101,6 +119,28 @@ impl Repl {
         self.threads_dir = threads_dir;
         self.global_instructions = global_instructions;
         self
+    }
+
+    /// The `[display]` caps, from `config.toml`.
+    pub fn with_display(mut self, display: DisplaySection) -> Self {
+        self.display = display;
+        self
+    }
+
+    /// What the terminal shows of a tool result: `/verbose`'s larger caps
+    /// while it is on, the configured ones while it is off.
+    fn caps(&self) -> Caps {
+        if self.verbose {
+            Caps {
+                lines: VERBOSE_RESULT_LINES,
+                bytes: VERBOSE_RESULT_BYTES,
+            }
+        } else {
+            Caps {
+                lines: self.display.result_lines,
+                bytes: self.display.result_bytes,
+            }
+        }
     }
 
     /// Start the REPL. `resumed` is what `Runtime::resume` found; an
@@ -182,15 +222,26 @@ impl Repl {
                 }
                 Command::Compact => {
                     let mut at_line_start = true;
+                    let caps = self.caps();
                     match self
                         .runtime
-                        .compact_now(&mut |s| render(s, &mut at_line_start))
+                        .compact_now(&mut |s| render(s, &mut at_line_start, caps))
                         .await
                     {
                         Ok(did) if did.is_empty() => println!("[nothing to compact]"),
                         Ok(_) => {}
                         Err(e) => println!("[error: {e}]"),
                     }
+                }
+                Command::Verbose => {
+                    self.verbose = !self.verbose;
+                    let caps = self.caps();
+                    println!(
+                        "[verbose {}: {} lines / {} bytes of tool output]",
+                        if self.verbose { "on" } else { "off" },
+                        caps.lines,
+                        caps.bytes
+                    );
                 }
                 Command::Unknown(cmd) => println!("unknown command: {cmd}"),
                 Command::Chat(text) => {
@@ -205,10 +256,11 @@ impl Repl {
 
     async fn run_skill(&mut self, name: &str, args: &str) {
         let mut at_line_start = true;
+        let caps = self.caps();
         let outcome = self
             .runtime
             .invoke_skill(self.user.clone(), name, args, &mut |signal| {
-                render(signal, &mut at_line_start)
+                render(signal, &mut at_line_start, caps)
             })
             .await;
         if !at_line_start {
@@ -223,6 +275,7 @@ impl Repl {
         &mut self,
         outcome: anyhow::Result<aigentic_runtime::TurnOutcome, aigentic_runtime::RuntimeError>,
     ) {
+        let caps = self.caps();
         let mut outcome = outcome;
         loop {
             match outcome {
@@ -230,7 +283,7 @@ impl Repl {
                     let mut at_line_start = true;
                     outcome = self
                         .runtime
-                        .continue_turn(&mut |signal| render(signal, &mut at_line_start))
+                        .continue_turn(&mut |signal| render(signal, &mut at_line_start, caps))
                         .await;
                     if !at_line_start {
                         println!();
@@ -264,18 +317,19 @@ impl Repl {
     /// A new turn for `text`, or the continuation of an interrupted one.
     async fn finish_turn(&mut self, text: Option<&str>) {
         let mut at_line_start = true;
+        let caps = self.caps();
         let outcome = match text {
             Some(text) => {
                 let blocks = vec![ContentBlock::Text(text.to_owned())];
                 self.runtime
                     .run_turn(self.user.clone(), blocks, &mut |signal| {
-                        render(signal, &mut at_line_start)
+                        render(signal, &mut at_line_start, caps)
                     })
                     .await
             }
             None => {
                 self.runtime
-                    .continue_turn(&mut |signal| render(signal, &mut at_line_start))
+                    .continue_turn(&mut |signal| render(signal, &mut at_line_start, caps))
                     .await
             }
         };
@@ -286,7 +340,7 @@ impl Repl {
     }
 }
 
-fn render(signal: Signal<'_>, at_line_start: &mut bool) {
+fn render(signal: Signal<'_>, at_line_start: &mut bool, caps: Caps) {
     match signal {
         Signal::TextDelta(t) => {
             print!("{t}");
@@ -305,7 +359,7 @@ fn render(signal: Signal<'_>, at_line_start: &mut bool) {
                 serde_json::from_value(event.payload.clone())
             {
                 let marker = if r.is_error { "✗" } else { "✓" };
-                for line in truncate_for_display(&r.content, RESULT_LINES, RESULT_BYTES).lines() {
+                for line in truncate_for_display(&r.content, caps.lines, caps.bytes).lines() {
                     println!("  {marker} {line}");
                 }
             }
@@ -413,6 +467,7 @@ mod tests {
         assert_eq!(parse_line("/help", &none), Command::Help);
         assert_eq!(parse_line("/skills", &none), Command::Skills);
         assert_eq!(parse_line("/compact", &none), Command::Compact);
+        assert_eq!(parse_line("/verbose", &none), Command::Verbose);
         assert_eq!(parse_line("/project", &none), Command::Project);
         assert_eq!(parse_line("/threads", &none), Command::Threads);
         assert_eq!(
@@ -454,6 +509,21 @@ mod tests {
     fn short_output_is_untouched() {
         assert_eq!(truncate_for_display("a\nb\n", 12, 1200), "a\nb\n");
         assert_eq!(truncate_for_display("", 12, 1200), "");
+    }
+
+    #[test]
+    fn the_verbose_cap_shows_what_the_configured_cap_cuts() {
+        let text: String = (0..20)
+            .map(|i| format!("line {i:02} {}\n", "x".repeat(30)))
+            .collect();
+        let configured = truncate_for_display(&text, 3, 600);
+        assert!(configured.starts_with("line 00 "), "{configured}");
+        assert!(configured.contains("more bytes)"), "{configured}");
+        assert_eq!(
+            truncate_for_display(&text, 40, 8000),
+            text,
+            "the verbose cap shows all of it"
+        );
     }
 
     #[test]
