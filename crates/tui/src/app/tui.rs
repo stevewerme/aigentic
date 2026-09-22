@@ -23,9 +23,23 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::app::composer::{Composer, MAX_ROWS};
 
-/// The inline viewport's height: tail rows, the composer, the status
-/// line. Fixed for now (ratatui's inline viewport does not grow).
-pub const VIEWPORT_ROWS: u16 = 10;
+/// The viewport's height starts here: the composer and the status line.
+pub const MIN_ROWS: u16 = 2;
+/// Rows of the changing part (streaming text, a running tool, pending
+/// reads) the viewport shows at most; the rest is in the scrollback.
+pub const MAX_ACTIVE_ROWS: usize = 12;
+
+/// The rows the pane needs: what `layout` draws, the active part capped.
+pub fn needed_rows(pane: &Pane<'_>) -> u16 {
+    let composer = pane.composer.lines().len().min(MAX_ROWS);
+    let rows = pane.active.len().min(MAX_ACTIVE_ROWS)
+        + pane.block.len()
+        + pane.popup.len()
+        + usize::from(pane.hint.is_some())
+        + composer
+        + 1;
+    u16::try_from(rows).unwrap_or(u16::MAX)
+}
 
 /// What the bottom pane shows.
 pub struct Pane<'a> {
@@ -43,11 +57,105 @@ pub struct Pane<'a> {
     pub popup: &'a [Line<'static>],
 }
 
+/// The crossterm backend, remembering where it last put the cursor.
+/// ratatui asks the terminal for the cursor position when it places an
+/// inline viewport; the answer arrives on the input, where the key-event
+/// stream is waiting for keys and can hold it until the query times out.
+/// After the first real query the shell always knows the position, since
+/// every draw ends by setting it, so the question is answered here.
+pub struct Tracked {
+    inner: CrosstermBackend<Stdout>,
+    known: Option<Position>,
+}
+
+impl Tracked {
+    fn new() -> Self {
+        Self {
+            inner: CrosstermBackend::new(std::io::stdout()),
+            known: None,
+        }
+    }
+}
+
+impl std::io::Write for Tracked {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        std::io::Write::write(&mut self.inner, buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::Write::flush(&mut self.inner)
+    }
+}
+
+impl ratatui::backend::Backend for Tracked {
+    type Error = std::io::Error;
+
+    fn draw<'a, I>(&mut self, content: I) -> std::io::Result<()>
+    where
+        I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+    {
+        self.inner.draw(content)
+    }
+    fn append_lines(&mut self, n: u16) -> std::io::Result<()> {
+        if let Some(p) = self.known.as_mut() {
+            let bottom = crossterm::terminal::size()?.1.saturating_sub(1);
+            p.y = (p.y + n).min(bottom);
+            p.x = 0;
+        }
+        self.inner.append_lines(n)
+    }
+    fn hide_cursor(&mut self) -> std::io::Result<()> {
+        self.inner.hide_cursor()
+    }
+    fn show_cursor(&mut self) -> std::io::Result<()> {
+        self.inner.show_cursor()
+    }
+    fn get_cursor_position(&mut self) -> std::io::Result<Position> {
+        match self.known {
+            Some(p) => Ok(p),
+            None => {
+                let p = self.inner.get_cursor_position()?;
+                self.known = Some(p);
+                Ok(p)
+            }
+        }
+    }
+    fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> std::io::Result<()> {
+        let p = position.into();
+        self.known = Some(p);
+        self.inner.set_cursor_position(p)
+    }
+    fn clear(&mut self) -> std::io::Result<()> {
+        self.inner.clear()
+    }
+    fn clear_region(&mut self, clear_type: ratatui::backend::ClearType) -> std::io::Result<()> {
+        self.inner.clear_region(clear_type)
+    }
+    fn size(&self) -> std::io::Result<ratatui::layout::Size> {
+        self.inner.size()
+    }
+    fn window_size(&mut self) -> std::io::Result<ratatui::backend::WindowSize> {
+        self.inner.window_size()
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        ratatui::backend::Backend::flush(&mut self.inner)
+    }
+    fn scroll_region_up(&mut self, region: std::ops::Range<u16>, n: u16) -> std::io::Result<()> {
+        self.inner.scroll_region_up(region, n)
+    }
+    fn scroll_region_down(&mut self, region: std::ops::Range<u16>, n: u16) -> std::io::Result<()> {
+        self.inner.scroll_region_down(region, n)
+    }
+}
+
 /// The shell over a real terminal.
 pub struct Shell {
-    terminal: Terminal<CrosstermBackend<Stdout>>,
+    terminal: Terminal<Tracked>,
     enhanced_keys: bool,
     stopped: bool,
+    /// The inline viewport's height now.
+    rows: u16,
+    /// The window size the viewport was last fitted to.
+    last_size: (u16, u16),
 }
 
 impl Shell {
@@ -62,18 +170,71 @@ impl Shell {
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
         )
         .is_ok();
-        let backend = CrosstermBackend::new(stdout);
         let terminal = Terminal::with_options(
-            backend,
+            Tracked::new(),
             TerminalOptions {
-                viewport: Viewport::Inline(VIEWPORT_ROWS),
+                viewport: Viewport::Inline(MIN_ROWS),
             },
         )?;
         Ok(Self {
             terminal,
             enhanced_keys,
             stopped: false,
+            rows: MIN_ROWS,
+            last_size: crossterm::terminal::size()?,
         })
+    }
+
+    /// Size the viewport to `wanted` rows (clamped to the screen). It
+    /// grows at once; it shrinks only when `may_shrink`, so a streaming
+    /// reply does not make it jump. ratatui's inline viewport has a fixed
+    /// height, so a new one is made at the old one's top: the old area is
+    /// cleared first, and the new one scrolls the screen only when it
+    /// needs more room below.
+    /// The height `fit` would move to, or `None` when it would not.
+    fn target(&self, wanted: u16, may_shrink: bool) -> anyhow::Result<Option<u16>> {
+        let screen = crossterm::terminal::size()?.1;
+        let wanted = wanted.clamp(MIN_ROWS, screen.saturating_sub(1).max(MIN_ROWS));
+        Ok((wanted != self.rows && (wanted > self.rows || may_shrink)).then_some(wanted))
+    }
+
+    /// Size the viewport to `wanted` rows (clamped to the screen). It
+    /// grows at once; it shrinks only when `may_shrink`, so a streaming
+    /// reply does not make it jump. A resized window is refitted at the
+    /// same height. ratatui's inline viewport has a fixed height, so a
+    /// new one is made at the old one's top: the old area is cleared
+    /// first, and the new one scrolls the screen only when it needs more
+    /// room below.
+    pub fn fit(&mut self, wanted: u16, may_shrink: bool) -> anyhow::Result<()> {
+        let size = crossterm::terminal::size()?;
+        let resized = size != self.last_size;
+        let rows = match self.target(wanted, may_shrink)? {
+            Some(rows) => rows,
+            None if resized => self.rows.min(size.1.saturating_sub(1).max(MIN_ROWS)),
+            None => return Ok(()),
+        };
+        let top = self
+            .terminal
+            .get_frame()
+            .area()
+            .y
+            .min(size.1.saturating_sub(rows));
+        let mut backend = Tracked::new();
+        {
+            use ratatui::backend::{Backend, ClearType};
+            backend.set_cursor_position(Position::new(0, top))?;
+            backend.clear_region(ClearType::AfterCursor)?;
+            Backend::flush(&mut backend)?;
+        }
+        self.terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(rows),
+            },
+        )?;
+        self.rows = rows;
+        self.last_size = size;
+        Ok(())
     }
 
     /// Put the terminal back. Called on quit and by `Drop`.
@@ -423,6 +584,31 @@ mod tests {
         assert_eq!(rows[1], "> one");
         assert_eq!(rows[2], "  two");
         assert_eq!(cursor, Some((5, 1)));
+    }
+
+    #[test]
+    fn needed_rows_count_every_part_and_cap_the_active_one() {
+        let composer = composer_with("one");
+        let idle = Pane {
+            active: &[],
+            composer: &composer,
+            status: "s",
+            hint: None,
+            block: &[],
+            popup: &[],
+        };
+        assert_eq!(needed_rows(&idle), 2);
+        let active: Vec<Line<'static>> = (0..30).map(|i| Line::raw(i.to_string())).collect();
+        let block = vec![Line::raw("b1"), Line::raw("b2")];
+        let busy = Pane {
+            active: &active,
+            composer: &composer,
+            status: "s",
+            hint: Some("h"),
+            block: &block,
+            popup: &[],
+        };
+        assert_eq!(needed_rows(&busy) as usize, MAX_ACTIVE_ROWS + 2 + 1 + 1 + 1);
     }
 
     #[test]

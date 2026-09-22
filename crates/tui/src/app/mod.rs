@@ -32,7 +32,7 @@ use crate::app::engine::{ClientRepl, Printer, PromptBlock};
 use crate::app::keymap::{Action, KeyContext, action_for};
 use crate::app::pager::Pager;
 use crate::app::status::Status;
-use crate::app::tui::{Pane, Shell, wrap_line};
+use crate::app::tui::{Pane, Shell, needed_rows, wrap_line};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -435,6 +435,8 @@ async fn run_shell(
             block: &block,
             popup: &popup_lines,
         };
+        out.shell
+            .fit(needed_rows(&pane), matches!(state, ThreadState::Idle))?;
         out.shell.draw(&pane)?;
         if let Some((title, text)) = out.page.take() {
             let lines = if title == "diff" {
