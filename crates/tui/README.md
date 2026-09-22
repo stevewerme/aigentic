@@ -87,7 +87,10 @@ interrupts it (nothing is posted; `!text` interrupts and posts) and Enter
 queues the message for the next turn. Idle, Ctrl-C or Esc clears the draft;
 on an empty composer a second Ctrl-C within a second quits and a second Esc
 recalls the last message sent, as Alt-Up does at any time. Ctrl-D quits.
-`/keys` prints the table. A permission request is a block above the
+`/keys` prints the table. `@` opens a fuzzy file picker over the project
+root (gitignored files skipped), `/` at the line's start the command list
+with descriptions; Up and Down move, Tab or Enter accepts, Esc closes. A
+permission request is a block above the
 composer, which keeps its draft: `y` once, `a` this session, `p` allow this
 command's leading words from now on (written to the project's
 `.aigentic/rules.toml`, or `rules.toml` beside `config.toml` when there is no

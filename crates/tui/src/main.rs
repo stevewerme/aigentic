@@ -530,7 +530,7 @@ async fn main() -> anyhow::Result<()> {
     let notices = client.take_notices().context("notice stream")?;
     let repl =
         ClientRepl::new(client, thread_id, &welcome.user, role, state, mode).with_skills(skills);
-    app::run(repl, notices, history, project_name).await?;
+    app::run(repl, notices, history, project_name, project_root).await?;
     drop(embedded);
     Ok(())
 }

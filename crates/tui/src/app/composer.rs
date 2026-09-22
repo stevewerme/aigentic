@@ -221,6 +221,22 @@ impl Composer {
         }
     }
 
+    /// The current line and the cursor's column in it.
+    pub fn current_line(&self) -> (&str, usize) {
+        (&self.lines[self.row], self.col)
+    }
+
+    /// Replace chars `start..cursor` on the current line with `text`;
+    /// the cursor lands after it.
+    pub fn replace_before_cursor(&mut self, start: usize, text: &str) {
+        self.walk = None;
+        let line = &mut self.lines[self.row];
+        let a = byte_at(line, start.min(self.col));
+        let b = byte_at(line, self.col);
+        line.replace_range(a..b, text);
+        self.col = start.min(self.col) + text.chars().count();
+    }
+
     /// Replace the whole text; the cursor goes to the end.
     pub fn set_text(&mut self, text: &str) {
         self.lines = text.split('\n').map(str::to_owned).collect();
@@ -333,6 +349,20 @@ mod tests {
         c.left();
         c.delete();
         assert_eq!(c.text(), "abcd");
+    }
+
+    #[test]
+    fn replace_before_cursor_swaps_the_token() {
+        let mut c = Composer::default();
+        c.insert_str("see @src/ma now");
+        c.left();
+        c.left();
+        c.left();
+        c.left();
+        assert_eq!(c.current_line(), ("see @src/ma now", 11));
+        c.replace_before_cursor(4, "@src/main.rs ");
+        assert_eq!(c.text(), "see @src/main.rs  now");
+        assert_eq!(c.cursor(), (0, 17));
     }
 
     #[test]

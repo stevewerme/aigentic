@@ -71,6 +71,44 @@ pub fn parse_line<'a>(line: &'a str, skills: &[String]) -> Command<'a> {
     }
 }
 
+/// Every built-in command and a description, for `/` completion.
+pub const COMMANDS: &[(&str, &str)] = &[
+    (
+        "cost",
+        "tokens for the thread, reported and estimated separately",
+    ),
+    ("pin", "pin a fact to the stable prefix: /pin <text>"),
+    ("compact", "run compaction now"),
+    (
+        "mode",
+        "show the permission mode, or set it: manual, accept-edits, auto",
+    ),
+    (
+        "interrupt",
+        "end the running turn and start one with this text",
+    ),
+    ("who", "the participants and their roles"),
+    ("queue", "what the thread is doing and what is queued"),
+    (
+        "policy",
+        "the rule table, the bash allow patterns, the mode and the grants",
+    ),
+    ("memory", "the memory files as the prefix carries them"),
+    (
+        "skills",
+        "list enabled skills; user-invoked ones are slash commands",
+    ),
+    (
+        "project",
+        "the layers, the knowledge mode and every tool's fate",
+    ),
+    ("threads", "this project's threads, newest first"),
+    ("diff", "the project's working-tree diff, in the pager"),
+    ("keys", "the key table: interrupt, recall, quit"),
+    ("help", "the command list"),
+    ("quit", "exit (Ctrl-D too)"),
+];
+
 pub const HELP: &str = "\
 /cost            tokens for the thread, reported and estimated separately
 /pin <text>      pin a fact to the stable prefix

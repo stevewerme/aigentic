@@ -541,6 +541,11 @@ impl ClientRepl {
         &self.state
     }
 
+    /// The user-invoked skills, for `/` completion.
+    pub fn skills(&self) -> &[String] {
+        &self.skills
+    }
+
     pub fn mode(&self) -> &str {
         &self.mode
     }

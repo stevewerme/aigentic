@@ -7,6 +7,7 @@
 
 pub mod cells;
 pub mod commands;
+pub mod completion;
 pub mod composer;
 pub mod diff;
 pub mod engine;
@@ -25,6 +26,7 @@ use futures_util::StreamExt;
 use tokio::sync::mpsc;
 
 use crate::app::cells::{Cell, ToolState, is_read_tool};
+use crate::app::completion::{FileIndex, Popup};
 use crate::app::composer::Composer;
 use crate::app::engine::{ClientRepl, Printer, PromptBlock};
 use crate::app::keymap::{Action, KeyContext, action_for};
@@ -43,10 +45,11 @@ pub async fn run(
     notices: mpsc::Receiver<Notice>,
     history: PathBuf,
     project: String,
+    root: PathBuf,
 ) -> anyhow::Result<()> {
     use std::io::IsTerminal;
     if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-        run_shell(engine, notices, history, project).await
+        run_shell(engine, notices, history, project, root).await
     } else {
         run_plain(engine, notices).await
     }
@@ -223,6 +226,31 @@ impl Printer for ShellOut {
     }
 }
 
+/// The popup's lines: the matches, the selected one highlighted, a
+/// description after a command.
+fn popup_lines(popup: &Popup) -> Vec<Line<'static>> {
+    popup
+        .items
+        .iter()
+        .enumerate()
+        .map(|(i, (item, desc))| {
+            let style = if i == popup.selected {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            let mut spans = vec![Span::styled(format!("  {item}"), style)];
+            if !desc.is_empty() {
+                spans.push(Span::styled(
+                    format!("  {desc}"),
+                    Style::default().add_modifier(Modifier::DIM),
+                ));
+            }
+            Line::from(spans)
+        })
+        .collect()
+}
+
 /// The prompt block's lines.
 fn block_lines(block: &PromptBlock, width: usize) -> Vec<Line<'static>> {
     let head = Style::default()
@@ -292,8 +320,23 @@ async fn run_shell(
     mut notices: mpsc::Receiver<Notice>,
     history: PathBuf,
     project: String,
+    root: PathBuf,
 ) -> anyhow::Result<()> {
     let mut out = ShellOut::new(Shell::start()?);
+    // The file index for `@`, walked once off the loop.
+    let mut files_task = Some(tokio::task::spawn_blocking(move || FileIndex::walk(&root)));
+    let mut files: Option<FileIndex> = None;
+    let commands: Vec<(String, String)> = commands::COMMANDS
+        .iter()
+        .map(|(n, d)| ((*n).to_owned(), (*d).to_owned()))
+        .chain(
+            engine
+                .skills()
+                .iter()
+                .map(|s| (s.clone(), "a user-invoked skill".to_owned())),
+        )
+        .collect();
+    let mut popup: Option<Popup> = None;
     let mut composer = Composer::with_history(&history);
     let mut status = Status {
         project,
@@ -338,6 +381,38 @@ async fn run_shell(
             .prompt_block()
             .map(|b| block_lines(b, out.shell.width()))
             .unwrap_or_default();
+        if files.is_none()
+            && let Some(task) = files_task.as_mut()
+            && task.is_finished()
+        {
+            files = files_task.take().unwrap().await.ok();
+        }
+        // The popup follows the composer: open, narrow or close on the
+        // token under the cursor.
+        popup = {
+            let (line, col) = composer.current_line();
+            match completion::token_at(line, col) {
+                Some(_) if reason_draft.is_none() => {
+                    let index = files.as_ref();
+                    match index {
+                        Some(index) => {
+                            completion::open(line, col, index, &commands).map(|mut p| {
+                                if let Some(old) = &popup
+                                    && old.kind == p.kind
+                                    && old.query == p.query
+                                {
+                                    p.selected = old.selected.min(p.items.len().saturating_sub(1));
+                                }
+                                p
+                            })
+                        }
+                        None => None,
+                    }
+                }
+                _ => None,
+            }
+        };
+        let popup_lines = popup.as_ref().map(popup_lines).unwrap_or_default();
         let hint = match (&armed, &state) {
             _ if reason_draft.is_some() => {
                 Some("deny with a reason · Enter sends · Esc cancels".to_owned())
@@ -358,6 +433,7 @@ async fn run_shell(
             status: &status.line(),
             hint: hint.as_deref(),
             block: &block,
+            popup: &popup_lines,
         };
         out.shell.draw(&pane)?;
         if let Some((title, text)) = out.page.take() {
@@ -421,6 +497,35 @@ async fn run_shell(
                                     composer.clear();
                                     continue;
                                 }
+                            }
+                        }
+                        // An open popup takes the navigation keys.
+                        if let Some(p) = popup.as_mut() {
+                            use crossterm::event::KeyCode as K;
+                            match key.code {
+                                K::Up => {
+                                    p.up();
+                                    continue;
+                                }
+                                K::Down => {
+                                    p.down();
+                                    continue;
+                                }
+                                K::Tab | K::Enter => {
+                                    if let Some(text) = p.accepted() {
+                                        composer.replace_before_cursor(p.start, &text);
+                                    }
+                                    popup = None;
+                                    continue;
+                                }
+                                K::Esc => {
+                                    // Close it by breaking the token.
+                                    composer.insert_char(' ');
+                                    composer.backspace();
+                                    popup = None;
+                                    continue;
+                                }
+                                _ => {}
                             }
                         }
                         let ctx = KeyContext {

@@ -39,6 +39,8 @@ pub struct Pane<'a> {
     /// The prompt block (a permission request, a question), above the
     /// hint. Already wrapped.
     pub block: &'a [Line<'static>],
+    /// The completion popup, between the hint and the composer.
+    pub popup: &'a [Line<'static>],
 }
 
 /// The shell over a real terminal.
@@ -216,7 +218,8 @@ pub fn layout(pane: &Pane<'_>, area: Rect) -> (Vec<Line<'static>>, Option<(u16, 
     });
 
     // Rows left for the tail after the composer, the hint and the status.
-    let fixed = composer_rows.len() + usize::from(hint.is_some()) + 1 + pane.block.len();
+    let fixed =
+        composer_rows.len() + usize::from(hint.is_some()) + 1 + pane.block.len() + pane.popup.len();
     let tail_rows_avail = height.saturating_sub(fixed);
     let skip = pane.active.len().saturating_sub(tail_rows_avail);
     let tail_rows: Vec<Line<'static>> = if tail_rows_avail == 0 {
@@ -237,11 +240,8 @@ pub fn layout(pane: &Pane<'_>, area: Rect) -> (Vec<Line<'static>>, Option<(u16, 
     if let Some(h) = hint {
         rows.push(h);
     }
-    let composer_top = if pane.hint.is_some() {
-        composer_top + 1
-    } else {
-        composer_top
-    };
+    rows.extend(pane.popup.iter().cloned());
+    let composer_top = composer_top + usize::from(pane.hint.is_some()) + pane.popup.len();
     rows.extend(composer_rows);
     rows.push(status);
     let cursor = cursor.map(|(x, y)| (x, u16::try_from(composer_top).unwrap_or(u16::MAX) + y));
@@ -370,6 +370,7 @@ mod tests {
             status: "manual · p · context ?",
             hint: None,
             block: &[],
+            popup: &[],
         };
         let (rows, cursor) = render(&pane, 40, 5);
         assert_eq!(rows[0], "");
@@ -393,6 +394,7 @@ mod tests {
             status: "s",
             hint: Some("queued 1 · ! sends now"),
             block: &[],
+            popup: &[],
         };
         // 4 rows: one tail row fits above hint, composer and status.
         let (rows, cursor) = render(&pane, 10, 4);
@@ -415,6 +417,7 @@ mod tests {
             status: "s",
             hint: None,
             block: &[],
+            popup: &[],
         };
         let (rows, cursor) = render(&pane, 20, 4);
         assert_eq!(rows[1], "> one");
