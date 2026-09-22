@@ -31,6 +31,10 @@ pub enum EventKind {
     /// Facts stated in the thread were written to the project's memory
     /// files; carries what was written and the cursor for the next run.
     MemoryExtracted,
+    /// The first event of a thread created by the daemon (phase 5):
+    /// which project it belongs to and the root its tools run in. Older
+    /// logs have none and are grouped by their directory instead.
+    ThreadStarted,
 }
 
 /// One line of a thread's append-only log. The log is the source of truth;
@@ -150,6 +154,12 @@ mod tests {
                 json!({"through_seq": 9, "written": [{"file": "decisions.md", "text": "Use Swedish.", "stated_by": {"kind": "user", "id": "steve"}, "at_seq": 0}],
                        "model": "m", "usage": {"input_tokens": 10, "output_tokens": 2}}),
             ),
+            event(
+                11,
+                EventKind::ThreadStarted,
+                steve_again(),
+                json!({"project": "vendela", "root": "/srv/vendela", "created_by": {"kind": "user", "id": "steve"}}),
+            ),
         ];
         events[2].parent_event = Some(events[1].id);
         events[9].parent_event = Some(events[8].id);
@@ -203,6 +213,10 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&events[10]).unwrap()["kind"],
             "memory_extracted"
+        );
+        assert_eq!(
+            serde_json::to_value(&events[11]).unwrap()["kind"],
+            "thread_started"
         );
         assert_eq!(value["seq"], 2);
         assert_eq!(value["author"], json!({"kind": "system"}));

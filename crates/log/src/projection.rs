@@ -58,11 +58,21 @@ struct Truncation {
 /// it immediately, so a message produced between an assistant message and
 /// its results (a `skill_loaded` from `load_skill`, say) is held back and
 /// emitted after the last of those results.
+///
+/// The horizon rule (phase 5): a `user_message` with `mid_turn` set
+/// arrived while a turn ran and is emitted only once a `turn_ended`
+/// follows it, so the model sees it from the next turn and a replay
+/// gives the live run's context exactly. `thread_started` emits nothing.
 pub fn project(events: &[Event]) -> Result<Projection, LogError> {
     let mut summaries: Vec<Summary> = Vec::new();
     let mut truncations: Vec<Truncation> = Vec::new();
     let mut blobs_dropped_before: Option<u64> = None;
     let mut pinned = Vec::new();
+    let last_turn_end = events
+        .iter()
+        .rev()
+        .find(|e| e.kind == EventKind::TurnEnded)
+        .map(|e| e.seq);
 
     for event in events {
         match event.kind {
@@ -163,6 +173,9 @@ pub fn project(events: &[Event]) -> Result<Projection, LogError> {
         match event.kind {
             EventKind::UserMessage => {
                 let p: UserMessagePayload = payload(event)?;
+                if p.mid_turn && !last_turn_end.is_some_and(|end| event.seq < end) {
+                    continue;
+                }
                 push(
                     &mut body,
                     &mut pending_calls,
@@ -216,6 +229,11 @@ pub fn project(events: &[Event]) -> Result<Projection, LogError> {
             }
             EventKind::Interrupted => {
                 let p: InterruptedPayload = payload(event)?;
+                let who = match &p.by {
+                    Some(Author::User(u)) => format!(" by {}", u.0),
+                    Some(Author::Agent(a)) => format!(" by {}", a.0),
+                    Some(Author::System) | None => String::new(),
+                };
                 let calls = if p.unanswered_calls.is_empty() {
                     String::new()
                 } else {
@@ -232,7 +250,7 @@ pub fn project(events: &[Event]) -> Result<Projection, LogError> {
                         role: Role::User,
                         author: Author::System,
                         blocks: vec![ContentBlock::Text(format!(
-                            "[The previous turn was interrupted: {}.{calls} Continue from here; rerun anything whose outcome is unknown.]",
+                            "[The previous turn was interrupted{who}: {}.{calls} Continue from here; rerun anything whose outcome is unknown.]",
                             p.reason
                         ))],
                     },
@@ -260,7 +278,8 @@ pub fn project(events: &[Event]) -> Result<Projection, LogError> {
             | EventKind::Pinned
             | EventKind::PermissionRequested
             | EventKind::PermissionDecided
-            | EventKind::MemoryExtracted => {}
+            | EventKind::MemoryExtracted
+            | EventKind::ThreadStarted => {}
         }
     }
 
@@ -441,6 +460,79 @@ mod tests {
                 json!({"text": "Use Swedish."}),
             ),
         ]
+    }
+
+    fn queued(seq: u64, text: &str) -> Event {
+        ev(
+            seq,
+            EventKind::UserMessage,
+            Author::User(UserId("magnus".into())),
+            json!({"blocks": [{"type": "text", "text": text}], "mid_turn": true}),
+        )
+    }
+
+    #[test]
+    fn a_mid_turn_message_waits_for_the_next_turn() {
+        // Turn one runs; magnus posts while it does; the turn ends.
+        let mut events = vec![
+            ev(
+                0,
+                EventKind::ThreadStarted,
+                steve(),
+                json!({"project": "p", "root": "/r", "created_by": {"kind": "user", "id": "steve"}}),
+            ),
+            user(1, "one"),
+            assistant(2, "reply one", false),
+            queued(3, "also this"),
+        ];
+        // No turn_ended yet: the queued message is not in context.
+        let p = project(&events).unwrap();
+        assert_eq!(
+            texts(&p),
+            vec!["one", "reply one"],
+            "thread_started emits nothing too"
+        );
+        // Even after a resume note, still the same turn.
+        events.push(ev(
+            4,
+            EventKind::Interrupted,
+            Author::System,
+            json!({"reason": "process exited mid-turn", "after_seq": 3, "unanswered_calls": []}),
+        ));
+        let p = project(&events).unwrap();
+        assert_eq!(texts(&p).len(), 3);
+        assert!(!texts(&p).iter().any(|t| t == "also this"));
+        // The turn ends: the message is in context, in log order.
+        events.push(ended(5));
+        let p = project(&events).unwrap();
+        let t = texts(&p);
+        assert_eq!(t[0], "one");
+        assert_eq!(t[1], "reply one");
+        assert_eq!(t[2], "also this");
+        assert_eq!(p.body[2].author, Author::User(UserId("magnus".into())));
+        // A message with the flag off is never held, as before phase 5.
+        events.push(user(6, "two"));
+        let p = project(&events).unwrap();
+        assert_eq!(texts(&p).last().map(String::as_str), Some("two"));
+    }
+
+    #[test]
+    fn an_interrupt_names_who_did_it() {
+        let events = vec![
+            user(0, "one"),
+            ev(
+                1,
+                EventKind::Interrupted,
+                Author::System,
+                json!({"reason": "interrupt", "after_seq": 0, "by": {"kind": "user", "id": "magnus"}}),
+            ),
+        ];
+        let p = project(&events).unwrap();
+        let note = texts(&p)[1].clone();
+        assert!(
+            note.starts_with("[The previous turn was interrupted by magnus: interrupt."),
+            "{note}"
+        );
     }
 
     #[test]

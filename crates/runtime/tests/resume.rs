@@ -20,9 +20,7 @@ fn new_event(kind: EventKind, author: Author, payload: serde_json::Value) -> New
     }
 }
 fn user_ev(text: &str) -> NewEvent {
-    let p = UserMessagePayload {
-        blocks: vec![ContentBlock::Text(text.into())],
-    };
+    let p = UserMessagePayload::new(vec![ContentBlock::Text(text.into())]);
     new_event(
         EventKind::UserMessage,
         steve(),

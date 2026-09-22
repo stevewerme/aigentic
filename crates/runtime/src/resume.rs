@@ -136,6 +136,7 @@ impl Runtime {
             reason: "process exited mid-turn".into(),
             after_seq,
             unanswered_calls: ids.clone(),
+            by: None,
         })
         .expect("serialisable");
         self.append(

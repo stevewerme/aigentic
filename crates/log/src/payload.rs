@@ -1,6 +1,8 @@
 //! Kind-specific payload shapes. `Event.payload` is free JSON on the wire;
 //! these structs are the contract for what each kind carries.
 
+use std::path::PathBuf;
+
 use aigentic_core::{Author, ContentBlock, RiskClass, ToolCall, ToolResult};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -9,6 +11,31 @@ use ulid::Ulid;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserMessagePayload {
     pub blocks: Vec<ContentBlock>,
+    /// Arrived while a turn was running (phase 5's queue). It is in the
+    /// log at once so every subscriber sees it, and in the model's
+    /// context only once a `turn_ended` follows it: the horizon rule in
+    /// the projection. Lines from before phase 5 read back as `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mid_turn: bool,
+}
+
+impl UserMessagePayload {
+    pub fn new(blocks: Vec<ContentBlock>) -> Self {
+        Self {
+            blocks,
+            mid_turn: false,
+        }
+    }
+}
+
+/// Payload of a `thread_started` event, the first event of a thread the
+/// daemon created: the project it belongs to (`None` outside any) and
+/// the root its tools run in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThreadStartedPayload {
+    pub project: Option<String>,
+    pub root: PathBuf,
+    pub created_by: Author,
 }
 
 /// Token usage for one model call, as persisted. The token fields mirror
@@ -190,15 +217,21 @@ pub struct PinnedPayload {
     pub text: String,
 }
 
-/// Payload of an `interrupted` event, appended on resume after a crash.
+/// Payload of an `interrupted` event: appended on resume after a crash
+/// (phase 2), or when a participant interrupts a running turn (phase 5).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InterruptedPayload {
+    /// `process exited mid-turn`, or `interrupt` for a participant's.
     pub reason: String,
     /// Last event that was fully written before the crash.
     pub after_seq: u64,
     /// Tool call ids that received synthetic error results.
     #[serde(default)]
     pub unanswered_calls: Vec<String>,
+    /// Who interrupted; `None` for a crash. Absent on lines from before
+    /// phase 5.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<Author>,
 }
 
 /// Who invoked a skill.
@@ -282,6 +315,68 @@ pub struct MemoryExtractedPayload {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn phase5_fields_default_and_stay_off_old_lines() {
+        // A phase 0 line has no `mid_turn`; it reads back false and a
+        // false value is not written, so old shapes are byte-stable.
+        let p: UserMessagePayload =
+            serde_json::from_value(json!({"blocks": [{"type": "text", "text": "hi"}]})).unwrap();
+        assert!(!p.mid_turn);
+        assert_eq!(
+            serde_json::to_value(&p).unwrap(),
+            json!({"blocks": [{"type": "text", "text": "hi"}]})
+        );
+        let queued = UserMessagePayload {
+            mid_turn: true,
+            ..UserMessagePayload::new(vec![ContentBlock::Text("later".into())])
+        };
+        let value = serde_json::to_value(&queued).unwrap();
+        assert_eq!(value["mid_turn"], true);
+        assert_eq!(
+            serde_json::from_value::<UserMessagePayload>(value).unwrap(),
+            queued
+        );
+
+        let p: InterruptedPayload = serde_json::from_value(
+            json!({"reason": "process exited mid-turn", "after_seq": 5, "unanswered_calls": []}),
+        )
+        .unwrap();
+        assert_eq!(p.by, None);
+        assert!(serde_json::to_value(&p).unwrap().get("by").is_none());
+        let by_steve = InterruptedPayload {
+            reason: "interrupt".into(),
+            after_seq: 9,
+            unanswered_calls: vec![],
+            by: Some(Author::User(aigentic_core::UserId("steve".into()))),
+        };
+        let value = serde_json::to_value(&by_steve).unwrap();
+        assert_eq!(value["by"], json!({"kind": "user", "id": "steve"}));
+        assert_eq!(
+            serde_json::from_value::<InterruptedPayload>(value).unwrap(),
+            by_steve
+        );
+
+        let started = ThreadStartedPayload {
+            project: Some("vendela".into()),
+            root: PathBuf::from("/srv/vendela"),
+            created_by: Author::User(aigentic_core::UserId("steve".into())),
+        };
+        let value = serde_json::to_value(&started).unwrap();
+        assert_eq!(
+            value,
+            json!({"project": "vendela", "root": "/srv/vendela", "created_by": {"kind": "user", "id": "steve"}})
+        );
+        assert_eq!(
+            serde_json::from_value::<ThreadStartedPayload>(value).unwrap(),
+            started
+        );
+        let none: ThreadStartedPayload = serde_json::from_value(
+            json!({"project": null, "root": "/tmp/x", "created_by": {"kind": "system"}}),
+        )
+        .unwrap();
+        assert_eq!(none.project, None);
+    }
 
     #[test]
     fn memory_extracted_round_trips_with_an_empty_written_default() {

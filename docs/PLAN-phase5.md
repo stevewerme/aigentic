@@ -1,6 +1,6 @@
 # Phase 5 plan
 
-Status: draft, written 2026-09-22 after the phase 4 close · Follows `docs/PRD.md` (the Server and multiplayer phase) and the phase 0 to 4 plans
+Status: step 1 landed on 2026-09-22; written the same day after the phase 4 close · Follows `docs/PRD.md` (the Server and multiplayer phase) and the phase 0 to 4 plans
 
 ## 0. Goal and done-when
 

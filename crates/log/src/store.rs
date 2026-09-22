@@ -306,9 +306,9 @@ mod tests {
         NewEvent {
             kind: EventKind::UserMessage,
             author: Author::User(UserId("steve".into())),
-            payload: serde_json::to_value(UserMessagePayload {
-                blocks: vec![ContentBlock::Text(text.into())],
-            })
+            payload: serde_json::to_value(UserMessagePayload::new(vec![ContentBlock::Text(
+                text.into(),
+            )]))
             .unwrap(),
             parent_event: None,
         }
