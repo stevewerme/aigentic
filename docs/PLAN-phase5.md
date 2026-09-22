@@ -705,4 +705,5 @@ From steps 10 and 11, before the acceptance run:
   acceptance item that wants a prompt must pick something off it.
 - A `[participants]` table that names anyone gives the owner no role
   unless listed, by section 6's rule; the VM's project files must list
-  the owner. Worth a `doctor` line.
+  the owner. `aigentic doctor` has a `participants` line for it since
+  after step 11.

@@ -6,8 +6,8 @@
 use std::path::Path;
 
 use crate::checks::{
-    Check, GhCli, Status, check_api_key_env, check_config, check_github, check_probe,
-    check_project, check_skills, check_threads_dir, origin_url,
+    Check, GhCli, Status, check_api_key_env, check_config, check_github, check_participants,
+    check_probe, check_project, check_skills, check_threads_dir, origin_url,
 };
 use crate::config;
 use crate::skills_cmd::SkillPaths;
@@ -40,6 +40,17 @@ pub async fn run(config_path: &Path, cwd: &Path, probe: bool) -> anyhow::Result<
     let config_dir = config_path
         .parent()
         .map_or_else(|| Path::new(".").to_path_buf(), Path::to_path_buf);
+    // The daemon's owner: server.toml's first user when that file is
+    // beside config.toml, else the config's user, who owns the embedded
+    // daemon. Never a token, never printed beyond the name.
+    let (owner, source) = match aigentic_server::ServerConfig::load(&config_dir.join("server.toml"))
+        .ok()
+        .and_then(|s| s.owner().map(str::to_owned))
+    {
+        Some(owner) => (owner, "server.toml"),
+        None => (config.user_name(), "config.toml's user"),
+    };
+    checks.push(check_participants(project.as_ref(), &owner, source));
     let project_root = project
         .as_ref()
         .map_or_else(|| cwd.to_path_buf(), |p| p.root.clone());

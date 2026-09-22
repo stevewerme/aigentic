@@ -150,6 +150,41 @@ pub fn check_threads_dir(dir: &Path) -> Check {
 
 /// The project at or above `cwd` opens; the knowledge folder loads and its
 /// mode is decided for `provider`'s window. `skip` outside a project.
+/// `[participants]` and the daemon's owner. An empty table gives the
+/// owner `admin` alone; a table that names anyone gives the owner
+/// nothing unless it names the owner too, which is the trap this line
+/// is for. `owner` is the daemon's owner and `source` where that name
+/// came from (`server.toml`'s first user, or `config.toml`'s `user` for
+/// the embedded daemon).
+pub fn check_participants(project: Option<&Project>, owner: &str, source: &str) -> Check {
+    let Some(project) = project else {
+        return Check::skip("participants", "no project");
+    };
+    let participants = &project.file.participants;
+    if participants.is_empty() {
+        return Check::ok(
+            "participants",
+            format!("none named; the daemon's owner {owner} ({source}) is admin alone"),
+        );
+    }
+    match participants.listed(owner) {
+        Some(role) => Check::ok(
+            "participants",
+            format!(
+                "{}; the daemon's owner {owner} ({source}) is {role}",
+                participants.describe().join(", ")
+            ),
+        ),
+        None => Check::fail(
+            "participants",
+            format!(
+                "{} named but not the daemon's owner {owner} ({source}): a table that names anyone gives the owner no role; add `{owner} = \"admin\"` to [participants]",
+                participants.0.len()
+            ),
+        ),
+    }
+}
+
 pub fn check_project(cwd: &Path, provider: &dyn Provider) -> (Check, Option<Project>) {
     let project = match Project::open(cwd) {
         Ok(Some(p)) => p,
@@ -455,6 +490,47 @@ mod tests {
         std::fs::write(&file, "").unwrap();
         let c = check_threads_dir(&file.join("under"));
         assert_eq!(c.status, Status::Fail);
+    }
+
+    #[test]
+    fn participants_check_wants_the_owner_listed_once_anyone_is() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            check_participants(None, "steve", "server.toml").status,
+            Status::Skip
+        );
+        std::fs::write(dir.path().join(FILE_NAME), "[project]\nname = \"p\"\n").unwrap();
+        let open = || Project::open(dir.path()).unwrap().unwrap();
+        let c = check_participants(Some(&open()), "steve", "server.toml");
+        assert_eq!(c.status, Status::Ok);
+        assert!(c.message.contains("admin alone"), "{}", c.message);
+
+        std::fs::write(
+            dir.path().join(FILE_NAME),
+            "[project]\nname = \"p\"\n[participants]\nmagnus = \"approve\"\n",
+        )
+        .unwrap();
+        let c = check_participants(Some(&open()), "steve", "config.toml's user");
+        assert_eq!(c.status, Status::Fail);
+        assert!(
+            c.message
+                .contains("not the daemon's owner steve (config.toml's user)")
+                && c.message.contains("steve = \"admin\""),
+            "{}",
+            c.message
+        );
+
+        std::fs::write(
+            dir.path().join(FILE_NAME),
+            "[project]\nname = \"p\"\n[participants]\nsteve = \"admin\"\nmagnus = \"approve\"\n",
+        )
+        .unwrap();
+        let c = check_participants(Some(&open()), "steve", "server.toml");
+        assert_eq!(c.status, Status::Ok);
+        assert_eq!(
+            c.message,
+            "magnus (approve), steve (admin); the daemon's owner steve (server.toml) is admin"
+        );
     }
 
     #[test]
