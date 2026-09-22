@@ -8,6 +8,7 @@
 //! omitted, so a single call can never flood the context.
 
 mod bash;
+pub mod diff;
 mod files;
 mod fs;
 pub mod knowledge;

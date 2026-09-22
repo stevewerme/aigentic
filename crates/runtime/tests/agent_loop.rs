@@ -43,7 +43,7 @@ async fn tool_call_round_trip_produces_the_exact_event_sequence() {
             &mut |s| match s {
                 Signal::TextDelta(t) => deltas.push_str(t),
                 Signal::Event(e) => signalled.push(e.kind),
-                Signal::ToolCallStarted(_) | Signal::Waiting(_) => {}
+                Signal::ToolCallStarted(_) | Signal::Waiting(_) | Signal::Usage(_) => {}
             },
         )
         .await

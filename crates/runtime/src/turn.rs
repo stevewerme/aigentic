@@ -233,6 +233,7 @@ impl Runtime {
                     context.len(),
                 )
             });
+            observe(Signal::Usage(self.window_usage(&context)));
             let usage = usage.unwrap_or_else(|| self.estimate_usage(&context, &agent, &blocks));
             spent.tokens += usage.total();
             if let Some(e) = error {

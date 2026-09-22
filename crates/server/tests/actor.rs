@@ -516,13 +516,20 @@ async fn a_decision_resumes_the_turn_and_a_late_subscriber_catches_up() {
         Response::Ok
     );
     assert_eq!(rig.kinds().last(), Some(&EventKind::Pinned));
-    // The mode change was broadcast before the pin landed.
+    // The mode change was broadcast before the pin landed. A usage push
+    // (the turn's end) may sit in front; it carries no order of its own.
+    let mut next = async || loop {
+        match late.recv().await {
+            Some(Notice::Usage { .. }) => continue,
+            other => return other,
+        }
+    };
     assert!(matches!(
-        late.recv().await,
+        next().await,
         Some(Notice::Mode { mode, .. }) if mode == "auto"
     ));
     assert!(matches!(
-        late.recv().await,
+        next().await,
         Some(Notice::Event { event, .. }) if event.kind == EventKind::Pinned
     ));
 }
@@ -591,4 +598,50 @@ async fn a_resumed_open_turn_is_continued_before_the_first_mail() {
     );
     drop(mailbox);
     task.await.unwrap();
+}
+
+#[tokio::test]
+async fn usage_is_pushed_after_the_call_and_again_when_the_turn_ends() {
+    let rig = rig(vec![Some(vec![text("reply"), done()])], false);
+    let (_, _, mut notices) = rig.subscribe(0).await;
+    assert_eq!(rig.post(steve(), "one", false).await, Response::Ok);
+    let seen = Rig::until_state(&mut notices, |s| *s == ThreadState::Idle).await;
+    // During the turn: a fill from the provider's window, timed.
+    let during: Vec<_> = seen
+        .iter()
+        .filter_map(|n| match n {
+            Notice::Usage {
+                tokens_in_window,
+                window,
+                turn_elapsed_ms,
+                queued,
+                ..
+            } => Some((*tokens_in_window, *window, *turn_elapsed_ms, *queued)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(during.len(), 1, "{during:?}");
+    assert_eq!(during[0].1, 1000);
+    assert!(during[0].0 > 0);
+    assert!(during[0].2.is_some());
+    assert_eq!(during[0].3, 0);
+    // After Idle: the same fill once more, untimed, so a status line
+    // drops its clock.
+    let last = tokio::time::timeout(Duration::from_secs(2), notices.recv())
+        .await
+        .expect("usage after idle")
+        .expect("channel open");
+    assert!(
+        matches!(
+            last,
+            Notice::Usage {
+                turn_elapsed_ms: None,
+                queued: 0,
+                ..
+            }
+        ),
+        "{last:?}"
+    );
+    drop(rig.mailbox);
+    rig.task.await.unwrap();
 }

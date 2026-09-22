@@ -114,11 +114,24 @@ impl Tool for WriteFileTool {
             if let Some(parent) = path.parent() {
                 tokio::fs::create_dir_all(parent).await.map_err(io)?;
             }
+            // What was there before, for the diff: nothing for a new file.
+            let before = match tokio::fs::read(&path).await {
+                Ok(bytes) => String::from_utf8(bytes).unwrap_or_default(),
+                Err(_) => String::new(),
+            };
             tokio::fs::write(&path, args.content.as_bytes())
                 .await
                 .map_err(io)?;
+            let diff = crate::diff::unified(&path, &before, &args.content);
             Ok(ToolOutput {
-                content: format!("wrote {} bytes to {}", args.content.len(), path.display()),
+                content: truncate_output(
+                    &format!(
+                        "{diff}wrote {} bytes to {}",
+                        args.content.len(),
+                        path.display()
+                    ),
+                    DEFAULT_OUTPUT_CAP,
+                ),
                 is_error: false,
             })
         })
@@ -137,6 +150,35 @@ mod tests {
     use serde_json::json;
 
     #[tokio::test]
+    async fn write_file_result_starts_with_a_diff() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = WriteFileTool::new(Workdir::new(dir.path()));
+        let out = write
+            .call(json!({"path": "n.txt", "content": "one\n"}))
+            .await
+            .unwrap();
+        let shown = dir.path().join("n.txt").display().to_string();
+        assert!(
+            out.content
+                .starts_with(&format!("--- a/{shown}\n+++ b/{shown}\n@@")),
+            "{}",
+            out.content
+        );
+        assert!(out.content.contains("+one\n"), "{}", out.content);
+        assert!(
+            out.content.ends_with(&format!("wrote 4 bytes to {shown}")),
+            "{}",
+            out.content
+        );
+        // Rewriting with the same content: no diff, just the summary.
+        let out = write
+            .call(json!({"path": "n.txt", "content": "one\n"}))
+            .await
+            .unwrap();
+        assert_eq!(out.content, format!("wrote 4 bytes to {shown}"));
+    }
+
+    #[tokio::test]
     async fn write_then_read_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         let workdir = Workdir::new(dir.path());
@@ -149,7 +191,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!out.is_error);
-        assert!(out.content.starts_with("wrote "));
+        assert!(out.content.contains("\nwrote "), "{}", out.content);
 
         let out = read
             .call(json!({"path": "src/nested/main.rs"}))

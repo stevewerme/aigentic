@@ -12,13 +12,14 @@
 //! (pin, compact, set the mode, a report) waits for the turn to end.
 
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use aigentic_api::{Notice, ReportKind, Response, ThreadState};
 use aigentic_runtime::aigentic_core::{Author, ContentBlock, Event, EventKind};
 use aigentic_runtime::aigentic_log::{PermissionRequestedPayload, UserMessagePayload};
 use aigentic_runtime::{
     ASKED_HUMAN, Answered, CancelToken, Decisions, Mode, Outbox, Pending, Queued, Resumed, Runtime,
-    Signal, TurnOutcome, inbox,
+    Signal, TurnOutcome, WindowUsage, inbox,
 };
 use tokio::sync::{mpsc, oneshot};
 use ulid::Ulid;
@@ -110,9 +111,31 @@ struct Shared {
     last_queued_by: Mutex<Option<Author>>,
     /// The permission mode's name, for `Opened`.
     mode: Mutex<String>,
+    /// When the running turn started; `None` while idle.
+    started: Mutex<Option<Instant>>,
+    /// The last window fill the runtime reported, re-sent when the queue
+    /// changes or the turn ends so a status line stays current.
+    last_usage: Mutex<Option<WindowUsage>>,
 }
 
 impl Shared {
+    /// `Notice::Usage` from the last fill, the turn's elapsed time and
+    /// the queue; nothing until the first model call reported a fill.
+    fn push_usage(&self) {
+        let Some(usage) = *self.last_usage.lock().unwrap_or_else(|e| e.into_inner()) else {
+            return;
+        };
+        let started = *self.started.lock().unwrap_or_else(|e| e.into_inner());
+        let queued = *self.queued.lock().unwrap_or_else(|e| e.into_inner());
+        self.broadcast(Notice::Usage {
+            thread: self.thread,
+            tokens_in_window: usage.tokens_in_window,
+            window: usage.window,
+            turn_elapsed_ms: started.map(|t| t.elapsed().as_millis() as u64),
+            queued,
+        });
+    }
+
     fn broadcast(&self, notice: Notice) {
         let mut subs = self.subscribers.lock().unwrap_or_else(|e| e.into_inner());
         subs.retain(|tx| tx.send(notice.clone()).is_ok());
@@ -156,6 +179,7 @@ impl Shared {
                 {
                     *self.queued.lock().unwrap_or_else(|e| e.into_inner()) += 1;
                     self.running(turn_by.clone());
+                    self.push_usage();
                     return;
                 }
                 // A decision or a result ends a wait.
@@ -168,6 +192,10 @@ impl Shared {
                 {
                     self.running(turn_by.clone());
                 }
+            }
+            Signal::Usage(usage) => {
+                *self.last_usage.lock().unwrap_or_else(|e| e.into_inner()) = Some(usage);
+                self.push_usage();
             }
             Signal::TextDelta(text) => self.broadcast(Notice::TextDelta {
                 thread: self.thread,
@@ -238,6 +266,8 @@ impl ThreadActor {
         let shared = Arc::new(Shared {
             thread,
             subscribers: Mutex::new(Vec::new()),
+            started: Mutex::new(None),
+            last_usage: Mutex::new(None),
             events: Mutex::new(runtime.log().read_all()?),
             state: Mutex::new(ThreadState::Idle),
             queued: Mutex::new(0),
@@ -446,6 +476,11 @@ impl ThreadActor {
                 Start::Post(a, _) | Start::Skill(a, _, _) | Start::Continue(a) => a.clone(),
             };
             *self.shared.queued.lock().unwrap_or_else(|e| e.into_inner()) = 0;
+            *self
+                .shared
+                .started
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
             self.shared.running(by.clone());
             let cancel = CancelToken::never();
             let (outbox, mut inbox) = inbox();
@@ -499,7 +534,13 @@ impl ThreadActor {
                 .take();
             next = self.after_turn(outcome, last_poster);
         }
+        *self
+            .shared
+            .started
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
         self.shared.set_state(ThreadState::Idle);
+        self.shared.push_usage();
     }
 
     /// Mail while a turn runs. Only what needs no runtime is handled

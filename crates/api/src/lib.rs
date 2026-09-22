@@ -215,6 +215,16 @@ pub enum Notice {
         thread: Ulid,
         mode: String,
     },
+    /// The window fill after a model call, a queue change or a turn's
+    /// end (phase 6): what a status line shows. `turn_elapsed_ms` is
+    /// `None` when no turn runs.
+    Usage {
+        thread: Ulid,
+        tokens_in_window: u64,
+        window: u64,
+        turn_elapsed_ms: Option<u64>,
+        queued: u32,
+    },
 }
 
 /// Where a thread is, for the state line and the listings.

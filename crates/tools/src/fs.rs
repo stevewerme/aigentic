@@ -327,8 +327,14 @@ impl Tool for EditFileTool {
                 .matches('\n')
                 .count()
                 + 1;
+            // The diff first, so a client can render the patch and the
+            // model sees exactly what changed; the summary line last.
+            let diff = crate::diff::unified(&path, &text, &edited);
             Ok(ToolOutput {
-                content: format!("edited {} at line {line}", path.display()),
+                content: truncate_output(
+                    &format!("{diff}edited {} at line {line}", path.display()),
+                    DEFAULT_OUTPUT_CAP,
+                ),
                 is_error: false,
             })
         })
@@ -468,12 +474,18 @@ mod tests {
             .call(json!({"path": "src/main.rs", "old_string": "    hello();\n", "new_string": "    hello();\n    bye();\n"}))
             .await
             .unwrap();
-        assert_eq!(
-            out.content,
-            format!(
-                "edited {} at line 2",
-                d.path().join("src/main.rs").display()
-            )
+        let shown = d.path().join("src/main.rs").display().to_string();
+        assert!(
+            out.content
+                .starts_with(&format!("--- a/{shown}\n+++ b/{shown}\n@@")),
+            "{}",
+            out.content
+        );
+        assert!(out.content.contains("+    bye();\n"), "{}", out.content);
+        assert!(
+            out.content.ends_with(&format!("edited {shown} at line 2")),
+            "{}",
+            out.content
         );
         assert_eq!(
             std::fs::read_to_string(d.path().join("src/main.rs")).unwrap(),

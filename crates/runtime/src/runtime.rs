@@ -306,6 +306,14 @@ impl Runtime {
         &self.knowledge
     }
 
+    /// The window fill for `context`, and the provider's window.
+    pub fn window_usage(&self, context: &[Message]) -> WindowUsage {
+        WindowUsage {
+            tokens_in_window: self.fill(context),
+            window: self.provider.capabilities().max_context_tokens,
+        }
+    }
+
     pub fn knowledge_mode(&self) -> KnowledgeMode {
         self.knowledge_mode
     }
@@ -372,9 +380,20 @@ pub enum Signal<'a> {
     TextDelta(&'a str),
     ToolCallStarted(&'a ToolCall),
     Event(&'a Event),
+    /// After every model call: the window fill, for a status line
+    /// (phase 6). The daemon computes it; a client never counts.
+    Usage(WindowUsage),
     /// The turn parked on a decision (phase 5); a client shows what is
     /// waited for.
     Waiting(&'a Pending),
+}
+
+/// How full the model's window is: the last call's reported prompt size
+/// plus what was appended since, against the provider's context length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowUsage {
+    pub tokens_in_window: u64,
+    pub window: u64,
 }
 
 /// The `turn_ended` reason when a participant interrupted the turn; an

@@ -65,6 +65,9 @@ pub struct ClientRepl {
     /// and has not answered: a decision from elsewhere withdraws it.
     prompted: Option<String>,
     quit: bool,
+    /// The last `Notice::Usage`: window fill and window, for the
+    /// status line (phase 6 step 3); kept, not yet shown.
+    usage: Option<(u64, u64)>,
 }
 
 impl ClientRepl {
@@ -88,6 +91,7 @@ impl ClientRepl {
             mode,
             partial: String::new(),
             prompted: None,
+            usage: None,
             quit: false,
         }
     }
@@ -418,6 +422,11 @@ impl ClientRepl {
                 self.state = state;
             }
             Notice::Event { event, .. } => self.render_event(&event, out),
+            Notice::Usage {
+                tokens_in_window,
+                window,
+                ..
+            } => self.usage = Some((tokens_in_window, window)),
         }
     }
 
