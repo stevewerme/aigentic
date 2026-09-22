@@ -5,6 +5,7 @@ mod checks;
 mod client_repl;
 mod config;
 mod doctor;
+mod exec;
 mod init_cmd;
 mod pocock;
 mod pocock_templates;
@@ -40,27 +41,27 @@ struct Cli {
     #[arg(long, global = true)]
     config: Option<PathBuf>,
     /// Thread to resume. Omit to start a new thread; its id is printed.
-    #[arg(long)]
+    #[arg(long, global = true)]
     thread: Option<Ulid>,
     /// Profile from the config file (default: the project's `[model]
     /// profile`, else the config's default_profile). For the embedded
     /// daemon and `project show`; a remote daemon uses the project's.
-    #[arg(long)]
+    #[arg(long, global = true)]
     profile: Option<String>,
     /// Permission mode: manual (default), accept-edits or auto. Session
     /// state; `/mode` changes it later.
-    #[arg(long, default_value = "manual")]
+    #[arg(long, global = true, default_value = "manual")]
     mode: Mode,
     /// A daemon to connect to (`unix:/path` or `tcp:host:port`). Without
     /// it, a daemon is started in this process for this directory.
-    #[arg(long)]
+    #[arg(long, global = true)]
     server: Option<String>,
     /// The environment variable holding your token for `--server`.
-    #[arg(long, default_value = "AIGENTIC_TOKEN")]
+    #[arg(long, global = true, default_value = "AIGENTIC_TOKEN")]
     token_env: String,
     /// The project on the daemon to work in (default: this directory's
     /// `aigentic.toml` name, else the first project you have a role in).
-    #[arg(long)]
+    #[arg(long, global = true)]
     project: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
@@ -98,6 +99,19 @@ enum Command {
         /// `AIGENTIC_TOKEN` on their machine. Nothing is stored.
         #[arg(long, value_name = "USER")]
         new_token: Option<String>,
+    },
+    /// Run one prompt to the end with no prompt shown: progress on
+    /// stderr, the final message on stdout. Exit 0 done, 1 failed, 3 done
+    /// but a request needed a human (denied), 130 interrupted.
+    Exec {
+        /// The prompt; read from stdin when absent.
+        prompt: Option<String>,
+        /// Every notice as a JSON line on stdout, then a summary line.
+        #[arg(long)]
+        json: bool,
+        /// Also write the final message to this file.
+        #[arg(short = 'o', long = "output-last-message", value_name = "FILE")]
+        output_last: Option<PathBuf>,
     },
     /// Check the config, keys, threads directory, project, skills and
     /// GitHub setup; exit 1 on any failure.
@@ -321,8 +335,26 @@ async fn main() -> anyhow::Result<()> {
             }
             std::process::exit(0);
         }
-        Some(Command::Doctor { .. } | Command::Init | Command::Serve { .. }) | None => {}
+        Some(
+            Command::Doctor { .. } | Command::Init | Command::Serve { .. } | Command::Exec { .. },
+        )
+        | None => {}
     }
+
+    // `exec` reads its prompt before anything connects, so a missing
+    // prompt fails fast.
+    let exec_args = match cli.command {
+        Some(Command::Exec {
+            prompt,
+            json,
+            output_last,
+        }) => Some(exec::ExecArgs {
+            prompt: exec::prompt_from(prompt)?,
+            json,
+            output_last,
+        }),
+        _ => None,
+    };
 
     // The REPL over the daemon's client: connect to `--server`, or start a
     // daemon in this process for this directory over a private socket.
@@ -357,6 +389,19 @@ async fn main() -> anyhow::Result<()> {
             (client, welcome, Some(embedded))
         }
     };
+    // `exec` never lands in a project by accident: it needs one named, a
+    // project file here, or a thread to continue.
+    if exec_args.is_some() && cli.project.is_none() && opened.is_none() && cli.thread.is_none() {
+        let names: Vec<&str> = welcome.projects.iter().map(|p| p.name.as_str()).collect();
+        bail!(
+            "exec needs a project: pass --project (one of: {}), run it in a project directory, or pass --thread",
+            if names.is_empty() {
+                "none".to_owned()
+            } else {
+                names.join(", ")
+            }
+        );
+    }
     let project_name = cli
         .project
         .clone()
@@ -418,6 +463,22 @@ async fn main() -> anyhow::Result<()> {
     } else {
         mode
     };
+
+    if let Some(args) = exec_args {
+        let notices = client.take_notices().context("notice stream")?;
+        let outcome = exec::run(
+            &client,
+            notices,
+            thread_id,
+            &state,
+            &args,
+            &mut std::io::stdout(),
+            &mut std::io::stderr(),
+        )
+        .await?;
+        drop(embedded);
+        std::process::exit(outcome.code);
+    }
 
     println!(
         "aigentic · {} · {} as {} ({}) · project {project_name}{}",
