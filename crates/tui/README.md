@@ -72,7 +72,20 @@ cargo run -p aigentic-tui -- doctor [--probe]                    # config, keys,
 cargo run -p aigentic-tui -- init                                # guided setup: config, project, GitHub, knowledge links
 cargo run -p aigentic-tui -- serve [--listen unix:/path|tcp:host:port]   # the daemon (phase 5): server.toml's users and projects
 cargo run -p aigentic-tui -- serve --new-token magnus            # a fresh token for a user, printed once, never stored
+cargo run -p aigentic-tui -- exec "prompt" [--json] [-o FILE]    # one turn, no prompts: final message on stdout, progress on stderr; exit 0/1/3/130
 ```
+
+At a terminal the client is an inline shell (phase 6 step 3): it draws only
+the bottom of the terminal (the streaming reply, the composer, a status
+line with mode, project, context fill, the turn's clock and the queue), and
+every finished line goes into the terminal's own scrollback, so the
+transcript scrolls, searches and copies like any other output and stays
+after quitting. Enter sends; Shift-Enter or Ctrl-J adds a line; a paste over
+1000 characters shows as a placeholder until sent; Up and Down walk the
+history when the composer is empty; Ctrl-C clears the draft or, empty, quits;
+Ctrl-D quits. Without a terminal (a pipe, a script) the client reads stdin
+lines and prints lines, which is what the acceptance items below and `exec`
+use.
 
 The daemon reads `server.toml` beside `config.toml`: `listen` (`unix`, `unix:/path`
 or `tcp:host:port`; plain TCP with tokens, so put a reverse proxy or an SSH

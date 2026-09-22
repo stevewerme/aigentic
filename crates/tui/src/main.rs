@@ -1,8 +1,8 @@
 //! `aigentic`: a plain streaming REPL over the runtime, and the `skills`
 //! subcommands. No full-screen mode; the terminal keeps its scrollback.
 
+mod app;
 mod checks;
-mod client_repl;
 mod config;
 mod doctor;
 mod exec;
@@ -10,7 +10,6 @@ mod init_cmd;
 mod pocock;
 mod pocock_templates;
 mod project_cmd;
-mod repl;
 mod skills_cmd;
 
 use std::path::PathBuf;
@@ -25,7 +24,7 @@ use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use ulid::Ulid;
 
-use crate::client_repl::{ClientRepl, TerminalInput};
+use crate::app::engine::ClientRepl;
 use crate::config::Config;
 use crate::project_cmd::ProjectCommand;
 use crate::skills_cmd::{SkillPaths, SkillsCommand};
@@ -269,7 +268,7 @@ async fn main() -> anyhow::Result<()> {
             .await?;
             println!(
                 "{}",
-                client_repl::list_threads_over(&client, &project).await?
+                app::engine::list_threads_over(&client, &project).await?
             );
             std::process::exit(0);
         }
@@ -290,7 +289,7 @@ async fn main() -> anyhow::Result<()> {
             .await?;
             println!(
                 "{}",
-                client_repl::project_report_over(&client, &project).await?
+                app::engine::project_report_over(&client, &project).await?
             );
             std::process::exit(0);
         }
@@ -497,7 +496,7 @@ async fn main() -> anyhow::Result<()> {
     );
     if cli.thread.is_some() {
         println!("thread {thread_id} resumed with {} events", events.len());
-        for line in client_repl::recent_lines(&events, 3) {
+        for line in app::engine::recent_lines(&events, 3) {
             println!("  {line}");
         }
     } else {
@@ -506,7 +505,7 @@ async fn main() -> anyhow::Result<()> {
     if let ThreadState::Running { by, queued } = &state {
         println!(
             "[a turn is running for {}; {queued} message(s) queued]",
-            client_repl::author_name(by)
+            app::engine::author_name(by)
         );
     }
     println!("/help lists commands; /project shows the layers; /who the participants; /quit exits");
@@ -530,13 +529,10 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let notices = client.take_notices().context("notice stream")?;
-    let mut input = TerminalInput::start(history)?;
-    let mut repl = ClientRepl::new(client, thread_id, &welcome.user, role, state, mode)
+    let repl = ClientRepl::new(client, thread_id, &welcome.user, role, state, mode)
         .with_display(display)
         .with_skills(skills);
-    let lines = std::mem::replace(&mut input.lines, tokio::sync::mpsc::unbounded_channel().1);
-    repl.run(lines, notices, &mut *input.printer).await;
-    input.printer.line("bye");
+    app::run(repl, notices, history, project_name).await?;
     drop(embedded);
     Ok(())
 }

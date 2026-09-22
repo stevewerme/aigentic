@@ -1,5 +1,5 @@
-//! The REPL's pure parts: the slash-command grammar and the display
-//! truncation. The loop itself is `client_repl.rs` since phase 5 step 9.
+//! The client's pure parts: the slash-command grammar and the display
+//! truncation. The loop itself is `app/engine.rs`.
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command<'a> {

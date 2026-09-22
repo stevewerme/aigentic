@@ -1,9 +1,10 @@
-//! The REPL over the daemon's client (phase 5 step 9): lines in,
-//! requests out, notices rendered as they arrive. The same code path
-//! whether the daemon is embedded for one user or remote for many.
-//! Rendering goes through a `Printer`, which is rustyline's external
-//! printer at the terminal (so lines land above the prompt) and a
-//! vector in tests. Approvals and answers (step 10) are requests like
+//! The client's engine (phase 5 step 9, moved under `app/` in phase 6
+//! step 3): lines in, requests out, notices rendered as they arrive.
+//! The same code path whether the daemon is embedded for one user or
+//! remote for many. Rendering goes through a `Printer`: the ratatui
+//! shell commits each line to the terminal's scrollback and shows the
+//! streaming tail, plain stdout does the same without a terminal, and
+//! a vector stands in for tests. Approvals and answers (step 10) are requests like
 //! any other: a permission request prompts `y / a / n` when this user's
 //! role may decide and says who it waits for when not; a question
 //! takes the next line from a user who may write; a prompt answered on
@@ -23,12 +24,16 @@ use aigentic_runtime::{ASKED_HUMAN, INTERRUPTED};
 use tokio::sync::mpsc;
 use ulid::Ulid;
 
+use crate::app::commands::{Command, HELP, parse_line, truncate_for_display};
 use crate::config::DisplaySection;
-use crate::repl::{Command, HELP, parse_line, truncate_for_display};
 
 /// Where rendered lines go.
 pub trait Printer {
+    /// A finished line: committed, never redrawn.
     fn line(&mut self, text: &str);
+    /// The assistant's streamed text not yet ended by a newline, after
+    /// each delta; empty once flushed. A shell redraws it in place.
+    fn tail(&mut self, _text: &str) {}
 }
 
 /// A vector, for tests.
@@ -68,6 +73,9 @@ pub struct ClientRepl {
     /// The last `Notice::Usage`: window fill and window, for the
     /// status line (phase 6 step 3); kept, not yet shown.
     usage: Option<(u64, u64)>,
+    /// A post went out while idle and its turn has not been seen
+    /// running yet; input at its end waits for that turn.
+    awaiting_turn: bool,
 }
 
 impl ClientRepl {
@@ -92,6 +100,7 @@ impl ClientRepl {
             partial: String::new(),
             prompted: None,
             usage: None,
+            awaiting_turn: false,
             quit: false,
         }
     }
@@ -134,10 +143,16 @@ impl ClientRepl {
         // A thread opened while it waits: the prompt is shown at once.
         let state = self.state.clone();
         self.show_state(&state, out);
+        // Input at its end (a pipe closed): the turn it started still
+        // finishes before the loop does.
+        let mut closed = false;
         while !self.quit {
+            if closed && !self.awaiting_turn && matches!(self.state, ThreadState::Idle) {
+                break;
+            }
             tokio::select! {
-                line = input.recv() => match line {
-                    None => break,
+                line = input.recv(), if !closed => match line {
+                    None => closed = true,
                     Some(line) => self.handle_line(&line, out).await,
                 },
                 notice = notices.recv() => match notice {
@@ -185,7 +200,7 @@ impl ClientRepl {
         }
     }
 
-    async fn handle_line(&mut self, line: &str, out: &mut dyn Printer) {
+    pub async fn handle_line(&mut self, line: &str, out: &mut dyn Printer) {
         // `!text` interrupts, as typing a command while the model streams
         // is the common case.
         if let Some(text) = line.strip_prefix('!') {
@@ -363,6 +378,9 @@ impl ClientRepl {
             (_, true) => "[interrupting]",
             (_, false) => "[queued for the next turn]",
         };
+        if matches!(r, Response::Ok) && matches!(self.state, ThreadState::Idle) {
+            self.awaiting_turn = true;
+        }
         self.show(r, ok, out);
     }
 
@@ -394,12 +412,36 @@ impl ClientRepl {
         if !self.partial.is_empty() {
             let text = std::mem::take(&mut self.partial);
             out.line(&text);
+            out.tail("");
         }
+    }
+
+    pub fn state(&self) -> &ThreadState {
+        &self.state
+    }
+
+    pub fn mode(&self) -> &str {
+        &self.mode
+    }
+
+    /// The last window fill the daemon reported: tokens in the window
+    /// and the window itself.
+    pub fn usage(&self) -> Option<(u64, u64)> {
+        self.usage
+    }
+
+    pub fn quit_requested(&self) -> bool {
+        self.quit
+    }
+
+    /// The thread waits on a request this client may answer.
+    pub fn prompting(&self) -> bool {
+        self.prompted.is_some()
     }
 
     /// One notice to lines. Streamed text is printed as its lines
     /// complete; the rest at the message's end.
-    fn render(&mut self, notice: Notice, out: &mut dyn Printer) {
+    pub fn render(&mut self, notice: Notice, out: &mut dyn Printer) {
         match notice {
             Notice::TextDelta { text, .. } => {
                 self.partial.push_str(&text);
@@ -407,6 +449,7 @@ impl ClientRepl {
                     let line: String = self.partial.drain(..=pos).collect();
                     out.line(line.trim_end_matches('\n'));
                 }
+                out.tail(&self.partial);
             }
             Notice::ToolCallStarted { call, .. } => {
                 self.flush_partial(out);
@@ -419,6 +462,9 @@ impl ClientRepl {
             Notice::State { state, .. } => {
                 self.flush_partial(out);
                 self.show_state(&state, out);
+                if !matches!(state, ThreadState::Idle) {
+                    self.awaiting_turn = false;
+                }
                 self.state = state;
             }
             Notice::Event { event, .. } => self.render_event(&event, out),
@@ -433,7 +479,7 @@ impl ClientRepl {
     /// What the thread waits for, as this user sees it: a prompt when
     /// their role may answer, else who it waits for. A wait that ends
     /// without our answer withdraws the prompt.
-    fn show_state(&mut self, state: &ThreadState, out: &mut dyn Printer) {
+    pub fn show_state(&mut self, state: &ThreadState, out: &mut dyn Printer) {
         match state {
             ThreadState::AwaitingApproval {
                 call_id,
@@ -700,81 +746,6 @@ pub async fn project_report_over(client: &Client, project: &str) -> anyhow::Resu
         Response::Text { text } => Ok(text),
         Response::Refused { reason } => anyhow::bail!("cannot report on {project}: {reason}"),
         other => anyhow::bail!("unexpected reply reporting on {project}: {other:?}"),
-    }
-}
-
-/// Lines typed at a terminal, read by rustyline on its own thread so the
-/// async loop is never blocked; rendered lines go above the prompt
-/// through its external printer. Without a terminal (a pipe, a script)
-/// plain stdin lines and stdout.
-pub struct TerminalInput {
-    pub lines: mpsc::UnboundedReceiver<String>,
-    pub printer: Box<dyn Printer + Send>,
-    _thread: std::thread::JoinHandle<()>,
-}
-
-struct ExternalPrinter(Box<dyn rustyline::ExternalPrinter + Send>);
-
-impl Printer for ExternalPrinter {
-    fn line(&mut self, text: &str) {
-        let _ = self.0.print(format!("{text}\n"));
-    }
-}
-
-struct Stdout;
-
-impl Printer for Stdout {
-    fn line(&mut self, text: &str) {
-        println!("{text}");
-    }
-}
-
-impl TerminalInput {
-    /// Start reading. `history` is rustyline's file.
-    pub fn start(history: std::path::PathBuf) -> anyhow::Result<Self> {
-        use std::io::IsTerminal;
-        let (tx, lines) = mpsc::unbounded_channel();
-        if !std::io::stdin().is_terminal() {
-            let thread = std::thread::spawn(move || {
-                use std::io::BufRead;
-                for line in std::io::stdin().lock().lines() {
-                    let Ok(line) = line else { break };
-                    if tx.send(line).is_err() {
-                        break;
-                    }
-                }
-            });
-            return Ok(Self {
-                lines,
-                printer: Box::new(Stdout),
-                _thread: thread,
-            });
-        }
-        let mut editor = rustyline::DefaultEditor::new()?;
-        let _ = editor.load_history(&history);
-        let printer = editor.create_external_printer()?;
-        let thread = std::thread::spawn(move || {
-            loop {
-                match editor.readline("> ") {
-                    Ok(line) => {
-                        if !line.trim().is_empty() {
-                            let _ = editor.add_history_entry(line.trim());
-                        }
-                        if tx.send(line).is_err() {
-                            break;
-                        }
-                    }
-                    Err(rustyline::error::ReadlineError::Interrupted) => continue,
-                    Err(_) => break,
-                }
-            }
-            let _ = editor.save_history(&history);
-        });
-        Ok(Self {
-            lines,
-            printer: Box::new(ExternalPrinter(Box::new(printer))),
-            _thread: thread,
-        })
     }
 }
 

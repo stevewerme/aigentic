@@ -41,7 +41,6 @@ thiserror = "2"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 dotenvy = "0.15"
-rustyline = "18"
 toml = "1"
 futures-core = "0.3"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
