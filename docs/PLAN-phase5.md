@@ -1,6 +1,6 @@
 # Phase 5 plan
 
-Status: steps 1 to 3 landed on 2026-09-22; written the same day after the phase 4 close · Follows `docs/PRD.md` (the Server and multiplayer phase) and the phase 0 to 4 plans
+Status: steps 1 to 4 landed on 2026-09-22; written the same day after the phase 4 close · Follows `docs/PRD.md` (the Server and multiplayer phase) and the phase 0 to 4 plans
 
 ## 0. Goal and done-when
 
@@ -73,7 +73,7 @@ crates/server/                   aigentic-server: the daemon, depends on runtime
   src/auth.rs                    tokens, roles, what each request needs
 crates/runtime/src/
   turn.rs                        continue_turn takes a CancelToken; the horizon rule for mid-turn messages
-  seams.rs                       turn_queue_next gets its body; policy_check parks on a Decisions channel
+  seams.rs                       turn_queue_next removed (the actor owns the queue); policy_check parks on Decisions
   decisions.rs                   Decisions: pending approvals and human questions as events plus a channel
   context.rs                     author names on user messages when the thread has more than one human
 crates/core/src/event.rs         EventKind gains ThreadStarted
@@ -170,20 +170,26 @@ impl Client {
 
 // crates/runtime/src/decisions.rs
 pub struct Decisions { /* pending permission requests and human questions, by call id; one oneshot each */ }
-pub enum Decided { Permission { allow: bool, scope: DecisionScope, by: Author }, Human { text: String, by: Author } }
+pub enum Pending { Permission { call_id, request: PermissionRequestedPayload }, Human { call_id, question } }
+pub enum Answered { Permission { allow: bool, session: bool, by: Author }, Human { text: String, by: Author } }   // `Decided` is taken by layers
 impl Decisions {
     pub fn pending(&self) -> Vec<Pending>;
-    pub fn decide(&self, call_id: &str, decided: Decided) -> Result<(), DecisionError>;   // NotPending, AlreadyDecided
+    pub fn decide(&self, call_id: &str, answered: Answered) -> Result<(), DecisionError>;   // NotPending, AlreadyDecided, WrongKind
 }
+pub struct CancelToken;   // Clone; cancel(by: Author), cancelled_by(), async cancelled() -> Author; never()
 impl Runtime {
     /// Replaces `with_approver` for the daemon: an Ask parks the turn on the channel;
     /// `decide` from any approver resumes it. The phase 3 Approver stays for tests and
     /// non-interactive runs (DenyAll).
     pub fn with_decisions(self, decisions: Arc<Decisions>) -> Self;
     /// A turn that can be cancelled: the in-flight model call is dropped, a running tool
-    /// is awaited (its timeout bounds it), `interrupted` is appended with `by`.
-    pub async fn continue_turn_until(&mut self, cancel: CancelToken, observe) -> Result<TurnOutcome, RuntimeError>;
+    /// is awaited (its timeout bounds it), the rest of its batch gets synthetic results,
+    /// `interrupted` is appended with `by`, then `turn_ended` with reason `interrupted`.
+    pub async fn run_turn_until(&mut self, author, blocks, cancel: &CancelToken, observe) -> Result<TurnOutcome, RuntimeError>;
+    pub async fn continue_turn_until(&mut self, cancel: &CancelToken, observe) -> Result<TurnOutcome, RuntimeError>;
 }
+pub enum Signal<'a> { /* phase 0-4 */ Waiting(&'a Pending) }   // the turn parked; a client shows what it waits for
+// crates/log/src/payload.rs: PermissionDecidedPayload gains `reason: Option<String>` (`interrupted` on the deny an interrupt writes)
 
 // crates/runtime/src/turn.rs — the horizon rule, a projection rule so replay is exact
 // A user_message with mid_turn = true is in context only once a turn_ended follows it.

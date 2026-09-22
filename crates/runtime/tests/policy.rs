@@ -258,7 +258,8 @@ async fn the_approver_answers_allow_session_and_deny_with_exact_events() {
         PermissionDecidedPayload {
             call_id: "c1".into(),
             allow: true,
-            scope: DecisionScope::Once
+            scope: DecisionScope::Once,
+            reason: None,
         }
     );
     assert_eq!(

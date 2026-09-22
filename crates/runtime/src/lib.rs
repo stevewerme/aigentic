@@ -20,6 +20,7 @@ mod approver;
 mod audit;
 mod compaction;
 mod context;
+mod decisions;
 mod error;
 pub mod harness_tools;
 pub mod knowledge;
@@ -37,6 +38,7 @@ pub use approver::{Answer, Approver, DenyAll};
 pub use audit::audit_tool_results;
 pub use compaction::SUMMARY_PROMPT;
 pub use context::{Prefix, build_context};
+pub use decisions::{Answered, CancelToken, DecisionError, Decisions, Pending};
 pub use error::RuntimeError;
 pub use knowledge::{Knowledge, KnowledgeMode};
 pub use layers::{Decided, GlobalLayer, Layers};
@@ -45,7 +47,7 @@ pub use mode::Mode;
 pub use project::{Project, ProjectError, ProjectFile};
 pub use resume::{INTERRUPTED_RESULT, Resumed};
 pub use runtime::{
-    ASKED_HUMAN, CompactionSettings, DEFAULT_BUDGET, DEFAULT_COMPACTION, Runtime, Signal,
-    TurnOutcome,
+    ASKED_HUMAN, CompactionSettings, DEFAULT_BUDGET, DEFAULT_COMPACTION, INTERRUPTED, Runtime,
+    Signal, TurnOutcome,
 };
 pub use seams::{SessionGrant, Verdict};

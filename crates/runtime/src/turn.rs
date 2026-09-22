@@ -7,13 +7,16 @@ use aigentic_core::{
     Author, CompletionRequest, ContentBlock, EventKind, ProviderEvent, ToolCall, ToolResult,
     ToolSpec,
 };
-use aigentic_log::{AssistantMessagePayload, ToolResultPayload, Usage, UserMessagePayload};
+use aigentic_log::{
+    AssistantMessagePayload, InterruptedPayload, ToolResultPayload, Usage, UserMessagePayload,
+};
 use futures_util::StreamExt;
 
 use aigentic_log::{Invoker, PolicyRecord};
 
+use crate::decisions::CancelToken;
 use crate::harness_tools::{ASK_HUMAN, HARNESS_CLASS, harness_specs, is_harness_tool};
-use crate::runtime::ASKED_HUMAN;
+use crate::runtime::{ASKED_HUMAN, INTERRUPTED};
 use crate::seams::{Verdict, denial_text};
 use crate::support::{Spent, flush_text};
 use crate::{Runtime, RuntimeError, Signal, TurnOutcome, build_context};
@@ -28,9 +31,22 @@ impl Runtime {
         blocks: Vec<ContentBlock>,
         observe: &mut dyn FnMut(Signal<'_>),
     ) -> Result<TurnOutcome, RuntimeError> {
+        self.run_turn_until(author, blocks, &CancelToken::never(), observe)
+            .await
+    }
+
+    /// `run_turn` with an interrupt token (phase 5): the daemon's actor
+    /// calls this so a `Post { interrupt: true }` can end the turn.
+    pub async fn run_turn_until(
+        &mut self,
+        author: Author,
+        blocks: Vec<ContentBlock>,
+        cancel: &CancelToken,
+        observe: &mut dyn FnMut(Signal<'_>),
+    ) -> Result<TurnOutcome, RuntimeError> {
         let payload = serde_json::to_value(UserMessagePayload::new(blocks)).expect("serialisable");
         self.append(EventKind::UserMessage, author, payload, None, observe)?;
-        self.continue_turn(observe).await
+        self.continue_turn_until(cancel, observe).await
     }
 
     /// A user-invoked skill (`/implement fix the off-by-one`): appends
@@ -60,6 +76,21 @@ impl Runtime {
         &mut self,
         observe: &mut dyn FnMut(Signal<'_>),
     ) -> Result<TurnOutcome, RuntimeError> {
+        self.continue_turn_until(&CancelToken::never(), observe)
+            .await
+    }
+
+    /// `continue_turn` with an interrupt (phase 5). When `cancel` fires:
+    /// the in-flight model call is dropped and nothing partial is
+    /// appended; a tool already running finishes (its timeout bounds
+    /// it) and its result is recorded; the rest of that batch gets
+    /// synthetic error results so every call has one; then
+    /// `interrupted` names who, and `turn_ended` says `interrupted`.
+    pub async fn continue_turn_until(
+        &mut self,
+        cancel: &CancelToken,
+        observe: &mut dyn FnMut(Signal<'_>),
+    ) -> Result<TurnOutcome, RuntimeError> {
         let mut spent = Spent {
             started: Instant::now(),
             iterations: 0,
@@ -70,8 +101,9 @@ impl Runtime {
         let specs: Vec<ToolSpec> = self.tool_specs();
 
         loop {
-            // Seam: an interrupt from the turn queue would be handled here.
-            let _ = self.turn_queue_next();
+            if let Some(by) = cancel.cancelled_by() {
+                return self.interrupt_turn(by, Vec::new(), &spent, observe);
+            }
             // The budget is checked here, before a model call, and never
             // between an assistant message and its tool results. Once an
             // assistant message with tool calls is in the log, every call
@@ -100,7 +132,17 @@ impl Runtime {
             let (mut blocks, mut text, mut usage, mut error) =
                 (Vec::new(), String::new(), None, None);
             let mut stream = self.provider.complete(&request);
-            while let Some(event) = stream.next().await {
+            let mut interrupted_by = None;
+            loop {
+                let event = tokio::select! {
+                    biased;
+                    by = cancel.cancelled() => {
+                        interrupted_by = Some(by);
+                        break;
+                    }
+                    event = stream.next() => event,
+                };
+                let Some(event) = event else { break };
                 match event {
                     ProviderEvent::TextDelta(t) => {
                         observe(Signal::TextDelta(&t));
@@ -120,6 +162,11 @@ impl Runtime {
                 }
             }
             drop(stream);
+            if let Some(by) = interrupted_by {
+                // Dropped mid-call: no partial message, as a crash would
+                // leave none.
+                return self.interrupt_turn(by, Vec::new(), &spent, observe);
+            }
             flush_text(&mut text, &mut blocks);
             spent.iterations += 1;
             let agent = Author::Agent(self.agent.clone());
@@ -155,9 +202,10 @@ impl Runtime {
             }
 
             let mut answered = false;
-            for call in calls {
+            let mut calls = calls.into_iter();
+            for call in calls.by_ref() {
                 observe(Signal::ToolCallStarted(&call));
-                let (result, record) = self.execute(&call, observe).await?;
+                let (result, record) = self.execute(&call, cancel, observe).await?;
                 answered |= call.name == ASK_HUMAN && !result.is_error;
                 let payload = serde_json::to_value(ToolResultPayload::new(result, record))
                     .expect("serialisable");
@@ -168,6 +216,39 @@ impl Runtime {
                     Some(assistant.id),
                     observe,
                 )?;
+                if cancel.cancelled_by().is_some() {
+                    break;
+                }
+            }
+            if let Some(by) = cancel.cancelled_by() {
+                // Every call must have a result before the turn ends, or
+                // the log could not be projected; the rest get synthetic
+                // ones that say why.
+                let mut synthetic = Vec::new();
+                for call in calls {
+                    let result = ToolResult {
+                        id: call.id.clone(),
+                        content: format!(
+                            "not run: the turn was interrupted by {} before this call",
+                            crate::seams::author_name(&by)
+                        ),
+                        is_error: true,
+                    };
+                    let payload = serde_json::to_value(ToolResultPayload::new(
+                        result,
+                        PolicyRecord::rule(INTERRUPTED, "deny"),
+                    ))
+                    .expect("serialisable");
+                    self.append(
+                        EventKind::ToolResult,
+                        Author::System,
+                        payload,
+                        Some(assistant.id),
+                        observe,
+                    )?;
+                    synthetic.push(call.id);
+                }
+                return self.interrupt_turn(by, synthetic, &spent, observe);
             }
             // A human's answer starts a turn: everything after it is new
             // work with its own budget. The client continues at once.
@@ -177,12 +258,40 @@ impl Runtime {
         }
     }
 
+    /// `interrupted` naming who, then `turn_ended` with reason
+    /// `interrupted`. `unanswered` lists the calls given synthetic results.
+    fn interrupt_turn(
+        &mut self,
+        by: Author,
+        unanswered: Vec<String>,
+        spent: &Spent,
+        observe: &mut dyn FnMut(Signal<'_>),
+    ) -> Result<TurnOutcome, RuntimeError> {
+        let after_seq = self.log.len().saturating_sub(1);
+        let payload = serde_json::to_value(InterruptedPayload {
+            reason: "interrupt".into(),
+            after_seq,
+            unanswered_calls: unanswered,
+            by: Some(by),
+        })
+        .expect("serialisable");
+        self.append(
+            EventKind::Interrupted,
+            Author::System,
+            payload,
+            None,
+            observe,
+        )?;
+        self.end_turn(INTERRUPTED, spent, observe)
+    }
+
     /// The one call site for tool execution, behind `policy_check`. An
     /// unknown tool is refused with a rule record; a harness tool is
     /// answered here; anything else runs from the registry.
     async fn execute(
         &mut self,
         call: &ToolCall,
+        cancel: &CancelToken,
         observe: &mut dyn FnMut(Signal<'_>),
     ) -> Result<(ToolResult, PolicyRecord), RuntimeError> {
         // A tool the layers hide is unknown to this thread: the same
@@ -204,10 +313,10 @@ impl Runtime {
                 PolicyRecord::rule("unknown tool", "deny"),
             ));
         };
-        match self.policy_check(call, class, observe)? {
+        match self.policy_check(call, class, cancel, observe).await? {
             Verdict::Run(record) => {
                 let result = if is_harness_tool(&call.name) {
-                    self.run_harness_tool(call, observe)?
+                    self.run_harness_tool(call, cancel, observe).await?
                 } else {
                     self.run_tool(call).await
                 };
@@ -217,6 +326,14 @@ impl Runtime {
                 ToolResult {
                     id: call.id.clone(),
                     content: denial_text(&record),
+                    is_error: true,
+                },
+                record,
+            )),
+            Verdict::RefuseWith { record, text } => Ok((
+                ToolResult {
+                    id: call.id.clone(),
+                    content: text,
                     is_error: true,
                 },
                 record,

@@ -577,6 +577,9 @@ fn render(signal: Signal<'_>, at_line_start: &mut bool, caps: Caps) {
             }
             *at_line_start = true;
         }
+        // The daemon's client (phase 5 step 9) shows what is waited for;
+        // this REPL answers through its approver and never parks.
+        Signal::Waiting(_) => {}
         Signal::Event(event) if event.kind == EventKind::Compacted => {
             if !*at_line_start {
                 println!();

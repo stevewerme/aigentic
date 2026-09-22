@@ -282,6 +282,11 @@ pub struct PermissionDecidedPayload {
     pub call_id: String,
     pub allow: bool,
     pub scope: DecisionScope,
+    /// Why, when it was not a person's choice: `interrupted` for a deny
+    /// written because the turn was interrupted while waiting. Absent on
+    /// lines from before phase 5.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// One line memory extraction wrote, with where it was stated so the
@@ -494,6 +499,7 @@ mod tests {
             call_id: "c2".into(),
             allow: false,
             scope: DecisionScope::Session,
+            reason: None,
         };
         let value = serde_json::to_value(&decided).unwrap();
         assert_eq!(

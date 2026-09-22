@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use aigentic_core::{AgentId, Budget, Event, Provider, ToolCall};
@@ -10,6 +11,7 @@ use aigentic_core::{ContentBlock, Message, Role};
 use aigentic_tools::{KnowledgeSnapshot, SEARCH_KNOWLEDGE, SearchKnowledgeTool};
 
 use crate::approver::{Approver, DenyAll};
+use crate::decisions::{Decisions, Pending};
 use crate::knowledge::{Knowledge, KnowledgeMode};
 use crate::layers::Layers;
 use crate::mode::Mode;
@@ -52,6 +54,9 @@ pub struct Runtime {
     pub(crate) registry: ToolRegistry,
     pub(crate) policy: Policy,
     pub(crate) approver: Box<dyn Approver>,
+    /// Phase 5: when set, an ask parks the turn here instead of calling
+    /// the approver.
+    pub(crate) decisions: Option<Arc<Decisions>>,
     pub(crate) session_grants: Vec<SessionGrant>,
     /// The permission mode; session state, never persisted.
     pub(crate) mode: Mode,
@@ -85,6 +90,7 @@ impl Runtime {
             registry,
             policy: Policy::defaults(),
             approver: Box::new(DenyAll),
+            decisions: None,
             session_grants: Vec::new(),
             mode: Mode::default(),
             skills: SkillSet::default(),
@@ -104,6 +110,18 @@ impl Runtime {
     pub fn with_policy(mut self, policy: Policy) -> Self {
         self.policy = policy;
         self
+    }
+
+    /// Phase 5: permission requests and `ask_human` questions park the
+    /// turn on `decisions`, which any approver may answer from anywhere.
+    /// The `Approver` is then not consulted.
+    pub fn with_decisions(mut self, decisions: Arc<Decisions>) -> Self {
+        self.decisions = Some(decisions);
+        self
+    }
+
+    pub fn decisions(&self) -> Option<&Arc<Decisions>> {
+        self.decisions.as_ref()
     }
 
     pub fn with_approver(mut self, approver: Box<dyn Approver>) -> Self {
@@ -346,7 +364,14 @@ pub enum Signal<'a> {
     TextDelta(&'a str),
     ToolCallStarted(&'a ToolCall),
     Event(&'a Event),
+    /// The turn parked on a decision (phase 5); a client shows what is
+    /// waited for.
+    Waiting(&'a Pending),
 }
+
+/// The `turn_ended` reason when a participant interrupted the turn; an
+/// `interrupted` event naming them precedes it.
+pub const INTERRUPTED: &str = "interrupted";
 
 /// The `turn_ended` reason when a human answered `ask_human`: the answer
 /// is in the log as the call's result, and the client continues with

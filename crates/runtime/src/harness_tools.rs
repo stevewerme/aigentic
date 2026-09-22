@@ -84,9 +84,10 @@ pub const HARNESS_CLASS: RiskClass = RiskClass::Safe;
 
 impl Runtime {
     /// Answer a harness tool. Called only after `policy_check` said run.
-    pub(crate) fn run_harness_tool(
+    pub(crate) async fn run_harness_tool(
         &mut self,
         call: &ToolCall,
+        cancel: &crate::CancelToken,
         observe: &mut dyn FnMut(Signal<'_>),
     ) -> Result<ToolResult, RuntimeError> {
         let id = call.id.clone();
@@ -118,9 +119,33 @@ impl Runtime {
                 Err(e) => err(format!("invalid arguments: {e}")),
             },
             ASK_HUMAN => match serde_json::from_value::<AskHumanArgs>(call.args.clone()) {
-                Ok(args) => match self.approver.ask_human(&args.question) {
-                    Some(answer) => ok(answer),
-                    None => err("no human available; treat this as a no".into()),
+                Ok(args) => match self.decisions.clone() {
+                    Some(decisions) => {
+                        let pending = crate::Pending::Human {
+                            call_id: call.id.clone(),
+                            question: args.question.clone(),
+                        };
+                        let rx = decisions.register(pending.clone());
+                        observe(Signal::Waiting(&pending));
+                        tokio::select! {
+                            biased;
+                            by = cancel.cancelled() => {
+                                decisions.withdraw(&call.id);
+                                err(format!(
+                                    "the turn was interrupted by {} before an answer",
+                                    crate::seams::author_name(&by)
+                                ))
+                            }
+                            decided = rx => match decided {
+                                Ok(crate::Answered::Human { text, .. }) => ok(text),
+                                _ => err("no human available; treat this as a no".into()),
+                            },
+                        }
+                    }
+                    None => match self.approver.ask_human(&args.question) {
+                        Some(answer) => ok(answer),
+                        None => err("no human available; treat this as a no".into()),
+                    },
                 },
                 Err(e) => err(format!("invalid arguments: {e}")),
             },
