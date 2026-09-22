@@ -513,6 +513,20 @@ which only changes what `doctor` expects (no repository, no GitHub).
    `DeniedWithReason`, the approval and question blocks.
 8. `tui: completion` — `@` files and `/` commands with `ignore` and
    `nucleo`.
+8b. `tui: the turn line` — while a turn runs, a line above the composer:
+    what it is doing (the running tool and its argument, else writing or
+    thinking), the turn's clock, tools called, the last prompt's size
+    and its cached share, output so far, and `esc interrupts`; when the
+    turn ends, one dim summary line in the transcript with the same
+    figures. Figures are the provider's reported usage from the events,
+    never counted by the client. The status line drops its clock.
+8c. `runtime, api, tui: the task list` — a built-in `update_tasks` tool
+    the model calls with its whole checklist (text and state: pending,
+    active, done); a `tasks_updated` event; the list drawn above the
+    composer while the turn runs and committed to the transcript when it
+    changes to all done. The system prompt asks for it on any task of
+    three steps or more. Its purpose is to keep a turn going until the
+    work is finished and to show where it is.
 9. `runtime, server: utility profile and titles` — `utility_profile`
    in config, `Runtime::utility`, `title.rs`, `thread_renamed`,
    `/rename`, `Push::Titled`; memory extraction moved to the utility
@@ -534,6 +548,14 @@ which only changes what `doctor` expects (no repository, no GitHub).
     `Latest`, `--new`, `/new`, `/threads` across projects, the
     directory prompt in the banner, `kind = "notes"` in `project init`
     and `doctor`; old fixtures still list.
+13b. **The working set** (section 13; grilled before it is built, after
+    step 13): the context is kept near a token target whatever the
+    window, used tool results become stubs with a handle, a `recall`
+    tool brings any of them or an older turn back from the log,
+    summaries of older turns are kept continuously on the utility
+    model, and broad exploration can run in a child context that returns
+    only its conclusion. Probably three or four commits; the grilling
+    sets the steps.
 14. `docs: phase 6 acceptance` — the tui README's phase 6 section:
     done-when 1 to 9 by hand with thread ids, then a week of daily use
     on the three projects from one thread, alternating backends by day
@@ -541,7 +563,8 @@ which only changes what `doctor` expects (no repository, no GitHub).
     whether each was right.
 
 Steps 1 and 2 land first so `exec` exists before the shell changes; 3
-to 8 are the client; 9 to 13 the inversion; 14 the close. Each step
+to 8c are the client; 9 to 13 the inversion; 13b the working set; 14 the
+close, a week of use with all of it. Each step
 passes `cargo fmt`, `cargo clippy --all-targets -- -D warnings` and
 `cargo test` before its commit.
 
@@ -634,7 +657,8 @@ Settled in the grilling of 2026-09-22 (Q1 to Q18) and in the draft.
 - Whether `exec --json`'s output is the raw `Push` or a simplified
   event schema like Codex's `ThreadItem`. Raw first; a stable schema
   when a second consumer exists.
-- A token ceiling for compaction and inline knowledge. Both are fractions
+- A token ceiling for compaction and inline knowledge (superseded by the
+  working-set target in section 13). Both are fractions
   of the window, and GLM 5.3 on TensorX has a 1 048 576-token window, so a
   thread compacts only near 734k tokens and knowledge stays inline up to
   about 315k: correct, but every call then carries a very long prompt.
@@ -642,3 +666,33 @@ Settled in the grilling of 2026-09-22 (Q1 to Q18) and in the draft.
   from the acceptance week's cost and latency.
 - The PRD's build-order table still lists the orchestrator as phase 6;
   update it when phase 6 closes, with the renumbering in section 0.
+
+## 13. The working set (to be grilled)
+
+The aim is that a person never manages the context window. Agents hit
+it today because forgetting is lossy and permanent; here the log keeps
+everything, so the harness can forget freely as long as it can bring
+things back. A first read of where tokens go (the first phase 6 thread
+on GLM 5.3): the final call's prompt was 12 269 tokens of which 12 224
+were cache reads, and one file read was two thirds of the thread. So
+the levers, in order of effect:
+
+1. A working-set target (around 100k to 150k tokens) instead of a
+   fraction of the window. It replaces section 12's ceiling question.
+2. Tool results evicted to a one-line stub with a handle once used:
+   `read_file docs/PLAN-phase6.md · 8k tokens · result 14`.
+3. `recall`: a tool that returns a stubbed result, a range of the log,
+   or a search over it. This is what makes eviction lossless.
+4. Summaries of older turns kept continuously on the utility model,
+   not one large compaction near the limit.
+5. Exploration in a child context (a sub-thread with read tools only)
+   returning its conclusion.
+
+The status line then reads `working 48k · thread 310k`, information
+rather than a warning. Questions for the grilling: which results are
+evicted and when (after the turn that used them, or by age), whether the
+stub carries a short summary, how `recall` is scoped across a project
+switch, whether the child context is phase 6 or phase 8, and how the
+prompt cache survives eviction (a changed early message invalidates
+everything after it, so eviction should happen in batches at a
+compaction boundary, not message by message).
