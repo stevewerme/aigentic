@@ -1,6 +1,6 @@
 # Phase 4 plan
 
-Status: steps 1 to 7 landed and done-when 1 to 5 passed on both backends on 2026-09-21; step 9 (acceptance follow-ups) planned, then the days of use · Follows `docs/PRD.md` (the Projects phase) and the phase 0 to 3 plans
+Status: steps 1 to 7 landed and done-when 1 to 5 passed on both backends on 2026-09-21; step 9 landed except its docs close (commit 7); step 10 (use follow-ups) planned on 2026-09-22 and not started · Follows `docs/PRD.md` (the Projects phase) and the phase 0 to 3 plans
 
 ## 0. Goal and done-when
 
@@ -402,6 +402,10 @@ lists this project's threads. REPL: `/project` and `/threads`.
   `write_file` and `edit_file` under `.aigentic/memory/` and nowhere
   else; the report's narrowing note; `ask_human` splits the turn and
   resets the budget; `touched` on `turn_ended`.
+- **Step 10** (tui, runtime): each doctor check both ways on temp
+  fixtures with a scripted `gh`; the display cap config and toggle; the
+  three modes against the policy table with the mode records; `init`'s
+  pure parts with scripted `gh` and answers; the three REPL commands.
 - **Pocock** (tui): the rendered files equal a snapshot taken from
   upstream's setup skill for the same answers.
 - Phase 0 to 3 tests unchanged apart from `build_context`'s signature and
@@ -476,11 +480,107 @@ scripted provider.
      prints `[turn ended: max_tokens; wrote a.rs, b.rs]` on a budget
      reason. Test: the payload lists the two paths a scripted turn
      wrote, and a turn without writes has an empty list.
-   - `docs: phase 4 acceptance closed` — the days of use recorded, the
+   - `docs: phase 4 acceptance closed` — written after step 10, with the
      two remaining notes (the flat-layout fallback cannot tell which
      project a pre-phase-4 thread belonged to; models prefer `read_file`
      on a known path over `search_knowledge` when the file is in the
      repository) kept as open items for phase 5.
+
+10. Use follow-ups, from the first days of real use (2026-09-22, tui
+    README "Days of use"): tool output floods the terminal, the prompts
+    are the other half of the noise, and onboarding is scattered over
+    a hand-written config, `project init` and `project setup`. Five
+    commits, in this order; each is implementable from this section
+    alone.
+
+    a. `tui: aigentic doctor` — `crates/tui/src/doctor.rs`, subcommand
+       `Doctor { probe: bool }`. One line per check, `ok`, `fail` or
+       `skip` then a message; exit 1 if any `fail`. Checks, in order:
+       config parses (path shown); each profile's `api_key_env` is set
+       (the name only, never the value); the threads directory exists
+       or can be created; the project opens (name, root, instructions
+       source, knowledge mode and file count, memory files); every
+       enabled skill loads against the lock (the startup check, without
+       starting); when `[pocock] issue_tracker = "github"`, `gh auth
+       status` succeeds and the remote is GitHub; with `--probe`, one
+       completion per profile with `max_output_tokens = 1` and the
+       reply's model and latency (the only network use, off by
+       default). The checks live in `crates/tui/src/checks.rs` as
+       `fn check_*(...) -> Check { name, status, message }` so `init`
+       (d) reuses them. Tests: each check on a temp config and project,
+       both outcomes; `gh` behind a `trait Gh { fn run(&self, args) ->
+       Result<String> }` with a scripted impl. No test touches the
+       network.
+
+    b. `tui: tool output cap and /verbose` — `RESULT_LINES` and
+       `RESULT_BYTES` become `[display] result_lines` (default 3) and
+       `result_bytes` (default 600) in `config.toml`, deny-unknown like
+       the rest; `/verbose` toggles the session between the configured
+       cap and 40 lines / 8000 bytes and prints which is on; the
+       omitted-bytes note stays. Test: `parse_line("/verbose")`, the
+       config defaults and override, and `truncate_for_display` at both
+       caps.
+
+    c. `runtime, tui: modes` — `pub enum Mode { Manual, AcceptEdits,
+       Auto }` in `crates/runtime/src/mode.rs`, `Runtime::set_mode`,
+       `mode()`, default `Manual`. `policy_check` asks `policy.decide`
+       first; a `Deny` stands in every mode (the memory rows, a
+       project's deny rules); otherwise `AcceptEdits` allows class
+       `write` and `Auto` allows anything that would have asked, each
+       with the record `PolicyRecord::rule("mode accept-edits" |
+       "mode auto", "allow")` so the log says why it ran. A mode is
+       session state like a session grant: never persisted, never an
+       event of its own. REPL `/mode` prints the current mode, `/mode
+       <name>` sets it, `--mode` at start, and the banner shows it;
+       `manual` shows nothing. Tests (runtime): under `AcceptEdits` a
+       `write_file` runs with the mode record and `bash rm -rf x` still
+       asks; under `Auto` the bash call runs with the mode record and a
+       `write_file` under `.aigentic/memory/` is still denied by the
+       rule; under `Manual` behaviour is unchanged (the phase 3 tests).
+
+    d. `tui: aigentic init` — `crates/tui/src/init_cmd.rs`, the guided
+       setup, in the spirit of upstream's `setup-matt-pocock-skills`:
+       explore, show, confirm, write. Refuses when stdin is not a
+       terminal. Sections, each showing what exists and proposing a
+       default the user accepts with Enter: (1) config: create
+       `config.toml` if absent from the tensorx/anthropic example, ask
+       which profile is default and confirm each profile's key
+       variable is set (run check a); (2) project: name from the
+       directory, description, `[model] profile`, written with the
+       `project init` template, and `AGENTS.md` created with a heading
+       and a "Commands" section if neither it nor
+       `.aigentic/instructions.md` exists; (3) GitHub: when the remote
+       is GitHub and `gh auth status` passes, `[pocock] issue_tracker =
+       "github"`, then `project setup`'s files, then `gh label list`
+       and `gh label create` for each of the five canonical triage
+       labels that is missing, one confirmation for the batch; (4)
+       knowledge: offer symlinks into `.aigentic/knowledge/` for
+       `docs/` and `CONTEXT.md` when they exist. Every file is shown
+       before it is written; nothing reaches GitHub without a yes; a
+       rerun shows current values as defaults and writes only what
+       changed. `gh` goes through the trait from (a). Tests: the pure
+       parts (the label diff from a listed set, the files an answer set
+       renders, the rerun leaving unchanged files alone) with a
+       scripted `Gh` and a scripted answer source `trait Ask`.
+
+    e. `tui: /profile, /policy, /memory` — `/profile <name>` swaps the
+       provider between turns (`Runtime::set_provider(provider, label)`
+       resets the window measure and re-decides the knowledge mode) and
+       prints the new banner line; `/policy` prints the rule table in
+       order with each rule's name and reason, the bash allow patterns,
+       the mode, and the session grants with who gave them; `/memory`
+       prints the memory files as the prefix carries them with line
+       counts and the `through_seq` of the last extraction. Tests:
+       `parse_line` for the three, the `/policy` and `/memory` text on
+       a fixture runtime, and `set_provider` flipping the knowledge
+       mode between a 1000- and a 100-token window.
+
+    The commits are `tui: aigentic doctor`, `tui: tool output cap and
+    /verbose`, `runtime, tui: modes`, `tui: aigentic init`, `tui:
+    /profile, /policy, /memory`, then step 9's `docs: phase 4
+    acceptance closed`. Folded tool output, routines and plan mode as
+    thread-level narrowing stay in phase 5 and 6, where sections 0 and
+    12 already put them.
 
 Each step passes `cargo fmt`, `cargo clippy --all-targets -- -D warnings`
 and `cargo test` before its commit.
