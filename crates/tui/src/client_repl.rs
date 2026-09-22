@@ -3,7 +3,11 @@
 //! whether the daemon is embedded for one user or remote for many.
 //! Rendering goes through a `Printer`, which is rustyline's external
 //! printer at the terminal (so lines land above the prompt) and a
-//! vector in tests.
+//! vector in tests. Approvals and answers (step 10) are requests like
+//! any other: a permission request prompts `y / a / n` when this user's
+//! role may decide and says who it waits for when not; a question
+//! takes the next line from a user who may write; a prompt answered on
+//! another connection first is withdrawn with who decided it.
 
 use std::collections::VecDeque;
 
@@ -57,8 +61,9 @@ pub struct ClientRepl {
     mode: String,
     /// Streamed assistant text not yet ended by a newline.
     partial: String,
-    /// Whether the last thing printed was our own streamed text; a
-    /// tool call or note then starts on its own line.
+    /// The call id of the request or question this client prompted for
+    /// and has not answered: a decision from elsewhere withdraws it.
+    prompted: Option<String>,
     quit: bool,
 }
 
@@ -82,6 +87,7 @@ impl ClientRepl {
             state,
             mode,
             partial: String::new(),
+            prompted: None,
             quit: false,
         }
     }
@@ -109,6 +115,10 @@ impl ClientRepl {
         matches!(self.role.as_deref(), Some("approve" | "admin"))
     }
 
+    fn may_write(&self) -> bool {
+        matches!(self.role.as_deref(), Some("write" | "approve" | "admin"))
+    }
+
     /// The loop: lines from `input` and notices from the client until
     /// `/quit`, end of input, or the daemon going away.
     pub async fn run(
@@ -117,6 +127,9 @@ impl ClientRepl {
         mut notices: mpsc::Receiver<Notice>,
         out: &mut dyn Printer,
     ) {
+        // A thread opened while it waits: the prompt is shown at once.
+        let state = self.state.clone();
+        self.show_state(&state, out);
         while !self.quit {
             tokio::select! {
                 line = input.recv() => match line {
@@ -184,9 +197,12 @@ impl ClientRepl {
             }
             return;
         }
-        // A pending question or request takes the line first.
+        // A pending question or request this client prompted for takes
+        // the line first; without the role the line is what it is.
         match &self.state {
-            ThreadState::AwaitingHuman { call_id, .. } if !line.trim().starts_with('/') => {
+            ThreadState::AwaitingHuman { call_id, .. }
+                if self.prompted.as_deref() == Some(call_id) && !line.trim().starts_with('/') =>
+            {
                 let call_id = call_id.clone();
                 let r = self
                     .request(Request::AnswerHuman {
@@ -195,10 +211,12 @@ impl ClientRepl {
                         text: line.trim().to_owned(),
                     })
                     .await;
-                self.show(r, "", out);
+                self.answered(r, out);
                 return;
             }
-            ThreadState::AwaitingApproval { call_id, .. } => {
+            ThreadState::AwaitingApproval { call_id, .. }
+                if self.prompted.as_deref() == Some(call_id) =>
+            {
                 let answer = match line.trim().to_ascii_lowercase().as_str() {
                     "y" | "yes" => Some((true, false)),
                     "a" | "always" => Some((true, true)),
@@ -215,7 +233,7 @@ impl ClientRepl {
                             session,
                         })
                         .await;
-                    self.show(r, "", out);
+                    self.answered(r, out);
                     return;
                 }
             }
@@ -350,6 +368,20 @@ impl ClientRepl {
         self.show(r, ok, out);
     }
 
+    /// The reply to our `Decide` or `AnswerHuman`: `Ok` closes the
+    /// prompt (the event that follows says what was decided); a refusal
+    /// says why, and a race lost to another connection reads as such.
+    fn answered(&mut self, response: Response, out: &mut dyn Printer) {
+        match response {
+            Response::Ok => self.prompted = None,
+            Response::Refused { reason } if reason.contains("already decided") => {
+                self.prompted = None;
+                out.line(&format!("[{reason}; someone else was first]"));
+            }
+            other => self.show(other, "", out),
+        }
+    }
+
     async fn report(&mut self, kind: ReportKind, out: &mut dyn Printer) {
         let r = self
             .request(Request::Report {
@@ -388,37 +420,60 @@ impl ClientRepl {
             }
             Notice::State { state, .. } => {
                 self.flush_partial(out);
-                match &state {
-                    ThreadState::AwaitingApproval {
-                        call,
-                        class,
-                        reason,
-                        ..
-                    } => {
-                        out.line(&format!(
-                            "[permission] {} (class {}): {reason}",
-                            call.name,
-                            class_name(*class)
-                        ));
-                        out.line(&format!(
-                            "  {}",
-                            truncate_for_display(&call.args.to_string(), 6, 600)
-                        ));
-                        if self.may_approve() {
-                            out.line("  allow? y once / a always this session / n no");
-                        } else {
-                            out.line("  waiting for an approver");
-                        }
-                    }
-                    ThreadState::AwaitingHuman { question, .. } => {
-                        out.line(&format!("[question] {question}"));
-                        out.line("  type the answer");
-                    }
-                    ThreadState::Running { .. } | ThreadState::Idle => {}
-                }
+                self.show_state(&state, out);
                 self.state = state;
             }
             Notice::Event { event, .. } => self.render_event(&event, out),
+        }
+    }
+
+    /// What the thread waits for, as this user sees it: a prompt when
+    /// their role may answer, else who it waits for. A wait that ends
+    /// without our answer withdraws the prompt.
+    fn show_state(&mut self, state: &ThreadState, out: &mut dyn Printer) {
+        match state {
+            ThreadState::AwaitingApproval {
+                call_id,
+                call,
+                class,
+                reason,
+            } => {
+                if self.may_approve() {
+                    out.line(&format!(
+                        "[permission] {} (class {}): {reason}",
+                        call.name,
+                        class_name(*class)
+                    ));
+                    out.line(&format!(
+                        "  {}",
+                        truncate_for_display(&call.args.to_string(), 6, 600)
+                    ));
+                    out.line("  allow? y once / a always this session / n no");
+                    self.prompted = Some(call_id.clone());
+                } else {
+                    out.line(&format!(
+                        "[waiting for an approver: {}]",
+                        describe_call(call)
+                    ));
+                }
+            }
+            ThreadState::AwaitingHuman { call_id, question } => {
+                if self.may_write() {
+                    out.line(&format!("[question] {question}"));
+                    out.line("  type the answer");
+                    self.prompted = Some(call_id.clone());
+                } else {
+                    out.line(&format!("[waiting for an answer: {question}]"));
+                }
+            }
+            ThreadState::Running { .. } | ThreadState::Idle => {
+                // A question's answer is a tool result with no author on
+                // the wire, so its withdrawal names nobody; a decision's
+                // event named its author before this state arrived.
+                if self.prompted.take().is_some() {
+                    out.line("[answered elsewhere]");
+                }
+            }
         }
     }
 
@@ -469,10 +524,15 @@ impl ClientRepl {
                         (false, _) => "denied",
                     };
                     let why = p.reason.map(|r| format!(" ({r})")).unwrap_or_default();
-                    out.line(&format!(
-                        "  [{what} by {}{why}]",
-                        author_name(&event.author)
-                    ));
+                    let who = author_name(&event.author);
+                    if self.prompted.as_deref() == Some(p.call_id.as_str()) {
+                        // Our prompt, decided on another connection.
+                        self.prompted = None;
+                        if who != self.user {
+                            out.line(&format!("[decided by {who}]"));
+                        }
+                    }
+                    out.line(&format!("  [{what} by {who}{why}]"));
                 }
             }
             EventKind::Interrupted => {
@@ -543,7 +603,7 @@ impl ClientRepl {
     }
 }
 
-fn author_name(author: &Author) -> String {
+pub fn author_name(author: &Author) -> String {
     match author {
         Author::User(u) => u.0.clone(),
         Author::Agent(a) => a.0.clone(),
@@ -744,25 +804,102 @@ mod tests {
             finish_reason: "stop".into(),
         }
     }
+    fn call(id: &str, name: &str, args: serde_json::Value) -> ProviderEvent {
+        ProviderEvent::ToolCall(ToolCall {
+            id: id.into(),
+            name: name.into(),
+            args,
+        })
+    }
+    fn tool_use() -> ProviderEvent {
+        ProviderEvent::Done {
+            finish_reason: "tool_use".into(),
+        }
+    }
+
+    /// A config with a scripted profile, threads and skills under `dir`.
+    fn config(dir: &std::path::Path) -> Config {
+        Config::parse(&format!(
+            "threads_dir = {:?}\nbundled_dir = {:?}\n[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n",
+            dir.join("threads").display(),
+            dir.display()
+        ))
+        .unwrap()
+    }
+
+    fn project(dir: &std::path::Path, name: &str, participants: &str) -> std::path::PathBuf {
+        let root = dir.join(name);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("aigentic.toml"),
+            format!("[project]\nname = \"{name}\"\n{participants}"),
+        )
+        .unwrap();
+        root
+    }
+
+    /// Create a thread in `project`, open it, and hand back what a REPL
+    /// needs.
+    async fn open(
+        client: &Client,
+        project: &str,
+        thread: Option<Ulid>,
+    ) -> (Ulid, ThreadState, String) {
+        let id = match thread {
+            Some(id) => id,
+            None => {
+                let Response::Thread { thread } = client
+                    .request(Request::CreateThread {
+                        project: project.into(),
+                    })
+                    .await
+                    .unwrap()
+                else {
+                    panic!()
+                };
+                thread.id
+            }
+        };
+        let Response::Opened { state, mode, .. } = client
+            .request(Request::Open {
+                thread: id,
+                from_seq: 0,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!()
+        };
+        (id, state, mode)
+    }
+
+    /// Notices until the state matches, with a moment for the other
+    /// connections to have seen the same notice.
+    async fn until_state(rx: &mut mpsc::Receiver<Notice>, pred: impl Fn(&ThreadState) -> bool) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let n = tokio::time::timeout_at(deadline, rx.recv())
+                .await
+                .expect("state in time")
+                .expect("notices open");
+            if let Notice::State { state, .. } = n
+                && pred(&state)
+            {
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 
     #[tokio::test]
     async fn the_repl_streams_a_reply_reports_and_quits_over_an_embedded_daemon() {
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("proj");
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("aigentic.toml"), "[project]\nname = \"proj\"\n").unwrap();
+        let root = project(dir.path(), "proj", "");
         let cfg_dir = dir.path().join("cfg");
         std::fs::create_dir_all(&cfg_dir).unwrap();
-        let threads = dir.path().join("threads");
-        let config = Config::parse(&format!(
-            "threads_dir = {:?}\nbundled_dir = {:?}\n[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n",
-            threads.display(),
-            dir.path().display()
-        ))
-        .unwrap();
         let script = vec![vec![text("Hej "), text("Steve!\nLine two"), done()]];
         let embedded = Server::embed_with(
-            config,
+            config(dir.path()),
             cfg_dir.clone(),
             root,
             "steve",
@@ -781,27 +918,9 @@ mod tests {
         assert_eq!(welcome.user, "steve");
         let role = welcome.projects[0].role.clone();
         assert_eq!(role.as_deref(), Some("admin"));
-        let Response::Thread { thread } = client
-            .request(Request::CreateThread {
-                project: "proj".into(),
-            })
-            .await
-            .unwrap()
-        else {
-            panic!()
-        };
-        let Response::Opened { state, mode, .. } = client
-            .request(Request::Open {
-                thread: thread.id,
-                from_seq: 0,
-            })
-            .await
-            .unwrap()
-        else {
-            panic!()
-        };
+        let (thread, state, mode) = open(&client, "proj", None).await;
         let notices = client.take_notices().unwrap();
-        let mut repl = ClientRepl::new(client, thread.id, "steve", role, state, mode);
+        let mut repl = ClientRepl::new(client, thread, "steve", role, state, mode);
         let (tx, rx) = mpsc::unbounded_channel();
         // Lines arrive as a person would type them, with a pause for the
         // turn to finish before the reports.
@@ -815,6 +934,8 @@ mod tests {
             tx.send("/queue".into()).unwrap();
             tx.send("/verbose".into()).unwrap();
             tx.send("/nope".into()).unwrap();
+            // The mode notice is asynchronous; let it land before quitting.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             tx.send("/quit".into()).unwrap();
         };
         let mut out = Lines::default();
@@ -852,5 +973,267 @@ mod tests {
             "{lines:#?}"
         );
         drop(embedded);
+    }
+
+    /// Step 10 for one person: an `ask_human` question takes the next
+    /// line as its answer and the turn continues; a `bash` call the rules
+    /// ask about prompts, `n` denies it, and the decision prints with the
+    /// user's own name. A second connection paces the typing on the
+    /// thread's state, as a person would on the prompt.
+    #[tokio::test]
+    async fn a_question_and_a_permission_request_are_answered_from_the_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = project(dir.path(), "proj", "");
+        let cfg_dir = dir.path().join("cfg");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        let script = vec![
+            vec![
+                call(
+                    "q1",
+                    "ask_human",
+                    serde_json::json!({"question": "which colour?"}),
+                ),
+                tool_use(),
+            ],
+            vec![
+                text("blue it is\n"),
+                call("b1", "bash", serde_json::json!({"command": "rm -rf x"})),
+                tool_use(),
+            ],
+            vec![text("fine, not deleting"), done()],
+        ];
+        let embedded = Server::embed_with(
+            config(dir.path()),
+            cfg_dir.clone(),
+            root,
+            "steve",
+            Arc::new(Factory(Mutex::new(Some(script)))),
+            Arc::new(DefaultReports {
+                global_instructions: cfg_dir.join("instructions.md"),
+            }),
+        )
+        .await
+        .unwrap();
+        let addr = Addr::Unix(embedded.socket.clone());
+        let (client, welcome) = Client::connect(&addr, &embedded.token).await.unwrap();
+        let role = welcome.projects[0].role.clone();
+        let (thread, state, mode) = open(&client, "proj", None).await;
+        let notices = client.take_notices().unwrap();
+        let mut repl = ClientRepl::new(client, thread, "steve", role, state, mode);
+        // The pacer: a second session on the same thread.
+        let (pacer, _) = Client::connect(&addr, &embedded.token).await.unwrap();
+        open(&pacer, "proj", Some(thread)).await;
+        let mut paced = pacer.take_notices().unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let feeder = async move {
+            tx.send("hello".into()).unwrap();
+            until_state(
+                &mut paced,
+                |s| matches!(s, ThreadState::AwaitingHuman { call_id, .. } if call_id == "q1"),
+            )
+            .await;
+            tx.send("blue".into()).unwrap();
+            until_state(
+                &mut paced,
+                |s| matches!(s, ThreadState::AwaitingApproval { call_id, .. } if call_id == "b1"),
+            )
+            .await;
+            tx.send("n".into()).unwrap();
+            until_state(&mut paced, |s| *s == ThreadState::Idle).await;
+            tx.send("/quit".into()).unwrap();
+        };
+        let mut out = Lines::default();
+        let ((), ()) = tokio::join!(repl.run(rx, notices, &mut out), feeder);
+        let lines = out.0;
+        let at = |needle: &str| {
+            lines
+                .iter()
+                .position(|l| l == needle)
+                .unwrap_or_else(|| panic!("no line {needle:?} in {lines:#?}"))
+        };
+        let question = at("[question] which colour?");
+        assert_eq!(lines[question + 1], "  type the answer");
+        let permission = at("[permission] bash (class exec): class exec: anything else in a shell");
+        assert_eq!(lines[permission + 1], "  {\"command\":\"rm -rf x\"}");
+        assert_eq!(
+            lines[permission + 2],
+            "  allow? y once / a always this session / n no"
+        );
+        let denied = at("  [denied by steve]");
+        assert!(question < permission && permission < denied, "{lines:#?}");
+        assert!(
+            lines.iter().any(|l| l.starts_with("  ✗ ")),
+            "the denied call's result: {lines:#?}"
+        );
+        assert!(
+            lines.contains(&"fine, not deleting".to_owned()),
+            "{lines:#?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains("elsewhere") || l.starts_with("[decided by")),
+            "{lines:#?}"
+        );
+        drop(embedded);
+    }
+
+    /// Step 10 for two people: steve (admin) is prompted and magnus
+    /// (approve) decides first on another connection, so steve's prompt
+    /// is withdrawn with `[decided by magnus]` and the decision prints
+    /// as `[allowed by magnus]`; the reviewer (read) is never prompted
+    /// and sees who the thread waits for.
+    #[tokio::test]
+    async fn a_prompt_decided_elsewhere_is_withdrawn_and_a_reader_only_watches() {
+        use aigentic_server::Listener;
+        use aigentic_server::config::{ProjectConfig, UserConfig};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = project(
+            dir.path(),
+            "p",
+            "[participants]\nsteve = \"admin\"\nmagnus = \"approve\"\nreviewer = \"read\"\n",
+        );
+        let cfg_dir = dir.path().join("cfg");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        let script = vec![
+            vec![
+                call("b1", "bash", serde_json::json!({"command": "printf ok"})),
+                tool_use(),
+            ],
+            vec![text("ran"), done()],
+        ];
+        let server_config = aigentic_server::ServerConfig {
+            listen: "unix".into(),
+            idle_unload_secs: 600,
+            users: ["steve", "magnus", "reviewer"]
+                .iter()
+                .map(|n| UserConfig {
+                    name: (*n).to_owned(),
+                    token_env: None,
+                    token: Some(format!("tok-{n}")),
+                })
+                .collect(),
+            projects: vec![ProjectConfig {
+                name: "p".into(),
+                root,
+            }],
+        };
+        let server = Arc::new(Server::new(
+            config(dir.path()),
+            cfg_dir.clone(),
+            server_config,
+            Arc::new(Factory(Mutex::new(Some(script)))),
+            Arc::new(DefaultReports {
+                global_instructions: cfg_dir.join("instructions.md"),
+            }),
+        ));
+        let socket = dir.path().join("d.sock");
+        let task = tokio::spawn(server.clone().serve(Listener::Unix(socket.clone())));
+        for _ in 0..200 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let addr = Addr::Unix(socket);
+        let connect = |user: &'static str| {
+            let addr = addr.clone();
+            async move {
+                Client::connect(&addr, &format!("tok-{user}"))
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let (steve, welcome) = connect("steve").await;
+        let steve_role = welcome.projects[0].role.clone();
+        let (thread, state, mode) = open(&steve, "p", None).await;
+        let steve_notices = steve.take_notices().unwrap();
+        let mut steve_repl = ClientRepl::new(steve, thread, "steve", steve_role, state, mode);
+
+        let (reviewer, welcome) = connect("reviewer").await;
+        let reviewer_role = welcome.projects[0].role.clone();
+        assert_eq!(reviewer_role.as_deref(), Some("read"));
+        let (_, state, mode) = open(&reviewer, "p", Some(thread)).await;
+        let reviewer_notices = reviewer.take_notices().unwrap();
+        let mut reviewer_repl =
+            ClientRepl::new(reviewer, thread, "reviewer", reviewer_role, state, mode);
+
+        let (magnus, _) = connect("magnus").await;
+        open(&magnus, "p", Some(thread)).await;
+        let mut magnus_notices = magnus.take_notices().unwrap();
+
+        let (steve_tx, steve_rx) = mpsc::unbounded_channel();
+        let (reviewer_tx, reviewer_rx) = mpsc::unbounded_channel();
+        let driver = async move {
+            steve_tx.send("go".into()).unwrap();
+            until_state(
+                &mut magnus_notices,
+                |s| matches!(s, ThreadState::AwaitingApproval { call_id, .. } if call_id == "b1"),
+            )
+            .await;
+            let r = magnus
+                .request(Request::Decide {
+                    thread,
+                    call_id: "b1".into(),
+                    allow: true,
+                    session: false,
+                })
+                .await
+                .unwrap();
+            assert_eq!(r, Response::Ok);
+            until_state(&mut magnus_notices, |s| *s == ThreadState::Idle).await;
+            // Steve's late `y` loses the race, without a stale prompt.
+            steve_tx.send("y".into()).unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            steve_tx.send("/quit".into()).unwrap();
+            reviewer_tx.send("/quit".into()).unwrap();
+        };
+        let mut steve_out = Lines::default();
+        let mut reviewer_out = Lines::default();
+        let ((), (), ()) = tokio::join!(
+            steve_repl.run(steve_rx, steve_notices, &mut steve_out),
+            reviewer_repl.run(reviewer_rx, reviewer_notices, &mut reviewer_out),
+            driver
+        );
+        let lines = steve_out.0;
+        let at = |needle: &str| {
+            lines
+                .iter()
+                .position(|l| l == needle)
+                .unwrap_or_else(|| panic!("no line {needle:?} in {lines:#?}"))
+        };
+        let prompt = at("  allow? y once / a always this session / n no");
+        let withdrawn = at("[decided by magnus]");
+        let allowed = at("  [allowed by magnus]");
+        assert!(prompt < withdrawn && withdrawn + 1 == allowed, "{lines:#?}");
+        assert!(lines.contains(&"  ✓ ok".to_owned()), "{lines:#?}");
+        assert!(lines.contains(&"ran".to_owned()), "{lines:#?}");
+        // The prompt was withdrawn, so the late `y` was a chat line the
+        // daemon took as a post, not a decision of a closed request.
+        assert!(
+            !lines.iter().any(|l| l.contains("already decided")),
+            "{lines:#?}"
+        );
+        let lines = reviewer_out.0;
+        assert!(
+            lines.contains(
+                &"[waiting for an approver: bash {\"command\":\"printf ok\"}]".to_owned()
+            ),
+            "{lines:#?}"
+        );
+        assert!(
+            lines.contains(&"  [allowed by magnus]".to_owned()),
+            "{lines:#?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.starts_with("[permission]") || l.starts_with("[decided by")),
+            "{lines:#?}"
+        );
+        assert!(lines.contains(&"steve: go".to_owned()), "{lines:#?}");
+        task.abort();
     }
 }
