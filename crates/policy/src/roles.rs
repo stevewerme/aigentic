@@ -114,6 +114,7 @@ pub fn needs(request: &Request) -> Option<Role> {
         Request::CreateThread { .. }
         | Request::Post { .. }
         | Request::InvokeSkill { .. }
+        | Request::Interrupt { .. }
         | Request::AnswerHuman { .. }
         | Request::Pin { .. } => Some(Role::Write),
         Request::Decide { .. } | Request::SetMode { .. } | Request::Compact { .. } => {
@@ -256,6 +257,7 @@ mod tests {
                 Some(Role::Approve),
             ),
             (Request::Compact { thread: t }, Some(Role::Approve)),
+            (Request::Interrupt { thread: t }, Some(Role::Write)),
         ];
         for (request, role) in rows {
             assert_eq!(needs(&request), role, "{request:?}");

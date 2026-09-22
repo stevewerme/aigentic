@@ -8,6 +8,7 @@
 pub mod commands;
 pub mod composer;
 pub mod engine;
+pub mod keymap;
 pub mod status;
 pub mod tui;
 
@@ -15,12 +16,13 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use aigentic_api::{Notice, ThreadState};
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event, EventStream, KeyEventKind};
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
 
 use crate::app::composer::Composer;
 use crate::app::engine::{ClientRepl, Printer};
+use crate::app::keymap::{Action, KeyContext, action_for};
 use crate::app::status::Status;
 use crate::app::tui::{Pane, Shell};
 
@@ -94,53 +96,8 @@ impl ShellOut {
     }
 }
 
-/// What a key asks for (step 4 grows this into the full table).
-#[derive(Debug, PartialEq, Eq)]
-enum Action {
-    Submit,
-    Newline,
-    Insert(char),
-    Backspace,
-    Delete,
-    Left,
-    Right,
-    Up,
-    Down,
-    Home,
-    End,
-    ClearLine,
-    /// Ctrl-C: clear the draft, or quit when it is already empty.
-    ClearOrQuit,
-    /// Ctrl-D: quit when the composer is empty.
-    QuitIfEmpty,
-    None,
-}
-
-fn action_for(key: &KeyEvent) -> Action {
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-    let alt = key.modifiers.contains(KeyModifiers::ALT);
-    match key.code {
-        KeyCode::Enter if shift || alt => Action::Newline,
-        KeyCode::Enter => Action::Submit,
-        KeyCode::Char('j') if ctrl => Action::Newline,
-        KeyCode::Char('c') if ctrl => Action::ClearOrQuit,
-        KeyCode::Char('d') if ctrl => Action::QuitIfEmpty,
-        KeyCode::Char('a') if ctrl => Action::Home,
-        KeyCode::Char('e') if ctrl => Action::End,
-        KeyCode::Char('u') if ctrl => Action::ClearLine,
-        KeyCode::Char(c) if !ctrl => Action::Insert(c),
-        KeyCode::Backspace => Action::Backspace,
-        KeyCode::Delete => Action::Delete,
-        KeyCode::Left => Action::Left,
-        KeyCode::Right => Action::Right,
-        KeyCode::Up => Action::Up,
-        KeyCode::Down => Action::Down,
-        KeyCode::Home => Action::Home,
-        KeyCode::End => Action::End,
-        _ => Action::None,
-    }
-}
+/// A second press of Ctrl-C or Esc within this long completes it.
+const ARM_WINDOW: Duration = Duration::from_secs(1);
 
 async fn run_shell(
     mut engine: ClientRepl,
@@ -162,6 +119,11 @@ async fn run_shell(
     let mut running_since: Option<Instant> = None;
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(TICK);
+    // Ctrl-C and Esc arm on an empty idle composer; the second press
+    // within the window quits or recalls.
+    let mut armed: Option<(Action, Instant)> = None;
+    // The last message sent (not a command), for Esc-Esc and Alt-Up.
+    let mut last_sent: Option<String> = None;
 
     // A thread opened while it waits: the prompt is shown at once.
     let state = engine.state().clone();
@@ -180,10 +142,19 @@ async fn run_shell(
             (_, None) => Some(Instant::now()),
         };
         status.elapsed = running_since.map(|t| t.elapsed());
-        let hint = match &state {
-            ThreadState::Running { queued, .. } if *queued > 0 => {
-                Some(format!("queued {queued} · ! sends now"))
+        if let Some((_, at)) = armed
+            && at.elapsed() > ARM_WINDOW
+        {
+            armed = None;
+        }
+        let hint = match (&armed, &state) {
+            (Some((Action::QuitArm, _)), _) => Some("Ctrl-C again to quit".to_owned()),
+            (Some((Action::RecallArm, _)), _) => {
+                Some("Esc again to recall the last message".to_owned())
             }
+            (_, ThreadState::Running { queued, .. }) if *queued > 0 => Some(format!(
+                "queued {queued} · ! sends now · Alt-Up copies the last back"
+            )),
             _ if engine.prompting() => Some("answer on the line: y / a / n, or the text".into()),
             _ => None,
         };
@@ -203,7 +174,14 @@ async fn run_shell(
                 let Some(Ok(event)) = event else { break };
                 match event {
                     Event::Key(key) if key.kind != KeyEventKind::Release => {
-                        match action_for(&key) {
+                        let ctx = KeyContext {
+                            running: !matches!(engine.state(), ThreadState::Idle),
+                            composer_empty: composer.is_empty(),
+                        };
+                        let action = action_for(&key, ctx);
+                        // An armed key completes on its second press.
+                        let was_armed = armed.take().map(|(a, _)| a);
+                        match action {
                             Action::Submit => {
                                 if let Some(text) = composer.take() {
                                     // The composer clears, so the message
@@ -211,6 +189,10 @@ async fn run_shell(
                                     for (i, line) in text.lines().enumerate() {
                                         let prefix = if i == 0 { "> " } else { "  " };
                                         out.line(&format!("{prefix}{line}"));
+                                    }
+                                    if !text.starts_with('/') {
+                                        last_sent =
+                                            Some(text.trim_start_matches('!').trim().to_owned());
                                     }
                                     engine.handle_line(&text, &mut out).await;
                                 }
@@ -225,19 +207,30 @@ async fn run_shell(
                             Action::Down => composer.down(),
                             Action::Home => composer.home(),
                             Action::End => composer.end(),
-                            Action::ClearLine => composer.clear(),
-                            Action::ClearOrQuit => {
-                                if composer.is_empty() {
+                            Action::ClearDraft => composer.clear(),
+                            Action::Interrupt => engine.interrupt(&mut out).await,
+                            Action::QuitArm => {
+                                if was_armed == Some(Action::QuitArm) {
                                     break;
                                 }
-                                composer.clear();
+                                armed = Some((Action::QuitArm, Instant::now()));
                             }
-                            Action::QuitIfEmpty => {
-                                if composer.is_empty() {
-                                    break;
+                            Action::RecallArm => {
+                                if was_armed == Some(Action::RecallArm) {
+                                    if let Some(text) = &last_sent {
+                                        composer.set_text(text);
+                                    }
+                                } else {
+                                    armed = Some((Action::RecallArm, Instant::now()));
                                 }
                             }
-                            Action::None => {}
+                            Action::Recall => {
+                                if let Some(text) = &last_sent {
+                                    composer.set_text(text);
+                                }
+                            }
+                            Action::Quit => break,
+                            Action::Transcript | Action::None => {}
                         }
                     }
                     Event::Paste(text) => composer.paste(&text),
@@ -259,49 +252,4 @@ async fn run_shell(
     out.shell.stop();
     println!("bye");
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
-        KeyEvent::new(code, mods)
-    }
-
-    #[test]
-    fn keys_map_to_actions() {
-        assert_eq!(
-            action_for(&key(KeyCode::Enter, KeyModifiers::NONE)),
-            Action::Submit
-        );
-        assert_eq!(
-            action_for(&key(KeyCode::Enter, KeyModifiers::SHIFT)),
-            Action::Newline
-        );
-        assert_eq!(
-            action_for(&key(KeyCode::Char('j'), KeyModifiers::CONTROL)),
-            Action::Newline
-        );
-        assert_eq!(
-            action_for(&key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
-            Action::ClearOrQuit
-        );
-        assert_eq!(
-            action_for(&key(KeyCode::Char('d'), KeyModifiers::CONTROL)),
-            Action::QuitIfEmpty
-        );
-        assert_eq!(
-            action_for(&key(KeyCode::Char('x'), KeyModifiers::NONE)),
-            Action::Insert('x')
-        );
-        assert_eq!(
-            action_for(&key(KeyCode::Char('X'), KeyModifiers::SHIFT)),
-            Action::Insert('X')
-        );
-        assert_eq!(
-            action_for(&key(KeyCode::Tab, KeyModifiers::NONE)),
-            Action::None
-        );
-    }
 }

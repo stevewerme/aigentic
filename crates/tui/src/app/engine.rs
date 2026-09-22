@@ -260,6 +260,11 @@ impl ClientRepl {
                     out.line(l);
                 }
             }
+            Command::Keys => {
+                for l in crate::app::keymap::KEYS.lines() {
+                    out.line(l);
+                }
+            }
             Command::Chat(text) => self.post(text, false, out).await,
             Command::Interrupt(text) => self.post(text, true, out).await,
             Command::Skill(name, args) => {
@@ -382,6 +387,16 @@ impl ClientRepl {
             self.awaiting_turn = true;
         }
         self.show(r, ok, out);
+    }
+
+    /// Ctrl-C or Esc while a turn runs: cancel it, post nothing.
+    pub async fn interrupt(&mut self, out: &mut dyn Printer) {
+        let r = self
+            .request(Request::Interrupt {
+                thread: self.thread,
+            })
+            .await;
+        self.show(r, "[interrupting]", out);
     }
 
     /// The reply to our `Decide` or `AnswerHuman`: `Ok` closes the

@@ -217,6 +217,7 @@ fn project_for(threads: &ThreadTable, request: &Request) -> Option<String> {
         | Request::Close { thread }
         | Request::Post { thread, .. }
         | Request::InvokeSkill { thread, .. }
+        | Request::Interrupt { thread }
         | Request::Decide { thread, .. }
         | Request::AnswerHuman { thread, .. }
         | Request::Pin { thread, .. }
@@ -299,6 +300,10 @@ async fn handle(
                 reply,
             })
             .await
+        }
+        Request::Interrupt { thread } => {
+            let by = author.clone();
+            ask_actor(threads, open, thread, |reply| Mail::Interrupt { by, reply }).await
         }
         Request::InvokeSkill { thread, name, args } => {
             let author = author.clone();

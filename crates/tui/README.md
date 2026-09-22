@@ -82,10 +82,14 @@ every finished line goes into the terminal's own scrollback, so the
 transcript scrolls, searches and copies like any other output and stays
 after quitting. Enter sends; Shift-Enter or Ctrl-J adds a line; a paste over
 1000 characters shows as a placeholder until sent; Up and Down walk the
-history when the composer is empty; Ctrl-C clears the draft or, empty, quits;
-Ctrl-D quits. Without a terminal (a pipe, a script) the client reads stdin
-lines and prints lines, which is what the acceptance items below and `exec`
-use.
+history when the composer is empty. While a turn runs, Ctrl-C or Esc
+interrupts it (nothing is posted; `!text` interrupts and posts) and Enter
+queues the message for the next turn. Idle, Ctrl-C or Esc clears the draft;
+on an empty composer a second Ctrl-C within a second quits and a second Esc
+recalls the last message sent, as Alt-Up does at any time. Ctrl-D quits.
+`/keys` prints the table. Without a terminal (a pipe, a script) the client
+reads stdin lines and prints lines, which is what the acceptance items below
+and `exec` use.
 
 The daemon reads `server.toml` beside `config.toml`: `listen` (`unix`, `unix:/path`
 or `tcp:host:port`; plain TCP with tokens, so put a reverse proxy or an SSH

@@ -645,3 +645,39 @@ async fn usage_is_pushed_after_the_call_and_again_when_the_turn_ends() {
     drop(rig.mailbox);
     rig.task.await.unwrap();
 }
+
+#[tokio::test]
+async fn an_interrupt_without_a_message_ends_the_turn_and_starts_none() {
+    let rig = rig(
+        vec![
+            Some(vec![slow("c1", 400), tool_use()]),
+            Some(vec![text("never"), done()]),
+        ],
+        true,
+    );
+    let (_, _, mut notices) = rig.subscribe(0).await;
+    // Idle: refused.
+    assert!(matches!(
+        rig.send(|reply| Mail::Interrupt { by: steve(), reply })
+            .await,
+        Response::Refused { .. }
+    ));
+    assert_eq!(rig.post(steve(), "go", false).await, Response::Ok);
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert_eq!(
+        rig.send(|reply| Mail::Interrupt {
+            by: magnus(),
+            reply
+        })
+        .await,
+        Response::Ok
+    );
+    Rig::until_state(&mut notices, |s| *s == ThreadState::Idle).await;
+    let kinds = rig.kinds();
+    assert!(kinds.contains(&EventKind::Interrupted), "{kinds:?}");
+    assert_eq!(kinds.last(), Some(&EventKind::TurnEnded));
+    // One turn only: the second script was never played.
+    assert_eq!(rig.seen.lock().unwrap().len(), 1);
+    drop(rig.mailbox);
+    rig.task.await.unwrap();
+}

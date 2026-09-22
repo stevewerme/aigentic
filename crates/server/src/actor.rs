@@ -40,6 +40,11 @@ pub enum Mail {
         args: String,
         reply: oneshot::Sender<Response>,
     },
+    /// Cancel the running turn, nothing posted; refused while idle.
+    Interrupt {
+        by: Author,
+        reply: oneshot::Sender<Response>,
+    },
     Decide {
         by: Author,
         call_id: String,
@@ -392,6 +397,12 @@ impl ThreadActor {
                 );
                 None
             }
+            Mail::Interrupt { reply, .. } => {
+                let _ = reply.send(Response::Refused {
+                    reason: "no turn is running".into(),
+                });
+                None
+            }
             Mail::Compact { reply } => {
                 // Async; `run` does it after this mail.
                 self.pending_compact = Some(reply);
@@ -629,6 +640,10 @@ impl ThreadActor {
             }
             Mail::Status { reply } => {
                 let _ = reply.send(shared.state());
+            }
+            Mail::Interrupt { by, reply } => {
+                cancel.cancel(by);
+                let _ = reply.send(Response::Ok);
             }
             Mail::InvokeSkill { reply, .. } => {
                 let _ = reply.send(Response::Refused {

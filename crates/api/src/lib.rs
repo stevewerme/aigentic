@@ -96,6 +96,12 @@ pub enum Request {
         name: String,
         args: String,
     },
+    /// Cancel the running turn without posting anything (Ctrl-C, Esc);
+    /// refused when no turn runs. `Post` with `interrupt` cancels and
+    /// posts in one.
+    Interrupt {
+        thread: Ulid,
+    },
     /// Answer a pending permission request; `session` makes it a
     /// standing grant for identical calls.
     Decide {

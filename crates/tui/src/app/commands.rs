@@ -30,6 +30,8 @@ pub enum Command<'a> {
     Memory,
     /// A user-invoked skill: its name and the rest of the line.
     Skill(&'a str, &'a str),
+    /// The key table.
+    Keys,
     Unknown(&'a str),
     Chat(&'a str),
     Empty,
@@ -50,6 +52,7 @@ pub fn parse_line<'a>(line: &'a str, skills: &[String]) -> Command<'a> {
         ("cost", _) => Command::Cost,
         ("quit" | "exit", _) => Command::Quit,
         ("help", _) => Command::Help,
+        ("keys", _) => Command::Keys,
         ("skills", _) => Command::Skills,
         ("project", _) => Command::Project,
         ("threads", _) => Command::Threads,
@@ -84,6 +87,7 @@ pub const HELP: &str = "\
 /project         the layers, the knowledge mode and every tool's fate
 /threads         this project's threads, newest first
 /<skill> [args]  run a user-invoked skill
+/keys            the key table: interrupt, recall, quit
 /help            this list
 /quit            exit (Ctrl-D too)
 Permission prompts (approve role): y once, a for the session, n to deny; a question takes the next line.";
