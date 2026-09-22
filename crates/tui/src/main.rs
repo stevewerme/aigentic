@@ -358,7 +358,6 @@ async fn main() -> anyhow::Result<()> {
     // The REPL over the daemon's client: connect to `--server`, or start a
     // daemon in this process for this directory over a private socket.
     let user = config.user_name();
-    let display = config.display;
     let history = config_path.with_file_name("history");
     let (client, welcome, embedded) = match &cli.server {
         Some(server) => {
@@ -529,9 +528,8 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let notices = client.take_notices().context("notice stream")?;
-    let repl = ClientRepl::new(client, thread_id, &welcome.user, role, state, mode)
-        .with_display(display)
-        .with_skills(skills);
+    let repl =
+        ClientRepl::new(client, thread_id, &welcome.user, role, state, mode).with_skills(skills);
     app::run(repl, notices, history, project_name).await?;
     drop(embedded);
     Ok(())

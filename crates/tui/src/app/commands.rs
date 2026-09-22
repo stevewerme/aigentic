@@ -11,9 +11,6 @@ pub enum Command<'a> {
     Threads,
     Pin(&'a str),
     Compact,
-    /// Toggle the session between the configured tool-output cap and a
-    /// larger one.
-    Verbose,
     /// Post as an interrupt: the running turn ends first (`!text` too).
     Interrupt(&'a str),
     /// The participants and their roles, and who you are.
@@ -57,7 +54,6 @@ pub fn parse_line<'a>(line: &'a str, skills: &[String]) -> Command<'a> {
         ("project", _) => Command::Project,
         ("threads", _) => Command::Threads,
         ("compact", _) => Command::Compact,
-        ("verbose", _) => Command::Verbose,
         ("interrupt", text) if !text.is_empty() => Command::Interrupt(text),
         ("who", _) => Command::Who,
         ("queue", _) => Command::Queue,
@@ -76,7 +72,6 @@ pub const HELP: &str = "\
 /cost            tokens for the thread, reported and estimated separately
 /pin <text>      pin a fact to the stable prefix
 /compact         run compaction now
-/verbose         toggle tool output between the configured cap and 40 lines / 8000 bytes
 /mode [name]     show the permission mode, or set it: manual, accept-edits, auto
 /interrupt <text> end the running turn and start one with this (or `!text`)
 /who             the participants and their roles
@@ -132,7 +127,7 @@ mod tests {
         assert_eq!(parse_line("/help", &none), Command::Help);
         assert_eq!(parse_line("/skills", &none), Command::Skills);
         assert_eq!(parse_line("/compact", &none), Command::Compact);
-        assert_eq!(parse_line("/verbose", &none), Command::Verbose);
+        assert_eq!(parse_line("/keys", &none), Command::Keys);
         assert_eq!(
             parse_line("/interrupt stop now", &none),
             Command::Interrupt("stop now")
@@ -195,7 +190,7 @@ mod tests {
     }
 
     #[test]
-    fn the_verbose_cap_shows_what_the_configured_cap_cuts() {
+    fn a_larger_cap_shows_what_a_small_one_cuts() {
         let text: String = (0..20)
             .map(|i| format!("line {i:02} {}\n", "x".repeat(30)))
             .collect();
@@ -205,7 +200,7 @@ mod tests {
         assert_eq!(
             truncate_for_display(&text, 40, 8000),
             text,
-            "the verbose cap shows all of it"
+            "the larger cap shows all of it"
         );
     }
 

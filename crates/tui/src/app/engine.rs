@@ -10,7 +10,7 @@
 //! takes the next line from a user who may write; a prompt answered on
 //! another connection first is withdrawn with who decided it.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use aigentic_api::client::Client;
 use aigentic_api::{Notice, ReportKind, Request, Response, ThreadState};
@@ -24,8 +24,8 @@ use aigentic_runtime::{ASKED_HUMAN, INTERRUPTED};
 use tokio::sync::mpsc;
 use ulid::Ulid;
 
+use crate::app::cells::{Cell, ToolState, summarise_args};
 use crate::app::commands::{Command, HELP, parse_line, truncate_for_display};
-use crate::config::DisplaySection;
 
 /// Where rendered lines go.
 pub trait Printer {
@@ -34,6 +34,19 @@ pub trait Printer {
     /// The assistant's streamed text not yet ended by a newline, after
     /// each delta; empty once flushed. A shell redraws it in place.
     fn tail(&mut self, _text: &str) {}
+    /// A cell; `done` false means it still changes (a running tool). The
+    /// default prints its head while running and the whole cell when
+    /// done, which is what a pipe wants.
+    fn cell(&mut self, cell: Cell, done: bool) {
+        let lines = cell.plain();
+        if done {
+            for l in &lines {
+                self.line(l);
+            }
+        } else if let Some(head) = lines.first() {
+            self.line(head);
+        }
+    }
 }
 
 /// A vector, for tests.
@@ -48,10 +61,6 @@ impl Printer for Lines {
     }
 }
 
-/// `/verbose`'s caps for tool results.
-const VERBOSE_RESULT_LINES: usize = 40;
-const VERBOSE_RESULT_BYTES: usize = 8000;
-
 /// What the client knows about its thread.
 pub struct ClientRepl {
     client: Client,
@@ -60,8 +69,8 @@ pub struct ClientRepl {
     /// The user's role in the project, from `Welcome`.
     role: Option<String>,
     skills: Vec<String>,
-    display: DisplaySection,
-    verbose: bool,
+    /// Running calls by id: name and summary, for the result's cell.
+    calls: HashMap<String, (String, String)>,
     state: ThreadState,
     mode: String,
     /// Streamed assistant text not yet ended by a newline.
@@ -93,8 +102,7 @@ impl ClientRepl {
             user: user.to_owned(),
             role,
             skills: Vec::new(),
-            display: DisplaySection::default(),
-            verbose: false,
+            calls: HashMap::new(),
             state,
             mode,
             partial: String::new(),
@@ -105,23 +113,10 @@ impl ClientRepl {
         }
     }
 
-    pub fn with_display(mut self, display: DisplaySection) -> Self {
-        self.display = display;
-        self
-    }
-
     /// The user-invoked skills, so `/<skill>` dispatches.
     pub fn with_skills(mut self, skills: Vec<String>) -> Self {
         self.skills = skills;
         self
-    }
-
-    fn caps(&self) -> (usize, usize) {
-        if self.verbose {
-            (VERBOSE_RESULT_LINES, VERBOSE_RESULT_BYTES)
-        } else {
-            (self.display.result_lines, self.display.result_bytes)
-        }
     }
 
     fn may_approve(&self) -> bool {
@@ -336,14 +331,6 @@ impl ClientRepl {
                     .await;
                 self.show(r, "[compacted]", out);
             }
-            Command::Verbose => {
-                self.verbose = !self.verbose;
-                let (lines, bytes) = self.caps();
-                out.line(&format!(
-                    "[verbose {}: {lines} lines / {bytes} bytes of tool output]",
-                    if self.verbose { "on" } else { "off" }
-                ));
-            }
             Command::Mode(None) => out.line(&format!(
                 "[mode {}: {}]",
                 self.mode,
@@ -426,7 +413,13 @@ impl ClientRepl {
     fn flush_partial(&mut self, out: &mut dyn Printer) {
         if !self.partial.is_empty() {
             let text = std::mem::take(&mut self.partial);
-            out.line(&text);
+            out.cell(
+                Cell::Assistant {
+                    text,
+                    fenced: false,
+                },
+                true,
+            );
             out.tail("");
         }
     }
@@ -462,13 +455,30 @@ impl ClientRepl {
                 self.partial.push_str(&text);
                 while let Some(pos) = self.partial.find('\n') {
                     let line: String = self.partial.drain(..=pos).collect();
-                    out.line(line.trim_end_matches('\n'));
+                    out.cell(
+                        Cell::Assistant {
+                            text: line.trim_end_matches('\n').to_owned(),
+                            fenced: false,
+                        },
+                        true,
+                    );
                 }
                 out.tail(&self.partial);
             }
             Notice::ToolCallStarted { call, .. } => {
                 self.flush_partial(out);
-                out.line(&format!("→ {}", describe_call(&call)));
+                let summary = summarise_args(&call);
+                self.calls
+                    .insert(call.id.clone(), (call.name.clone(), summary.clone()));
+                out.cell(
+                    Cell::Tool {
+                        name: call.name,
+                        summary,
+                        state: ToolState::Running,
+                        output: String::new(),
+                    },
+                    false,
+                );
             }
             Notice::Mode { mode, .. } => {
                 self.mode = mode.clone();
@@ -546,7 +556,6 @@ impl ClientRepl {
         event: &aigentic_runtime::aigentic_core::Event,
         out: &mut dyn Printer,
     ) {
-        let (lines, bytes) = self.caps();
         match event.kind {
             EventKind::AssistantMessage => self.flush_partial(out),
             EventKind::UserMessage => {
@@ -581,10 +590,23 @@ impl ClientRepl {
                             out.line(&format!("[answered by {who}]"));
                         }
                     }
-                    let marker = if r.is_error { "✗" } else { "✓" };
-                    for line in truncate_for_display(&r.content, lines, bytes).lines() {
-                        out.line(&format!("  {marker} {line}"));
-                    }
+                    let (name, summary) = self
+                        .calls
+                        .remove(&r.id)
+                        .unwrap_or_else(|| ("tool".to_owned(), String::new()));
+                    out.cell(
+                        Cell::Tool {
+                            name,
+                            summary,
+                            state: if r.is_error {
+                                ToolState::Err
+                            } else {
+                                ToolState::Ok
+                            },
+                            output: r.content,
+                        },
+                        true,
+                    );
                 }
             }
             EventKind::PermissionDecided => {
@@ -1003,7 +1025,7 @@ mod tests {
             tx.send("/mode".into()).unwrap();
             tx.send("/mode auto".into()).unwrap();
             tx.send("/queue".into()).unwrap();
-            tx.send("/verbose".into()).unwrap();
+            tx.send("/keys".into()).unwrap();
             tx.send("/nope".into()).unwrap();
             // The mode notice is asynchronous; let it land before quitting.
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1035,10 +1057,7 @@ mod tests {
             lines.iter().any(|l| l == "idle; nothing queued"),
             "{lines:#?}"
         );
-        assert!(
-            lines.iter().any(|l| l.starts_with("[verbose on:")),
-            "{lines:#?}"
-        );
+        assert!(lines.iter().any(|l| l.starts_with("Enter ")), "{lines:#?}");
         assert!(
             lines.iter().any(|l| l == "unknown command: /nope"),
             "{lines:#?}"
@@ -1134,7 +1153,7 @@ mod tests {
         let denied = at("  [denied by steve]");
         assert!(question < permission && permission < denied, "{lines:#?}");
         assert!(
-            lines.iter().any(|l| l.starts_with("  ✗ ")),
+            lines.iter().any(|l| l.starts_with("• Failed ")),
             "the denied call's result: {lines:#?}"
         );
         assert!(
@@ -1293,7 +1312,7 @@ mod tests {
         let question = at("[question] which colour?");
         let answered = at("[answered by magnus]");
         assert!(question < answered, "{lines:#?}");
-        assert!(lines.contains(&"  ✓ blue".to_owned()), "{lines:#?}");
+        assert!(lines.contains(&"  └ blue".to_owned()), "{lines:#?}");
         assert!(lines.contains(&"blue it is".to_owned()), "{lines:#?}");
         assert!(
             !lines.iter().any(|l| l == "[answered elsewhere]"),
@@ -1492,7 +1511,7 @@ mod tests {
         let withdrawn = at("[decided by magnus]");
         let allowed = at("  [allowed by magnus]");
         assert!(prompt < withdrawn && withdrawn + 1 == allowed, "{lines:#?}");
-        assert!(lines.contains(&"  ✓ ok".to_owned()), "{lines:#?}");
+        assert!(lines.contains(&"  └ ok".to_owned()), "{lines:#?}");
         assert!(lines.contains(&"ran".to_owned()), "{lines:#?}");
         // The prompt was withdrawn, so the late `y` was a chat line the
         // daemon took as a post, not a decision of a closed request.

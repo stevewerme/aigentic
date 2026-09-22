@@ -5,10 +5,13 @@
 //! lines in and out, which is what the README's acceptance items and
 //! `exec` use.
 
+pub mod cells;
 pub mod commands;
 pub mod composer;
 pub mod engine;
 pub mod keymap;
+pub mod markdown;
+pub mod pager;
 pub mod status;
 pub mod tui;
 
@@ -20,11 +23,14 @@ use crossterm::event::{Event, EventStream, KeyEventKind};
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
 
+use crate::app::cells::{Cell, ToolState, is_read_tool};
 use crate::app::composer::Composer;
 use crate::app::engine::{ClientRepl, Printer};
 use crate::app::keymap::{Action, KeyContext, action_for};
+use crate::app::pager::Pager;
 use crate::app::status::Status;
-use crate::app::tui::{Pane, Shell};
+use crate::app::tui::{Pane, Shell, wrap_line};
+use ratatui::text::Line;
 
 /// How often the status line's clock is redrawn while a turn runs.
 const TICK: Duration = Duration::from_millis(250);
@@ -69,30 +75,134 @@ impl Printer for Stdout {
     }
 }
 
-/// The shell's printer: finished lines to the scrollback, the tail kept
-/// for the next draw. Lines that arrive before the shell is up, or
-/// while a draw failed, are not lost: they wait in `pending`.
+/// How many cells the pager keeps.
+const TRANSCRIPT_KEEP: usize = 2000;
+
+/// The shell's printer. Finished cells go to the scrollback; what still
+/// changes (pending reads, a running tool, the assistant's unfinished
+/// line) stays in the viewport. Consecutive reads fold into one
+/// `Explored` cell, committed when something else arrives.
 struct ShellOut {
     shell: Shell,
+    /// Every committed cell, for the pager.
+    transcript: Vec<Cell>,
+    /// Committed lines the next draw flushes.
+    pending: Vec<Line<'static>>,
+    /// Reads not yet committed as one `Explored`.
+    explored: Vec<String>,
+    /// The running tool, if any.
+    running: Option<Cell>,
+    /// The assistant's text since its last newline.
     tail: String,
-    pending: Vec<String>,
+    /// Inside a code fence in the assistant's text.
+    fenced: bool,
+}
+
+impl ShellOut {
+    fn new(shell: Shell) -> Self {
+        Self {
+            shell,
+            transcript: Vec::new(),
+            pending: Vec::new(),
+            explored: Vec::new(),
+            running: None,
+            tail: String::new(),
+            fenced: false,
+        }
+    }
+
+    fn commit(&mut self, cell: Cell) {
+        let width = self.shell.width();
+        self.pending.extend(cell.styled(width));
+        self.transcript.push(cell);
+        if self.transcript.len() > TRANSCRIPT_KEEP {
+            self.transcript.remove(0);
+        }
+    }
+
+    fn flush_explored(&mut self) {
+        if !self.explored.is_empty() {
+            let entries = std::mem::take(&mut self.explored);
+            self.commit(Cell::Explored(entries));
+        }
+    }
+
+    fn flush(&mut self) -> anyhow::Result<()> {
+        for line in std::mem::take(&mut self.pending) {
+            self.shell.commit(line)?;
+        }
+        Ok(())
+    }
+
+    /// The viewport's changing part, wrapped to the width.
+    fn active_lines(&self) -> Vec<Line<'static>> {
+        let width = self.shell.width();
+        let mut lines = Vec::new();
+        if !self.explored.is_empty() {
+            lines.extend(Cell::Explored(self.explored.clone()).styled(width));
+        }
+        if let Some(cell) = &self.running {
+            lines.extend(cell.styled(width));
+        }
+        if !self.tail.is_empty() {
+            lines.extend(wrap_line(&markdown::line(&self.tail, self.fenced), width));
+        }
+        lines
+    }
 }
 
 impl Printer for ShellOut {
     fn line(&mut self, text: &str) {
-        self.pending.push(text.to_owned());
+        self.flush_explored();
+        self.commit(Cell::Note(text.to_owned()));
     }
+
     fn tail(&mut self, text: &str) {
         self.tail = text.to_owned();
     }
-}
 
-impl ShellOut {
-    fn flush(&mut self) -> anyhow::Result<()> {
-        for line in std::mem::take(&mut self.pending) {
-            self.shell.commit(&line)?;
+    fn cell(&mut self, cell: Cell, done: bool) {
+        match (&cell, done) {
+            (Cell::Assistant { text, .. }, _) => {
+                self.flush_explored();
+                let fence = markdown::is_fence(text);
+                let cell = Cell::Assistant {
+                    text: text.clone(),
+                    fenced: self.fenced,
+                };
+                self.commit(cell);
+                if fence {
+                    self.fenced = !self.fenced;
+                }
+            }
+            (Cell::Tool { name, .. }, false) => {
+                if !is_read_tool(name) {
+                    self.flush_explored();
+                }
+                self.running = Some(cell);
+            }
+            (
+                Cell::Tool {
+                    name,
+                    summary,
+                    state,
+                    ..
+                },
+                true,
+            ) => {
+                self.running = None;
+                if is_read_tool(name) && *state == ToolState::Ok {
+                    self.explored.push(format!("{name} {summary}"));
+                } else {
+                    self.flush_explored();
+                    self.commit(cell);
+                }
+            }
+            (_, _) => {
+                self.flush_explored();
+                self.commit(cell);
+            }
         }
-        Ok(())
     }
 }
 
@@ -105,11 +215,7 @@ async fn run_shell(
     history: PathBuf,
     project: String,
 ) -> anyhow::Result<()> {
-    let mut out = ShellOut {
-        shell: Shell::start()?,
-        tail: String::new(),
-        pending: Vec::new(),
-    };
+    let mut out = ShellOut::new(Shell::start()?);
     let mut composer = Composer::with_history(&history);
     let mut status = Status {
         project,
@@ -158,8 +264,9 @@ async fn run_shell(
             _ if engine.prompting() => Some("answer on the line: y / a / n, or the text".into()),
             _ => None,
         };
+        let active = out.active_lines();
         let pane = Pane {
-            tail: &out.tail,
+            active: &active,
             composer: &composer,
             status: &status.line(),
             hint: hint.as_deref(),
@@ -186,10 +293,7 @@ async fn run_shell(
                                 if let Some(text) = composer.take() {
                                     // The composer clears, so the message
                                     // itself goes to the transcript here.
-                                    for (i, line) in text.lines().enumerate() {
-                                        let prefix = if i == 0 { "> " } else { "  " };
-                                        out.line(&format!("{prefix}{line}"));
-                                    }
+                                    out.cell(Cell::User(text.clone()), true);
                                     if !text.starts_with('/') {
                                         last_sent =
                                             Some(text.trim_start_matches('!').trim().to_owned());
@@ -230,7 +334,33 @@ async fn run_shell(
                                 }
                             }
                             Action::Quit => break,
-                            Action::Transcript | Action::None => {}
+                            Action::Transcript => {
+                                let mut pager = Pager::new(&out.transcript);
+                                out.shell.alternate(|term| {
+                                    term.draw(|f| {
+                                        let area = f.area();
+                                        let rows = pager.view(area);
+                                        for (i, line) in rows.into_iter().enumerate() {
+                                            let y = area.y + i as u16;
+                                            if y >= area.bottom() {
+                                                break;
+                                            }
+                                            f.render_widget(
+                                                line,
+                                                ratatui::layout::Rect::new(area.x, y, area.width, 1),
+                                            );
+                                        }
+                                    })?;
+                                    let height = term.size()?.height as usize;
+                                    match crossterm::event::read()? {
+                                        Event::Key(k) if k.kind != KeyEventKind::Release => {
+                                            Ok(pager.key(k.code, height))
+                                        }
+                                        _ => Ok(false),
+                                    }
+                                })?;
+                            }
+                            Action::None => {}
                         }
                     }
                     Event::Paste(text) => composer.paste(&text),

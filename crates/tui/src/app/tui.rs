@@ -29,8 +29,9 @@ pub const VIEWPORT_ROWS: u16 = 10;
 
 /// What the bottom pane shows.
 pub struct Pane<'a> {
-    /// The assistant's text since its last newline.
-    pub tail: &'a str,
+    /// What is still changing: pending reads, a running tool, the
+    /// assistant's text since its last newline. Already wrapped.
+    pub active: &'a [Line<'static>],
     pub composer: &'a Composer,
     pub status: &'a str,
     /// A one-line hint shown above the composer (queued, Ctrl-C again).
@@ -89,10 +90,18 @@ impl Shell {
         println!();
     }
 
+    /// The terminal's width in columns.
+    pub fn width(&self) -> usize {
+        self.terminal
+            .size()
+            .map(|s| usize::from(s.width.max(1)))
+            .unwrap_or(80)
+    }
+
     /// Commit one finished line to the scrollback, wrapped to the width.
-    pub fn commit(&mut self, text: &str) -> anyhow::Result<()> {
-        let width = self.terminal.size()?.width.max(1);
-        let rows = wrap(text, width as usize);
+    pub fn commit(&mut self, line: Line<'static>) -> anyhow::Result<()> {
+        let width = self.width();
+        let rows = wrap_line(&line, width);
         let height = u16::try_from(rows.len().max(1)).unwrap_or(u16::MAX);
         self.terminal.insert_before(height, |buf| {
             for (i, row) in rows.iter().enumerate() {
@@ -100,10 +109,33 @@ impl Shell {
                 if y >= buf.area.bottom() {
                     break;
                 }
-                Line::raw(row.as_str()).render(Rect::new(buf.area.x, y, buf.area.width, 1), buf);
+                row.clone()
+                    .render(Rect::new(buf.area.x, y, buf.area.width, 1), buf);
             }
         })?;
         Ok(())
+    }
+
+    /// The pager, in the alternate screen, until `draw` says to leave.
+    /// The inline viewport is untouched underneath and comes back as
+    /// the terminal restores its main screen.
+    pub fn alternate<F>(&mut self, mut draw: F) -> anyhow::Result<()>
+    where
+        F: FnMut(&mut Terminal<CrosstermBackend<Stdout>>) -> anyhow::Result<bool>,
+    {
+        use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
+        let mut out = std::io::stdout();
+        crossterm::execute!(out, EnterAlternateScreen)?;
+        let mut full = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
+        let result = loop {
+            match draw(&mut full) {
+                Ok(true) => break Ok(()),
+                Ok(false) => {}
+                Err(e) => break Err(e),
+            }
+        };
+        let _ = crossterm::execute!(out, LeaveAlternateScreen);
+        result
     }
 
     /// Draw the bottom pane.
@@ -183,12 +215,11 @@ pub fn layout(pane: &Pane<'_>, area: Rect) -> (Vec<Line<'static>>, Option<(u16, 
     // Rows left for the tail after the composer, the hint and the status.
     let fixed = composer_rows.len() + usize::from(hint.is_some()) + 1;
     let tail_rows_avail = height.saturating_sub(fixed);
-    let tail_rows: Vec<Line<'static>> = if pane.tail.is_empty() || tail_rows_avail == 0 {
+    let skip = pane.active.len().saturating_sub(tail_rows_avail);
+    let tail_rows: Vec<Line<'static>> = if tail_rows_avail == 0 {
         Vec::new()
     } else {
-        let wrapped = wrap(pane.tail, width);
-        let skip = wrapped.len().saturating_sub(tail_rows_avail);
-        wrapped.into_iter().skip(skip).map(Line::raw).collect()
+        pane.active.iter().skip(skip).cloned().collect()
     };
 
     // Bottom-align: blank rows first.
@@ -232,9 +263,10 @@ fn fit(s: &str, width: usize) -> String {
     out
 }
 
-/// Wrap at the width by display columns; an empty text is one empty
-/// row. No word wrapping: a break falls where the column runs out,
-/// which keeps code and paths honest.
+/// Wrap plain text at the width by display columns; an empty text is
+/// one empty row. No word wrapping: a break falls where the column
+/// runs out, which keeps code and paths honest.
+#[cfg(test)]
 pub fn wrap(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut rows = Vec::new();
@@ -252,6 +284,35 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
         }
         rows.push(row);
     }
+    rows
+}
+
+/// Wrap a styled line at the width, keeping each span's style across
+/// the break. An empty line is one empty row.
+pub fn wrap_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    let mut current: Vec<Span<'static>> = Vec::new();
+    let mut w = 0;
+    for span in &line.spans {
+        let mut piece = String::new();
+        for c in span.content.chars() {
+            let cw = c.width().unwrap_or(0);
+            if w + cw > width && w > 0 {
+                if !piece.is_empty() {
+                    current.push(Span::styled(std::mem::take(&mut piece), span.style));
+                }
+                rows.push(Line::from(std::mem::take(&mut current)));
+                w = 0;
+            }
+            piece.push(c);
+            w += cw;
+        }
+        if !piece.is_empty() {
+            current.push(Span::styled(piece, span.style));
+        }
+    }
+    rows.push(Line::from(current));
     rows
 }
 
@@ -300,7 +361,7 @@ mod tests {
     fn the_pane_is_bottom_aligned_with_composer_then_status() {
         let composer = composer_with("hello");
         let pane = Pane {
-            tail: "",
+            active: &[],
             composer: &composer,
             status: "manual · p · context ?",
             hint: None,
@@ -317,8 +378,12 @@ mod tests {
     #[test]
     fn the_tail_wraps_above_the_composer_and_shows_its_last_rows() {
         let composer = composer_with("");
+        let active: Vec<Line<'static>> = wrap("abcdefghij1234567890xyz", 10)
+            .into_iter()
+            .map(Line::raw)
+            .collect();
         let pane = Pane {
-            tail: "abcdefghij1234567890xyz",
+            active: &active,
             composer: &composer,
             status: "s",
             hint: Some("queued 1 · ! sends now"),
@@ -339,7 +404,7 @@ mod tests {
         composer.insert_str("two");
         composer.up();
         let pane = Pane {
-            tail: "",
+            active: &[],
             composer: &composer,
             status: "s",
             hint: None,
@@ -348,6 +413,23 @@ mod tests {
         assert_eq!(rows[1], "> one");
         assert_eq!(rows[2], "  two");
         assert_eq!(cursor, Some((5, 1)));
+    }
+
+    #[test]
+    fn wrap_line_keeps_span_styles_across_the_break() {
+        let line = Line::from(vec![
+            Span::raw("abc"),
+            Span::styled("defgh", Style::default().fg(Color::Red)),
+        ]);
+        let rows = wrap_line(&line, 4);
+        assert_eq!(rows.len(), 2);
+        let texts: Vec<String> = rows
+            .iter()
+            .map(|r| r.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert_eq!(texts, vec!["abcd", "efgh"]);
+        assert_eq!(rows[1].spans[0].style.fg, Some(Color::Red));
+        assert_eq!(wrap_line(&Line::raw(""), 4).len(), 1);
     }
 
     #[test]
