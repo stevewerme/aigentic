@@ -50,6 +50,8 @@ pub enum Mail {
         call_id: String,
         allow: bool,
         session: bool,
+        prefix: Option<Vec<String>>,
+        reason: Option<String>,
         reply: oneshot::Sender<Response>,
     },
     Answer {
@@ -202,6 +204,10 @@ impl Shared {
                 *self.last_usage.lock().unwrap_or_else(|e| e.into_inner()) = Some(usage);
                 self.push_usage();
             }
+            Signal::Note(text) => self.broadcast(Notice::Note {
+                thread: self.thread,
+                text,
+            }),
             Signal::TextDelta(text) => self.broadcast(Notice::TextDelta {
                 thread: self.thread,
                 text: text.to_owned(),
@@ -589,10 +595,21 @@ impl ThreadActor {
                 call_id,
                 allow,
                 session,
+                prefix,
+                reason,
                 reply,
             } => {
                 let _ = reply.send(
-                    match decisions.decide(&call_id, Answered::Permission { allow, session, by }) {
+                    match decisions.decide(
+                        &call_id,
+                        Answered::Permission {
+                            allow,
+                            session,
+                            by,
+                            prefix,
+                            reason,
+                        },
+                    ) {
                         Ok(()) => Response::Ok,
                         Err(e) => Response::Refused {
                             reason: e.to_string(),

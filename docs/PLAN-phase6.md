@@ -1,6 +1,6 @@
 # Phase 6 plan
 
-Status: grilled and settled on 2026-09-22 (18 questions, section 11 records the answers); steps 1 to 6 landed the same day · Follows `docs/PRD.md` (the Terminal application and Projects sections) and the phase 0 to 5 plans · Renumbers the PRD's build order: the client is phase 6, sandboxing phase 7, the orchestrator phase 8; multiplayer acceptance (phase 5 step 11) waits behind all three
+Status: grilled and settled on 2026-09-22 (18 questions, section 11 records the answers); steps 1 to 7 landed the same day · Follows `docs/PRD.md` (the Terminal application and Projects sections) and the phase 0 to 5 plans · Renumbers the PRD's build order: the client is phase 6, sandboxing phase 7, the orchestrator phase 8; multiplayer acceptance (phase 5 step 11) waits behind all three
 
 ## 0. Goal and done-when
 

@@ -316,6 +316,8 @@ async fn roles_are_checked_before_the_log_and_thread_started_comes_first() {
             call_id: "c".into(),
             allow: true,
             session: false,
+            prefix: None,
+            reason: None,
         })
         .await
         .unwrap();
@@ -425,6 +427,8 @@ async fn two_sessions_see_every_notice_in_order_and_a_reconnect_catches_up() {
                 call_id: "c1".into(),
                 allow: false,
                 session: false,
+                prefix: None,
+                reason: None,
             })
             .await
             .unwrap(),
@@ -521,6 +525,8 @@ async fn idle_threads_unload_but_never_while_awaiting_approval() {
             call_id: "c1".into(),
             allow: true,
             session: false,
+            prefix: None,
+            reason: None,
         })
         .await
         .unwrap();

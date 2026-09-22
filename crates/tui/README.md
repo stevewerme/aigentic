@@ -87,7 +87,16 @@ interrupts it (nothing is posted; `!text` interrupts and posts) and Enter
 queues the message for the next turn. Idle, Ctrl-C or Esc clears the draft;
 on an empty composer a second Ctrl-C within a second quits and a second Esc
 recalls the last message sent, as Alt-Up does at any time. Ctrl-D quits.
-`/keys` prints the table. Replies render light markdown (bold, inline code,
+`/keys` prints the table. A permission request is a block above the
+composer, which keeps its draft: `y` once, `a` this session, `p` allow this
+command's leading words from now on (written to the project's
+`.aigentic/rules.toml`, or `rules.toml` beside `config.toml` when there is no
+project file; the file is plain TOML you can edit), `n` deny, `Esc` then a
+typed reason, which the model reads in the result as `denied by <you>:
+<reason>`. On a pipe the same answers are lines: `y`, `a`, `p`, `n`, or
+`n <reason>`. The default allow list covers the build, test, format and lint
+commands, read-only git, and the read-only coreutils. Replies render light
+markdown (bold, inline code,
 fenced blocks, bullets); a tool call is a bullet line with the command or
 path, its output under it cut to the first three and last two lines with
 `… +N lines`, and consecutive reads fold into one `Explored` line. An edit

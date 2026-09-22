@@ -130,6 +130,13 @@ pub async fn build_thread(
     };
 
     let skill_paths = SkillPaths::new(&root.root, config_dir, config.bundled_dir.as_deref());
+    // `p` answers land in the project's rules file, or the personal one
+    // when the root has no project file.
+    let rules_file = if opened.is_some() {
+        root.root.join(".aigentic").join("rules.toml")
+    } else {
+        config_dir.join("rules.toml")
+    };
     let mut available = tools.names();
     available.extend(aigentic_runtime::harness_tools::harness_names());
     let available = layers.allowed_tools(&available);
@@ -142,7 +149,11 @@ pub async fn build_thread(
     let mut runtime = Runtime::new(provider, tools, log, AgentId("assistant".into()))
         .with_layers(layers)
         .with_model_label(&model)
-        .with_policy(file.policy().with_root(&root.root, &root.root))
+        .with_policy(
+            file.policy()
+                .with_root(&root.root, &root.root)
+                .with_rules_file(&rules_file),
+        )
         .with_skills(skills);
     if let Some(p) = profile {
         runtime = runtime

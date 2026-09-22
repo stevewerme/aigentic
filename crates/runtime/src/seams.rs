@@ -140,6 +140,8 @@ impl Runtime {
             }));
         }
 
+        let mut prefix_to_allow: Option<Vec<String>> = None;
+        let mut human_reason: Option<String> = None;
         let (allow, scope, author, reason) = match self.decisions.clone() {
             Some(decisions) => {
                 let pending = Pending::Permission {
@@ -155,12 +157,19 @@ impl Runtime {
                         (false, DecisionScope::Once, by, Some(crate::runtime::INTERRUPTED.to_owned()))
                     }
                     decided = rx => match decided {
-                        Ok(Answered::Permission { allow, session, by }) => (
-                            allow,
-                            if session { DecisionScope::Session } else { DecisionScope::Once },
-                            by,
-                            None,
-                        ),
+                        Ok(Answered::Permission { allow, session, by, prefix, reason }) => {
+                            if allow {
+                                prefix_to_allow = prefix;
+                            } else {
+                                human_reason = reason.filter(|r| !r.trim().is_empty());
+                            }
+                            (
+                                allow,
+                                if session { DecisionScope::Session } else { DecisionScope::Once },
+                                by,
+                                None,
+                            )
+                        }
                         // The table dropped the sender: treat as a deny by nobody.
                         Ok(Answered::Human { .. }) | Err(_) => (false, DecisionScope::Once, Author::System, None),
                     },
@@ -184,10 +193,19 @@ impl Runtime {
             scope,
             author.clone(),
             Some(requested.id),
-            reason,
+            reason.or_else(|| human_reason.clone()),
             observe,
         )?;
         let who = author_name(&author);
+        // `p`: the prefix joins the allow list now and in the rules file.
+        if allow && let Some(prefix) = prefix_to_allow {
+            let pattern = prefix.join(" ");
+            if let Err(e) = self.policy.allow_prefix(&pattern) {
+                observe(Signal::Note(format!(
+                    "could not write the rules file for `{pattern}`: {e}"
+                )));
+            }
+        }
         if scope == DecisionScope::Session && allow {
             self.session_grants.push(SessionGrant {
                 tool: call.name.clone(),
@@ -202,6 +220,11 @@ impl Runtime {
         };
         Ok(if allow {
             Verdict::Run(record)
+        } else if let Some(why) = human_reason {
+            Verdict::RefuseWith {
+                record,
+                text: format!("denied by {who}: {why}"),
+            }
         } else if interrupted {
             Verdict::RefuseWith {
                 record,

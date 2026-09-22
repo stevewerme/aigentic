@@ -36,6 +36,9 @@ pub struct Pane<'a> {
     pub status: &'a str,
     /// A one-line hint shown above the composer (queued, Ctrl-C again).
     pub hint: Option<&'a str>,
+    /// The prompt block (a permission request, a question), above the
+    /// hint. Already wrapped.
+    pub block: &'a [Line<'static>],
 }
 
 /// The shell over a real terminal.
@@ -213,7 +216,7 @@ pub fn layout(pane: &Pane<'_>, area: Rect) -> (Vec<Line<'static>>, Option<(u16, 
     });
 
     // Rows left for the tail after the composer, the hint and the status.
-    let fixed = composer_rows.len() + usize::from(hint.is_some()) + 1;
+    let fixed = composer_rows.len() + usize::from(hint.is_some()) + 1 + pane.block.len();
     let tail_rows_avail = height.saturating_sub(fixed);
     let skip = pane.active.len().saturating_sub(tail_rows_avail);
     let tail_rows: Vec<Line<'static>> = if tail_rows_avail == 0 {
@@ -229,6 +232,7 @@ pub fn layout(pane: &Pane<'_>, area: Rect) -> (Vec<Line<'static>>, Option<(u16, 
         rows.push(Line::raw(""));
     }
     rows.extend(tail_rows);
+    rows.extend(pane.block.iter().cloned());
     let composer_top = rows.len();
     if let Some(h) = hint {
         rows.push(h);
@@ -365,6 +369,7 @@ mod tests {
             composer: &composer,
             status: "manual · p · context ?",
             hint: None,
+            block: &[],
         };
         let (rows, cursor) = render(&pane, 40, 5);
         assert_eq!(rows[0], "");
@@ -387,6 +392,7 @@ mod tests {
             composer: &composer,
             status: "s",
             hint: Some("queued 1 · ! sends now"),
+            block: &[],
         };
         // 4 rows: one tail row fits above hint, composer and status.
         let (rows, cursor) = render(&pane, 10, 4);
@@ -408,6 +414,7 @@ mod tests {
             composer: &composer,
             status: "s",
             hint: None,
+            block: &[],
         };
         let (rows, cursor) = render(&pane, 20, 4);
         assert_eq!(rows[1], "> one");

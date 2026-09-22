@@ -228,6 +228,8 @@ async fn a_decision_from_an_approver_resumes_the_turn_with_their_author() {
                 allow: true,
                 session: true,
                 by: magnus(),
+                prefix: None,
+                reason: None,
             }
         })
         .await;
@@ -238,7 +240,9 @@ async fn a_decision_from_an_approver_resumes_the_turn_with_their_author() {
                 Answered::Permission {
                     allow: false,
                     session: false,
-                    by: magnus()
+                    by: magnus(),
+                    prefix: None,
+                    reason: None,
                 }
             ),
             Err(DecisionError::AlreadyDecided("c1".into()))
@@ -469,7 +473,9 @@ async fn an_interrupt_while_awaiting_approval_denies_with_the_interrupter() {
             Answered::Permission {
                 allow: true,
                 session: false,
-                by: magnus()
+                by: magnus(),
+                prefix: None,
+                reason: None,
             }
         ),
         Err(DecisionError::AlreadyDecided("c1".into()))

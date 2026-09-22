@@ -159,10 +159,17 @@ pub fn default_bash_allow() -> Vec<String> {
         "cargo clippy",
         "cargo check",
         "cargo run",
+        "cargo doc",
+        "cargo tree",
+        "cargo metadata",
         "git status",
         "git diff",
         "git log",
         "git show",
+        "git branch",
+        "git ls-files",
+        "git rev-parse",
+        "git blame",
         "ls",
         "pwd",
         "cat",
@@ -172,9 +179,118 @@ pub fn default_bash_allow() -> Vec<String> {
         "rg",
         "find",
         "wc",
+        "which",
+        "sort",
+        "uniq",
+        "diff",
+        "stat",
+        "du",
+        "tree",
         "echo",
     ]
     .into_iter()
     .map(str::to_owned)
     .collect()
+}
+
+/// The words of `command` a person is asked to allow "from now on": the
+/// command and its bare words (subcommands, flags) up to the first that
+/// looks like a value (a path, a URL, a number, a quote, an assignment).
+/// `curl -s https://x` gives `curl -s`; `cargo test --workspace` gives
+/// all three. Empty for a compound command.
+pub fn prefix_of(command: &str) -> Vec<String> {
+    if crate::COMPOUND_MARKERS.iter().any(|m| command.contains(m)) {
+        return Vec::new();
+    }
+    let looks_like_value = |w: &str| {
+        w.contains('/')
+            || w.contains('.')
+            || w.contains(':')
+            || w.contains('=')
+            || w.contains('"')
+            || w.contains('\'')
+            || w.chars().all(|c| c.is_ascii_digit())
+    };
+    let mut out = Vec::new();
+    for (i, w) in command.split_whitespace().enumerate() {
+        if i > 0 && looks_like_value(w) {
+            break;
+        }
+        out.push(w.to_owned());
+    }
+    out
+}
+
+/// `allow = ["curl -s", "gh pr"]` in the rules file; missing or unreadable
+/// is empty.
+pub fn load_rules_file(path: &std::path::Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(value) = text.parse::<toml::Table>() else {
+        return Vec::new();
+    };
+    value
+        .get("allow")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Append one pattern to the file's `allow` list, creating the file and
+/// its directory.
+pub fn append_rules_file(path: &std::path::Path, pattern: &str) -> std::io::Result<()> {
+    let mut allow = load_rules_file(path);
+    if !allow.contains(&pattern.to_owned()) {
+        allow.push(pattern.to_owned());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut table = toml::Table::new();
+    table.insert(
+        "allow".into(),
+        toml::Value::Array(allow.into_iter().map(toml::Value::String).collect()),
+    );
+    std::fs::write(
+        path,
+        format!(
+            "# Commands allowed without asking, by leading words (`p` in the client).\n{}",
+            toml::to_string(&table).expect("serialisable")
+        ),
+    )
+}
+
+#[cfg(test)]
+mod prefix_tests {
+    use super::*;
+
+    #[test]
+    fn prefixes_stop_at_the_first_value() {
+        assert_eq!(prefix_of("curl -s https://example.com"), vec!["curl", "-s"]);
+        assert_eq!(
+            prefix_of("cargo test --workspace"),
+            vec!["cargo", "test", "--workspace"]
+        );
+        assert_eq!(prefix_of("git log -n 5"), vec!["git", "log", "-n"]);
+        assert_eq!(prefix_of("./run.sh now"), vec!["./run.sh", "now"]);
+        assert!(prefix_of("ls | wc -l").is_empty());
+    }
+
+    #[test]
+    fn the_rules_file_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".aigentic/rules.toml");
+        assert!(load_rules_file(&path).is_empty());
+        append_rules_file(&path, "curl -s").unwrap();
+        append_rules_file(&path, "gh pr").unwrap();
+        append_rules_file(&path, "curl -s").unwrap();
+        assert_eq!(load_rules_file(&path), vec!["curl -s", "gh pr"]);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("# Commands allowed"), "{text}");
+    }
 }

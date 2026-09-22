@@ -39,6 +39,10 @@ pub enum Answered {
         /// A standing grant for identical calls this session.
         session: bool,
         by: Author,
+        /// With `allow`: a command prefix to allow from now on.
+        prefix: Option<Vec<String>>,
+        /// With a deny: why, for the model.
+        reason: Option<String>,
     },
     Human {
         text: String,
@@ -320,6 +324,8 @@ mod tests {
                 allow: true,
                 session: false,
                 by: magnus(),
+                prefix: None,
+                reason: None,
             },
         )
         .unwrap();
@@ -330,7 +336,9 @@ mod tests {
                 Answered::Permission {
                     allow: false,
                     session: false,
-                    by: magnus()
+                    by: magnus(),
+                    prefix: None,
+                    reason: None,
                 }
             ),
             Err(DecisionError::AlreadyDecided("c1".into()))
@@ -340,7 +348,9 @@ mod tests {
             Answered::Permission {
                 allow: true,
                 session: false,
-                by: magnus()
+                by: magnus(),
+                prefix: None,
+                reason: None,
             }
         );
         // Withdrawn: a late answer is AlreadyDecided too.

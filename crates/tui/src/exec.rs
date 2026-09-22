@@ -30,6 +30,10 @@ pub const EXIT_INTERRUPTED: i32 = 130;
 /// The answer to an `ask_human` question when nobody is there.
 pub const NO_HUMAN: &str = "No human is available: this is a non-interactive run (aigentic exec). Continue without an answer, or stop and say what you needed.";
 
+/// Why a permission request is denied here, told to the model.
+pub const NON_INTERACTIVE: &str =
+    "this is a non-interactive run (aigentic exec) and nobody can approve";
+
 /// How many result lines the progress on stderr shows per tool call.
 const RESULT_LINES: usize = 3;
 
@@ -257,6 +261,8 @@ impl Follow {
                             call_id,
                             allow: false,
                             session: false,
+                            prefix: None,
+                            reason: Some(NON_INTERACTIVE.into()),
                         })
                         .await?;
                 }
@@ -274,6 +280,10 @@ impl Follow {
                         .await?;
                 }
             },
+            Notice::Note { text, .. } => {
+                self.end_line(err)?;
+                writeln!(err, "[{text}]")?;
+            }
             Notice::Mode { .. } | Notice::Usage { .. } => {}
         }
         Ok(false)

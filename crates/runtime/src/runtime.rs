@@ -383,6 +383,9 @@ pub enum Signal<'a> {
     /// After every model call: the window fill, for a status line
     /// (phase 6). The daemon computes it; a client never counts.
     Usage(WindowUsage),
+    /// A remark for the person that is not an event (a rules file that
+    /// could not be written).
+    Note(String),
     /// The turn parked on a decision (phase 5); a client shows what is
     /// waited for.
     Waiting(&'a Pending),

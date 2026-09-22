@@ -193,6 +193,8 @@ impl Rig {
                 call_id: call_id.into(),
                 allow,
                 session: false,
+                prefix: None,
+                reason: None,
                 reply,
             })
             .unwrap();

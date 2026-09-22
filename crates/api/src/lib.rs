@@ -110,6 +110,13 @@ pub enum Request {
         allow: bool,
         #[serde(default)]
         session: bool,
+        /// With `allow`: also allow commands starting with these words
+        /// from now on, written to the project's rules file (step 7).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prefix: Option<Vec<String>>,
+        /// With a deny: why, told to the model in the result.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     AnswerHuman {
         thread: Ulid,
@@ -233,6 +240,12 @@ pub enum Notice {
         window: u64,
         turn_elapsed_ms: Option<u64>,
         queued: u32,
+    },
+    /// A remark for the person that is not an event (a rules file that
+    /// could not be written).
+    Note {
+        thread: Ulid,
+        text: String,
     },
 }
 
@@ -374,6 +387,8 @@ mod tests {
                 call_id: "c1".into(),
                 allow: true,
                 session: true,
+                prefix: None,
+                reason: None,
             },
             Request::AnswerHuman {
                 thread: thread(),

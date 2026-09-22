@@ -27,6 +27,55 @@ use ulid::Ulid;
 use crate::app::cells::{Cell, ToolState, summarise_args};
 use crate::app::commands::{Command, HELP, parse_line, truncate_for_display};
 
+/// What the thread waits on from this user, for a shell to draw as a
+/// block above the composer and a pipe to print as lines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromptBlock {
+    Permission {
+        tool: String,
+        class: &'static str,
+        reason: String,
+        /// The command or path, one line.
+        summary: String,
+        /// The words `p` allows from now on (bash only).
+        prefix: Option<Vec<String>>,
+    },
+    Question {
+        question: String,
+    },
+}
+
+impl PromptBlock {
+    /// Plain lines, for a pipe.
+    pub fn plain(&self) -> Vec<String> {
+        match self {
+            PromptBlock::Permission {
+                tool,
+                class,
+                reason,
+                summary,
+                prefix,
+            } => {
+                let mut lines = vec![
+                    format!("[permission] {tool} (class {class}): {reason}"),
+                    format!("  {summary}"),
+                ];
+                let p = match prefix {
+                    Some(p) => format!(" / p allow `{}` from now on", p.join(" ")),
+                    None => String::new(),
+                };
+                lines.push(format!(
+                    "  allow? y once / a always this session{p} / n no / n <reason> no, and why"
+                ));
+                lines
+            }
+            PromptBlock::Question { question } => {
+                vec![format!("[question] {question}"), "  type the answer".into()]
+            }
+        }
+    }
+}
+
 /// Where rendered lines go.
 pub trait Printer {
     /// A finished line: committed, never redrawn.
@@ -37,6 +86,13 @@ pub trait Printer {
     /// A cell; `done` false means it still changes (a running tool). The
     /// default prints its head while running and the whole cell when
     /// done, which is what a pipe wants.
+    /// The thread waits on this user: a shell draws a block, a pipe
+    /// prints the lines.
+    fn prompt(&mut self, block: &PromptBlock) {
+        for l in block.plain() {
+            self.line(&l);
+        }
+    }
     /// A long text to page through (`/diff`); a pipe prints it.
     fn pager(&mut self, _title: &str, text: &str) {
         for l in text.lines() {
@@ -84,6 +140,8 @@ pub struct ClientRepl {
     /// The call id of the request or question this client prompted for
     /// and has not answered: a decision from elsewhere withdraws it.
     prompted: Option<String>,
+    /// What the prompt is about, while `prompted`.
+    block: Option<PromptBlock>,
     quit: bool,
     /// The last `Notice::Usage`: window fill and window, for the
     /// status line (phase 6 step 3); kept, not yet shown.
@@ -113,6 +171,7 @@ impl ClientRepl {
             mode,
             partial: String::new(),
             prompted: None,
+            block: None,
             usage: None,
             awaiting_turn: false,
             quit: false,
@@ -231,23 +290,24 @@ impl ClientRepl {
             ThreadState::AwaitingApproval { call_id, .. }
                 if self.prompted.as_deref() == Some(call_id) =>
             {
-                let answer = match line.trim().to_ascii_lowercase().as_str() {
-                    "y" | "yes" => Some((true, false)),
-                    "a" | "always" => Some((true, true)),
-                    "n" | "no" => Some((false, false)),
+                let trimmed = line.trim();
+                let (head, rest) = trimmed
+                    .split_once(char::is_whitespace)
+                    .map_or((trimmed, ""), |(h, r)| (h, r.trim()));
+                let prefix = match &self.block {
+                    Some(PromptBlock::Permission { prefix, .. }) => prefix.clone(),
                     _ => None,
                 };
-                if let Some((allow, session)) = answer {
-                    let call_id = call_id.clone();
-                    let r = self
-                        .request(Request::Decide {
-                            thread: self.thread,
-                            call_id,
-                            allow,
-                            session,
-                        })
-                        .await;
-                    self.answered(r, out);
+                let answer = match head.to_ascii_lowercase().as_str() {
+                    "y" | "yes" => Some((true, false, None, None)),
+                    "a" | "always" => Some((true, true, None, None)),
+                    "p" => Some((true, prefix.is_none(), prefix, None)),
+                    "n" | "no" if rest.is_empty() => Some((false, false, None, None)),
+                    "n" | "no" => Some((false, false, None, Some(rest.to_owned()))),
+                    _ => None,
+                };
+                if let Some((allow, session, prefix, reason)) = answer {
+                    self.decide(allow, session, prefix, reason, out).await;
                     return;
                 }
             }
@@ -394,6 +454,37 @@ impl ClientRepl {
         self.show(r, ok, out);
     }
 
+    /// Answer the permission request this client prompted for. `p` sends
+    /// a prefix (allow from now on), `Esc` a reason with the deny.
+    pub async fn decide(
+        &mut self,
+        allow: bool,
+        session: bool,
+        prefix: Option<Vec<String>>,
+        reason: Option<String>,
+        out: &mut dyn Printer,
+    ) {
+        let Some(call_id) = self.prompted.clone() else {
+            return;
+        };
+        let r = self
+            .request(Request::Decide {
+                thread: self.thread,
+                call_id,
+                allow,
+                session,
+                prefix,
+                reason,
+            })
+            .await;
+        self.answered(r, out);
+    }
+
+    /// The block the shell draws while this client is prompted.
+    pub fn prompt_block(&self) -> Option<&PromptBlock> {
+        self.prompted.as_ref().and(self.block.as_ref())
+    }
+
     /// Ctrl-C or Esc while a turn runs: cancel it, post nothing.
     pub async fn interrupt(&mut self, out: &mut dyn Printer) {
         let r = self
@@ -409,9 +500,13 @@ impl ClientRepl {
     /// says why, and a race lost to another connection reads as such.
     fn answered(&mut self, response: Response, out: &mut dyn Printer) {
         match response {
-            Response::Ok => self.prompted = None,
+            Response::Ok => {
+                self.prompted = None;
+                self.block = None;
+            }
             Response::Refused { reason } if reason.contains("already decided") => {
                 self.prompted = None;
+                self.block = None;
                 out.line(&format!("[{reason}; someone else was first]"));
             }
             other => self.show(other, "", out),
@@ -458,11 +553,6 @@ impl ClientRepl {
 
     pub fn quit_requested(&self) -> bool {
         self.quit
-    }
-
-    /// The thread waits on a request this client may answer.
-    pub fn prompting(&self) -> bool {
-        self.prompted.is_some()
     }
 
     /// One notice to lines. Streamed text is printed as its lines
@@ -516,6 +606,10 @@ impl ClientRepl {
                 window,
                 ..
             } => self.usage = Some((tokens_in_window, window)),
+            Notice::Note { text, .. } => {
+                self.flush_partial(out);
+                out.line(&format!("[{text}]"));
+            }
         }
     }
 
@@ -531,16 +625,24 @@ impl ClientRepl {
                 reason,
             } => {
                 if self.may_approve() {
-                    out.line(&format!(
-                        "[permission] {} (class {}): {reason}",
-                        call.name,
-                        class_name(*class)
-                    ));
-                    out.line(&format!(
-                        "  {}",
-                        truncate_for_display(&call.args.to_string(), 6, 600)
-                    ));
-                    out.line("  allow? y once / a always this session / n no");
+                    let prefix = (call.name == "bash")
+                        .then(|| {
+                            call.args
+                                .get("command")
+                                .and_then(|c| c.as_str())
+                                .map(aigentic_runtime::aigentic_policy::prefix_of)
+                        })
+                        .flatten()
+                        .filter(|p| !p.is_empty());
+                    let block = PromptBlock::Permission {
+                        tool: call.name.clone(),
+                        class: class_name(*class),
+                        reason: reason.clone(),
+                        summary: truncate_for_display(&summarise_args(call), 1, 600),
+                        prefix,
+                    };
+                    out.prompt(&block);
+                    self.block = Some(block);
                     self.prompted = Some(call_id.clone());
                 } else {
                     out.line(&format!(
@@ -551,8 +653,11 @@ impl ClientRepl {
             }
             ThreadState::AwaitingHuman { call_id, question } => {
                 if self.may_write() {
-                    out.line(&format!("[question] {question}"));
-                    out.line("  type the answer");
+                    let block = PromptBlock::Question {
+                        question: question.clone(),
+                    };
+                    out.prompt(&block);
+                    self.block = Some(block);
                     self.prompted = Some(call_id.clone());
                 } else {
                     out.line(&format!("[waiting for an answer: {question}]"));
@@ -565,6 +670,7 @@ impl ClientRepl {
                 if self.prompted.take().is_some() {
                     out.line("[answered elsewhere]");
                 }
+                self.block = None;
             }
         }
     }
@@ -1170,10 +1276,10 @@ mod tests {
         let question = at("[question] which colour?");
         assert_eq!(lines[question + 1], "  type the answer");
         let permission = at("[permission] bash (class exec): class exec: anything else in a shell");
-        assert_eq!(lines[permission + 1], "  {\"command\":\"rm -rf x\"}");
+        assert_eq!(lines[permission + 1], "  rm -rf x");
         assert_eq!(
             lines[permission + 2],
-            "  allow? y once / a always this session / n no"
+            "  allow? y once / a always this session / p allow `rm -rf x` from now on / n no / n <reason> no, and why"
         );
         let denied = at("  [denied by steve]");
         assert!(question < permission && permission < denied, "{lines:#?}");
@@ -1507,6 +1613,8 @@ mod tests {
                     call_id: "b1".into(),
                     allow: true,
                     session: false,
+                    prefix: None,
+                    reason: None,
                 })
                 .await
                 .unwrap();
@@ -1529,10 +1637,10 @@ mod tests {
         let at = |needle: &str| {
             lines
                 .iter()
-                .position(|l| l == needle)
+                .position(|l| l.starts_with(needle))
                 .unwrap_or_else(|| panic!("no line {needle:?} in {lines:#?}"))
         };
-        let prompt = at("  allow? y once / a always this session / n no");
+        let prompt = at("  allow? y once / a always this session");
         let withdrawn = at("[decided by magnus]");
         let allowed = at("  [allowed by magnus]");
         assert!(prompt < withdrawn && withdrawn + 1 == allowed, "{lines:#?}");
@@ -1563,5 +1671,92 @@ mod tests {
         );
         assert!(lines.contains(&"steve: go".to_owned()), "{lines:#?}");
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn p_allows_the_prefix_from_now_on_and_n_with_a_reason_tells_the_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = project(dir.path(), "proj", "");
+        let cfg_dir = dir.path().join("cfg");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        let curl = || {
+            call(
+                "c",
+                "bash",
+                serde_json::json!({"command": "curl -s https://example.com"}),
+            )
+        };
+        let script = vec![
+            // Turn 1: curl asks; `p` allows curl -s from now on.
+            vec![curl(), tool_use()],
+            vec![text("fetched"), done()],
+            // Turn 2: the same call runs without asking.
+            vec![curl(), tool_use()],
+            vec![text("fetched again"), done()],
+            // Turn 3: a different command asks; `n why` denies with a reason.
+            vec![
+                call("d", "bash", serde_json::json!({"command": "rm -rf build"})),
+                tool_use(),
+            ],
+            vec![text("ok"), done()],
+        ];
+        let embedded = Server::embed_with(
+            config(dir.path()),
+            cfg_dir.clone(),
+            root.clone(),
+            "steve",
+            None,
+            Factory::scripted(script),
+            Arc::new(DefaultReports {
+                global_instructions: cfg_dir.join("instructions.md"),
+            }),
+        )
+        .await
+        .unwrap();
+        let (client, welcome) =
+            Client::connect(&Addr::Unix(embedded.socket.clone()), &embedded.token)
+                .await
+                .unwrap();
+        let role = welcome.projects[0].role.clone();
+        let (thread, state, mode) = open(&client, "proj", None).await;
+        let notices = client.take_notices().unwrap();
+        let mut repl = ClientRepl::new(client, thread, "steve", role, state, mode);
+        let (tx, rx) = mpsc::unbounded_channel();
+        let feeder = async move {
+            let pause = || tokio::time::sleep(std::time::Duration::from_millis(400));
+            tx.send("one".into()).unwrap();
+            pause().await;
+            tx.send("p".into()).unwrap();
+            pause().await;
+            tx.send("two".into()).unwrap();
+            pause().await;
+            tx.send("three".into()).unwrap();
+            pause().await;
+            tx.send("n the build directory is shared".into()).unwrap();
+            pause().await;
+            tx.send("/quit".into()).unwrap();
+        };
+        let mut out = Lines::default();
+        let ((), ()) = tokio::join!(repl.run(rx, notices, &mut out), feeder);
+        let lines = out.0;
+        let asks = lines
+            .iter()
+            .filter(|l| l.starts_with("[permission] bash"))
+            .count();
+        assert_eq!(asks, 2, "curl asked once, rm once: {lines:#?}");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("p allow `curl -s` from now on")),
+            "{lines:#?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("denied by steve: the build directory is shared")),
+            "{lines:#?}"
+        );
+        let rules = std::fs::read_to_string(root.join(".aigentic/rules.toml")).unwrap();
+        assert!(rules.contains("\"curl -s\""), "{rules}");
     }
 }

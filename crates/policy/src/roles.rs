@@ -246,6 +246,8 @@ mod tests {
                     call_id: "c".into(),
                     allow: true,
                     session: false,
+                    prefix: None,
+                    reason: None,
                 },
                 Some(Role::Approve),
             ),
@@ -278,6 +280,8 @@ mod tests {
             call_id: "c".into(),
             allow: false,
             session: false,
+            prefix: None,
+            reason: None,
         };
         assert!(may(
             "r",

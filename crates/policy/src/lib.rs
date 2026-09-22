@@ -13,7 +13,9 @@ use aigentic_core::{RiskClass, ToolCall};
 use serde::{Deserialize, Serialize};
 
 pub use roles::{Participants, Role, needs};
-pub use rules::{Decision, MEMORY_PREFIX, MEMORY_REASON, Rule, default_bash_allow, default_rules};
+pub use rules::{
+    Decision, MEMORY_PREFIX, MEMORY_REASON, Rule, default_bash_allow, default_rules, prefix_of,
+};
 
 /// Shell operators that make a command compound. A compound command never
 /// matches an allow pattern; the check is syntactic and conservative.
@@ -46,6 +48,13 @@ pub struct Policy {
     pub root: Option<PathBuf>,
     #[serde(skip)]
     pub cwd: Option<PathBuf>,
+    /// Patterns a person allowed "from now on" (phase 6 step 7), kept
+    /// apart from `bash_allow` so a project's replacement list does not
+    /// drop them. Loaded from and appended to `rules_file`.
+    #[serde(skip)]
+    pub allowed_prefixes: Vec<String>,
+    #[serde(skip)]
+    pub rules_file: Option<PathBuf>,
 }
 
 impl Default for Policy {
@@ -62,6 +71,37 @@ impl Policy {
             bash_allow: default_bash_allow(),
             root: None,
             cwd: None,
+            allowed_prefixes: Vec::new(),
+            rules_file: None,
+        }
+    }
+
+    /// The rules file: `.aigentic/rules.toml` in a project, else the
+    /// config directory's. Its `allow` patterns join the allow list;
+    /// `allow_prefix` appends there.
+    pub fn with_rules_file(mut self, path: &Path) -> Self {
+        self.allowed_prefixes = rules::load_rules_file(path);
+        self.rules_file = Some(path.to_path_buf());
+        self
+    }
+
+    /// Allow `pattern` (words a command must start with) from now on:
+    /// in memory, and in the rules file when there is one. Returns where
+    /// it was written.
+    pub fn allow_prefix(&mut self, pattern: &str) -> std::io::Result<Option<PathBuf>> {
+        let pattern = pattern.split_whitespace().collect::<Vec<_>>().join(" ");
+        if pattern.is_empty() {
+            return Ok(None);
+        }
+        if !self.allowed_prefixes.contains(&pattern) {
+            self.allowed_prefixes.push(pattern.clone());
+        }
+        match &self.rules_file {
+            Some(path) => {
+                rules::append_rules_file(path, &pattern)?;
+                Ok(Some(path.clone()))
+            }
+            None => Ok(None),
         }
     }
 
@@ -168,6 +208,7 @@ impl Policy {
         let command = call.args.get("command")?.as_str()?;
         self.bash_allow
             .iter()
+            .chain(self.allowed_prefixes.iter())
             .find(|p| command_matches(command, p))
             .map(String::as_str)
     }
@@ -375,6 +416,8 @@ mod tests {
         let p = Policy {
             rules: vec![],
             bash_allow: vec![],
+            allowed_prefixes: vec![],
+            rules_file: None,
             root: None,
             cwd: None,
         };

@@ -320,6 +320,8 @@ async fn handle(
             call_id,
             allow,
             session,
+            prefix,
+            reason,
         } => {
             let by = author.clone();
             ask_actor(threads, open, thread, |reply| Mail::Decide {
@@ -327,6 +329,8 @@ async fn handle(
                 call_id,
                 allow,
                 session,
+                prefix,
+                reason,
                 reply,
             })
             .await

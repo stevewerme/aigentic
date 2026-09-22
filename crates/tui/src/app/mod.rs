@@ -26,12 +26,13 @@ use tokio::sync::mpsc;
 
 use crate::app::cells::{Cell, ToolState, is_read_tool};
 use crate::app::composer::Composer;
-use crate::app::engine::{ClientRepl, Printer};
+use crate::app::engine::{ClientRepl, Printer, PromptBlock};
 use crate::app::keymap::{Action, KeyContext, action_for};
 use crate::app::pager::Pager;
 use crate::app::status::Status;
 use crate::app::tui::{Pane, Shell, wrap_line};
-use ratatui::text::Line;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
 
 /// How often the status line's clock is redrawn while a turn runs.
 const TICK: Duration = Duration::from_millis(250);
@@ -161,6 +162,12 @@ impl Printer for ShellOut {
         self.commit(Cell::Note(text.to_owned()));
     }
 
+    fn prompt(&mut self, _block: &PromptBlock) {
+        // Drawn above the composer from the engine's state, not
+        // committed to the transcript.
+        self.flush_explored();
+    }
+
     fn pager(&mut self, title: &str, text: &str) {
         // Drawn by the loop after this step.
         self.flush_explored();
@@ -216,6 +223,44 @@ impl Printer for ShellOut {
     }
 }
 
+/// The prompt block's lines.
+fn block_lines(block: &PromptBlock, width: usize) -> Vec<Line<'static>> {
+    let head = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let lines = match block {
+        PromptBlock::Permission {
+            tool,
+            class,
+            reason,
+            summary,
+            prefix,
+        } => {
+            let p = match prefix {
+                Some(p) => format!(" · p allow `{}` from now on", p.join(" ")),
+                None => String::new(),
+            };
+            vec![
+                Line::from(Span::styled(
+                    format!("permission · {tool} ({class}) · {reason}"),
+                    head,
+                )),
+                Line::from(Span::raw(format!("  {summary}"))),
+                Line::from(Span::styled(
+                    format!("  y once · a this session{p} · n deny · esc deny with a reason"),
+                    dim,
+                )),
+            ]
+        }
+        PromptBlock::Question { question } => vec![
+            Line::from(Span::styled(format!("question · {question}"), head)),
+            Line::from(Span::styled("  type the answer and press Enter", dim)),
+        ],
+    };
+    lines.iter().flat_map(|l| wrap_line(l, width)).collect()
+}
+
 /// The pager over `lines` in the alternate screen until it is closed.
 fn page(shell: &mut Shell, title: &str, lines: Vec<Line<'static>>) -> anyhow::Result<()> {
     let mut pager = Pager::new(title, lines);
@@ -263,6 +308,9 @@ async fn run_shell(
     let mut armed: Option<(Action, Instant)> = None;
     // The last message sent (not a command), for Esc-Esc and Alt-Up.
     let mut last_sent: Option<String> = None;
+    // Esc on a permission prompt: the composer takes the reason; the
+    // draft it held comes back after.
+    let mut reason_draft: Option<String> = None;
 
     // A thread opened while it waits: the prompt is shown at once.
     let state = engine.state().clone();
@@ -286,7 +334,14 @@ async fn run_shell(
         {
             armed = None;
         }
+        let block = engine
+            .prompt_block()
+            .map(|b| block_lines(b, out.shell.width()))
+            .unwrap_or_default();
         let hint = match (&armed, &state) {
+            _ if reason_draft.is_some() => {
+                Some("deny with a reason · Enter sends · Esc cancels".to_owned())
+            }
             (Some((Action::QuitArm, _)), _) => Some("Ctrl-C again to quit".to_owned()),
             (Some((Action::RecallArm, _)), _) => {
                 Some("Esc again to recall the last message".to_owned())
@@ -294,7 +349,6 @@ async fn run_shell(
             (_, ThreadState::Running { queued, .. }) if *queued > 0 => Some(format!(
                 "queued {queued} · ! sends now · Alt-Up copies the last back"
             )),
-            _ if engine.prompting() => Some("answer on the line: y / a / n, or the text".into()),
             _ => None,
         };
         let active = out.active_lines();
@@ -303,6 +357,7 @@ async fn run_shell(
             composer: &composer,
             status: &status.line(),
             hint: hint.as_deref(),
+            block: &block,
         };
         out.shell.draw(&pane)?;
         if let Some((title, text)) = out.page.take() {
@@ -322,6 +377,52 @@ async fn run_shell(
                 let Some(Ok(event)) = event else { break };
                 match event {
                     Event::Key(key) if key.kind != KeyEventKind::Release => {
+                        // A permission prompt takes single keys first.
+                        if let Some(PromptBlock::Permission { prefix, .. }) =
+                            engine.prompt_block().cloned()
+                        {
+                            use crossterm::event::KeyCode as K;
+                            if let Some(draft) = reason_draft.clone() {
+                                match key.code {
+                                    K::Enter => {
+                                        let reason = composer.take().unwrap_or_default();
+                                        composer.set_text(&draft);
+                                        reason_draft = None;
+                                        engine
+                                            .decide(false, false, None, Some(reason), &mut out)
+                                            .await;
+                                        continue;
+                                    }
+                                    K::Esc => {
+                                        composer.set_text(&draft);
+                                        reason_draft = None;
+                                        continue;
+                                    }
+                                    _ => {}
+                                }
+                            } else {
+                                let plain = key.modifiers.is_empty()
+                                    || key.modifiers == crossterm::event::KeyModifiers::SHIFT;
+                                let handled = match key.code {
+                                    K::Char('y') if plain => Some((true, false, None)),
+                                    K::Char('a') if plain => Some((true, true, None)),
+                                    K::Char('p') if plain => {
+                                        Some((true, prefix.is_none(), prefix.clone()))
+                                    }
+                                    K::Char('n') if plain => Some((false, false, None)),
+                                    _ => None,
+                                };
+                                if let Some((allow, session, prefix)) = handled {
+                                    engine.decide(allow, session, prefix, None, &mut out).await;
+                                    continue;
+                                }
+                                if key.code == K::Esc {
+                                    reason_draft = Some(composer.text());
+                                    composer.clear();
+                                    continue;
+                                }
+                            }
+                        }
                         let ctx = KeyContext {
                             running: !matches!(engine.state(), ThreadState::Idle),
                             composer_empty: composer.is_empty(),
