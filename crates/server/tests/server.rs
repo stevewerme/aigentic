@@ -549,3 +549,94 @@ async fn idle_threads_unload_but_never_while_awaiting_approval() {
     };
     assert_eq!(events.last().map(|e| e.kind), Some(EventKind::TurnEnded));
 }
+
+/// The same daemon over TCP on a loopback port the system picks.
+#[tokio::test]
+async fn tcp_on_a_loopback_port_serves_the_same_sessions() {
+    let d = daemon(vec![vec![Some(vec![text("hi"), done()])]], 600).await;
+    let bound = d
+        .server
+        .clone()
+        .listen(Listener::Tcp("127.0.0.1".into(), 0))
+        .await
+        .unwrap();
+    let port = bound.port().unwrap();
+    assert!(port > 0);
+    assert_eq!(bound.addr(), format!("tcp:127.0.0.1:{port}"));
+    let task = tokio::spawn(bound.serve());
+    let addr = Addr::Tcp("127.0.0.1".into(), port);
+    let err = Client::connect(&addr, "tok-nobody").await.unwrap_err();
+    assert!(matches!(err, ClientError::Refused(_)), "{err}");
+    let (steve, welcome) = Client::connect(&addr, "tok-steve").await.unwrap();
+    assert_eq!(welcome.user, "steve");
+    let Response::Thread { thread } = steve
+        .request(Request::CreateThread {
+            project: "q".into(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    let mut notices = steve.take_notices().unwrap();
+    steve
+        .request(Request::Open {
+            thread: thread.id,
+            from_seq: 0,
+        })
+        .await
+        .unwrap();
+    steve
+        .request(Request::Post {
+            thread: thread.id,
+            blocks: vec![ContentBlock::Text("go".into())],
+            interrupt: false,
+        })
+        .await
+        .unwrap();
+    until_state(&mut notices, |s| *s == ThreadState::Idle).await;
+    assert_eq!(
+        d.log("q", thread.id),
+        vec![
+            EventKind::ThreadStarted,
+            EventKind::UserMessage,
+            EventKind::AssistantMessage,
+            EventKind::TurnEnded
+        ]
+    );
+    // Listener strings parse both ways; nonsense is refused.
+    assert_eq!(
+        Listener::parse("tcp:0.0.0.0:7420").unwrap(),
+        Listener::Tcp("0.0.0.0".into(), 7420)
+    );
+    assert!(matches!(
+        Listener::parse("unix:/tmp/x.sock").unwrap(),
+        Listener::Unix(_)
+    ));
+    for bad in ["tcp:7420", "tcp::1", "tcp:h:x", "unix:", "http://x"] {
+        assert!(Listener::parse(bad).is_err(), "{bad}");
+    }
+    task.abort();
+}
+
+/// A line over the cap closes the session rather than growing memory;
+/// the daemon goes on serving others.
+#[tokio::test]
+async fn an_oversized_line_closes_only_that_session() {
+    use tokio::io::AsyncWriteExt;
+    let d = daemon(vec![], 600).await;
+    let mut raw = tokio::net::UnixStream::connect(&d.socket).await.unwrap();
+    let huge = vec![b'x'; aigentic_server::session::MAX_LINE_BYTES + 1024];
+    // The daemon may close mid-write; that is the point.
+    let _ = raw.write_all(&huge).await;
+    let _ = raw.write_all(b"\n").await;
+    let mut probe = [0u8; 1];
+    use tokio::io::AsyncReadExt;
+    let closed = tokio::time::timeout(Duration::from_secs(5), raw.read(&mut probe))
+        .await
+        .expect("closed in time");
+    assert!(matches!(closed, Ok(0) | Err(_)), "{closed:?}");
+    // Others still connect.
+    let (_, welcome) = d.connect("steve").await;
+    assert_eq!(welcome.user, "steve");
+}

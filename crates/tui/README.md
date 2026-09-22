@@ -69,8 +69,19 @@ cargo run -p aigentic-tui -- project show                        # layers, knowl
 cargo run -p aigentic-tui -- threads                             # this project's threads, newest first
 cargo run -p aigentic-tui -- doctor [--probe]                    # config, keys, threads dir, project, skills, gh; exit 1 on a fail
 cargo run -p aigentic-tui -- init                                # guided setup: config, project, GitHub, knowledge links
-cargo run -p aigentic-tui -- serve [--listen unix:/path]         # the daemon (phase 5): server.toml's users and projects over a socket
+cargo run -p aigentic-tui -- serve [--listen unix:/path|tcp:host:port]   # the daemon (phase 5): server.toml's users and projects
+cargo run -p aigentic-tui -- serve --new-token magnus            # a fresh token for a user, printed once, never stored
 ```
+
+The daemon reads `server.toml` beside `config.toml`: `listen` (`unix`, `unix:/path`
+or `tcp:host:port`; plain TCP with tokens, so put a reverse proxy or an SSH
+tunnel in front of it on a network), `idle_unload_secs`, `[[users]]` with
+`name` and `token_env` (the variable in the daemon's environment holding that
+user's token; the first user is the owner), and `[[projects]]` with `name` and
+`root` (the checkout on the daemon's machine). A session says hello with its
+token, is told which projects it has a role in, and every request is checked
+against `[participants]` in the project's `aigentic.toml` before it reaches the
+thread. A line over 4 MiB closes the session.
 
 `init` is the guided setup, in the spirit of upstream's
 `setup-matt-pocock-skills`: explore, show, confirm, write. It needs a

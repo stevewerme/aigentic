@@ -80,6 +80,11 @@ enum Command {
         /// The daemon's own config (default: server.toml beside config.toml).
         #[arg(long)]
         server_config: Option<PathBuf>,
+        /// Print a fresh token for this user once and exit; put it in the
+        /// user's `token_env` variable on the daemon and in
+        /// `AIGENTIC_TOKEN` on their machine. Nothing is stored.
+        #[arg(long, value_name = "USER")]
+        new_token: Option<String>,
     },
     /// Check the config, keys, threads directory, project, skills and
     /// GitHub setup; exit 1 on any failure.
@@ -109,8 +114,24 @@ async fn main() -> anyhow::Result<()> {
     if let Some(Command::Serve {
         listen,
         server_config,
+        new_token,
     }) = cli.command
     {
+        if let Some(user) = new_token {
+            let server_path = server_config
+                .clone()
+                .unwrap_or_else(aigentic_server::config::default_server_config_path);
+            let var = aigentic_server::ServerConfig::load(&server_path)
+                .ok()
+                .and_then(|s| s.users.into_iter().find(|u| u.name == user))
+                .and_then(|u| u.token_env)
+                .unwrap_or_else(|| format!("AIGENTIC_TOKEN_{}", user.to_ascii_uppercase()));
+            println!("{}", aigentic_server::serve::random_token());
+            eprintln!(
+                "token for {user}, shown once: export it as {var} where the daemon runs and as AIGENTIC_TOKEN on {user}'s machine"
+            );
+            return Ok(());
+        }
         let config = Config::load(&config_path)?;
         let config_dir = config_path
             .parent()

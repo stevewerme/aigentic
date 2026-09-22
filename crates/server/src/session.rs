@@ -19,6 +19,54 @@ use crate::auth;
 use crate::config::ServerConfig;
 use crate::threads::{ThreadError, ThreadTable};
 
+/// The longest line a session may send; longer closes it. A post can
+/// carry a large block, so this is generous, but not unbounded.
+pub const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
+
+/// One line without its newline, or `None` at end of stream. A line
+/// over the cap is an error, which closes the session. Works on the
+/// reader's own buffer, so nothing is read past the newline.
+async fn next_line<R: AsyncBufReadExt + Unpin>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+) -> std::io::Result<Option<String>> {
+    buf.clear();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(if buf.is_empty() {
+                None
+            } else {
+                Some(String::from_utf8_lossy(buf).into_owned())
+            });
+        }
+        match available.iter().position(|&b| b == b'\n') {
+            Some(pos) => {
+                buf.extend_from_slice(&available[..pos]);
+                reader.consume(pos + 1);
+                if buf.len() > MAX_LINE_BYTES {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "line over the size cap",
+                    ));
+                }
+                return Ok(Some(String::from_utf8_lossy(buf).into_owned()));
+            }
+            None => {
+                let n = available.len();
+                buf.extend_from_slice(available);
+                reader.consume(n);
+                if buf.len() > MAX_LINE_BYTES {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "line over the size cap",
+                    ));
+                }
+            }
+        }
+    }
+}
+
 /// The daemon's name and version, for `Welcome`.
 pub fn server_name() -> String {
     format!("aigentic {}", env!("CARGO_PKG_VERSION"))
@@ -32,7 +80,8 @@ pub async fn serve(
     config: Arc<ServerConfig>,
     threads: Arc<ThreadTable>,
 ) -> std::io::Result<()> {
-    let mut lines = BufReader::new(reader).lines();
+    let mut reader = BufReader::new(reader);
+    let mut buf = Vec::new();
     // One writer task: responses and notices interleave on the same
     // line stream in the order they are sent here.
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
@@ -51,7 +100,7 @@ pub async fn serve(
 
     // Hello.
     let user = loop {
-        let Some(line) = lines.next_line().await? else {
+        let Some(line) = next_line(&mut reader, &mut buf).await? else {
             writer_task.abort();
             return Ok(());
         };
@@ -118,7 +167,7 @@ pub async fn serve(
     let mut open: HashMap<Ulid, (crate::actor::Mailbox, tokio::task::JoinHandle<()>)> =
         HashMap::new();
 
-    while let Some(line) = lines.next_line().await? {
+    while let Some(line) = next_line(&mut reader, &mut buf).await? {
         let Ok(frame) = decode(&line) else {
             continue;
         };

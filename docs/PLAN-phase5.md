@@ -1,6 +1,6 @@
 # Phase 5 plan
 
-Status: steps 1 to 7 landed on 2026-09-22; written the same day after the phase 4 close · Follows `docs/PRD.md` (the Server and multiplayer phase) and the phase 0 to 4 plans
+Status: steps 1 to 8 landed on 2026-09-22; written the same day after the phase 4 close · Follows `docs/PRD.md` (the Server and multiplayer phase) and the phase 0 to 4 plans
 
 ## 0. Goal and done-when
 
@@ -223,7 +223,8 @@ pub struct Server { config: Arc<Config>, config_dir, server: Arc<ServerConfig>, 
 impl Server {
     pub fn new(config: Config, config_dir, server: ServerConfig, providers: Arc<dyn ProviderFactory>, reports: Arc<dyn Reports>) -> Self;
     pub fn from_configs(config, config_dir, server) -> Self;                         // providers from config.toml's profiles
-    pub async fn serve(self: Arc<Self>, listener: Listener) -> Result<(), ServerError>;   // Listener::Unix now, Tcp in step 8; sweeps idle threads
+    pub async fn listen(self: Arc<Self>, listener: Listener) -> Result<Bound, ServerError>;   // Unix or Tcp; Bound::port() reports an ephemeral port
+    pub async fn serve(self: Arc<Self>, listener: Listener) -> Result<(), ServerError>;    // listen then Bound::serve; sweeps idle threads
     pub async fn embed(config, config_dir, root, user) -> Result<Embedded, ServerError>;   // a private Unix socket and an in-memory token
 }
 // crates/server/src/build.rs: `build_thread` is what the tui's main did through phase 4 (project, provider, layers, skills, policy, log);

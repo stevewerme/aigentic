@@ -6,7 +6,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::net::UnixListener;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::{TcpListener, UnixListener};
 
 use crate::actor::{NoReports, Reports};
 use crate::build::{Profiles, ProviderFactory};
@@ -25,7 +26,7 @@ pub enum ServerError {
     },
     #[error("{0}")]
     Io(#[from] std::io::Error),
-    #[error("listen = {0:?} is not supported by this daemon; use \"unix\" or \"unix:/path\"")]
+    #[error("listen = {0:?}: use \"unix\", \"unix:/path\" or \"tcp:host:port\"")]
     Listen(String),
 }
 
@@ -33,22 +34,130 @@ pub enum ServerError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Listener {
     Unix(PathBuf),
+    /// Plain TCP with tokens; TLS is a reverse proxy's or an SSH
+    /// tunnel's job in this phase (plan decision 9). Port 0 asks the
+    /// system for one, which `Bound::addr` then reports.
+    Tcp(String, u16),
 }
 
 impl Listener {
-    /// From `server.toml`'s `listen`: `"unix"` derives the path.
+    /// From `server.toml`'s `listen`: `"unix"` derives the path,
+    /// `"unix:/path"` names it, `"tcp:host:port"` binds TCP.
     pub fn parse(listen: &str) -> Result<Self, ServerError> {
-        match listen {
-            "unix" => Ok(Listener::Unix(default_socket_path())),
-            s if s.starts_with("unix:") => Ok(Listener::Unix(PathBuf::from(&s[5..]))),
-            other => Err(ServerError::Listen(other.to_owned())),
+        if listen == "unix" {
+            return Ok(Listener::Unix(default_socket_path()));
         }
+        if let Some(path) = listen.strip_prefix("unix:") {
+            if path.is_empty() {
+                return Err(ServerError::Listen(listen.to_owned()));
+            }
+            return Ok(Listener::Unix(PathBuf::from(path)));
+        }
+        if let Some(rest) = listen.strip_prefix("tcp:") {
+            let (host, port) = rest
+                .rsplit_once(':')
+                .ok_or_else(|| ServerError::Listen(listen.to_owned()))?;
+            let port = port
+                .parse()
+                .map_err(|_| ServerError::Listen(listen.to_owned()))?;
+            if host.is_empty() {
+                return Err(ServerError::Listen(listen.to_owned()));
+            }
+            return Ok(Listener::Tcp(host.to_owned(), port));
+        }
+        Err(ServerError::Listen(listen.to_owned()))
     }
 
     pub fn addr(&self) -> String {
         match self {
             Listener::Unix(p) => format!("unix:{}", p.display()),
+            Listener::Tcp(h, p) => format!("tcp:{h}:{p}"),
         }
+    }
+}
+
+enum Socket {
+    Unix(UnixListener, PathBuf),
+    Tcp(TcpListener),
+}
+
+/// A bound listener, not yet accepting: `addr` says where, which is
+/// what a caller with port 0 needs.
+pub struct Bound {
+    server: Arc<Server>,
+    socket: Socket,
+}
+
+impl Bound {
+    /// Where it listens, with the real port.
+    pub fn addr(&self) -> String {
+        match &self.socket {
+            Socket::Unix(_, path) => format!("unix:{}", path.display()),
+            Socket::Tcp(l) => l
+                .local_addr()
+                .map(|a| format!("tcp:{}:{}", a.ip(), a.port()))
+                .unwrap_or_else(|_| "tcp:?".into()),
+        }
+    }
+
+    /// The TCP port, when TCP.
+    pub fn port(&self) -> Option<u16> {
+        match &self.socket {
+            Socket::Tcp(l) => l.local_addr().ok().map(|a| a.port()),
+            Socket::Unix(..) => None,
+        }
+    }
+
+    /// Accept forever, sweeping idle threads on the side.
+    pub async fn serve(self) -> Result<(), ServerError> {
+        let server = self.server;
+        let sweeper = {
+            let server = server.clone();
+            tokio::spawn(async move {
+                let idle = server.server.idle_unload();
+                let every = idle
+                    .min(Duration::from_secs(60))
+                    .max(Duration::from_secs(1));
+                loop {
+                    tokio::time::sleep(every).await;
+                    let _ = server.threads.sweep(idle).await;
+                }
+            })
+        };
+        let spawn = |r: Box<dyn AsyncRead + Unpin + Send>,
+                     w: Box<dyn AsyncWrite + Unpin + Send>| {
+            let config = server.server.clone();
+            let threads = server.threads.clone();
+            tokio::spawn(async move {
+                let _ = session::serve(r, w, config, threads).await;
+            });
+        };
+        let result = match &self.socket {
+            Socket::Unix(unix, _) => loop {
+                match unix.accept().await {
+                    Ok((stream, _)) => {
+                        let (r, w) = stream.into_split();
+                        spawn(Box::new(r), Box::new(w));
+                    }
+                    Err(e) => break Err(ServerError::Io(e)),
+                }
+            },
+            Socket::Tcp(tcp) => loop {
+                match tcp.accept().await {
+                    Ok((stream, _)) => {
+                        let _ = stream.set_nodelay(true);
+                        let (r, w) = stream.into_split();
+                        spawn(Box::new(r), Box::new(w));
+                    }
+                    Err(e) => break Err(ServerError::Io(e)),
+                }
+            },
+        };
+        sweeper.abort();
+        if let Socket::Unix(_, path) = &self.socket {
+            let _ = std::fs::remove_file(path);
+        }
+        result
     }
 }
 
@@ -98,63 +207,56 @@ impl Server {
         Self::new(config, config_dir, server, providers, Arc::new(NoReports))
     }
 
-    /// Accept forever. A stale socket file from a dead daemon is removed
+    /// Bind. A stale Unix socket file from a dead daemon is removed
     /// first; a live one refuses the bind.
-    pub async fn serve(self: Arc<Self>, listener: Listener) -> Result<(), ServerError> {
-        let Listener::Unix(path) = &listener;
-        if path.exists() {
-            // Live or stale? A connect tells.
-            match tokio::net::UnixStream::connect(path).await {
-                Ok(_) => {
-                    return Err(ServerError::Bind {
+    pub async fn listen(self: Arc<Self>, listener: Listener) -> Result<Bound, ServerError> {
+        let socket = match &listener {
+            Listener::Unix(path) => {
+                if path.exists() {
+                    // Live or stale? A connect tells.
+                    match tokio::net::UnixStream::connect(path).await {
+                        Ok(_) => {
+                            return Err(ServerError::Bind {
+                                addr: listener.addr(),
+                                source: std::io::Error::new(
+                                    std::io::ErrorKind::AddrInUse,
+                                    "a daemon is already listening",
+                                ),
+                            });
+                        }
+                        Err(_) => {
+                            let _ = std::fs::remove_file(path);
+                        }
+                    }
+                }
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let unix = UnixListener::bind(path).map_err(|source| ServerError::Bind {
+                    addr: listener.addr(),
+                    source,
+                })?;
+                Socket::Unix(unix, path.clone())
+            }
+            Listener::Tcp(host, port) => {
+                let tcp = TcpListener::bind((host.as_str(), *port))
+                    .await
+                    .map_err(|source| ServerError::Bind {
                         addr: listener.addr(),
-                        source: std::io::Error::new(
-                            std::io::ErrorKind::AddrInUse,
-                            "a daemon is already listening",
-                        ),
-                    });
-                }
-                Err(_) => {
-                    let _ = std::fs::remove_file(path);
-                }
-            }
-        }
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let unix = UnixListener::bind(path).map_err(|source| ServerError::Bind {
-            addr: listener.addr(),
-            source,
-        })?;
-        let sweeper = {
-            let server = self.clone();
-            tokio::spawn(async move {
-                let idle = server.server.idle_unload();
-                let every = idle
-                    .min(Duration::from_secs(60))
-                    .max(Duration::from_secs(1));
-                loop {
-                    tokio::time::sleep(every).await;
-                    let _ = server.threads.sweep(idle).await;
-                }
-            })
-        };
-        let result = loop {
-            match unix.accept().await {
-                Ok((stream, _)) => {
-                    let (r, w) = stream.into_split();
-                    let config = self.server.clone();
-                    let threads = self.threads.clone();
-                    tokio::spawn(async move {
-                        let _ = session::serve(Box::new(r), Box::new(w), config, threads).await;
-                    });
-                }
-                Err(e) => break Err(ServerError::Io(e)),
+                        source,
+                    })?;
+                Socket::Tcp(tcp)
             }
         };
-        sweeper.abort();
-        let _ = std::fs::remove_file(path);
-        result
+        Ok(Bound {
+            server: self,
+            socket,
+        })
+    }
+
+    /// Bind and accept forever.
+    pub async fn serve(self: Arc<Self>, listener: Listener) -> Result<(), ServerError> {
+        self.listen(listener).await?.serve().await
     }
 
     /// A daemon in this process for one user over a private socket:
