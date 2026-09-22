@@ -6,8 +6,8 @@
 use std::path::Path;
 
 use crate::checks::{
-    Check, Gh, GhCli, Status, check_api_key_env, check_config, check_github, check_probe,
-    check_project, check_skills, check_threads_dir,
+    Check, GhCli, Status, check_api_key_env, check_config, check_github, check_probe,
+    check_project, check_skills, check_threads_dir, origin_url,
 };
 use crate::config;
 use crate::skills_cmd::SkillPaths;
@@ -80,24 +80,3 @@ fn finish(checks: &[Check]) -> i32 {
         0
     }
 }
-
-/// `git config --get remote.origin.url` at `root`, `None` when unset or
-/// outside a repository.
-fn origin_url(root: &Path) -> Option<String> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["config", "--get", "remote.origin.url"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let url = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-    (!url.is_empty()).then_some(url)
-}
-
-// `Gh` is the seam `init` (plan section 10 d) will script; the doctor
-// only ever uses the real binary.
-#[allow(dead_code)]
-fn _seam(_: &dyn Gh) {}

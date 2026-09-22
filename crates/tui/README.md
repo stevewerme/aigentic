@@ -68,7 +68,25 @@ cargo run -p aigentic-tui -- project setup                       # render docs/a
 cargo run -p aigentic-tui -- project show                        # layers, knowledge mode, every tool's fate
 cargo run -p aigentic-tui -- threads                             # this project's threads, newest first
 cargo run -p aigentic-tui -- doctor [--probe]                    # config, keys, threads dir, project, skills, gh; exit 1 on a fail
+cargo run -p aigentic-tui -- init                                # guided setup: config, project, GitHub, knowledge links
 ```
+
+`init` is the guided setup, in the spirit of upstream's
+`setup-matt-pocock-skills`: explore, show, confirm, write. It needs a
+terminal. Four sections, each showing what exists and proposing a
+default that Enter accepts: the config (created from the example when
+absent, the default profile, whether each key variable is set); the
+project (name, description, `[model] profile` into `aigentic.toml`, the
+`.aigentic/` folders, and an `AGENTS.md` with a heading and a Commands
+section when no instructions file exists); GitHub (when origin is on
+GitHub and `gh auth status` passes: `[pocock] issue_tracker = "github"`,
+the `project setup` files, and `gh label create` for each of the five
+triage labels the repo lacks, one confirmation for the batch); and
+knowledge (symlinks into `.aigentic/knowledge/` for `docs/` and
+`CONTEXT.md`). Every file is shown before it is written, nothing reaches
+GitHub without a yes, and a rerun shows current values as defaults and
+writes only what changed. Hand edits elsewhere in `aigentic.toml` are
+kept.
 
 `doctor` prints one line per check (`ok`, `fail` or `skip`, then the
 message) and exits 1 when any fails. It names each profile's key variable

@@ -152,7 +152,7 @@ pub struct Config {
     pub display: DisplaySection,
 }
 
-const EXAMPLE: &str = r#"default_profile = "tensorx"
+pub const EXAMPLE: &str = r#"default_profile = "tensorx"
 
 [profiles.tensorx]
 provider = "openai_compat"

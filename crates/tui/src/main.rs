@@ -6,6 +6,7 @@ mod checks;
 mod config;
 mod cost;
 mod doctor;
+mod init_cmd;
 mod pocock;
 mod pocock_templates;
 mod project_cmd;
@@ -66,6 +67,9 @@ enum Command {
     },
     /// List this project's threads, newest first.
     Threads,
+    /// Guided setup: config, project file and AGENTS.md, GitHub issues
+    /// and labels through `gh`, knowledge links. Shows every file first.
+    Init,
     /// Check the config, keys, threads directory, project, skills and
     /// GitHub setup; exit 1 on any failure.
     Doctor {
@@ -87,6 +91,9 @@ async fn main() -> anyhow::Result<()> {
     if let Some(Command::Doctor { probe }) = cli.command {
         let code = doctor::run(&config_path, &cwd, probe).await?;
         std::process::exit(code);
+    }
+    if let Some(Command::Init) = cli.command {
+        std::process::exit(init_cmd::run(&config_path, &cwd)?);
     }
     let config = Config::load(&config_path)?;
     let config_dir = config_path
@@ -173,7 +180,7 @@ async fn main() -> anyhow::Result<()> {
             }
             std::process::exit(0);
         }
-        Some(Command::Doctor { .. }) | None => {}
+        Some(Command::Doctor { .. } | Command::Init) | None => {}
     }
 
     let (profile_name, profile) = config.select(profile_arg)?;

@@ -276,12 +276,28 @@ pub fn check_github(project: Option<&Project>, gh: &dyn Gh, remote: Option<&str>
     }
 }
 
-fn is_github_remote(url: &str) -> bool {
+pub fn is_github_remote(url: &str) -> bool {
     let url = url.trim();
     url.starts_with("git@github.com:")
         || url.starts_with("https://github.com/")
         || url.starts_with("ssh://git@github.com/")
         || url.starts_with("git://github.com/")
+}
+
+/// `git config --get remote.origin.url` at `root`, `None` when unset or
+/// outside a repository.
+pub fn origin_url(root: &Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["config", "--get", "remote.origin.url"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let url = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    (!url.is_empty()).then_some(url)
 }
 
 /// One completion with `max_output_tokens = 1`: the endpoint answers for

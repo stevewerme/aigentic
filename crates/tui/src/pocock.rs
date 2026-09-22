@@ -293,7 +293,7 @@ pub fn setup(project: &Project) -> anyhow::Result<Vec<(PathBuf, Outcome)>> {
     Ok(done)
 }
 
-fn write_if_changed(path: &Path, text: &str) -> anyhow::Result<Outcome> {
+pub fn write_if_changed(path: &Path, text: &str) -> anyhow::Result<Outcome> {
     if std::fs::read_to_string(path).is_ok_and(|t| t == text) {
         return Ok(Outcome::Unchanged);
     }
