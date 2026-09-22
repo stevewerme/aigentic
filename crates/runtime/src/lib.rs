@@ -48,4 +48,4 @@ pub use runtime::{
     ASKED_HUMAN, CompactionSettings, DEFAULT_BUDGET, DEFAULT_COMPACTION, Runtime, Signal,
     TurnOutcome,
 };
-pub use seams::Verdict;
+pub use seams::{SessionGrant, Verdict};

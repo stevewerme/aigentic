@@ -155,6 +155,31 @@ impl Runtime {
         self.mode
     }
 
+    /// The standing `AllowForSession` answers, in the order given.
+    pub fn session_grants(&self) -> &[SessionGrant] {
+        &self.session_grants
+    }
+
+    /// Swap the provider between turns (`/profile`). `label` is the model
+    /// name recorded on summaries. The window measure resets and the
+    /// knowledge mode is re-decided for the new provider's window, so a
+    /// folder that was inline can become an index and back.
+    pub fn set_provider(
+        &mut self,
+        provider: Box<dyn Provider>,
+        label: impl Into<String>,
+    ) -> Result<(), crate::ProjectError> {
+        self.provider = provider;
+        self.model_label = label.into();
+        self.measured = None;
+        self.reload_knowledge()
+    }
+
+    /// The model name recorded on summaries: the profile's model.
+    pub fn model_label(&self) -> &str {
+        &self.model_label
+    }
+
     pub fn with_compaction(mut self, settings: CompactionSettings) -> Self {
         self.compaction = settings;
         self

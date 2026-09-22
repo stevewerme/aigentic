@@ -262,12 +262,7 @@ async fn main() -> anyhow::Result<()> {
         .with_approver(Box::new(InlineApprover::new(user.clone())));
     runtime.set_mode(cli.mode);
 
-    println!(
-        "aigentic · profile {profile_name} · {} · {}{}",
-        profile.model,
-        profile.endpoint(),
-        repl::mode_banner(cli.mode)
-    );
+    println!("{}", repl::banner_line(profile_name, profile, cli.mode));
     match &opened {
         Some(p) => {
             let mut layers_loaded = Vec::new();
@@ -335,9 +330,11 @@ async fn main() -> anyhow::Result<()> {
 
     let resumed = runtime.resume(torn, &mut |_| {})?;
     let history = config_path.with_file_name("history");
+    let profile_name = profile_name.to_owned();
     repl::Repl::new(runtime, user, history)
         .with_project_paths(threads_dir, global_instructions)
         .with_display(config.display)
+        .with_config(config, &profile_name)
         .run(resumed)
         .await
 }

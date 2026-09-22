@@ -22,6 +22,7 @@ use serde_json::json;
 struct Counting {
     script: Mutex<std::collections::VecDeque<Vec<ProviderEvent>>>,
     seen: Seen,
+    window: u64,
 }
 
 impl Provider for Counting {
@@ -49,7 +50,7 @@ impl Provider for Counting {
             supports_images: false,
             supports_caching: false,
             supports_structured_output: false,
-            max_context_tokens: 1000,
+            max_context_tokens: self.window,
         }
     }
 }
@@ -84,6 +85,7 @@ fn rig(dir: &tempfile::TempDir, script: Vec<Vec<ProviderEvent>>) -> (Runtime, Se
     let provider = Counting {
         script: Mutex::new(script.into()),
         seen: seen.clone(),
+        window: 1000,
     };
     let log = ThreadLog::open(dir.path(), ulid::Ulid::generate()).unwrap();
     let project = Project::open(dir.path()).unwrap().unwrap();
@@ -204,4 +206,36 @@ async fn a_change_on_disk_is_picked_up_at_the_next_turn_and_can_flip_the_mode() 
     let seen = seen.lock().unwrap();
     assert!(texts(&seen[0][0]).starts_with("# Project knowledge\n"));
     assert!(texts(&seen[1][0]).starts_with("# Project knowledge (index)"));
+}
+
+#[tokio::test]
+async fn set_provider_re_decides_the_mode_for_the_new_window() {
+    // ~200 tokens of knowledge: inline at a 1000 window (line 400),
+    // index at a 100 window (line 40).
+    let dir = project_dir(800);
+    let (mut rt, _seen) = rig(&dir, vec![]);
+    assert_eq!(rt.knowledge_mode(), KnowledgeMode::Inline);
+    let has_search = |rt: &Runtime| {
+        rt.tool_specs()
+            .into_iter()
+            .any(|s| s.name == "search_knowledge")
+    };
+    assert!(!has_search(&rt));
+    let small = Counting {
+        script: Mutex::new(Vec::new().into()),
+        seen: Arc::new(Mutex::new(Vec::new())),
+        window: 100,
+    };
+    rt.set_provider(Box::new(small), "small").unwrap();
+    assert_eq!(rt.knowledge_mode(), KnowledgeMode::Index);
+    assert!(has_search(&rt), "search_knowledge registered on the swap");
+    assert_eq!(rt.model_label(), "small");
+    let big = Counting {
+        script: Mutex::new(Vec::new().into()),
+        seen: Arc::new(Mutex::new(Vec::new())),
+        window: 1000,
+    };
+    rt.set_provider(Box::new(big), "big").unwrap();
+    assert_eq!(rt.knowledge_mode(), KnowledgeMode::Inline);
+    assert!(!has_search(&rt), "and removed on the swap back");
 }

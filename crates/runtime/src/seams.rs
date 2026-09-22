@@ -31,12 +31,12 @@ impl Verdict {
 /// A standing `AllowForSession` answer. Never persisted; each use is still
 /// a `permission_decided` event referencing the first.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SessionGrant {
-    pub(crate) tool: String,
+pub struct SessionGrant {
+    pub tool: String,
     /// For `bash`, the exact command; `None` for every other tool.
-    pub(crate) command: Option<String>,
-    pub(crate) first_event: Ulid,
-    pub(crate) author: Author,
+    pub command: Option<String>,
+    pub first_event: Ulid,
+    pub author: Author,
 }
 
 impl SessionGrant {

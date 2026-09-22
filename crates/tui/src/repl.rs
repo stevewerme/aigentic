@@ -3,14 +3,15 @@ use std::path::PathBuf;
 
 use aigentic_runtime::aigentic_core::{Author, ContentBlock, EventKind, ToolCall};
 use aigentic_runtime::aigentic_log::{
-    CompactedPayload, CompactionStrategy, DecisionScope, PermissionDecidedPayload,
-    SkillLoadedPayload, ToolResultPayload,
+    CompactedPayload, CompactionStrategy, DecisionScope, MemoryExtractedPayload,
+    PermissionDecidedPayload, SkillLoadedPayload, ToolResultPayload,
 };
+use aigentic_runtime::aigentic_policy::Decision;
 use aigentic_runtime::{ASKED_HUMAN, Mode, Resumed, Runtime, Signal};
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 
-use crate::config::DisplaySection;
+use crate::config::{Config, DisplaySection, Profile};
 use crate::cost::cost_of;
 use crate::project_cmd::{list_threads, render_threads, report};
 
@@ -28,6 +29,10 @@ pub struct Repl {
     global_instructions: PathBuf,
     /// The `[display]` caps for tool results.
     display: DisplaySection,
+    /// The config, for `/profile`; absent in tests.
+    config: Option<Config>,
+    /// The profile the runtime's provider was built from.
+    profile_name: String,
     /// Whether `/verbose` widened the caps for this session.
     verbose: bool,
 }
@@ -54,6 +59,12 @@ pub enum Command<'a> {
     Verbose,
     /// Print the permission mode, or set it when a name is given.
     Mode(Option<&'a str>),
+    /// Swap the provider to a profile from the config, between turns.
+    Profile(&'a str),
+    /// The rule table, the bash allow patterns, the mode and the grants.
+    Policy,
+    /// The memory files as the prefix carries them.
+    Memory,
     /// A user-invoked skill: its name and the rest of the line.
     Skill(&'a str, &'a str),
     Unknown(&'a str),
@@ -83,6 +94,9 @@ pub fn parse_line<'a>(line: &'a str, skills: &[String]) -> Command<'a> {
         ("verbose", _) => Command::Verbose,
         ("mode", "") => Command::Mode(None),
         ("mode", name) => Command::Mode(Some(name)),
+        ("profile", name) if !name.is_empty() => Command::Profile(name),
+        ("policy", _) => Command::Policy,
+        ("memory", _) => Command::Memory,
         ("pin", text) if !text.is_empty() => Command::Pin(text),
         (name, args) if skills.iter().any(|s| s == name) => Command::Skill(name, args),
         _ => Command::Unknown(trimmed),
@@ -95,6 +109,9 @@ const HELP: &str = "\
 /compact         run compaction now
 /verbose         toggle tool output between the configured cap and 40 lines / 8000 bytes
 /mode [name]     show the permission mode, or set it: manual, accept-edits, auto
+/profile <name>  swap the provider to that profile from the config, for the next turn on
+/policy          the rule table, the bash allow patterns, the mode and the session grants
+/memory          the memory files as the prefix carries them, and the last extraction
 /skills          list enabled skills; user-invoked ones are slash commands
 /project         the layers, the knowledge mode and every tool's fate
 /threads         this project's threads, newest first
@@ -112,8 +129,17 @@ impl Repl {
             threads_dir: PathBuf::new(),
             global_instructions: PathBuf::new(),
             display: DisplaySection::default(),
+            config: None,
+            profile_name: String::new(),
             verbose: false,
         }
+    }
+
+    /// The config and the profile the provider came from, for `/profile`.
+    pub fn with_config(mut self, config: Config, profile_name: &str) -> Self {
+        self.config = Some(config);
+        self.profile_name = profile_name.to_owned();
+        self
     }
 
     pub fn with_project_paths(
@@ -258,6 +284,18 @@ impl Repl {
                     }
                     Err(e) => println!("[{e}]"),
                 },
+                Command::Profile(name) => {
+                    let _ = editor.add_history_entry(line.trim());
+                    match self.switch_profile(name) {
+                        Ok(line) => println!("{line}"),
+                        Err(e) => println!("[error: {e}]"),
+                    }
+                }
+                Command::Policy => println!("{}", policy_report(&self.runtime)),
+                Command::Memory => match self.runtime.log().read_all() {
+                    Ok(events) => println!("{}", memory_report(&self.runtime, &events)),
+                    Err(e) => println!("[error: {e}]"),
+                },
                 Command::Unknown(cmd) => println!("unknown command: {cmd}"),
                 Command::Chat(text) => {
                     let _ = editor.add_history_entry(text);
@@ -267,6 +305,24 @@ impl Repl {
         }
         let _ = editor.save_history(&self.history);
         Ok(())
+    }
+
+    /// `/profile <name>`: build the provider for `name` from the config
+    /// with its key from the environment and swap it in. Budget and
+    /// compaction settings stay the session's; the new banner line comes
+    /// back.
+    fn switch_profile(&mut self, name: &str) -> anyhow::Result<String> {
+        let Some(config) = &self.config else {
+            anyhow::bail!("no config loaded; /profile needs one");
+        };
+        let (profile_name, profile) = config.select(Some(name))?;
+        let api_key = profile.api_key()?;
+        let provider = profile.build_provider(api_key);
+        self.runtime
+            .set_provider(provider, &profile.model)
+            .map_err(|e| anyhow::anyhow!("reloading knowledge: {e}"))?;
+        self.profile_name = profile_name.to_owned();
+        Ok(banner_line(profile_name, profile, self.runtime.mode()))
     }
 
     async fn run_skill(&mut self, name: &str, args: &str) {
@@ -353,6 +409,130 @@ impl Repl {
         }
         self.settle(outcome).await;
     }
+}
+
+/// The first banner line: profile, model, endpoint and the mode unless
+/// it is `manual`. Never the key.
+pub fn banner_line(profile_name: &str, profile: &Profile, mode: Mode) -> String {
+    format!(
+        "aigentic · profile {profile_name} · {} · {}{}",
+        profile.model,
+        profile.endpoint(),
+        mode_banner(mode)
+    )
+}
+
+fn author_name(author: &Author) -> &str {
+    match author {
+        Author::User(u) => u.0.as_str(),
+        Author::Agent(a) => a.0.as_str(),
+        Author::System => "system",
+    }
+}
+
+/// `/policy`: the rule table in order with each rule's name, decision
+/// and reason, the bash allow patterns, the mode, and the session grants
+/// with who gave them.
+pub fn policy_report(runtime: &Runtime) -> String {
+    let policy = runtime.policy();
+    let mut out = String::from("policy rules, first match wins\n");
+    let width = policy
+        .rules
+        .iter()
+        .map(|r| r.name().len())
+        .max()
+        .unwrap_or(0);
+    for (i, rule) in policy.rules.iter().enumerate() {
+        let decision = match rule.decision {
+            Decision::Allow => "allow",
+            Decision::Ask => "ask",
+            Decision::Deny => "deny",
+        };
+        out.push_str(&format!(
+            "  {:>2}. {:<width$}  {decision:<5}  {}\n",
+            i + 1,
+            rule.name(),
+            rule.reason
+        ));
+    }
+    out.push_str(&format!(
+        "bash allow patterns: {}\n",
+        if policy.bash_allow.is_empty() {
+            "none".to_owned()
+        } else {
+            policy.bash_allow.join(", ")
+        }
+    ));
+    out.push_str(&format!(
+        "mode {}: {}\n",
+        runtime.mode(),
+        mode_meaning(runtime.mode())
+    ));
+    let grants = runtime.session_grants();
+    if grants.is_empty() {
+        out.push_str("session grants: none");
+    } else {
+        out.push_str("session grants (this session only)\n");
+        for g in grants {
+            let what = match &g.command {
+                Some(c) => format!("bash {c:?}"),
+                None => g.tool.clone(),
+            };
+            out.push_str(&format!("  {what}  by {}\n", author_name(&g.author)));
+        }
+    }
+    out.trim_end().to_owned()
+}
+
+/// `/memory`: the memory files with line counts, the `through_seq` of
+/// the last extraction in `events`, then the block as the prefix carries
+/// it.
+pub fn memory_report(
+    runtime: &Runtime,
+    events: &[aigentic_runtime::aigentic_core::Event],
+) -> String {
+    let Some(project) = runtime.layers().project.as_ref() else {
+        return "no project: memory needs an aigentic.toml".to_owned();
+    };
+    let files: Vec<String> = project
+        .memory
+        .iter()
+        .map(|(name, text)| {
+            let lines = text.lines().filter(|l| !l.trim().is_empty()).count();
+            format!("{name} ({lines} lines)")
+        })
+        .collect();
+    let mut out = format!(
+        "memory files in {}: {}\n",
+        project.memory_dir().display(),
+        if files.is_empty() {
+            "none".to_owned()
+        } else {
+            files.join(", ")
+        }
+    );
+    let last = events
+        .iter()
+        .rev()
+        .find(|e| e.kind == EventKind::MemoryExtracted)
+        .and_then(|e| serde_json::from_value::<MemoryExtractedPayload>(e.payload.clone()).ok());
+    match last {
+        Some(p) => out.push_str(&format!(
+            "last extraction: through seq {}, {} lines written by {}\n",
+            p.through_seq,
+            p.written.len(),
+            p.model
+        )),
+        None => out.push_str("last extraction: none in this thread\n"),
+    }
+    match project.memory_prefix() {
+        Some(block) => {
+            out.push_str("as the prefix carries it:\n");
+            out.push_str(&block);
+        }
+        None => out.push_str("nothing in the prefix: every file is empty"),
+    }
+    out.trim_end().to_owned()
 }
 
 /// What the mode does, for `/mode` and the banner.
@@ -507,6 +687,13 @@ mod tests {
         );
         assert_eq!(mode_banner(Mode::Manual), "");
         assert_eq!(mode_banner(Mode::Auto), " · mode auto");
+        assert_eq!(
+            parse_line("/profile anthropic", &none),
+            Command::Profile("anthropic")
+        );
+        assert_eq!(parse_line("/profile", &none), Command::Unknown("/profile"));
+        assert_eq!(parse_line("/policy", &none), Command::Policy);
+        assert_eq!(parse_line("/memory", &none), Command::Memory);
         assert_eq!(parse_line("/project", &none), Command::Project);
         assert_eq!(parse_line("/threads", &none), Command::Threads);
         assert_eq!(
@@ -579,5 +766,143 @@ mod tests {
         let out = truncate_for_display(&wide, 12, 100);
         assert!(out.starts_with(&"x".repeat(100)), "{out}");
         assert!(out.contains("… (400 more bytes)"), "{out}");
+    }
+
+    use aigentic_runtime::aigentic_core::{
+        AgentId, Capabilities, CompletionRequest, Message, Provider, ProviderEvent,
+    };
+    use aigentic_runtime::aigentic_log::{NewEvent, ThreadLog};
+    use aigentic_runtime::aigentic_tools::{ToolRegistry, Workdir};
+    use aigentic_runtime::{Layers, Project};
+    use futures_core::Stream;
+    use std::pin::Pin;
+
+    struct Silent;
+    impl Provider for Silent {
+        fn complete(
+            &self,
+            _: &CompletionRequest<'_>,
+        ) -> Pin<Box<dyn Stream<Item = ProviderEvent> + Send + '_>> {
+            Box::pin(futures_util::stream::empty())
+        }
+        fn count_tokens(&self, _: &[Message]) -> u64 {
+            1
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                supports_tools: true,
+                supports_images: false,
+                supports_caching: false,
+                supports_structured_output: false,
+                max_context_tokens: 1000,
+            }
+        }
+    }
+
+    fn fixture(dir: &std::path::Path) -> Runtime {
+        std::fs::write(
+            dir.join("aigentic.toml"),
+            "[project]\nname = \"p\"\n[policy]\nbash_allow = [\"ls\", \"cargo test\"]\n",
+        )
+        .unwrap();
+        let mem = dir.join(".aigentic/memory");
+        std::fs::create_dir_all(&mem).unwrap();
+        std::fs::write(
+            mem.join("decisions.md"),
+            "- Use Swedish.\n- Keep it short.\n",
+        )
+        .unwrap();
+        std::fs::write(mem.join("facts.md"), "\n").unwrap();
+        let project = Project::open_root(dir).unwrap();
+        let log = ThreadLog::open(dir, ulid::Ulid::generate()).unwrap();
+        Runtime::new(
+            Box::new(Silent),
+            ToolRegistry::builtin(Workdir::new(dir)),
+            log,
+            AgentId("a".into()),
+        )
+        .with_policy(project.file.policy())
+        .with_layers(Layers::default().with_project(project))
+    }
+
+    #[test]
+    fn the_policy_report_lists_rules_patterns_mode_and_grants() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rt = fixture(dir.path());
+        let text = policy_report(&rt);
+        assert!(
+            text.starts_with("policy rules, first match wins\n   1. class safe"),
+            "{text}"
+        );
+        assert!(text.contains("harness self-management"), "{text}");
+        assert!(
+            text.contains(&format!(
+                "deny   {}",
+                aigentic_runtime::aigentic_policy::MEMORY_REASON
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains("\nbash allow patterns: ls, cargo test\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("\nmode manual: every ask goes to you\n"),
+            "{text}"
+        );
+        assert!(text.ends_with("session grants: none"), "{text}");
+        rt.set_mode(Mode::Auto);
+        let text = policy_report(&rt);
+        assert!(text.contains("\nmode auto: "), "{text}");
+    }
+
+    #[test]
+    fn the_memory_report_counts_files_and_names_the_last_extraction() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = fixture(dir.path());
+        let text = memory_report(&rt, &[]);
+        assert!(
+            text.starts_with(&format!(
+                "memory files in {}: decisions.md (2 lines), facts.md (0 lines)\nlast extraction: none in this thread\nas the prefix carries it:\n# Project memory",
+                dir.path().join(".aigentic/memory").display()
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains("\n## decisions.md\n\n- Use Swedish.\n- Keep it short."),
+            "{text}"
+        );
+        assert!(
+            !text.contains("## facts.md"),
+            "an empty file is not in the prefix: {text}"
+        );
+
+        let mut log = ThreadLog::open(dir.path(), ulid::Ulid::generate()).unwrap();
+        log.append(NewEvent {
+            kind: EventKind::MemoryExtracted,
+            author: Author::System,
+            payload: serde_json::json!({
+                "through_seq": 7,
+                "written": [{"file": "decisions.md", "text": "- Use Swedish.", "stated_by": {"kind": "user", "id": "steve"}, "at_seq": 3}],
+                "model": "m",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            }),
+            parent_event: None,
+        })
+        .unwrap();
+        let events = log.read_all().unwrap();
+        let text = memory_report(&rt, &events);
+        assert!(
+            text.contains("last extraction: through seq 7, 1 lines written by m\n"),
+            "{text}"
+        );
+
+        let bare = Runtime::new(
+            Box::new(Silent),
+            ToolRegistry::empty(),
+            ThreadLog::open(dir.path(), ulid::Ulid::generate()).unwrap(),
+            AgentId("a".into()),
+        );
+        assert!(memory_report(&bare, &[]).starts_with("no project"));
     }
 }

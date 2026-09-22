@@ -105,7 +105,14 @@ compactions and memory extractions), `/pin <text>` (a fact for the stable
 prefix, never summarised), `/compact` (run compaction now and report what it
 did), `/verbose` (toggle the session between the configured cap and 40 lines
 / 8000 bytes; it prints which is on), `/mode [name]` (show or set the
-permission mode, below), `/skills` (the enabled set), `/project`
+permission mode, below), `/profile <name>` (swap the provider to that
+profile from the config for the next turn on; the knowledge mode is
+re-decided for the new window and the banner line is printed again;
+budget and compaction settings stay), `/policy` (the rule table in order
+with each rule's name, decision and reason, the bash allow patterns, the
+mode, and the session grants with who gave them), `/memory` (the memory
+files with line counts, the `through_seq` of the last extraction, and
+the block as the prefix carries it), `/skills` (the enabled set), `/project`
 (the same report as `project show`, over the live registry so MCP tools are
 included), `/threads`, `/<skill> [args]` for every enabled user-invoked
 skill, `/help`, `/quit`. Anything else starting with `/` prints `unknown
