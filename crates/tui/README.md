@@ -63,7 +63,7 @@ any non-empty value.
 cargo run -p aigentic-tui --                                     # new thread over a daemon embedded for this directory
 cargo run -p aigentic-tui -- --server tcp:vm:7420 --project vendela   # the same client against a remote daemon; token in AIGENTIC_TOKEN
 cargo run -p aigentic-tui -- --thread <ULID>                     # resume by replaying the log
-cargo run -p aigentic-tui -- --thread <ULID> --profile anthropic # same thread, other backend
+cargo run -p aigentic-tui -- --thread <ULID>                     # the backend is the project's [model] profile (see phase 5 item 26)
 cargo run -p aigentic-tui -- project init                        # aigentic.toml + .aigentic/{knowledge,memory}
 cargo run -p aigentic-tui -- project setup                       # render docs/agents/*.md from [pocock]
 cargo run -p aigentic-tui -- project show                        # layers, knowledge mode, every tool's fate
@@ -654,3 +654,158 @@ symlinked knowledge, the banner's count, the narrowing note) and step
 10; the two that did not (the flat-layout fallback's missing project,
 `read_file` preferred over `search_knowledge` for files in the
 repository) are phase 5 open items in `docs/PLAN-phase4.md` section 12.
+
+### Phase 5 acceptance (docs/PLAN-phase5.md done-when 1 to 5)
+
+Two people, two machines, one daemon. Everything below is a by-hand run;
+record thread ids and findings under "Results" as phase 4 did. Items 21
+to 25 are done-when 1 to 5; item 26 is the rerun of items 1 to 20
+through the socket. The three findings step 10's tests turned up are
+folded into the items so the run does not trip on them.
+
+**The daemon on the VM.** One machine holds the checkouts and runs
+`aigentic serve`; nothing else needs a checkout, a key or the skills.
+
+1. Build and install the one binary on the VM
+   (`cargo install --path crates/tui --force`), then clone this
+   repository there too: `config.toml`'s `bundled_dir` must point at
+   that checkout, because the vendored `skills/` and
+   `skills.lock.toml` live in it and the daemon builds every thread
+   (the phase 4 open item on a single-binary home for bundled skills
+   is answered this way for phase 5).
+2. `~/.config/aigentic/config.toml` on the VM holds the profiles and
+   `bundled_dir`; the key variables live in the daemon's environment
+   only. A client machine's `config.toml` needs nothing but
+   `[display]`, and `user` for the embedded case.
+3. `~/.config/aigentic/server.toml`:
+
+   ```toml
+   listen = "tcp:127.0.0.1:7420"        # loopback; clients reach it over an SSH tunnel
+   idle_unload_secs = 600
+
+   [[users]]
+   name = "steve"                       # first user: the daemon's owner
+   token_env = "AIGENTIC_TOKEN_STEVE"
+
+   [[users]]
+   name = "magnus"
+   token_env = "AIGENTIC_TOKEN_MAGNUS"
+
+   [[projects]]
+   name = "aigentic"
+   root = "/srv/aigentic"
+
+   [[projects]]
+   name = "vendela"
+   root = "/srv/vendela"
+   ```
+
+4. Mint one token per user with `aigentic serve --new-token magnus`;
+   it prints once and is never stored. Put each in the named variable
+   in the daemon's environment (a systemd unit's `EnvironmentFile=`
+   with mode 0600 is the plain answer; the same file holds the model
+   keys) and hand each person theirs out of band. Never paste one into
+   a chat, a shell history or a file in a checkout.
+5. In each project's `aigentic.toml`, `[participants]` names everyone
+   with a role, the owner included: a table that names anyone gives
+   the owner nothing unless listed (an absent table is the only case
+   where the owner is admin by default). For done-when 3 the roles
+   below assume `steve = "admin"`, `magnus = "approve"` and a third
+   name with `"write"`, then `"read"`.
+6. Start the daemon (`aigentic serve`, or the unit) and check its
+   banner counts the users and projects and names the listener. From each
+   client machine open a tunnel, `ssh -N -L 7420:127.0.0.1:7420 vm`,
+   export the person's token as `AIGENTIC_TOKEN`, and run
+   `aigentic --server tcp:127.0.0.1:7420 --project aigentic`. The
+   banner must say `as <name> (<role>)` with the daemon's version.
+   Plain TCP carries the tokens, so nothing listens off loopback
+   without a proxy in front (plan decision 9).
+
+21. Done-when 1, attribution. Both people open the same thread (the
+    second with `--thread <ULID>` after the first's banner prints it).
+    Each posts a message; the other's arrives live as `<name>: ...`
+    and the model's reply names both. Then ask for something the
+    rules prompt on, and let the person who did not ask decide: pick a
+    shell command off the default allow list (`printf`, not `echo`;
+    the list in `docs/PLAN-phase3.md` section 4 runs without asking),
+    or an edit under `manual`. The asker sees the prompt and does not
+    answer; the other sees the same prompt and answers `y`; the asker's
+    terminal prints `[decided by magnus]` then `[allowed by magnus]`,
+    and the log's `permission_decided` event carries
+    `{"kind":"user","id":"magnus"}`. Also try the reverse: the
+    asker answers first and the other's prompt is withdrawn the same
+    way. A `read` user on the thread sees `[waiting for an approver:
+    ...]` and no prompt.
+22. Done-when 2, queue and interrupt. Ask for a long answer; while it
+    streams, the other person posts a line: it prints in both
+    terminals at once as `<name>: ...` with `[queued for the next
+    turn]` for the poster, `/queue` counts it, and the model does not
+    address it until the next turn starts (which it does on its own
+    when the running one ends). Then, during another long answer, post
+    `!stop, do X instead`: within a second the stream stops,
+    `[interrupted by <name>]` prints, the log has `interrupted {
+    reason: "interrupt", by }`, and the new turn answers the interrupt.
+    Then interrupt while a tool runs (`bash sleep 20`): the tool's
+    result is recorded before the interrupt, in the log and on screen.
+    Then interrupt while a prompt waits: the request is denied with
+    the interrupter's name and `(interrupted)`. Then `kill -9` the
+    daemon mid-turn and restart it: the first `--thread` resume shows
+    the phase 2 synthetic results and the interrupted note over the
+    socket, and the thread continues.
+23. Done-when 3, roles. With the third name as `"read"`: their post is
+    `[refused: ...]` naming the role, and the log (on the VM) gains no
+    event. As `"write"`: their post lands, their `y` on a prompt is
+    `[refused: ...]`, their answer to an `ask_human` question lands.
+    As `"approve"`: `/mode auto` sets the mode and every subscriber
+    prints `[mode auto]`; a `write` user's `/mode` is refused. Roles
+    change in the project file on the VM, which is read on every
+    request, so the next request picks the change up.
+24. Done-when 4, the client alone. On a laptop with no daemon
+    reachable, `aigentic` in a checkout embeds one: the banner says
+    `embedded daemon`, and a prompt answered by yourself prints
+    `[allowed by <you>]`. Item 26 is the rest of this done-when.
+25. Done-when 5, thread project. From a client machine with no
+    checkout, `aigentic --server ... --project vendela` creates a
+    thread; on the VM `aigentic threads` in `/srv/vendela` lists it
+    (that command reads the log directory, so it runs where the logs
+    are: it is not over the API yet), and the log's first line is
+    `thread_started` with the project name, the root the daemon used
+    and `created_by`. Resume one pre-phase-5 thread by id (a flat
+    phase 3 log and a phase 4 directory log) through the embedded
+    daemon and expect both to open and replay.
+26. Items 1 to 20 through the socket, on the VM and embedded. The
+    outcomes are the same; the mechanics differ in four places. Item
+    2's thread is created over the API and the banner says `embedded
+    daemon`. Item 8's backend swap has no flag: `--profile` is
+    accepted and ignored on the REPL path since step 9 (the embedded
+    daemon builds the thread from the project's `[model] profile`), so
+    set that line in `aigentic.toml` between resumes; the flag still
+    selects for `project show`. Items 9 and 10 kill the daemon rather
+    than the client: with the embedded daemon that is the same
+    process, so they read as before; on the VM they are item 22's last
+    step. Item 13's `a` grant lasts while the daemon keeps the thread
+    loaded (`idle_unload_secs` after the last session closes, never
+    while a prompt waits), not until the process exits, and the
+    prompt's Ctrl-C deny is gone: `n`. Everything else, `/cost` and
+    `/project` included, is rendered by the daemon and reads the same.
+
+Then the two days of use phase 4 asked for, this time with two people
+in Vendela and here, on both backends, and the daemon on the VM for
+both days. Note as before what the harness got wrong and what the
+model did, and which of those became a commit.
+
+Results: not yet run as of 2026-09-22. Steps 1 to 10 are on `main`
+(the last is `e9c1450`); items 21 to 26 wait for the VM and the second
+person. What step 10's tests already hold, over a private socket with a
+scripted provider and no network: an `ask_human` question answered from
+the prompt with the turn continuing, a `bash` request denied with
+`[denied by steve]`, and over a three-user daemon the prompt on
+`steve`'s terminal withdrawn with `[decided by magnus]` when magnus
+decided first while the `read` user saw only `[waiting for an
+approver: bash {"command":"printf ok"}]` and the decision. Three
+findings from writing those tests are in the items above: `echo` is on
+the default allow list; a `[participants]` table must list the owner;
+and `ask_human`'s answering author is not in the log (the tool result
+is authored `system`), so a question answered elsewhere prints
+`[answered elsewhere]` with no name until the runtime records it. A
+fourth, from writing item 26: `--profile` is a no-op on the REPL path.
