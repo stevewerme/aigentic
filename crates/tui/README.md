@@ -509,6 +509,25 @@ fourteen docs under `.aigentic/knowledge/` and `threshold_fraction =
   reported both axes with #50 as the spec. No sub-agents exist here, so
   the two axes ran in sequence, which it said.
 
+Days of use, for done-when 1:
+
+- 2026-09-21, here, thread `01M32SZ1SVD0MDGYS77H0558TP`: "what's next
+  in the plan, and the Pocock skills feel unused" became a review of
+  the 33 pending vendored skills, 24 accepted and 9 declined, and the
+  model went on to implement a `rejected` review state after an
+  `ask_human` answer chose the design. The turn hit the 2M budget
+  mid-edit with the tree uncompilable; that produced step 9's turn split
+  and `touched` list. Finished by hand as `bfaeef7` and `10f44c7`.
+- 2026-09-22, Steve's notes after a day and a half on both projects:
+  tool output takes over the terminal even at twelve lines; a folded
+  view needs the next client, not this REPL. A mode selector (auto,
+  accept edits, manual) is wanted for the same reason: the prompts are
+  the other half of the noise. Onboarding is the weakest surface:
+  profile, key, project, GitHub through `gh`, and the scaffolding
+  `[pocock]` renders should be one guided command, in the spirit of
+  upstream's setup skill, and the `gh` integration should be able to
+  set up issues and labels.
+
 Done-when 1 to 5 hold on both backends as of 2026-09-21 (items 16 to
 20 above, each on TensorX `z-ai/glm-5.3` and Anthropic `claude-opus-5`),
 with one harness fix along the way (`c437679`, memory re-read at turn
