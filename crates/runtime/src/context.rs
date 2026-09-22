@@ -9,6 +9,9 @@ use aigentic_log::{LogError, Projection, project};
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Prefix<'a> {
     pub global: Option<&'a str>,
+    /// The harness's own standing instructions (phase 6 step 8c): how to
+    /// use its tools. Fixed text, after the person's global block.
+    pub harness: Option<&'a str>,
     pub project: Option<&'a str>,
     /// One line under the project instructions when the project names
     /// participants (phase 5): who is in it and their roles, so the
@@ -53,6 +56,9 @@ pub fn build_context(prefix: &Prefix<'_>, events: &[Event]) -> Result<Vec<Messag
     }
     let mut context = Vec::with_capacity(body.len() + 7);
     if let Some(text) = prefix.global {
+        context.push(system(text.to_owned()));
+    }
+    if let Some(text) = prefix.harness {
         context.push(system(text.to_owned()));
     }
     if let Some(text) = prefix.project {
@@ -157,6 +163,7 @@ mod tests {
         ];
         let prefix = Prefix {
             global: Some("You are terse."),
+            harness: Some("Keep a checklist."),
             project: Some("This is Vendela."),
             participants: None,
             knowledge: Some("# Knowledge\n\n...".into()),
@@ -169,6 +176,7 @@ mod tests {
             texts,
             vec![
                 "You are terse.",
+                "Keep a checklist.",
                 "This is Vendela.",
                 "# Knowledge\n\n...",
                 "# Project memory\n\n- Use Swedish.",
@@ -177,8 +185,8 @@ mod tests {
                 "hej"
             ]
         );
-        assert!(ctx[..6].iter().all(|m| m.role == Role::System));
-        assert_eq!(ctx[6].role, Role::User);
+        assert!(ctx[..7].iter().all(|m| m.role == Role::System));
+        assert_eq!(ctx[7].role, Role::User);
 
         let ctx = build_context(&Prefix::default(), &events[1..2]).unwrap();
         assert_eq!(ctx.len(), 1, "no prefix, no pins: body only");

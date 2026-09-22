@@ -1,6 +1,6 @@
 # Phase 6 plan
 
-Status: grilled and settled on 2026-09-22 (18 questions, section 11 records the answers); steps 1 to 8b landed the same day · Follows `docs/PRD.md` (the Terminal application and Projects sections) and the phase 0 to 5 plans · Renumbers the PRD's build order: the client is phase 6, sandboxing phase 7, the orchestrator phase 8; multiplayer acceptance (phase 5 step 11) waits behind all three
+Status: grilled and settled on 2026-09-22 (18 questions, section 11 records the answers); steps 1 to 8c landed the same day · Follows `docs/PRD.md` (the Terminal application and Projects sections) and the phase 0 to 5 plans · Renumbers the PRD's build order: the client is phase 6, sandboxing phase 7, the orchestrator phase 8; multiplayer acceptance (phase 5 step 11) waits behind all three
 
 ## 0. Goal and done-when
 
@@ -522,10 +522,14 @@ which only changes what `doctor` expects (no repository, no GitHub).
     never counted by the client. The status line drops its clock.
 8c. `runtime, api, tui: the task list` — a built-in `update_tasks` tool
     the model calls with its whole checklist (text and state: pending,
-    active, done); a `tasks_updated` event; the list drawn above the
+    active, done); no new event, since the call already carries the
+    whole list in the log; the list drawn above the
     composer while the turn runs and committed to the transcript when it
     changes to all done. The system prompt asks for it on any task of
-    three steps or more. Its purpose is to keep a turn going until the
+    three steps or more: as landed, a fixed harness block after the
+    person's global instructions, set by the daemon's build (the tool's
+    description alone got zero calls from GLM 5.3 on an explicit
+    four-step task; the block got four and five). Its purpose is to keep a turn going until the
     work is finished and to show where it is.
 9. `runtime, server: utility profile and titles` — `utility_profile`
    in config, `Runtime::utility`, `title.rs`, `thread_renamed`,

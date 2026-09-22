@@ -1,5 +1,5 @@
 //! Tools the runtime answers itself because they need the log or the
-//! human: `pin`, `ask_human` and `load_skill`. They appear in the specs
+//! human: `pin`, `ask_human`, `load_skill` and `update_tasks`. They appear in the specs
 //! like any tool, with class `safe`, so the model's view is uniform; the
 //! tools crate never sees them.
 
@@ -14,6 +14,38 @@ use crate::{Runtime, RuntimeError, Signal};
 pub const PIN: &str = "pin";
 pub const ASK_HUMAN: &str = "ask_human";
 pub const LOAD_SKILL: &str = "load_skill";
+/// The model's checklist (phase 6 step 8c). The call is the record: the
+/// whole list is in its arguments, so a client draws it from the call and
+/// a replay of the log shows every version.
+pub const UPDATE_TASKS: &str = "update_tasks";
+
+/// The harness's standing instructions, one system block after the
+/// person's global ones. A tool description alone did not make GLM 5.3
+/// keep the checklist (zero calls on an explicit four-step task); this
+/// line did (four and five calls in two runs).
+pub const HARNESS_INSTRUCTIONS: &str = "For any request of three or more steps, call update_tasks before anything else with every step, then again as each step starts and finishes. Work one step at a time.";
+
+/// One checklist item as the model sends it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]
+pub struct Task {
+    pub text: String,
+    #[serde(default)]
+    pub state: TaskState,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskState {
+    #[default]
+    Pending,
+    Active,
+    Done,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateTasksArgs {
+    pub tasks: Vec<Task>,
+}
 
 #[derive(Debug, Deserialize)]
 struct PinArgs {
@@ -44,6 +76,25 @@ pub fn harness_specs(offer_load_skill: bool) -> Vec<ToolSpec> {
             }),
         },
         ToolSpec {
+            name: UPDATE_TASKS.into(),
+            description: "Keep a short checklist of the work and show it to the human. For any task of three steps or more, call it first with every step, then again whenever a step starts or finishes, sending the whole list each time. Keep exactly one step active while you work, mark a step done only when it is finished and checked, and do not end your turn while a step is pending unless you say why.".into(),
+            schema: json!({
+                "type": "object",
+                "properties": {"tasks": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "text": {"type": "string", "description": "The step, a few words."},
+                            "state": {"type": "string", "enum": ["pending", "active", "done"]}
+                        },
+                        "required": ["text", "state"]
+                    }
+                }},
+                "required": ["tasks"]
+            }),
+        },
+        ToolSpec {
             name: PIN.into(),
             description: "Pin a short fact to the stable prefix so it survives compaction: a decision, a constraint, a path that matters.".into(),
             schema: json!({
@@ -71,12 +122,17 @@ pub fn harness_specs(offer_load_skill: bool) -> Vec<ToolSpec> {
 /// The harness tools' names, for a skill's `requires` check: they are
 /// always available, whatever the registry holds.
 pub fn harness_names() -> Vec<String> {
-    vec![ASK_HUMAN.into(), LOAD_SKILL.into(), PIN.into()]
+    vec![
+        ASK_HUMAN.into(),
+        LOAD_SKILL.into(),
+        PIN.into(),
+        UPDATE_TASKS.into(),
+    ]
 }
 
 /// Whether the runtime answers this tool itself.
 pub fn is_harness_tool(name: &str) -> bool {
-    matches!(name, PIN | ASK_HUMAN | LOAD_SKILL)
+    matches!(name, PIN | ASK_HUMAN | LOAD_SKILL | UPDATE_TASKS)
 }
 
 /// Every harness tool is `safe`.
@@ -179,6 +235,27 @@ impl Runtime {
                         ))
                     }
                 },
+                Err(e) => err(format!("invalid arguments: {e}")),
+            },
+            UPDATE_TASKS => match serde_json::from_value::<UpdateTasksArgs>(call.args.clone()) {
+                Ok(args) if args.tasks.is_empty() => err("send at least one task".into()),
+                Ok(args) => {
+                    let done = args
+                        .tasks
+                        .iter()
+                        .filter(|t| t.state == TaskState::Done)
+                        .count();
+                    let active = args
+                        .tasks
+                        .iter()
+                        .filter(|t| t.state == TaskState::Active)
+                        .count();
+                    let mut text = format!("tasks: {done} of {} done", args.tasks.len());
+                    if active > 1 {
+                        text.push_str("; keep one step active at a time");
+                    }
+                    ok(text)
+                }
                 Err(e) => err(format!("invalid arguments: {e}")),
             },
             other => err(format!("unknown harness tool: {other}")),

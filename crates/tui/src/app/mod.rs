@@ -165,6 +165,11 @@ impl Printer for ShellOut {
         self.commit(Cell::Note(text.to_owned()));
     }
 
+    fn tasks(&mut self, _tasks: &[aigentic_runtime::harness_tools::Task]) {
+        // Drawn above the turn line from the engine's state.
+        self.flush_explored();
+    }
+
     fn prompt(&mut self, _block: &PromptBlock) {
         // Drawn above the composer from the engine's state, not
         // committed to the transcript.
@@ -381,10 +386,20 @@ async fn run_shell(
         {
             armed = None;
         }
-        let block = engine
-            .prompt_block()
-            .map(|b| block_lines(b, out.shell.width()))
-            .unwrap_or_default();
+        let mut block: Vec<Line<'static>> = if engine.tasks().is_empty() {
+            Vec::new()
+        } else {
+            cells::task_lines(engine.tasks())
+                .iter()
+                .flat_map(|l| wrap_line(l, out.shell.width()))
+                .collect()
+        };
+        block.extend(
+            engine
+                .prompt_block()
+                .map(|b| block_lines(b, out.shell.width()))
+                .unwrap_or_default(),
+        );
         if files.is_none()
             && let Some(task) = files_task.as_mut()
             && task.is_finished()

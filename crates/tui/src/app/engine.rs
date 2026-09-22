@@ -169,6 +169,13 @@ pub trait Printer {
             self.line(&l);
         }
     }
+    /// The checklist changed. A pipe prints it; a shell draws it from
+    /// the engine instead.
+    fn tasks(&mut self, tasks: &[aigentic_runtime::harness_tools::Task]) {
+        for l in Cell::Tasks(tasks.to_vec()).plain() {
+            self.line(&l);
+        }
+    }
     /// A long text to page through (`/diff`); a pipe prints it.
     fn pager(&mut self, _title: &str, text: &str) {
         for l in text.lines() {
@@ -220,6 +227,11 @@ pub struct ClientRepl {
     block: Option<PromptBlock>,
     /// The running turn's figures; `None` while idle.
     turn: Option<TurnStats>,
+    /// The model's checklist from its last `update_tasks`, until it is all
+    /// done or the turn ends.
+    tasks: Vec<aigentic_runtime::harness_tools::Task>,
+    /// The `update_tasks` call ids, whose results draw nothing.
+    task_calls: std::collections::HashSet<String>,
     quit: bool,
     /// The last `Notice::Usage`: window fill and window, for the
     /// status line (phase 6 step 3); kept, not yet shown.
@@ -251,6 +263,8 @@ impl ClientRepl {
             prompted: None,
             block: None,
             turn: None,
+            tasks: Vec::new(),
+            task_calls: std::collections::HashSet::new(),
             usage: None,
             awaiting_turn: false,
             quit: false,
@@ -559,6 +573,18 @@ impl ClientRepl {
         self.answered(r, out);
     }
 
+    /// The checklist the shell draws above the turn line.
+    pub fn tasks(&self) -> &[aigentic_runtime::harness_tools::Task] {
+        &self.tasks
+    }
+
+    /// Commit the checklist to the transcript and clear it.
+    fn settle_tasks(&mut self, out: &mut dyn Printer) {
+        if !self.tasks.is_empty() {
+            out.cell(Cell::Tasks(std::mem::take(&mut self.tasks)), true);
+        }
+    }
+
     /// The running turn's figures, for the turn line.
     pub fn turn(&self) -> Option<&TurnStats> {
         self.turn.as_ref()
@@ -664,6 +690,25 @@ impl ClientRepl {
                     );
                 }
                 out.tail(&self.partial);
+            }
+            Notice::ToolCallStarted { call, .. }
+                if call.name == aigentic_runtime::harness_tools::UPDATE_TASKS =>
+            {
+                self.flush_partial(out);
+                self.task_calls.insert(call.id.clone());
+                if let Ok(args) = serde_json::from_value::<
+                    aigentic_runtime::harness_tools::UpdateTasksArgs,
+                >(call.args.clone())
+                {
+                    use aigentic_runtime::harness_tools::TaskState;
+                    self.tasks = args.tasks;
+                    out.tasks(&self.tasks);
+                    if !self.tasks.is_empty()
+                        && self.tasks.iter().all(|t| t.state == TaskState::Done)
+                    {
+                        self.settle_tasks(out);
+                    }
+                }
             }
             Notice::ToolCallStarted { call, .. } => {
                 self.flush_partial(out);
@@ -819,6 +864,12 @@ impl ClientRepl {
                 }
                 if let Ok(ToolResultPayload { result: r, .. }) =
                     serde_json::from_value(event.payload.clone())
+                    && self.task_calls.remove(&r.id)
+                {
+                    return;
+                }
+                if let Ok(ToolResultPayload { result: r, .. }) =
+                    serde_json::from_value(event.payload.clone())
                 {
                     // Our question, answered on another connection: the
                     // result is that person's event.
@@ -887,6 +938,7 @@ impl ClientRepl {
             }
             EventKind::TurnEnded => {
                 self.flush_partial(out);
+                self.settle_tasks(out);
                 if let Some(t) = self.turn.take() {
                     out.cell(Cell::Summary(format!("─ {}", t.figures())), true);
                 }

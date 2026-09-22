@@ -74,6 +74,10 @@ pub struct Runtime {
     /// The last call's reported prompt size and the context length it was
     /// measured at, so window fill is exact plus the estimated growth.
     pub(crate) measured: Option<(u64, usize)>,
+    /// The harness's standing instructions in the prefix; off unless the
+    /// builder asks, so the library's own context stays exactly what its
+    /// caller put in.
+    pub(crate) harness_instructions: Option<&'static str>,
 }
 
 impl Runtime {
@@ -104,7 +108,16 @@ impl Runtime {
             compaction: DEFAULT_COMPACTION,
             model_label: "unknown".into(),
             measured: None,
+            harness_instructions: None,
         }
+    }
+
+    /// Put the harness's standing instructions in the prefix (how to use
+    /// `update_tasks`); the daemon does for every thread it builds.
+    pub fn with_harness_instructions(mut self) -> Self {
+        self.harness_instructions = Some(crate::harness_tools::HARNESS_INSTRUCTIONS);
+        self.measured = None;
+        self
     }
 
     pub fn with_policy(mut self, policy: Policy) -> Self {
@@ -337,6 +350,7 @@ impl Runtime {
     pub(crate) fn prefix(&self) -> crate::Prefix<'_> {
         crate::Prefix {
             global: self.layers.global.instructions.as_deref(),
+            harness: self.harness_instructions,
             project: self.layers.project_instructions(),
             participants: self.participants_line(),
             knowledge: self.knowledge.prefix(self.knowledge_mode),

@@ -154,7 +154,8 @@ pub async fn build_thread(
                 .with_root(&root.root, &root.root)
                 .with_rules_file(&rules_file),
         )
-        .with_skills(skills);
+        .with_skills(skills)
+        .with_harness_instructions();
     if let Some(p) = profile {
         runtime = runtime
             .with_compaction(p.compaction_settings())

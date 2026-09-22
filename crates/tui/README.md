@@ -92,7 +92,9 @@ recalls the last message sent, as Alt-Up does at any time. Ctrl-D quits.
 what it is doing (the running tool, writing, or thinking), its clock, the
 tools called, the last prompt's size and cached share, and the output so
 far; when it ends, the same figures stay in the transcript as one dim line.
-`@` opens a fuzzy file picker over the project
+For work of three steps or more the model keeps a checklist
+(`update_tasks`); it shows above the turn line with the active step marked
+and stays in the transcript when it is all done or the turn ends. `@` opens a fuzzy file picker over the project
 root (gitignored files skipped), `/` at the line's start the command list
 with descriptions; Up and Down move, Tab or Enter accepts, Esc closes. A
 permission request is a block above the

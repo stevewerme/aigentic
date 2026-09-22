@@ -5,6 +5,7 @@
 //! `… +N lines`. Consecutive reads fold into one `Explored` cell.
 
 use aigentic_runtime::aigentic_core::ToolCall;
+use aigentic_runtime::harness_tools::{Task, TaskState};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -49,6 +50,33 @@ pub enum Cell {
     Note(String),
     /// A turn's figures when it ends, dim.
     Summary(String),
+    /// The model's checklist.
+    Tasks(Vec<Task>),
+}
+
+/// The checklist's lines: a head with the count, then one line a step.
+pub fn task_lines(tasks: &[Task]) -> Vec<Line<'static>> {
+    let done = tasks.iter().filter(|t| t.state == TaskState::Done).count();
+    let mut lines = vec![Line::from(vec![
+        Span::styled("• ", Style::default().fg(Color::Cyan)),
+        Span::styled("Tasks", Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!(" {done}/{}", tasks.len()),
+            Style::default().add_modifier(Modifier::DIM),
+        ),
+    ])];
+    for t in tasks {
+        let (mark, style) = match t.state {
+            TaskState::Done => ("✓", Style::default().add_modifier(Modifier::DIM)),
+            TaskState::Active => ("▸", Style::default().add_modifier(Modifier::BOLD)),
+            TaskState::Pending => ("○", Style::default()),
+        };
+        lines.push(Line::from(Span::styled(
+            format!("  {mark} {}", t.text),
+            style,
+        )));
+    }
+    lines
 }
 
 /// Tools whose consecutive calls fold into `Explored`.
@@ -167,6 +195,7 @@ impl Cell {
                 }
                 lines
             }
+            Cell::Tasks(tasks) => task_lines(tasks),
             Cell::Summary(text) => vec![Line::from(Span::styled(
                 text.clone(),
                 Style::default().add_modifier(Modifier::DIM),
@@ -320,6 +349,33 @@ mod tests {
         assert_eq!(plain[3], "-b");
         assert_eq!(plain[4], "  … +3 lines (ctrl-t for all)");
         assert_eq!(cell.full().len(), 9);
+    }
+
+    #[test]
+    fn tasks_render_with_marks_and_a_count() {
+        let cell = Cell::Tasks(vec![
+            Task {
+                text: "read the plan".into(),
+                state: TaskState::Done,
+            },
+            Task {
+                text: "write the code".into(),
+                state: TaskState::Active,
+            },
+            Task {
+                text: "run the gate".into(),
+                state: TaskState::Pending,
+            },
+        ]);
+        assert_eq!(
+            cell.plain(),
+            vec![
+                "• Tasks 1/3",
+                "  ✓ read the plan",
+                "  ▸ write the code",
+                "  ○ run the gate"
+            ]
+        );
     }
 
     #[test]
