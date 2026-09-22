@@ -12,6 +12,7 @@ use aigentic_tools::{KnowledgeSnapshot, SEARCH_KNOWLEDGE, SearchKnowledgeTool};
 use crate::approver::{Approver, DenyAll};
 use crate::knowledge::{Knowledge, KnowledgeMode};
 use crate::layers::Layers;
+use crate::mode::Mode;
 use crate::seams::SessionGrant;
 
 /// Per-turn defaults. `max_tokens` counts every call's input and output
@@ -52,6 +53,8 @@ pub struct Runtime {
     pub(crate) policy: Policy,
     pub(crate) approver: Box<dyn Approver>,
     pub(crate) session_grants: Vec<SessionGrant>,
+    /// The permission mode; session state, never persisted.
+    pub(crate) mode: Mode,
     pub(crate) skills: SkillSet,
     pub(crate) log: ThreadLog,
     pub(crate) agent: AgentId,
@@ -83,6 +86,7 @@ impl Runtime {
             policy: Policy::defaults(),
             approver: Box::new(DenyAll),
             session_grants: Vec::new(),
+            mode: Mode::default(),
             skills: SkillSet::default(),
             log,
             agent,
@@ -139,6 +143,16 @@ impl Runtime {
 
     pub fn policy(&self) -> &Policy {
         &self.policy
+    }
+
+    /// The permission mode. Takes effect on the next `policy_check`; a
+    /// `Deny` from the rules stands in every mode.
+    pub fn set_mode(&mut self, mode: Mode) {
+        self.mode = mode;
+    }
+
+    pub fn mode(&self) -> Mode {
+        self.mode
     }
 
     pub fn with_compaction(mut self, settings: CompactionSettings) -> Self {

@@ -573,3 +573,145 @@ async fn a_tool_the_layers_hide_is_not_offered_and_is_refused_as_unknown() {
     assert!(r.touched.lock().unwrap().is_empty());
     audit(&r);
 }
+
+// Step 10 c: the permission mode stands in for the human on what the
+// rules would ask, never on what they deny, and the record names it.
+
+fn touch_memory(id: &str) -> ProviderEvent {
+    touch(id, ".aigentic/memory/decisions.md")
+}
+
+#[tokio::test]
+async fn accept_edits_runs_writes_with_the_mode_record_and_still_asks_for_bash() {
+    let mut r = rig(
+        vec![
+            vec![
+                touch("c1", "a.rs"),
+                bash("c2", "rm -rf x"),
+                done("tool_use"),
+            ],
+            vec![text("done"), done("stop")],
+        ],
+        vec![Answer::Deny],
+        Policy::defaults(),
+    );
+    r.runtime.set_mode(aigentic_runtime::Mode::AcceptEdits);
+    assert_eq!(r.runtime.mode(), aigentic_runtime::Mode::AcceptEdits);
+    r.runtime
+        .run_turn(steve(), vec![ContentBlock::Text("go".into())], &mut |_| {})
+        .await
+        .unwrap();
+    assert_eq!(
+        kinds(&r),
+        vec![
+            EventKind::UserMessage,
+            EventKind::AssistantMessage,
+            EventKind::ToolResult,
+            EventKind::PermissionRequested,
+            EventKind::PermissionDecided,
+            EventKind::ToolResult,
+            EventKind::AssistantMessage,
+            EventKind::TurnEnded,
+        ]
+    );
+    let p = result_at(&r, 2);
+    assert_eq!(
+        p.policy,
+        Some(PolicyRecord::rule("mode accept-edits", "allow"))
+    );
+    assert_eq!(*r.touched.lock().unwrap(), vec!["a.rs".to_owned()]);
+    let asked = r.asked.lock().unwrap();
+    assert_eq!(asked.len(), 1, "the shell still asks");
+    assert_eq!(asked[0].call.name, "bash");
+    drop(asked);
+    assert!(result_at(&r, 5).result.is_error, "denied by the approver");
+    audit(&r);
+}
+
+#[tokio::test]
+async fn auto_runs_what_would_ask_and_a_rule_deny_still_stands() {
+    let mut r = rig(
+        vec![
+            vec![bash("c1", "rm -rf x"), done("tool_use")],
+            vec![touch_memory("c2"), done("tool_use")],
+            vec![text("done"), done("stop")],
+        ],
+        vec![],
+        // The default table plus the memory rule for the `touch` tool,
+        // whose `path` sits under `.aigentic/memory/`.
+        Policy::configured(
+            vec![Rule::tool_path(
+                "touch",
+                aigentic_policy::MEMORY_PREFIX,
+                Decision::Deny,
+                aigentic_policy::MEMORY_REASON,
+            )],
+            None,
+        ),
+    );
+    r.runtime.set_mode(aigentic_runtime::Mode::Auto);
+    r.runtime
+        .run_turn(steve(), vec![ContentBlock::Text("go".into())], &mut |_| {})
+        .await
+        .unwrap();
+    assert_eq!(
+        kinds(&r),
+        vec![
+            EventKind::UserMessage,
+            EventKind::AssistantMessage,
+            EventKind::ToolResult,
+            EventKind::AssistantMessage,
+            EventKind::ToolResult,
+            EventKind::AssistantMessage,
+            EventKind::TurnEnded,
+        ],
+        "nothing was asked"
+    );
+    let p = result_at(&r, 2);
+    assert_eq!(p.policy, Some(PolicyRecord::rule("mode auto", "allow")));
+    assert!(!p.result.is_error, "{}", p.result.content);
+    let p = result_at(&r, 4);
+    assert!(p.result.is_error);
+    assert!(
+        matches!(p.policy, Some(PolicyRecord::Rule { ref decision, .. }) if decision == "deny"),
+        "{:?}",
+        p.policy
+    );
+    assert!(r.touched.lock().unwrap().is_empty(), "the deny stood");
+    assert!(r.asked.lock().unwrap().is_empty());
+    audit(&r);
+}
+
+#[tokio::test]
+async fn manual_is_the_default_and_asks_as_before() {
+    let mut r = rig(
+        vec![
+            vec![touch("c1", "a.rs"), done("tool_use")],
+            vec![text("done"), done("stop")],
+        ],
+        vec![Answer::Allow],
+        Policy::defaults(),
+    );
+    assert_eq!(r.runtime.mode(), aigentic_runtime::Mode::Manual);
+    r.runtime
+        .run_turn(steve(), vec![ContentBlock::Text("go".into())], &mut |_| {})
+        .await
+        .unwrap();
+    assert_eq!(
+        kinds(&r),
+        vec![
+            EventKind::UserMessage,
+            EventKind::AssistantMessage,
+            EventKind::PermissionRequested,
+            EventKind::PermissionDecided,
+            EventKind::ToolResult,
+            EventKind::AssistantMessage,
+            EventKind::TurnEnded,
+        ]
+    );
+    assert!(matches!(
+        result_at(&r, 4).policy,
+        Some(PolicyRecord::Human { allow: true, .. })
+    ));
+    audit(&r);
+}

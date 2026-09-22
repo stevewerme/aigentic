@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use aigentic_runtime::aigentic_core::{AgentId, Author, UserId};
 use aigentic_runtime::aigentic_log::{Repair, ThreadLog};
 use aigentic_runtime::aigentic_tools::{ToolRegistry, Workdir};
-use aigentic_runtime::{GlobalLayer, Layers, Project, ProjectFile, Runtime};
+use aigentic_runtime::{GlobalLayer, Layers, Mode, Project, ProjectFile, Runtime};
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use ulid::Ulid;
@@ -44,6 +44,10 @@ struct Cli {
     /// profile`, else the config's default_profile).
     #[arg(long)]
     profile: Option<String>,
+    /// Permission mode: manual (default), accept-edits or auto. Session
+    /// state; `/mode` changes it later.
+    #[arg(long, default_value = "manual")]
+    mode: Mode,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -249,11 +253,13 @@ async fn main() -> anyhow::Result<()> {
         .with_policy(project.policy().with_root(&project_root, &cwd))
         .with_skills(skills)
         .with_approver(Box::new(InlineApprover::new(user.clone())));
+    runtime.set_mode(cli.mode);
 
     println!(
-        "aigentic · profile {profile_name} · {} · {}",
+        "aigentic · profile {profile_name} · {} · {}{}",
         profile.model,
-        profile.endpoint()
+        profile.endpoint(),
+        repl::mode_banner(cli.mode)
     );
     match &opened {
         Some(p) => {

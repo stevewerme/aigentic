@@ -25,6 +25,7 @@ pub mod harness_tools;
 pub mod knowledge;
 pub mod layers;
 mod memory;
+pub mod mode;
 pub mod project;
 mod resume;
 mod runtime;
@@ -40,6 +41,7 @@ pub use error::RuntimeError;
 pub use knowledge::{Knowledge, KnowledgeMode};
 pub use layers::{Decided, GlobalLayer, Layers};
 pub use memory::{MEMORY_FILES, MEMORY_PROMPT};
+pub use mode::Mode;
 pub use project::{Project, ProjectError, ProjectFile};
 pub use resume::{INTERRUPTED_RESULT, Resumed};
 pub use runtime::{

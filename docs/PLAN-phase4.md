@@ -1,6 +1,6 @@
 # Phase 4 plan
 
-Status: steps 1 to 7 landed and done-when 1 to 5 passed on both backends on 2026-09-21; step 9 landed except its docs close (commit 7); step 10 a and b landed on 2026-09-22, c to e next · Follows `docs/PRD.md` (the Projects phase) and the phase 0 to 3 plans
+Status: steps 1 to 7 landed and done-when 1 to 5 passed on both backends on 2026-09-21; step 9 landed except its docs close (commit 7); step 10 a to c landed on 2026-09-22, d and e next · Follows `docs/PRD.md` (the Projects phase) and the phase 0 to 3 plans
 
 ## 0. Goal and done-when
 

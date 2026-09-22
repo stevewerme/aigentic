@@ -86,11 +86,22 @@ estimated shown separately, plus cache reads and writes, the reasoning share,
 compactions and memory extractions), `/pin <text>` (a fact for the stable
 prefix, never summarised), `/compact` (run compaction now and report what it
 did), `/verbose` (toggle the session between the configured cap and 40 lines
-/ 8000 bytes; it prints which is on), `/skills` (the enabled set), `/project`
+/ 8000 bytes; it prints which is on), `/mode [name]` (show or set the
+permission mode, below), `/skills` (the enabled set), `/project`
 (the same report as `project show`, over the live registry so MCP tools are
 included), `/threads`, `/<skill> [args]` for every enabled user-invoked
 skill, `/help`, `/quit`. Anything else starting with `/` prints `unknown
 command`. Ctrl-D quits; Ctrl-C clears the line.
+
+The permission mode is session state, like a session grant: never
+persisted, never an event. `--mode` sets it at start and `/mode <name>`
+changes it between turns; the banner shows it unless it is `manual`.
+`manual` (default) sends every ask to you. `accept-edits` runs
+`write`-class calls that would have asked; the shell still asks. `auto`
+runs anything the rules would ask about. A rule's `deny` (the memory
+files, a project's own deny rules) stands in every mode, and each call a
+mode lets through carries the record `mode accept-edits` or `mode auto`
+on its tool result, so the log still says why it ran.
 
 An answered `ask_human` ends the turn with reason `asked_human` and the
 REPL continues at once: what follows the answer is a new turn with its

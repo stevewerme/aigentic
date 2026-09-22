@@ -6,7 +6,7 @@ use aigentic_runtime::aigentic_log::{
     CompactedPayload, CompactionStrategy, DecisionScope, PermissionDecidedPayload,
     SkillLoadedPayload, ToolResultPayload,
 };
-use aigentic_runtime::{ASKED_HUMAN, Resumed, Runtime, Signal};
+use aigentic_runtime::{ASKED_HUMAN, Mode, Resumed, Runtime, Signal};
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 
@@ -52,6 +52,8 @@ pub enum Command<'a> {
     /// Toggle the session between the configured tool-output cap and a
     /// larger one.
     Verbose,
+    /// Print the permission mode, or set it when a name is given.
+    Mode(Option<&'a str>),
     /// A user-invoked skill: its name and the rest of the line.
     Skill(&'a str, &'a str),
     Unknown(&'a str),
@@ -79,6 +81,8 @@ pub fn parse_line<'a>(line: &'a str, skills: &[String]) -> Command<'a> {
         ("threads", _) => Command::Threads,
         ("compact", _) => Command::Compact,
         ("verbose", _) => Command::Verbose,
+        ("mode", "") => Command::Mode(None),
+        ("mode", name) => Command::Mode(Some(name)),
         ("pin", text) if !text.is_empty() => Command::Pin(text),
         (name, args) if skills.iter().any(|s| s == name) => Command::Skill(name, args),
         _ => Command::Unknown(trimmed),
@@ -90,6 +94,7 @@ const HELP: &str = "\
 /pin <text>      pin a fact to the stable prefix
 /compact         run compaction now
 /verbose         toggle tool output between the configured cap and 40 lines / 8000 bytes
+/mode [name]     show the permission mode, or set it: manual, accept-edits, auto
 /skills          list enabled skills; user-invoked ones are slash commands
 /project         the layers, the knowledge mode and every tool's fate
 /threads         this project's threads, newest first
@@ -243,6 +248,16 @@ impl Repl {
                         caps.bytes
                     );
                 }
+                Command::Mode(None) => {
+                    println!("[mode {}]", self.runtime.mode());
+                }
+                Command::Mode(Some(name)) => match name.parse::<Mode>() {
+                    Ok(mode) => {
+                        self.runtime.set_mode(mode);
+                        println!("[mode {mode}: {}]", mode_meaning(mode));
+                    }
+                    Err(e) => println!("[{e}]"),
+                },
                 Command::Unknown(cmd) => println!("unknown command: {cmd}"),
                 Command::Chat(text) => {
                     let _ = editor.add_history_entry(text);
@@ -337,6 +352,23 @@ impl Repl {
             println!();
         }
         self.settle(outcome).await;
+    }
+}
+
+/// What the mode does, for `/mode` and the banner.
+pub fn mode_meaning(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Manual => "every ask goes to you",
+        Mode::AcceptEdits => "writes run without asking; the shell still asks",
+        Mode::Auto => "anything the rules would ask about runs; denials stand",
+    }
+}
+
+/// The banner's mode note: nothing for `manual`.
+pub fn mode_banner(mode: Mode) -> String {
+    match mode {
+        Mode::Manual => String::new(),
+        other => format!(" · mode {other}"),
     }
 }
 
@@ -468,6 +500,13 @@ mod tests {
         assert_eq!(parse_line("/skills", &none), Command::Skills);
         assert_eq!(parse_line("/compact", &none), Command::Compact);
         assert_eq!(parse_line("/verbose", &none), Command::Verbose);
+        assert_eq!(parse_line("/mode", &none), Command::Mode(None));
+        assert_eq!(
+            parse_line("/mode accept-edits", &none),
+            Command::Mode(Some("accept-edits"))
+        );
+        assert_eq!(mode_banner(Mode::Manual), "");
+        assert_eq!(mode_banner(Mode::Auto), " · mode auto");
         assert_eq!(parse_line("/project", &none), Command::Project);
         assert_eq!(parse_line("/threads", &none), Command::Threads);
         assert_eq!(

@@ -9,6 +9,7 @@ use aigentic_policy::Outcome;
 use ulid::Ulid;
 
 use crate::approver::Answer;
+use crate::mode::Mode;
 use crate::{Runtime, RuntimeError, Signal};
 
 /// What policy decided for one call, with the record the tool result
@@ -56,8 +57,8 @@ fn bash_command(call: &ToolCall) -> Option<String> {
 }
 
 impl Runtime {
-    /// The policy seam. Rules decide first; an `Ask` consults the session
-    /// grants, then the approver, appending `permission_requested` and
+    /// The policy seam. Rules decide first; an `Ask` consults the mode,
+    /// then the session grants, then the approver, appending `permission_requested` and
     /// `permission_decided` so every human answer is an attributed event.
     pub fn policy_check(
         &mut self,
@@ -79,6 +80,20 @@ impl Runtime {
             }
             Outcome::Ask { reason } => reason,
         };
+
+        // The mode stands in for the human on what the rules would ask
+        // about, never on what they deny. The record names the mode.
+        let mode_allows = match self.mode {
+            Mode::Manual => false,
+            Mode::AcceptEdits => class == RiskClass::Write,
+            Mode::Auto => true,
+        };
+        if mode_allows {
+            return Ok(Verdict::Run(PolicyRecord::rule(
+                self.mode.rule_name(),
+                "allow",
+            )));
+        }
 
         let request = PermissionRequestedPayload {
             call: call.clone(),
