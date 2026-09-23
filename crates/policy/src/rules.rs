@@ -149,8 +149,9 @@ pub fn default_rules() -> Vec<Rule> {
     ]
 }
 
-/// The default bash allow patterns: a command whose leading words equal
-/// the pattern's words, with no shell operators.
+/// The default bash allow patterns: the commands a segment may start
+/// with to be read-only. The full rule — quoting, chains, redirections
+/// and each command's writing flags — is `shell::classify`'s.
 pub fn default_bash_allow() -> Vec<String> {
     [
         "cargo fmt",
@@ -183,6 +184,9 @@ pub fn default_bash_allow() -> Vec<String> {
         "gh run view",
         "gh repo view",
         "gh label list",
+        // Reads through the API; a method that writes or a field
+        // without one still asks (issue #15).
+        "gh api",
         "ls",
         "pwd",
         "cat",
@@ -200,6 +204,16 @@ pub fn default_bash_allow() -> Vec<String> {
         "du",
         "tree",
         "echo",
+        // Reads a line at a time, numbered; harmless.
+        "nl",
+        // Column and character surgery on stdin: no file of its own.
+        "cut",
+        "tr",
+        // A filter language, quoted as one argument; writing happens
+        // only through the program, which the rules read.
+        "awk",
+        "jq",
+        "sed",
     ]
     .into_iter()
     .map(str::to_owned)
@@ -210,9 +224,10 @@ pub fn default_bash_allow() -> Vec<String> {
 /// command and its bare words (subcommands, flags) up to the first that
 /// looks like a value (a path, a URL, a number, a quote, an assignment).
 /// `curl -s https://x` gives `curl -s`; `cargo test --workspace` gives
-/// all three. Empty for a compound command.
+/// all three. Empty for a compound command: no single prefix stands for
+/// a chain.
 pub fn prefix_of(command: &str) -> Vec<String> {
-    if crate::COMPOUND_MARKERS.iter().any(|m| command.contains(m)) {
+    if crate::shell::is_compound(command) {
         return Vec::new();
     }
     let looks_like_value = |w: &str| {

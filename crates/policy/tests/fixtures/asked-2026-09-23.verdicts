@@ -1,0 +1,343 @@
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+ask sed -n
+ask sed -n
+allow
+allow
+ask date +%F
+allow
+allow
+allow
+allow
+allow
+ask -
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+ask date -I
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+ask date
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+ask git commit -m
+allow
+allow
+ask find
+allow
+allow
+allow
+ask curl -s
+allow
+allow
+ask git remote -v
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+ask git remote -v
+ask gh label create ready-for-agent --description
+ask gh issue create --label ready-for-agent --title
+ask git check-ignore
+ask gh issue create --label ready-for-agent --title
+ask gh issue create --label ready-for-agent --title
+ask gh issue create --label ready-for-agent --title
+ask gh issue create --label ready-for-agent --title
+ask gh api
+ask gh api --method POST
+ask gh api --method POST
+ask gh api
+allow
+allow
+ask gh api
+ask gh api
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+ask gh issue comment
+ask rm
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+ask git remote -v
+allow
+allow
+ask git push
+ask gh auth status
+allow
+allow
+allow
+allow
+allow
+allow
+ask npx --yes create-next-app@latest aigentic-web --typescript --tailwind --eslint --app --src-dir --import-alias
+ask npx --yes shadcn@latest add button --yes
+ask npx --yes shadcn@latest init --help
+ask npx --yes shadcn@latest init -d -f
+ask npx tsc --noEmit
+ask aigentic project init
+ask git commit -m
+ask gh repo create aigentic-web --private --source
+allow
+ask git check-ignore
+allow
+allow
+allow
+ask -
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+ask -
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+ask git push
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+ask python3 -
+ask -
+allow
+ask python3 -
+ask python3 -
+ask python3 -
+ask python3 -
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+ask python3 -
+ask python3 -
+allow
+allow
+allow
+allow
+allow
+allow
+ask -
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+ask awk
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+ask git stash push -m
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+allow
+ask git stash pop
+ask git stash list
+allow
+allow
+ask git stash list
+ask git stash list
+ask -
+ask git fsck --unreachable
+ask -
+allow
+allow
+allow
+ask -
+ask git add
+ask git stash push --keep-index -m
+allow
+allow
+ask -
+allow
+ask git commit -m
+ask git stash pop
+ask git push origin main
+ask cargo install --path
+allow
+ask python3 -c
+allow
+allow
+allow

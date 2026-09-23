@@ -245,9 +245,13 @@ Default bash allow patterns: `cargo fmt`, `cargo build`, `cargo test`,
 `cargo clippy`, `cargo check`, `cargo run`, `git status`, `git diff`,
 `git log`, `git show`, `ls`, `pwd`, `cat`, `head`, `tail`, `grep`, `rg`,
 `find`, `wc`, `echo`. A pattern matches a command whose first word, or
-first two words for `cargo` and `git`, equal the pattern, and that
+first two words for `cargo` and `git`, equal the pattern's, and that
 contains no `|`, `;`, `&&`, `>`, `$(` or backtick. A compound command
-always asks.
+always asks. *(Amended by #15 and #16: a command line is now read
+segment by segment, with quoting, so `grep -n "a|b"` is one command;
+every segment read-only runs without asking, and a line that is not
+runs as one ask for its riskiest segment. The rules live in
+`crates/policy/src/shell.rs`.)*
 
 **Asking.** The runtime appends `permission_requested`, calls the
 `Approver`, appends `permission_decided` with the human's author, and then
