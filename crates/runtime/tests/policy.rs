@@ -718,3 +718,49 @@ async fn manual_is_the_default_and_asks_as_before() {
     ));
     audit(&r);
 }
+
+/// Allows every prompt, but only after a human-sized pause.
+struct SlowYes;
+impl Approver for SlowYes {
+    fn author(&self) -> Author {
+        steve()
+    }
+    fn ask(&mut self, _: &PermissionRequestedPayload) -> Answer {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        Answer::Allow
+    }
+    fn ask_human(&mut self, _: &str) -> Option<String> {
+        None
+    }
+}
+
+#[tokio::test]
+async fn time_waiting_on_a_prompt_does_not_count_against_the_wall_time_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = ThreadLog::open(dir.path(), ulid::Ulid::generate()).unwrap();
+    let (provider, _seen) = scripted(vec![
+        vec![touch("t1", "a"), done("tool_use")],
+        vec![touch("t2", "b"), done("tool_use")],
+        vec![text("ok"), done("stop")],
+    ]);
+    let touched = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = ToolRegistry::builtin(aigentic_tools::Workdir::new(dir.path()));
+    registry.register(Box::new(Touch(touched.clone()))).unwrap();
+    let mut runtime = Runtime::new(provider, registry, log, aigentic_core::AgentId("w".into()))
+        .with_policy(Policy::defaults())
+        .with_approver(Box::new(SlowYes))
+        .with_budget(aigentic_core::Budget {
+            max_iterations: 10,
+            max_tokens: u64::MAX,
+            max_wall_time: std::time::Duration::from_millis(200),
+        });
+    let outcome = runtime
+        .run_turn(steve(), vec![ContentBlock::Text("go".into())], &mut |_| {})
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome.reason, "done",
+        "600 ms of prompts against a 200 ms budget: only working time counts"
+    );
+    assert_eq!(*touched.lock().unwrap(), vec!["a", "b"]);
+}

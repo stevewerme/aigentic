@@ -10,6 +10,10 @@ use crate::{Runtime, RuntimeError, Signal, TurnOutcome};
 /// What a turn has used so far, checked against the `Budget`.
 pub(crate) struct Spent {
     pub(crate) started: Instant,
+    /// Time parked on a human (a permission prompt, an `ask_human`),
+    /// which the wall-time budget does not count: a turn that waited
+    /// twenty minutes for approvals has not worked for twenty minutes.
+    pub(crate) waited: std::time::Duration,
     pub(crate) iterations: u32,
     pub(crate) tokens: u64,
 }
@@ -41,7 +45,8 @@ impl Runtime {
             Some("max_iterations")
         } else if spent.tokens >= self.budget.max_tokens {
             Some("max_tokens")
-        } else if spent.started.elapsed() >= self.budget.max_wall_time {
+        } else if spent.started.elapsed().saturating_sub(spent.waited) >= self.budget.max_wall_time
+        {
             Some("max_wall_time")
         } else {
             None

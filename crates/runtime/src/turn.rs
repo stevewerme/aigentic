@@ -142,6 +142,7 @@ impl Runtime {
     ) -> Result<TurnOutcome, RuntimeError> {
         let mut spent = Spent {
             started: Instant::now(),
+            waited: std::time::Duration::ZERO,
             iterations: 0,
             tokens: 0,
         };
@@ -264,7 +265,9 @@ impl Runtime {
             for call in calls.by_ref() {
                 self.drain_inbox(inbox, observe)?;
                 observe(Signal::ToolCallStarted(&call));
-                let (result, record, by) = self.execute(&call, cancel, inbox, observe).await?;
+                let (result, record, by) = self
+                    .execute(&call, cancel, inbox, observe, &mut spent.waited)
+                    .await?;
                 answered |= call.name == ASK_HUMAN && !result.is_error;
                 let payload = serde_json::to_value(ToolResultPayload::new(result, record))
                     .expect("serialisable");
@@ -388,13 +391,15 @@ impl Runtime {
     /// unknown tool is refused with a rule record; a harness tool is
     /// answered here; anything else runs from the registry. The author
     /// is the result event's: the human who answered an `ask_human`,
-    /// else the system.
+    /// else the system. Time spent in the policy check (a prompt) and in
+    /// `ask_human` is added to `waited`.
     async fn execute(
         &mut self,
         call: &ToolCall,
         cancel: &CancelToken,
         inbox: &mut Inbox,
         observe: &mut (dyn FnMut(Signal<'_>) + Send),
+        waited: &mut std::time::Duration,
     ) -> Result<(ToolResult, PolicyRecord, Author), RuntimeError> {
         // A tool the layers hide is unknown to this thread: the same
         // refusal as a name that was never registered.
@@ -416,10 +421,18 @@ impl Runtime {
                 Author::System,
             ));
         };
-        match self.policy_check(call, class, cancel, observe).await? {
+        let asked = Instant::now();
+        let verdict = self.policy_check(call, class, cancel, observe).await?;
+        *waited += asked.elapsed();
+        match verdict {
             Verdict::Run(record) => {
                 let (result, by) = if is_harness_tool(&call.name) {
-                    self.run_harness_tool(call, cancel, observe).await?
+                    let started = Instant::now();
+                    let ran = self.run_harness_tool(call, cancel, observe).await?;
+                    if call.name == ASK_HUMAN {
+                        *waited += started.elapsed();
+                    }
+                    ran
                 } else {
                     (
                         self.run_tool_draining(call, inbox, observe).await?,
