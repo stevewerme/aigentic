@@ -160,7 +160,7 @@ pub fn to_wire(context: &[Message]) -> Vec<WireMessage> {
                             kind: "function".into(),
                             function: WireFunctionCall {
                                 name: c.name.clone(),
-                                arguments: c.args.to_string(),
+                                arguments: crate::replay_args(&c.args).to_string(),
                             },
                         }),
                         _ => None,
@@ -375,6 +375,21 @@ mod tests {
             r#"{"path":"Cargo.toml"}"#
         );
         assert_eq!(wire[2]["reasoning_content"], "hmm");
+    }
+
+    #[test]
+    fn malformed_arguments_replay_as_an_empty_object() {
+        let ctx = vec![Message {
+            role: Role::Assistant,
+            author: Author::Agent(AgentId("worker".into())),
+            blocks: vec![ContentBlock::ToolCall(ToolCall {
+                id: "call_bad".into(),
+                name: "update_tasks".into(),
+                args: serde_json::Value::String(r#"{"state": "text": "x"}"#.into()),
+            })],
+        }];
+        let wire = serde_json::to_value(to_wire(&ctx)).unwrap();
+        assert_eq!(wire[0]["tool_calls"][0]["function"]["arguments"], "{}");
     }
 
     #[test]

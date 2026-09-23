@@ -11,6 +11,20 @@ pub mod sse;
 pub use anthropic::{Anthropic, AnthropicConfig, Thinking};
 pub use openai_compat::{OpenAiCompat, OpenAiCompatConfig};
 
+/// A call's arguments as the wire must carry them on replay: an object.
+/// A model that emitted malformed JSON leaves its raw text in the log as a
+/// string (the tool already answered with an error quoting it), and both
+/// APIs reject any history whose tool call arguments are not an object, so
+/// every later turn would fail. The log keeps the original; the wire gets
+/// `{}`.
+pub(crate) fn replay_args(args: &serde_json::Value) -> serde_json::Value {
+    if args.is_object() {
+        args.clone()
+    } else {
+        serde_json::Value::Object(serde_json::Map::new())
+    }
+}
+
 /// One HTTP client configuration for every adapter. Idle pooled
 /// connections are dropped after a few seconds: a tool call can take
 /// longer than a server's keep-alive timeout, and reusing a connection the

@@ -176,7 +176,8 @@ fn translate(m: &Message) -> Vec<(&'static str, Vec<Value>)> {
                 .filter_map(|b| match b {
                     ContentBlock::Text(t) => Some(json!({"type": "text", "text": t})),
                     ContentBlock::ToolCall(c) => Some(json!({
-                        "type": "tool_use", "id": c.id, "name": c.name, "input": c.args,
+                        "type": "tool_use", "id": c.id, "name": c.name,
+                        "input": crate::replay_args(&c.args),
                     })),
                     ContentBlock::ProviderBlob(blob)
                         if blob.provider == PROVIDER_NAME && blob.data.is_object() =>
@@ -213,6 +214,20 @@ mod tests {
             author,
             blocks,
         }
+    }
+
+    #[test]
+    fn malformed_arguments_replay_as_an_empty_object() {
+        let m = msg(
+            Role::Assistant,
+            vec![ContentBlock::ToolCall(ToolCall {
+                id: "toolu_bad".into(),
+                name: "update_tasks".into(),
+                args: Value::String(r#"{"state": "text": "x"}"#.into()),
+            })],
+        );
+        let turns = translate(&m);
+        assert_eq!(turns[0].1[0]["input"], json!({}));
     }
 
     fn thinking_blob() -> ContentBlock {
