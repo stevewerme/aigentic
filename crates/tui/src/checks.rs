@@ -156,6 +156,37 @@ pub fn check_window(name: &str, profile: &Profile) -> Check {
     }
 }
 
+/// A project's `.env` is gitignored when the project is a repository:
+/// it holds the model key next to the app's secrets.
+pub fn check_env_ignored(root: &Path) -> Check {
+    let env = root.join(".env");
+    if !env.is_file() {
+        return Check::skip("env", "no .env here");
+    }
+    let in_repo = std::process::Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(root)
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !in_repo {
+        return Check::ok("env", ".env (no repository)");
+    }
+    let ignored = std::process::Command::new("git")
+        .args(["check-ignore", "-q", ".env"])
+        .current_dir(root)
+        .status()
+        .is_ok_and(|s| s.success());
+    if ignored {
+        Check::ok("env", ".env is gitignored")
+    } else {
+        Check::new(
+            "env",
+            Status::Warn,
+            ".env is not gitignored: it holds keys; add it to .gitignore",
+        )
+    }
+}
+
 /// The threads directory exists or can be created.
 pub fn check_threads_dir(dir: &Path) -> Check {
     if dir.is_dir() {
@@ -726,5 +757,28 @@ mod tests {
         let b = check_window("b", &c.profiles["b"]);
         assert_eq!(b.status, Status::Ok);
         assert_eq!(b.message, "1048576 tokens");
+    }
+
+    #[test]
+    fn an_env_file_outside_gitignore_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(check_env_ignored(root).status, Status::Skip);
+        std::fs::write(root.join(".env"), "K=v\n").unwrap();
+        assert_eq!(check_env_ignored(root).status, Status::Ok, "no repository");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-q"]);
+        // A local rule wins over a global excludes file that may ignore
+        // .env on the machine running the test.
+        std::fs::write(root.join(".gitignore"), "!.env\n").unwrap();
+        assert_eq!(check_env_ignored(root).status, Status::Warn);
+        std::fs::write(root.join(".gitignore"), ".env\n").unwrap();
+        assert_eq!(check_env_ignored(root).status, Status::Ok);
     }
 }

@@ -6,8 +6,9 @@
 use std::path::Path;
 
 use crate::checks::{
-    Check, GhCli, Status, check_api_key_env, check_config, check_github, check_participants,
-    check_probe, check_project, check_skills, check_threads_dir, check_window, origin_url,
+    Check, GhCli, Status, check_api_key_env, check_config, check_env_ignored, check_github,
+    check_participants, check_probe, check_project, check_skills, check_threads_dir, check_window,
+    origin_url,
 };
 use crate::config;
 use crate::skills_cmd::SkillPaths;
@@ -52,6 +53,9 @@ pub async fn run(config_path: &Path, cwd: &Path, probe: bool) -> anyhow::Result<
         None => (config.user_name(), "config.toml's user"),
     };
     checks.push(check_participants(project.as_ref(), &owner, source));
+    checks.push(check_env_ignored(
+        project.as_ref().map_or(cwd, |p| p.root.as_path()),
+    ));
     let project_root = project
         .as_ref()
         .map_or_else(|| cwd.to_path_buf(), |p| p.root.clone());
