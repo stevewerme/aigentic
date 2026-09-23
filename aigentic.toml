@@ -28,7 +28,14 @@ issue_tracker = "github"         # `aigentic project setup` renders docs/agents/
 # docs_dir = "docs"
 
 [skills]
-enabled = ["implement", "tdd", "code-review", "diagnosing-bugs", "grilling"]
+# Every engineering skill accepted at review (ask-matt, setup-matt-pocock-skills
+# and wizard were rejected), plus grilling, which several of them lean on.
+enabled = [
+  "code-review", "codebase-design", "diagnosing-bugs", "domain-modeling",
+  "grill-with-docs", "implement", "improve-codebase-architecture", "prototype",
+  "research", "resolving-merge-conflicts", "tdd", "to-spec", "to-tickets",
+  "triage", "wayfinder", "grilling",
+]
 
 [policy]
 # rules = [{ class = "write", decision = "allow" }]   # prepended to the defaults
