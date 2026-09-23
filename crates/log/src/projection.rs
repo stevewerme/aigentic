@@ -280,7 +280,24 @@ pub fn project(events: &[Event]) -> Result<Projection, LogError> {
             }
             EventKind::AssistantMessage => {
                 let p: AssistantMessagePayload = payload(event)?;
-                let drop_blobs = blobs_dropped_before.is_some_and(|at| event.seq < at);
+                // A provider blob (a model's reasoning) is replayed only
+                // while it can matter: in the open turn, for a message
+                // whose calls are not stubbed. Reasoning from a finished
+                // turn, or behind the eviction boundary, is dropped; it
+                // was 61% of a build thread's context (issue #35). No
+                // provider needs it back: Anthropic keeps only the last
+                // assistant message's thinking in a tool loop, and
+                // OpenAI-compatible reasoning is informational.
+                let settled = last_turn_end.is_some_and(|end| event.seq < end);
+                let mut call_ids = p.blocks.iter().filter_map(|b| match b {
+                    ContentBlock::ToolCall(c) => Some(&c.id),
+                    _ => None,
+                });
+                let behind_boundary =
+                    call_ids.clone().next().is_some() && call_ids.all(|id| stubbed.contains(id));
+                let drop_blobs = settled
+                    || behind_boundary
+                    || blobs_dropped_before.is_some_and(|at| event.seq < at);
                 let blocks = p
                     .blocks
                     .into_iter()
@@ -782,7 +799,11 @@ mod tests {
     fn phase0_shape_is_unchanged_without_compaction() {
         let p = project(&two_turns()).unwrap();
         assert_eq!(texts(&p), vec!["one", "reply one", "two", "reply two"]);
-        assert_eq!(p.body[1].blocks.len(), 2, "blobs survive with no summary");
+        assert_eq!(
+            p.body[1].blocks.len(),
+            1,
+            "a finished turn's blob is dropped even with no summary (#35)"
+        );
         assert_eq!(p.compacted_through, None);
     }
 
@@ -816,6 +837,20 @@ mod tests {
             "retained turn keeps text, loses its blob"
         );
         assert_eq!(p.compacted_through, Some(2));
+    }
+
+    #[test]
+    fn reasoning_from_a_finished_turn_is_not_replayed() {
+        let events = vec![
+            user(1, "one"),
+            assistant(2, "reply one", true),
+            ended(3),
+            user(4, "two"),
+            assistant(5, "reply two", true),
+        ];
+        let p = project(&events).unwrap();
+        assert_eq!(p.body[1].blocks.len(), 1, "finished turn: blob dropped");
+        assert_eq!(p.body[3].blocks.len(), 2, "open turn: blob kept");
     }
 
     #[test]
@@ -1131,6 +1166,40 @@ mod tests {
             ],
             "no event, no stub, open turn included"
         );
+    }
+
+    #[test]
+    fn reasoning_behind_the_eviction_boundary_is_not_replayed() {
+        let thinking = |seq: u64, id: &str, command: &str| {
+            ev(
+                seq,
+                EventKind::AssistantMessage,
+                agent(),
+                json!({"blocks": [
+                    {"type": "tool_call", "id": id, "name": "bash", "args": {"command": command}},
+                    {"type": "provider_blob", "provider": "openai_compat", "data": {"reasoning_content": "long thoughts"}},
+                ]}),
+            )
+        };
+        let long = "line\n".repeat(200);
+        let events = vec![
+            user(0, "build it"),
+            thinking(1, "c1", "cargo test"),
+            result(2, "c1", &long),
+            thinking(3, "c2", "cargo test"),
+            result(4, "c2", &long),
+            evicted(5, 2),
+        ];
+        let p = project(&events).unwrap();
+        let blobs = |i: usize| {
+            p.body[i]
+                .blocks
+                .iter()
+                .filter(|b| matches!(b, ContentBlock::ProviderBlob(_)))
+                .count()
+        };
+        assert_eq!(blobs(1), 0, "behind the boundary: reasoning dropped");
+        assert_eq!(blobs(3), 1, "the latest call keeps its reasoning");
     }
 
     #[test]
