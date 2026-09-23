@@ -14,6 +14,7 @@ pub mod engine;
 pub mod keymap;
 pub mod look;
 pub mod markdown;
+pub mod menu;
 pub mod pager;
 pub mod status;
 pub mod tui;
@@ -22,15 +23,16 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use aigentic_api::{Notice, ThreadState};
-use crossterm::event::{Event, EventStream, KeyEventKind};
+use crossterm::event::{Event, EventStream, KeyCode as K, KeyEventKind};
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
 
 use crate::app::cells::{Cell, ToolState, is_read_tool};
 use crate::app::completion::{FileIndex, Popup};
 use crate::app::composer::Composer;
-use crate::app::engine::{ClientRepl, Printer, PromptBlock};
+use crate::app::engine::{ClientRepl, MenuKey, Printer};
 use crate::app::keymap::{Action, KeyContext, action_for};
+use crate::app::menu::{Menu, Pick};
 use crate::app::pager::Pager;
 use crate::app::status::Status;
 use crate::app::tui::{Pane, Shell, needed_rows, wrap_line};
@@ -198,7 +200,7 @@ impl Printer for ShellOut {
         self.flush_explored();
     }
 
-    fn prompt(&mut self, _block: &PromptBlock) {
+    fn prompt(&mut self, _menu: &Menu) {
         // Drawn above the composer from the engine's state, not
         // committed to the transcript.
         self.flush_explored();
@@ -285,42 +287,97 @@ fn popup_lines(popup: &Popup) -> Vec<Line<'static>> {
         .collect()
 }
 
-/// The prompt block's lines.
-fn block_lines(block: &PromptBlock, width: usize) -> Vec<Line<'static>> {
+/// The prompt menu's lines: the header in plain words, what is asked
+/// about in full (wrapped, capped), and the rows to pick from with the
+/// selected one marked. Already wrapped; the pane draws them as they
+/// are.
+fn block_lines(menu: &Menu, width: usize) -> Vec<Line<'static>> {
     let head = Style::default()
         .fg(Color::Yellow)
         .add_modifier(Modifier::BOLD);
     let dim = Style::default().add_modifier(Modifier::DIM);
-    let lines = match block {
-        PromptBlock::Permission {
-            tool,
-            class,
-            reason,
-            summary,
-            prefix,
-        } => {
-            let p = match prefix {
-                Some(p) => format!(" · p allow `{}` from now on", p.join(" ")),
-                None => String::new(),
+    let mut lines = vec![Line::from(Span::styled(format!(" {}", menu.title), head))];
+    lines.extend(body_lines(menu, width));
+    let inner = width.saturating_sub(6).max(1);
+    for (i, row) in menu.rows.iter().enumerate() {
+        let selected = i == menu.selected;
+        let style = if selected {
+            Style::default().add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        let mut rows = wrap_line(&Line::from(Span::styled(row.label.clone(), style)), inner);
+        for (r, line) in rows.iter_mut().enumerate() {
+            let lead = if r > 0 {
+                Span::raw(" ".repeat(6))
+            } else if selected {
+                Span::styled(format!(" ❯ {}. ", i + 1), head)
+            } else {
+                Span::raw(format!("   {}. ", i + 1))
             };
-            vec![
-                Line::from(Span::styled(
-                    format!("permission · {tool} ({class}) · {reason}"),
-                    head,
-                )),
-                Line::from(Span::raw(format!("  {summary}"))),
-                Line::from(Span::styled(
-                    format!("  y once · a this session{p} · n deny · esc deny with a reason"),
-                    dim,
-                )),
-            ]
+            line.spans.insert(0, lead);
         }
-        PromptBlock::Question { question } => vec![
-            Line::from(Span::styled(format!("question · {question}"), head)),
-            Line::from(Span::styled("  type the answer and press Enter", dim)),
-        ],
-    };
-    lines.iter().flat_map(|l| wrap_line(l, width)).collect()
+        // The deny's Esc hint, dim, out by the right edge.
+        if row.pick == Pick::Deny
+            && let Some(first) = rows.first_mut()
+        {
+            let used: usize = first
+                .spans
+                .iter()
+                .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref()))
+                .sum();
+            let pad = width
+                .saturating_sub(used + unicode_width::UnicodeWidthStr::width("(esc)"))
+                .max(2);
+            first.spans.push(Span::raw(" ".repeat(pad)));
+            first.spans.push(Span::styled("(esc)", dim));
+        }
+        lines.extend(rows);
+    }
+    if let Some(note) = &menu.note {
+        lines.extend(hang(note, 3, width, dim));
+    }
+    lines
+}
+
+/// `text` wrapped to `width - indent`, every row indented, so wrapped
+/// rows hang under the first.
+fn hang(text: &str, indent: usize, width: usize, style: Style) -> Vec<Line<'static>> {
+    let inner = width.saturating_sub(indent).max(1);
+    text.split('\n')
+        .flat_map(|l| wrap_line(&Line::from(Span::styled(l.to_owned(), style)), inner))
+        .map(|mut row| {
+            let mut spans = vec![Span::raw(" ".repeat(indent))];
+            spans.append(&mut row.spans);
+            Line::from(spans)
+        })
+        .collect()
+}
+
+/// Rows the body may take before it is capped head and tail, as tool
+/// output is.
+const BODY_ROWS: usize = 8;
+
+/// The body wrapped and hanging; a very long one keeps its head and
+/// tail with a note of what fell out.
+fn body_lines(menu: &Menu, width: usize) -> Vec<Line<'static>> {
+    if menu.body.is_empty() {
+        return Vec::new();
+    }
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let mut rows = hang(&menu.body, 3, width, Style::default());
+    if rows.len() > BODY_ROWS {
+        let kept = BODY_ROWS - 3;
+        let omitted = rows.len() - kept - 2;
+        let mut capped: Vec<_> = rows.drain(..kept).collect();
+        capped.push(Line::from(Span::styled(
+            format!("   … {omitted} rows"),
+            dim,
+        )));
+        capped.extend(rows.into_iter().skip(omitted));
+        rows = capped;
+    }
+    rows
 }
 
 /// The pager over `lines` in the alternate screen until it is closed.
@@ -426,11 +483,17 @@ async fn run_shell(
         {
             armed = None;
         }
-        block_since = match (engine.prompt_block(), block_since) {
+        block_since = match (engine.menu(), block_since) {
             (None, _) => None,
             (Some(_), Some(t)) => Some(t),
             (Some(_), None) => Some(Instant::now()),
         };
+        // The prompt went away while its reason input was open: the
+        // draft comes back (the reason is moot).
+        if reason_draft.is_some() && engine.menu().is_none() {
+            let draft = reason_draft.take().unwrap();
+            composer.set_text(&draft);
+        }
         let mut block: Vec<Line<'static>> = if engine.tasks().is_empty() {
             Vec::new()
         } else {
@@ -441,8 +504,8 @@ async fn run_shell(
         };
         block.extend(
             engine
-                .prompt_block()
-                .map(|b| block_lines(b, out.shell.width()))
+                .menu()
+                .map(|m| block_lines(m, out.shell.width()))
                 .unwrap_or_default(),
         );
         if files.is_none()
@@ -520,58 +583,30 @@ async fn run_shell(
                 let Some(Ok(event)) = event else { break };
                 match event {
                     Event::Key(key) if key.kind != KeyEventKind::Release => {
-                        // A permission prompt takes single keys first.
-                        if let Some(PromptBlock::Permission { prefix, .. }) =
-                            engine.prompt_block().cloned()
-                        {
-                            use crossterm::event::KeyCode as K;
-                            if let Some(draft) = reason_draft.clone() {
-                                match key.code {
-                                    K::Enter => {
-                                        let reason = composer.take().unwrap_or_default();
-                                        composer.set_text(&draft);
-                                        reason_draft = None;
-                                        engine
-                                            .decide(false, false, None, Some(reason), &mut out)
-                                            .await;
-                                        continue;
-                                    }
-                                    K::Esc => {
-                                        composer.set_text(&draft);
-                                        reason_draft = None;
-                                        continue;
-                                    }
-                                    _ => {}
-                                }
-                            } else {
-                                let settled =
-                                    block_since.is_some_and(|t| t.elapsed() >= PROMPT_GRACE);
-                                let plain = settled
-                                    && (key.modifiers.is_empty()
-                                        || key.modifiers == crossterm::event::KeyModifiers::SHIFT);
-                                let handled = match key.code {
-                                    K::Char('y') if plain => Some((true, false, None)),
-                                    K::Char('a') if plain => Some((true, true, None)),
-                                    K::Char('p') if plain => {
-                                        Some((true, prefix.is_none(), prefix.clone()))
-                                    }
-                                    K::Char('n') if plain => Some((false, false, None)),
-                                    _ => None,
-                                };
-                                if let Some((allow, session, prefix)) = handled {
-                                    engine.decide(allow, session, prefix, None, &mut out).await;
+                        // The prompt's reason input takes Enter and Esc;
+                        // everything else types.
+                        if let Some(draft) = reason_draft.clone() {
+                            match key.code {
+                                K::Enter => {
+                                    let reason = composer
+                                        .take()
+                                        .map(|r| r.trim().to_owned())
+                                        .filter(|r| !r.is_empty());
+                                    composer.set_text(&draft);
+                                    reason_draft = None;
+                                    engine.prompt_text(reason, &mut out).await;
                                     continue;
                                 }
-                                if key.code == K::Esc {
-                                    reason_draft = Some(composer.text());
-                                    composer.clear();
+                                K::Esc => {
+                                    composer.set_text(&draft);
+                                    reason_draft = None;
                                     continue;
                                 }
+                                _ => {}
                             }
                         }
                         // An open popup takes the navigation keys.
                         if let Some(p) = popup.as_mut() {
-                            use crossterm::event::KeyCode as K;
                             match key.code {
                                 K::Up => {
                                     p.up();
@@ -596,6 +631,25 @@ async fn run_shell(
                                     continue;
                                 }
                                 _ => {}
+                            }
+                        }
+                        // A prompt menu takes its keys: the selection
+                        // always, the answering keys once the grace has
+                        // passed.
+                        if engine.menu().is_some() {
+                            let settled =
+                                block_since.is_some_and(|t| t.elapsed() >= PROMPT_GRACE);
+                            match engine
+                                .menu_key(&key, composer.is_empty(), settled, &mut out)
+                                .await
+                            {
+                                MenuKey::Passed => {}
+                                MenuKey::Used => continue,
+                                MenuKey::Reason => {
+                                    reason_draft = Some(composer.text());
+                                    composer.clear();
+                                    continue;
+                                }
                             }
                         }
                         let ctx = KeyContext {
@@ -678,4 +732,124 @@ async fn run_shell(
     out.shell.stop();
     println!("bye");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::menu::Menu;
+    use aigentic_runtime::aigentic_core::{RiskClass, ToolCall};
+    use serde_json::json;
+
+    fn text(lines: &[Line<'_>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect()
+    }
+
+    fn bash(command: &str) -> ToolCall {
+        ToolCall {
+            id: "c1".into(),
+            name: "bash".into(),
+            args: json!({"command": command}),
+        }
+    }
+
+    fn approval(command: &str) -> Menu {
+        Menu::permission(
+            &bash(command),
+            RiskClass::Exec,
+            "class exec: anything else in a shell",
+        )
+    }
+
+    /// The screen the issue draws: the header in plain words, the
+    /// command in full under it, the rows numbered with the selected one
+    /// marked, and Esc named on the deny.
+    #[test]
+    fn the_approval_menu_renders_as_the_issue_draws_it() {
+        let menu = approval("sed -n '/^## 4\\./,/^## 10\\./p' docs/PLAN-phase6.md");
+        let lines = text(&block_lines(&menu, 76));
+        assert_eq!(
+            lines,
+            vec![
+                " Run this command?".to_owned(),
+                "   sed -n '/^## 4\\./,/^## 10\\./p' docs/PLAN-phase6.md".to_owned(),
+                " ❯ 1. Yes".to_owned(),
+                "   2. Yes, and don't ask again for `sed -n` in this project".to_owned(),
+                format!("   3. No, and tell the agent why{}(esc)", " ".repeat(39)),
+            ]
+        );
+    }
+
+    /// The full text wraps and hangs; nothing is cut to one line, and a
+    /// very long one is capped head and tail, as tool output is.
+    #[test]
+    fn the_body_wraps_and_a_very_long_one_is_capped() {
+        let menu = approval("grep pattern crates/tui/src");
+        let lines = text(&block_lines(&menu, 40));
+        assert_eq!(
+            lines,
+            vec![
+                " Run this command?".to_owned(),
+                "   grep pattern crates/tui/src".to_owned(),
+                " ❯ 1. Yes".to_owned(),
+                "   2. Yes, and don't ask again for `grep".to_owned(),
+                "      pattern` in this project".to_owned(),
+                "   3. No, and tell the agent why   (esc)".to_owned(),
+            ]
+        );
+        let command = (1..=12)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let menu = approval(&command);
+        let lines = text(&block_lines(&menu, 40));
+        assert_eq!(
+            lines[..9],
+            [
+                " Run this command?",
+                "   line1",
+                "   line2",
+                "   line3",
+                "   line4",
+                "   line5",
+                "   … 5 rows",
+                "   line11",
+                "   line12",
+            ]
+        );
+    }
+
+    /// A question in the pre-options shape: the question, and the
+    /// composer takes the answer. A rule's own reason is a dim line
+    /// under the options; a class-generated one is not shown.
+    #[test]
+    fn a_question_is_the_question_and_a_rules_reason_stays() {
+        let menu = Menu::question("which colour?");
+        assert_eq!(
+            text(&block_lines(&menu, 40)),
+            vec![" which colour?", "   type the answer"]
+        );
+        let call = ToolCall {
+            id: "c2".into(),
+            name: "mcp.docs.search".into(),
+            args: json!({"query": "phase 6"}),
+        };
+        let menu = Menu::permission(&call, RiskClass::Network, "mcp.docs: the plan says ask");
+        let lines = block_lines(&menu, 76);
+        let last = lines.last().unwrap();
+        assert_eq!(
+            last.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>(),
+            "   mcp.docs: the plan says ask"
+        );
+        assert!(last.spans[1].style.add_modifier.contains(Modifier::DIM));
+        assert!(menu.note.is_some());
+        let menu = approval("rm -rf build");
+        assert_eq!(menu.note, None, "the class reason adds nothing");
+    }
 }

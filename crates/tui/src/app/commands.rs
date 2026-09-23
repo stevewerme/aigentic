@@ -138,7 +138,7 @@ pub const HELP: &str = "\
 /keys            the key table: interrupt, recall, quit
 /help            this list
 /quit            exit (Ctrl-D too)
-Permission prompts (approve role): y once, a for the session, n to deny; a question takes the next line.";
+Permission prompts (approve role) are a menu: Up/Down or a digit picks, Enter confirms; Esc answers with a reason; y/a/n still work. A question takes the next line.";
 
 /// Keep the first `max_lines` lines and `max_bytes` bytes; note the rest.
 pub fn truncate_for_display(text: &str, max_lines: usize, max_bytes: usize) -> String {

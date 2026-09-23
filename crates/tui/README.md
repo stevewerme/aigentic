@@ -256,15 +256,22 @@ the project root. `bash` is not covered: narrowing and policy decide
 what the model sees and what runs, not what a shell can reach.
 
 A call the policy asks about is a thread state, `AwaitingApproval`, that
-every session on the thread sees. A user with `approve` (or `admin`) gets
-the tool, its class, the reason and the arguments, then the prompt: `y`
-runs it once, `a` runs it and every identical call (same tool; for `bash`,
-the same command) while the daemon keeps the thread loaded, `n` denies.
-Anyone else sees `[waiting for an approver: bash rm -rf x]` and cannot
-answer. The answer is a `Decide` request; the first one wins, and a prompt
-answered on another connection first is withdrawn with `[decided by
-magnus]` before the decision prints as `[allowed by magnus]`, `[allowed
-for this session by magnus]` or `[denied by magnus]`. Every decision is
+every session on the thread sees. A user with `approve` (or `admin`)
+gets the menu: a header in plain words ("Run this command?", "Edit this
+file?", "Use the network?", "Call this MCP tool?"), the full command
+under it (wrapped; a very long one keeps head and tail), and the rows
+to pick from — arrows or a digit and Enter, Esc to answer with a reason,
+`y`/`a`/`n` as hidden accelerators that wait out a 500 ms grace so keys
+meant for the composer do not answer. One row allows once; one allows
+more — `prefix_of`'s words in this project for `bash` when it gives
+them, else a session grant, which for `bash` is the exact command and
+for any other tool every call to it. The choice is echoed into the
+scrollback as `↳ Yes, ...`. Anyone else sees `[waiting for an
+approver: bash rm -rf x]` and cannot answer. The answer is a `Decide`
+request; the first one wins, and a prompt answered on another
+connection first is withdrawn with `[decided by magnus]` before the
+decision prints as `[allowed by magnus]`, `[allowed for this session by
+magnus]` or `[denied by magnus]`. Every decision is
 a `permission_decided` event with the decider's user id; a session grant
 is still an event each time it is used. Rule decisions are recorded on
 the tool result. An `ask_human` question works the same way through
@@ -276,7 +283,8 @@ the call's `tool_result` event, authored by the person who gave it, as a
 the prompt at once. There is no timeout: a request waits until someone
 decides or interrupts, and an interrupt denies it with the interrupter's
 name and the reason `interrupted`. With stdin not a terminal the prompt
-still waits for a line; nothing is denied by default.
+prints the options numbered and reads a number or text; nothing is
+denied by default.
 
 Skills resolve from `./skills`, then `~/.config/aigentic/skills`, then
 the bundled `skills/` in `bundled_dir`; each root has its own

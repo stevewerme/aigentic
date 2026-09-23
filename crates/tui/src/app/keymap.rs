@@ -91,18 +91,20 @@ pub fn action_for(key: &KeyEvent, ctx: KeyContext) -> Action {
 
 /// `/keys`.
 pub const KEYS: &str = "\
-Enter            send; while a turn runs: queue for the next turn (in the log at once)
+Enter            send; while a turn runs: queue for the next turn (in the log at once); a prompt menu: pick the row
 !text Enter      interrupt the running turn, then send this
 Shift-Enter      new line (Ctrl-J where the terminal sends plain Enter)
 Ctrl-C           turn running: interrupt · draft: clear it · empty: press again within a second to quit
-Esc              turn running: interrupt · draft: clear it · empty: Esc again recalls the last message sent
+Esc              turn running: interrupt · draft: clear it · a permission menu: answer with a reason · empty: Esc again recalls the last message sent
 Alt-Up           copy the last message sent into the composer (a queued one stays queued)
-Up / Down        move in the draft; on one line, walk the history
+Up / Down        move in the draft; on one line, walk the history; a prompt menu: move its selection
+0-9              a prompt menu: pick that row
+Space            a prompt menu: toggle a row (multi-select)
 Ctrl-A / Ctrl-E  start / end of the line
 Ctrl-U           clear the draft
 Ctrl-T           the transcript pager (step 5)
 Ctrl-D           quit when the composer is empty
-y / a / n        answer a permission prompt: once / this session / no";
+y / a / n        a permission menu, hidden: once / allow more / no";
 
 #[cfg(test)]
 mod tests {

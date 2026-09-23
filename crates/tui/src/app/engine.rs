@@ -5,9 +5,9 @@
 //! shell commits each line to the terminal's scrollback and shows the
 //! streaming tail, plain stdout does the same without a terminal, and
 //! a vector stands in for tests. Approvals and answers (step 10) are requests like
-//! any other: a permission request prompts `y / a / n` when this user's
-//! role may decide and says who it waits for when not; a question
-//! takes the next line from a user who may write; a prompt answered on
+//! any other: a permission request or an `ask_human` question becomes a
+//! selectable menu (`menu.rs`) when this user's role may answer and says
+//! who it waits for when not; a prompt answered on
 //! another connection first is withdrawn with who decided it.
 
 use std::collections::{HashMap, VecDeque};
@@ -26,54 +26,18 @@ use ulid::Ulid;
 
 use crate::app::cells::{Cell, ToolState, summarise_args};
 use crate::app::commands::{Command, HELP, parse_line, truncate_for_display};
+use crate::app::menu::{Keyed, Kind, Menu, Pick};
 
-/// What the thread waits on from this user, for a shell to draw as a
-/// block above the composer and a pipe to print as lines.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PromptBlock {
-    Permission {
-        tool: String,
-        class: &'static str,
-        reason: String,
-        /// The command or path, one line.
-        summary: String,
-        /// The words `p` allows from now on (bash only).
-        prefix: Option<Vec<String>>,
-    },
-    Question {
-        question: String,
-    },
-}
-
-impl PromptBlock {
-    /// Plain lines, for a pipe.
-    pub fn plain(&self) -> Vec<String> {
-        match self {
-            PromptBlock::Permission {
-                tool,
-                class,
-                reason,
-                summary,
-                prefix,
-            } => {
-                let mut lines = vec![
-                    format!("[permission] {tool} (class {class}): {reason}"),
-                    format!("  {summary}"),
-                ];
-                let p = match prefix {
-                    Some(p) => format!(" / p allow `{}` from now on", p.join(" ")),
-                    None => String::new(),
-                };
-                lines.push(format!(
-                    "  allow? y once / a always this session{p} / n no / n <reason> no, and why"
-                ));
-                lines
-            }
-            PromptBlock::Question { question } => {
-                vec![format!("[question] {question}"), "  type the answer".into()]
-            }
-        }
-    }
+/// What a key on the prompt menu came to, from `ClientRepl::menu_key`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuKey {
+    /// Not a menu key; the caller carries on.
+    Passed,
+    /// Handled: the selection moved, or the decision went out.
+    Used,
+    /// The composer should take the deny's reason; the draft it held
+    /// comes back after.
+    Reason,
 }
 
 /// A running turn's figures, from the provider's reported usage on the
@@ -164,10 +128,10 @@ pub trait Printer {
     /// A cell; `done` false means it still changes (a running tool). The
     /// default prints its head while running and the whole cell when
     /// done, which is what a pipe wants.
-    /// The thread waits on this user: a shell draws a block, a pipe
+    /// The thread waits on this user: a shell draws the menu, a pipe
     /// prints the lines.
-    fn prompt(&mut self, block: &PromptBlock) {
-        for l in block.plain() {
+    fn prompt(&mut self, menu: &Menu) {
+        for l in menu.plain() {
             self.line(&l);
         }
     }
@@ -230,8 +194,8 @@ pub struct ClientRepl {
     /// The call id of the request or question this client prompted for
     /// and has not answered: a decision from elsewhere withdraws it.
     prompted: Option<String>,
-    /// What the prompt is about, while `prompted`.
-    block: Option<PromptBlock>,
+    /// The prompt menu while `prompted`.
+    menu: Option<Menu>,
     /// The running turn's figures; `None` while idle.
     turn: Option<TurnStats>,
     /// The project the thread moved to, once it has; the shell's status
@@ -273,7 +237,7 @@ impl ClientRepl {
             mode,
             partial: String::new(),
             prompted: None,
-            block: None,
+            menu: None,
             turn: None,
             project: None,
             title: None,
@@ -397,24 +361,18 @@ impl ClientRepl {
             ThreadState::AwaitingApproval { call_id, .. }
                 if self.prompted.as_deref() == Some(call_id) =>
             {
-                let trimmed = line.trim();
-                let (head, rest) = trimmed
-                    .split_once(char::is_whitespace)
-                    .map_or((trimmed, ""), |(h, r)| (h, r.trim()));
-                let prefix = match &self.block {
-                    Some(PromptBlock::Permission { prefix, .. }) => prefix.clone(),
-                    _ => None,
-                };
-                let answer = match head.to_ascii_lowercase().as_str() {
-                    "y" | "yes" => Some((true, false, None, None)),
-                    "a" | "always" => Some((true, true, None, None)),
-                    "p" => Some((true, prefix.is_none(), prefix, None)),
-                    "n" | "no" if rest.is_empty() => Some((false, false, None, None)),
-                    "n" | "no" => Some((false, false, None, Some(rest.to_owned()))),
-                    _ => None,
-                };
-                if let Some((allow, session, prefix, reason)) = answer {
-                    self.decide(allow, session, prefix, reason, out).await;
+                if let Some(Keyed::Decide { pick, reason, echo }) =
+                    self.menu.as_ref().and_then(|m| m.line(line))
+                {
+                    out.line(&echo);
+                    match pick {
+                        Pick::Allow { session, prefix } => {
+                            self.decide(true, session, prefix, reason, out).await;
+                        }
+                        Pick::Deny => {
+                            self.decide(false, false, None, reason, out).await;
+                        }
+                    }
                     return;
                 }
             }
@@ -631,9 +589,67 @@ impl ClientRepl {
         self.turn.as_ref()
     }
 
-    /// The block the shell draws while this client is prompted.
-    pub fn prompt_block(&self) -> Option<&PromptBlock> {
-        self.prompted.as_ref().and(self.block.as_ref())
+    /// The menu the shell draws while this client is prompted.
+    pub fn menu(&self) -> Option<&Menu> {
+        self.prompted.as_ref().and(self.menu.as_ref())
+    }
+
+    /// A key while the menu is up: the selection, the digits, the hidden
+    /// accelerators and Enter, sending the decision with the echo of
+    /// what was chosen. `composer_empty` and `settled` as `Menu::key`
+    /// takes them. `Reason` says the composer should take the deny's
+    /// reason.
+    pub async fn menu_key(
+        &mut self,
+        key: &crossterm::event::KeyEvent,
+        composer_empty: bool,
+        settled: bool,
+        out: &mut dyn Printer,
+    ) -> MenuKey {
+        if self.prompted.is_none() {
+            return MenuKey::Passed;
+        }
+        let Some(menu) = self.menu.as_mut() else {
+            return MenuKey::Passed;
+        };
+        match menu.key(key, composer_empty, settled) {
+            Keyed::Passed => MenuKey::Passed,
+            Keyed::Used => MenuKey::Used,
+            Keyed::Reason => MenuKey::Reason,
+            Keyed::Decide { pick, reason, echo } => {
+                out.line(&echo);
+                match pick {
+                    Pick::Allow { session, prefix } => {
+                        self.decide(true, session, prefix, reason, out).await;
+                    }
+                    Pick::Deny => {
+                        self.decide(false, false, None, reason, out).await;
+                    }
+                }
+                MenuKey::Used
+            }
+        }
+    }
+
+    /// The composer's text for the prompt, Enter on the reason input:
+    /// a deny's reason, with none when it was empty. A prompt answered
+    /// elsewhere first is gone; the text goes nowhere.
+    pub async fn prompt_text(&mut self, reason: Option<String>, out: &mut dyn Printer) {
+        if self.menu().is_none() {
+            return;
+        }
+        if self
+            .menu
+            .as_ref()
+            .is_some_and(|m| m.kind == Kind::Permission)
+        {
+            let echo = match &reason {
+                Some(r) => format!("↳ No: {r}"),
+                None => "↳ No".into(),
+            };
+            out.line(&echo);
+            self.decide(false, false, None, reason, out).await;
+        }
     }
 
     /// Ctrl-C or Esc while a turn runs: cancel it, post nothing.
@@ -653,11 +669,11 @@ impl ClientRepl {
         match response {
             Response::Ok => {
                 self.prompted = None;
-                self.block = None;
+                self.menu = None;
             }
             Response::Refused { reason } if reason.contains("already decided") => {
                 self.prompted = None;
-                self.block = None;
+                self.menu = None;
                 out.line(&format!("[{reason}; someone else was first]"));
             }
             other => self.show(other, "", out),
@@ -811,24 +827,9 @@ impl ClientRepl {
                 reason,
             } => {
                 if self.may_approve() {
-                    let prefix = (call.name == "bash")
-                        .then(|| {
-                            call.args
-                                .get("command")
-                                .and_then(|c| c.as_str())
-                                .map(aigentic_runtime::aigentic_policy::prefix_of)
-                        })
-                        .flatten()
-                        .filter(|p| !p.is_empty());
-                    let block = PromptBlock::Permission {
-                        tool: call.name.clone(),
-                        class: class_name(*class),
-                        reason: reason.clone(),
-                        summary: truncate_for_display(&summarise_args(call), 1, 600),
-                        prefix,
-                    };
-                    out.prompt(&block);
-                    self.block = Some(block);
+                    let menu = Menu::permission(call, *class, reason);
+                    out.prompt(&menu);
+                    self.menu = Some(menu);
                     self.prompted = Some(call_id.clone());
                 } else {
                     out.line(&format!(
@@ -839,11 +840,9 @@ impl ClientRepl {
             }
             ThreadState::AwaitingHuman { call_id, question } => {
                 if self.may_write() {
-                    let block = PromptBlock::Question {
-                        question: question.clone(),
-                    };
-                    out.prompt(&block);
-                    self.block = Some(block);
+                    let menu = Menu::question(question);
+                    out.prompt(&menu);
+                    self.menu = Some(menu);
                     self.prompted = Some(call_id.clone());
                 } else {
                     out.line(&format!("[waiting for an answer: {question}]"));
@@ -856,7 +855,7 @@ impl ClientRepl {
                 if self.prompted.take().is_some() {
                     out.line("[answered elsewhere]");
                 }
-                self.block = None;
+                self.menu = None;
             }
         }
     }
@@ -1076,17 +1075,6 @@ pub fn author_name(author: &Author) -> String {
         Author::User(u) => u.0.clone(),
         Author::Agent(a) => a.0.clone(),
         Author::System => "system".into(),
-    }
-}
-
-fn class_name(class: aigentic_runtime::aigentic_core::RiskClass) -> &'static str {
-    use aigentic_runtime::aigentic_core::RiskClass;
-    match class {
-        RiskClass::Read => "read",
-        RiskClass::Write => "write",
-        RiskClass::Exec => "exec",
-        RiskClass::Network => "network",
-        RiskClass::Safe => "safe",
     }
 }
 
@@ -1520,14 +1508,22 @@ mod tests {
         };
         let question = at("[question] which colour?");
         assert_eq!(lines[question + 1], "  type the answer");
-        let permission = at("[permission] bash (class exec): class exec: anything else in a shell");
+        let permission = at("[permission] Run this command?");
         assert_eq!(lines[permission + 1], "  rm -rf x");
+        assert_eq!(lines[permission + 2], "  1. Yes");
         assert_eq!(
-            lines[permission + 2],
-            "  allow? y once / a always this session / p allow `rm -rf x` from now on / n no / n <reason> no, and why"
+            lines[permission + 3],
+            "  2. Yes, and don't ask again for `rm -rf x` in this project"
         );
+        assert_eq!(lines[permission + 4], "  3. No, and tell the agent why");
+        // The feeder answered `n`: the choice is echoed, then the
+        // decision prints.
+        let echo = at("↳ No");
         let denied = at("  [denied by steve]");
-        assert!(question < permission && permission < denied, "{lines:#?}");
+        assert!(
+            question < permission && permission < echo && echo < denied,
+            "{lines:#?}"
+        );
         assert!(
             lines.iter().any(|l| l.starts_with("• Failed ")),
             "the denied call's result: {lines:#?}"
@@ -1885,7 +1881,7 @@ mod tests {
                 .position(|l| l.starts_with(needle))
                 .unwrap_or_else(|| panic!("no line {needle:?} in {lines:#?}"))
         };
-        let prompt = at("  allow? y once / a always this session");
+        let prompt = at("[permission] Run this command?");
         let withdrawn = at("[decided by magnus]");
         let allowed = at("  [allowed by magnus]");
         assert!(prompt < withdrawn && withdrawn + 1 == allowed, "{lines:#?}");
@@ -1986,14 +1982,20 @@ mod tests {
         let lines = out.0;
         let asks = lines
             .iter()
-            .filter(|l| l.starts_with("[permission] bash"))
+            .filter(|l| l.starts_with("[permission] Run this command?"))
             .count();
         assert_eq!(asks, 2, "curl asked once, rm once: {lines:#?}");
         assert!(
             lines
                 .iter()
-                .any(|l| l.contains("p allow `curl -s` from now on")),
+                .any(|l| l.contains("don't ask again for `curl -s` in this project")),
             "{lines:#?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l == "↳ Yes, and don't ask again for `curl -s` in this project"),
+            "the choice is echoed into the record: {lines:#?}"
         );
         assert!(
             lines
