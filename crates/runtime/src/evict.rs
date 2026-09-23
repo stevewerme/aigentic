@@ -79,6 +79,22 @@ impl Runtime {
             Some(seq) => calls.iter().filter(|s| **s <= seq).count(),
             None => 0,
         };
+        // Pressure first (issue #32): under the line nothing is stubbed.
+        // Sweeping a small context saved a few thousand tokens, broke
+        // the prompt cache each time, and made a reading turn forget
+        // and re-read the same files (150 calls, 21 sweeps, no edit).
+        // A lower ceiling lowers the line with it.
+        let line = match (
+            self.compaction.evict_above_tokens,
+            self.compaction.context_ceiling_tokens,
+        ) {
+            (0, _) => 0,
+            (line, 0) => line,
+            (line, ceiling) => line.min(ceiling),
+        };
+        if line > 0 && !self.over_the_ceiling(&events, line, None, &mut None)? {
+            return Ok(false);
+        }
         // How far to evict: all but the last `keep_last_calls`, cut to
         // the block line so the next sweep lands on the next block.
         let mut target = (calls.len().saturating_sub(self.compaction.keep_last_calls)

@@ -187,7 +187,12 @@ fn flat_text(messages: &[Message]) -> String {
 
 #[tokio::test]
 async fn a_two_hundred_call_turn_with_large_results_and_edits_stays_under_128k() {
-    let (seen, sweeps, mut rt) = run_turn(200, 400, DEFAULT_COMPACTION).await;
+    // Sweeps on call count alone, to exercise the mechanics.
+    let count_only = aigentic_runtime::CompactionSettings {
+        evict_above_tokens: 0,
+        ..DEFAULT_COMPACTION
+    };
+    let (seen, sweeps, mut rt) = run_turn(200, 400, count_only).await;
     assert!((20..30).contains(&sweeps));
 
     // Every call stayed under the ceiling of tokens we are willing to
@@ -255,8 +260,23 @@ async fn the_ceiling_drives_the_sweep_deeper_than_the_last_calls_window() {
 }
 
 #[tokio::test]
-async fn the_cached_prefix_is_stable_between_sweeps() {
+async fn a_small_context_is_never_swept() {
+    // Forty calls of reading stay far under the 64k line: nothing is
+    // stubbed, so the turn keeps everything it read (issue #32).
     let (seen, sweeps, _rt) = run_turn(40, 300, DEFAULT_COMPACTION).await;
+    assert_eq!(sweeps, 0);
+    let requests = seen.lock().unwrap();
+    let flat = flat_text(requests.last().unwrap());
+    assert_eq!(flat.matches("dropped from context; re-run it").count(), 0);
+}
+
+#[tokio::test]
+async fn the_cached_prefix_is_stable_between_sweeps() {
+    let count_only = aigentic_runtime::CompactionSettings {
+        evict_above_tokens: 0,
+        ..DEFAULT_COMPACTION
+    };
+    let (seen, sweeps, _rt) = run_turn(40, 300, count_only).await;
     assert!(sweeps >= 3, "the turn must sweep to test stability");
     let requests = seen.lock().unwrap();
     // Between sweeps the context only grows at the end: each request is

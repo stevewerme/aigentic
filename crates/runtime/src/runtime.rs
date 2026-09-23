@@ -48,6 +48,10 @@ pub struct CompactionSettings {
     /// compaction's trigger line and the in-turn sweep both aim under
     /// it (issue #30). Zero means no ceiling, only the fraction.
     pub context_ceiling_tokens: u64,
+    /// The in-turn sweep runs only while the context is over this line
+    /// (issue #32): under it nothing is stubbed, so a turn that is still
+    /// reading keeps what it read. Zero sweeps on call count alone.
+    pub evict_above_tokens: u64,
 }
 
 pub const DEFAULT_COMPACTION: CompactionSettings = CompactionSettings {
@@ -57,6 +61,7 @@ pub const DEFAULT_COMPACTION: CompactionSettings = CompactionSettings {
     summary_max_output_tokens: 2048,
     keep_last_calls: 12,
     context_ceiling_tokens: 128_000,
+    evict_above_tokens: 64_000,
 };
 
 /// One thread's runtime: the provider, the tool registry and the single

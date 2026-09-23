@@ -241,6 +241,9 @@ pub struct CompactionConfig {
     /// What one call's context may cost, whatever the window (issue #30).
     #[serde(default)]
     pub context_ceiling_tokens: Option<u64>,
+    /// The sweep runs only over this many tokens (issue #32).
+    #[serde(default)]
+    pub evict_above_tokens: Option<u64>,
 }
 
 impl CompactionConfig {
@@ -256,6 +259,7 @@ impl CompactionConfig {
             context_ceiling_tokens: self
                 .context_ceiling_tokens
                 .unwrap_or(base.context_ceiling_tokens),
+            evict_above_tokens: self.evict_above_tokens.unwrap_or(base.evict_above_tokens),
         }
     }
 
