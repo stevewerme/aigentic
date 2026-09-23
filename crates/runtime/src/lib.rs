@@ -22,6 +22,7 @@ mod compaction;
 mod context;
 mod decisions;
 mod error;
+mod evict;
 pub mod harness_tools;
 pub mod knowledge;
 pub mod layers;

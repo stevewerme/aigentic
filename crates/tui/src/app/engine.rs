@@ -1065,7 +1065,10 @@ impl ClientRepl {
                     self.title = Some(p.title);
                 }
             }
-            EventKind::Pinned | EventKind::PermissionRequested | EventKind::ThreadStarted => {}
+            EventKind::Pinned
+            | EventKind::PermissionRequested
+            | EventKind::ThreadStarted
+            | EventKind::ContextEvicted => {}
         }
     }
 }

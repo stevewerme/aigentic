@@ -166,6 +166,9 @@ impl Runtime {
             }
             // Compaction, at an iteration boundary only: every tool call
             // already has its result, so no summary range splits a turn.
+            // Eviction runs at the same boundary, and first: stubbing is
+            // free where a summary costs a call (issue #30).
+            self.evict_stale(observe)?;
             if let Err(e) = self.compact(observe).await {
                 if let RuntimeError::Provider(p) = &e {
                     self.end_turn(&format!("provider_error: {p}"), &spent, observe)?;

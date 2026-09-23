@@ -226,6 +226,10 @@ pub struct CompactionConfig {
     pub max_result_bytes: Option<usize>,
     #[serde(default)]
     pub summary_max_output_tokens: Option<u64>,
+    /// Calls of the running turn kept in full before in-turn eviction
+    /// stubs the rest (issue #30).
+    #[serde(default)]
+    pub keep_last_calls: Option<usize>,
 }
 
 impl CompactionConfig {
@@ -237,6 +241,7 @@ impl CompactionConfig {
             summary_max_output_tokens: self
                 .summary_max_output_tokens
                 .unwrap_or(base.summary_max_output_tokens),
+            keep_last_calls: self.keep_last_calls.unwrap_or(base.keep_last_calls),
         }
     }
 

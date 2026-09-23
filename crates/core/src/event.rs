@@ -43,6 +43,12 @@ pub enum EventKind {
     /// to where, the new working root, and the workspace. The projection
     /// tells the model; a reload builds the thread in the last one.
     ProjectSwitched,
+    /// In-turn eviction (issue #30): tool results and successful
+    /// edit/write arguments at or before `through_seq`, within the turn
+    /// the event was appended in, are stubbed in projection. The
+    /// originals stay in the log; the sweep appends one per block of
+    /// calls, so the cached prefix is stable between sweeps.
+    ContextEvicted,
 }
 
 /// One line of a thread's append-only log. The log is the source of truth;

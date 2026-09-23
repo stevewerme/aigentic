@@ -39,6 +39,10 @@ pub struct CompactionSettings {
     pub max_result_bytes: usize,
     /// Output cap for the summarisation call.
     pub summary_max_output_tokens: u64,
+    /// Calls of the running turn kept in full before in-turn eviction
+    /// stubs the rest (issue #30). Failed results and the last result of
+    /// each distinct tool always stay on top of these.
+    pub keep_last_calls: usize,
 }
 
 pub const DEFAULT_COMPACTION: CompactionSettings = CompactionSettings {
@@ -46,6 +50,7 @@ pub const DEFAULT_COMPACTION: CompactionSettings = CompactionSettings {
     keep_turns: 8,
     max_result_bytes: 4096,
     summary_max_output_tokens: 2048,
+    keep_last_calls: 12,
 };
 
 /// One thread's runtime: the provider, the tool registry and the single

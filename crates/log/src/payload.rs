@@ -235,6 +235,17 @@ pub struct PinnedPayload {
     pub text: String,
 }
 
+/// Payload of a `context_evicted` event (issue #30): within the turn the
+/// event was appended in, tool results at or before `through_seq` and the
+/// arguments of their successful `edit_file` / `write_file` calls are
+/// stubbed in projection, except failed results and the last result of
+/// each distinct tool. The originals stay in the log.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextEvictedPayload {
+    /// The last stubbed event's seq, inclusive.
+    pub through_seq: u64,
+}
+
 /// Payload of an `interrupted` event: appended on resume after a crash
 /// (phase 2), or when a participant interrupts a running turn (phase 5).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -437,6 +448,17 @@ mod tests {
         let p: ToolResultPayload = serde_json::from_value(line).unwrap();
         assert_eq!(p.result.id, "c1");
         assert_eq!(p.policy, None);
+    }
+
+    #[test]
+    fn context_evicted_round_trips_with_one_field() {
+        let p = ContextEvictedPayload { through_seq: 41 };
+        let value = serde_json::to_value(&p).unwrap();
+        assert_eq!(value, json!({"through_seq": 41}));
+        assert_eq!(
+            serde_json::from_value::<ContextEvictedPayload>(value).unwrap(),
+            p
+        );
     }
 
     #[test]

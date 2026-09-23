@@ -6,8 +6,8 @@ use aigentic_core::{Author, ContentBlock, Event, EventKind, Message, Role};
 use time::format_description::well_known::Rfc3339;
 
 use crate::payload::{
-    AssistantMessagePayload, CompactedPayload, CompactionStrategy, InterruptedPayload,
-    PinnedPayload, SkillLoadedPayload, ToolResultPayload, UserMessagePayload,
+    AssistantMessagePayload, CompactedPayload, CompactionStrategy, ContextEvictedPayload,
+    InterruptedPayload, PinnedPayload, SkillLoadedPayload, ToolResultPayload, UserMessagePayload,
 };
 use crate::store::LogError;
 
@@ -40,13 +40,37 @@ struct Truncation {
     max_bytes: usize,
 }
 
+/// An in-turn eviction: the turn it belongs to (the `turn_ended` before
+/// it, `None` when that turn opens the thread) and how far it reaches.
+#[derive(Debug, Clone, Copy)]
+struct Eviction {
+    turn: Option<u64>,
+    through: u64,
+}
+
+/// What the first pass needs to know about a tool call's result.
+#[derive(Debug, Clone, Copy)]
+struct CallResult {
+    seq: u64,
+    /// The turn the result belongs to, keyed like [`Eviction::turn`].
+    turn: Option<u64>,
+    is_error: bool,
+    /// For a successful `edit_file` / `write_file`: its result's diff
+    /// shape, `-removed/+added`, for the argument stub.
+    diff: Option<(u64, u64)>,
+}
+
 /// Project events into the canonical messages a provider sees, oldest
 /// first, with compaction applied.
 ///
 /// Rules, in order: pinned events lift out of the body; a summary replaces
 /// its range with one user-role message from the system author (later
 /// summaries win where ranges overlap); truncations shorten tool results in
-/// their range; provider blobs are dropped from every assistant message
+/// their range; a `context_evicted` event stubs the tool results at or
+/// before its `through_seq` within its own turn, and the arguments of their
+/// successful `edit_file` / `write_file` calls with the diff shape, except
+/// failed results and the last result of each distinct tool, which stay;
+/// provider blobs are dropped from every assistant message
 /// that predates the latest summary compaction; an interrupted event
 /// becomes a short note; a loaded skill becomes a user-role message from
 /// the system author (a marker line, then the body); `turn_ended`,
@@ -73,6 +97,19 @@ pub fn project(events: &[Event]) -> Result<Projection, LogError> {
         .rev()
         .find(|e| e.kind == EventKind::TurnEnded)
         .map(|e| e.seq);
+
+    // In-turn eviction: what each call is, what its result is, and the
+    // last result of each distinct tool per turn, so the second pass can
+    // decide what the `context_evicted` events stub.
+    let mut evictions: Vec<Eviction> = Vec::new();
+    let mut calls: std::collections::HashMap<String, (String, serde_json::Value)> =
+        std::collections::HashMap::new();
+    let mut results: std::collections::HashMap<String, CallResult> =
+        std::collections::HashMap::new();
+    let mut last_of_tool: std::collections::HashMap<(Option<u64>, String), u64> =
+        std::collections::HashMap::new();
+    let mut turn: Option<u64> = None;
+    let mut stubbed: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for event in events {
         match event.kind {
@@ -110,7 +147,61 @@ pub fn project(events: &[Event]) -> Result<Projection, LogError> {
                 let p: PinnedPayload = payload(event)?;
                 pinned.push(p.text);
             }
+            EventKind::TurnEnded => {
+                turn = Some(event.seq);
+            }
+            EventKind::ContextEvicted => {
+                let p: ContextEvictedPayload = payload(event)?;
+                evictions.push(Eviction {
+                    turn,
+                    through: p.through_seq,
+                });
+            }
+            EventKind::AssistantMessage => {
+                let p: AssistantMessagePayload = payload(event)?;
+                for block in &p.blocks {
+                    if let ContentBlock::ToolCall(c) = block {
+                        calls.insert(c.id.clone(), (c.name.clone(), c.args.clone()));
+                    }
+                }
+            }
+            EventKind::ToolResult => {
+                let p: ToolResultPayload = payload(event)?;
+                let Some((name, _)) = calls.get(&p.result.id) else {
+                    continue;
+                };
+                let is_edit = name == "edit_file" || name == "write_file";
+                results.insert(
+                    p.result.id.clone(),
+                    CallResult {
+                        seq: event.seq,
+                        turn,
+                        is_error: p.result.is_error,
+                        diff: (!p.result.is_error && is_edit)
+                            .then(|| diff_lines(&p.result.content)),
+                    },
+                );
+                last_of_tool.insert((turn, name.clone()), event.seq);
+            }
             _ => {}
+        }
+    }
+    for (id, r) in &results {
+        if r.is_error {
+            continue; // a failure is information; it stays
+        }
+        let Some((name, _)) = calls.get(id) else {
+            continue;
+        };
+        // The last result of each distinct tool stays, however old.
+        if last_of_tool.get(&(r.turn, name.clone())) == Some(&r.seq) {
+            continue;
+        }
+        if evictions
+            .iter()
+            .any(|e| e.turn == r.turn && r.seq <= e.through)
+        {
+            stubbed.insert(id.clone());
         }
     }
 
@@ -193,6 +284,19 @@ pub fn project(events: &[Event]) -> Result<Projection, LogError> {
                 let blocks = p
                     .blocks
                     .into_iter()
+                    .map(|b| match &b {
+                        // A successful edit whose result is stubbed loses
+                        // its old/new strings: the diff shape is enough,
+                        // and the file can be re-read.
+                        ContentBlock::ToolCall(c)
+                            if stubbed.contains(&c.id)
+                                && (c.name == "edit_file" || c.name == "write_file") =>
+                        {
+                            let diff = results.get(&c.id).and_then(|r| r.diff).unwrap_or((0, 0));
+                            stub_call_args(c, diff)
+                        }
+                        _ => b,
+                    })
                     .filter(|b| !(drop_blobs && matches!(b, ContentBlock::ProviderBlob(_))))
                     .collect();
                 push(
@@ -208,7 +312,11 @@ pub fn project(events: &[Event]) -> Result<Projection, LogError> {
             }
             EventKind::ToolResult => {
                 let ToolResultPayload { mut result, .. } = payload(event)?;
-                if let Some(max) = truncations
+                if stubbed.contains(&result.id) {
+                    if let Some((name, args)) = calls.get(&result.id) {
+                        result.content = result_stub(name, args, &result.content);
+                    }
+                } else if let Some(max) = truncations
                     .iter()
                     .filter(|t| t.from <= event.seq && event.seq <= t.to)
                     .map(|t| t.max_bytes)
@@ -301,6 +409,7 @@ pub fn project(events: &[Event]) -> Result<Projection, LogError> {
             EventKind::TurnEnded
             | EventKind::Compacted
             | EventKind::Pinned
+            | EventKind::ContextEvicted
             | EventKind::PermissionRequested
             | EventKind::PermissionDecided
             | EventKind::MemoryExtracted
@@ -328,6 +437,60 @@ pub fn summary_marker(from_seq: u64, to_seq: u64, model: &str, date: &str) -> St
 /// The line placed before a loaded skill's body so the model knows what it is.
 pub fn skill_marker(name: &str) -> String {
     format!("[Skill `{name}` loaded; follow it for this task]")
+}
+
+/// The stub an evicted result projects to: what ran, roughly with what,
+/// how big it was, and how to get it back (issue #30).
+fn result_stub(name: &str, args: &serde_json::Value, content: &str) -> String {
+    format!(
+        "[result of {name} {} · {} lines · dropped from context; re-run it if you need it again]",
+        short_args(args),
+        content.lines().count()
+    )
+}
+
+/// A call's arguments as one short line: enough to tell two calls of the
+/// same tool apart, never the payload itself.
+fn short_args(args: &serde_json::Value) -> String {
+    let text = serde_json::to_string(args).unwrap_or_default();
+    if text.chars().count() <= 60 {
+        text
+    } else {
+        format!("{}…", text.chars().take(59).collect::<String>())
+    }
+}
+
+/// A successful edit/write call whose result is stubbed: the arguments
+/// become the diff shape, read off the result before it was stubbed.
+fn stub_call_args(call: &aigentic_core::ToolCall, diff: (u64, u64)) -> ContentBlock {
+    let path = call
+        .args
+        .get("path")
+        .and_then(|p| p.as_str())
+        .unwrap_or_default();
+    let (removed, added) = diff;
+    let stub = format!("[edited {path}: -{removed}/+{added} lines]");
+    ContentBlock::ToolCall(aigentic_core::ToolCall {
+        id: call.id.clone(),
+        name: call.name.clone(),
+        args: serde_json::json!({ "evicted": stub }),
+    })
+}
+
+/// The `-removed/+added` line counts of a unified diff, headers excluded.
+fn diff_lines(content: &str) -> (u64, u64) {
+    let (mut removed, mut added) = (0, 0);
+    for line in content.lines() {
+        if line.starts_with("---") || line.starts_with("+++") {
+            continue;
+        }
+        match line.as_bytes().first() {
+            Some(b'-') => removed += 1,
+            Some(b'+') => added += 1,
+            _ => {}
+        }
+    }
+    (removed, added)
 }
 
 fn payload<T: serde::de::DeserializeOwned>(event: &Event) -> Result<T, LogError> {
@@ -458,6 +621,60 @@ mod tests {
             agent(),
             serde_json::to_value(p).unwrap(),
         )
+    }
+    fn call(seq: u64, id: &str, name: &str, args: serde_json::Value) -> Event {
+        ev(
+            seq,
+            EventKind::AssistantMessage,
+            agent(),
+            serde_json::to_value(AssistantMessagePayload {
+                blocks: vec![ContentBlock::ToolCall(ToolCall {
+                    id: id.into(),
+                    name: name.into(),
+                    args,
+                })],
+                usage: None,
+            })
+            .unwrap(),
+        )
+    }
+    fn failed(seq: u64, id: &str, content: &str) -> Event {
+        ev(
+            seq,
+            EventKind::ToolResult,
+            Author::System,
+            json!({"id": id, "content": content, "is_error": true}),
+        )
+    }
+    fn evicted(seq: u64, through: u64) -> Event {
+        ev(
+            seq,
+            EventKind::ContextEvicted,
+            Author::System,
+            json!({"through_seq": through}),
+        )
+    }
+    /// Every tool result's content, oldest first, as `name:content`.
+    fn results(p: &Projection) -> Vec<(String, String)> {
+        p.body
+            .iter()
+            .flat_map(|m| m.blocks.iter())
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult(r) => Some((r.id.clone(), r.content.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+    /// The arguments of every tool call, oldest first.
+    fn call_args(p: &Projection) -> Vec<serde_json::Value> {
+        p.body
+            .iter()
+            .flat_map(|m| m.blocks.iter())
+            .filter_map(|b| match b {
+                ContentBlock::ToolCall(c) => Some(c.args.clone()),
+                _ => None,
+            })
+            .collect()
     }
     fn texts(p: &Projection) -> Vec<String> {
         p.body
@@ -885,5 +1102,193 @@ mod tests {
                 is_error: false
             })]
         );
+    }
+
+    #[test]
+    fn an_old_log_without_context_evicted_replays_unchanged() {
+        // Recorded before in-turn eviction: closed turns and an open one
+        // alike project with every result in full, however many calls
+        // the turn holds.
+        let long = "x".repeat(500);
+        let events = vec![
+            user(0, "build it"),
+            call(1, "c1", "bash", json!({"command": "cargo test"})),
+            result(2, "c1", &long),
+            call(3, "c2", "bash", json!({"command": "cargo build"})),
+            result(4, "c2", &long),
+            ended(5),
+            user(6, "and keep going"),
+            call(7, "c3", "read_file", json!({"path": "a.rs"})),
+            result(8, "c3", &long),
+        ];
+        let p = project(&events).unwrap();
+        assert_eq!(
+            results(&p),
+            vec![
+                ("c1".into(), long.clone()),
+                ("c2".into(), long.clone()),
+                ("c3".into(), long.clone())
+            ],
+            "no event, no stub, open turn included"
+        );
+    }
+
+    #[test]
+    fn evicted_results_stub_but_failures_and_the_last_per_tool_stay() {
+        let long = "line\n".repeat(200);
+        let events = vec![
+            user(0, "build it"),
+            call(1, "c1", "bash", json!({"command": "cargo test"})),
+            result(2, "c1", &long),
+            call(3, "c2", "read_file", json!({"path": "a.rs"})),
+            result(4, "c2", &long),
+            call(5, "c3", "bash", json!({"command": "cargo test"})),
+            result(6, "c3", &long),
+            call(7, "c4", "grep", json!({"pattern": "x"})),
+            failed(8, "c4", "no matches"),
+            call(
+                9,
+                "c5",
+                "write_file",
+                json!({"path": "src/new.rs", "content": "one\ntwo\n"}),
+            ),
+            result(
+                10,
+                "c5",
+                "--- a/src/new.rs\n+++ b/src/new.rs\n@@ -0,0 +1,2 @@\n+one\n+two\nwrote 8 bytes to src/new.rs",
+            ),
+            call(
+                11,
+                "c7",
+                "write_file",
+                json!({"path": "src/other.rs", "content": "x\n"}),
+            ),
+            result(
+                12,
+                "c7",
+                "--- a/src/other.rs\n+++ b/src/other.rs\n@@ -0,0 +1,1 @@\n+x\nwrote 2 bytes to src/other.rs",
+            ),
+            evicted(13, 12),
+            call(
+                14,
+                "c6",
+                "edit_file",
+                json!({"path": "src/new.rs", "old_string": "one", "new_string": "ONE"}),
+            ),
+            result(15, "c6", "edited src/new.rs at line 1"),
+        ];
+        let p = project(&events).unwrap();
+        assert_eq!(
+            results(&p),
+            vec![
+                (
+                    "c1".into(),
+                    "[result of bash {\"command\":\"cargo test\"} · 200 lines · dropped from context; re-run it if you need it again]".into()
+                ),
+                ("c2".into(), long.clone()), // last read_file of the turn
+                ("c3".into(), long),         // last bash result of the turn
+                ("c4".into(), "no matches".into()), // failures stay
+                (
+                    "c5".into(),
+                    "[result of write_file {\"content\":\"one\\ntwo\\n\",\"path\":\"src/new.rs\"} · 6 lines · dropped from context; re-run it if you need it again]".into()
+                ),
+                // The last write_file result stays, in range though it is.
+                (
+                    "c7".into(),
+                    "--- a/src/other.rs\n+++ b/src/other.rs\n@@ -0,0 +1,1 @@\n+x\nwrote 2 bytes to src/other.rs".into()
+                ),
+                ("c6".into(), "edited src/new.rs at line 1".into()), // after the boundary
+            ]
+        );
+        // The tool contract holds: role and author unchanged, ids intact.
+        assert!(p.body.iter().any(|m| m.role == Role::Tool
+            && m.author == Author::System
+            && matches!(&m.blocks[0], ContentBlock::ToolResult(r) if r.id == "c1" && !r.is_error)));
+        // Successful edit/write arguments stub with the diff shape; the
+        // last of a tool and the call after the boundary keep theirs.
+        assert_eq!(
+            call_args(&p),
+            vec![
+                json!({"command": "cargo test"}),
+                json!({"path": "a.rs"}),
+                json!({"command": "cargo test"}),
+                json!({"pattern": "x"}),
+                json!({"evicted": "[edited src/new.rs: -0/+2 lines]"}),
+                json!({"path": "src/other.rs", "content": "x\n"}),
+                json!({"path": "src/new.rs", "old_string": "one", "new_string": "ONE"}),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failed_edit_keeps_its_arguments_and_only_its_own_turn_is_evicted() {
+        let long = "y".repeat(300);
+        let events = vec![
+            user(0, "one"),
+            call(1, "c1", "bash", json!({"command": "ls"})),
+            result(2, "c1", &long),
+            ended(3),
+            user(4, "two"),
+            call(
+                5,
+                "c2",
+                "edit_file",
+                json!({"path": "a.rs", "old_string": "x", "new_string": "y"}),
+            ),
+            failed(6, "c2", "a.rs: old_string not found"),
+            call(7, "c3", "bash", json!({"command": "ls"})),
+            result(8, "c3", &long),
+            evicted(9, 6),
+        ];
+        let p = project(&events).unwrap();
+        // The closed turn's result is untouched: the sweep only ever
+        // records its own turn.
+        assert_eq!(
+            results(&p),
+            vec![
+                ("c1".into(), long.clone()),
+                ("c2".into(), "a.rs: old_string not found".into()),
+                ("c3".into(), long), // last bash result of the open turn
+            ]
+        );
+        // A failed edit's arguments stay: the rule is successful edits.
+        assert_eq!(
+            call_args(&p)[1],
+            json!({"path": "a.rs", "old_string": "x", "new_string": "y"})
+        );
+    }
+
+    #[test]
+    fn long_result_args_are_shortened_in_the_stub() {
+        let events = vec![
+            user(0, "go"),
+            call(
+                1,
+                "c1",
+                "write_file",
+                json!({"path": "big.rs", "content": "z".repeat(400)}),
+            ),
+            result(2, "c1", "wrote 400 bytes to big.rs"),
+            evicted(3, 2),
+            call(
+                4,
+                "c2",
+                "write_file",
+                json!({"path": "z.rs", "content": "q"}),
+            ),
+            result(5, "c2", "wrote 1 byte to z.rs"),
+        ];
+        let p = project(&events).unwrap();
+        let (_, stub) = results(&p)[0].clone();
+        assert!(
+            stub.starts_with("[result of write_file {\"content\":\"zz"),
+            "{stub}"
+        );
+        assert!(stub.contains("…"), "the arguments are cut short: {stub}");
+        assert!(
+            stub.ends_with(" · dropped from context; re-run it if you need it again]"),
+            "{stub}"
+        );
+        assert!(stub.len() < 200, "{stub}");
     }
 }
