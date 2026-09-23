@@ -18,6 +18,18 @@ pub(crate) struct Spent {
     pub(crate) tokens: u64,
 }
 
+/// What one call spends of the `max_tokens` budget: uncached input,
+/// cache writes and output in full, cache reads at a tenth. A cached
+/// prefix is re-read on every call, so counting it in full ended a build
+/// turn after sixteen calls on a 140k context of which 99% was cached
+/// (phase 6 test spin); providers price a cache read at about a tenth.
+pub(crate) fn budget_tokens(usage: &Usage) -> u64 {
+    usage.input_tokens
+        + usage.cache_write_tokens
+        + usage.output_tokens
+        + usage.cache_read_tokens / 10
+}
+
 impl Runtime {
     /// Usage for a call whose provider reported none: `count_tokens` over
     /// the context for input and over the produced blocks for output,
@@ -152,5 +164,23 @@ impl Runtime {
 pub(crate) fn flush_text(text: &mut String, blocks: &mut Vec<ContentBlock>) {
     if !text.is_empty() {
         blocks.push(ContentBlock::Text(std::mem::take(text)));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_reads_spend_a_tenth_of_the_budget() {
+        let usage = Usage {
+            input_tokens: 200,
+            output_tokens: 300,
+            cache_read_tokens: 140_000,
+            cache_write_tokens: 500,
+            reasoning_tokens: None,
+            estimated: false,
+        };
+        assert_eq!(budget_tokens(&usage), 200 + 300 + 500 + 14_000);
     }
 }
