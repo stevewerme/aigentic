@@ -127,18 +127,6 @@ impl Anthropic {
 
 type EventStream<'a> = Pin<Box<dyn Stream<Item = ProviderEvent> + Send + 'a>>;
 
-/// Retries for an overloaded or rate-limited reply before any content
-/// has streamed: HTTP 429/503/529, or a stream whose first event is an
-/// `overloaded_error`. Backoff 1s, 3s, 8s. Overload waves observed during
-/// the phase 2 acceptance lasted minutes; anything longer belongs to the
-/// user, who sees the error as a turn_ended event and can re-ask.
-const RETRIES: usize = 3;
-const BACKOFF: [std::time::Duration; RETRIES] = [
-    std::time::Duration::from_secs(1),
-    std::time::Duration::from_secs(3),
-    std::time::Duration::from_secs(8),
-];
-
 /// Debugging aid: with `AIGENTIC_DUMP_REQUESTS=<dir>` every request body
 /// is written there as `<unix-millis>.json`. Never includes the key.
 /// Diffing two consecutive bodies is how a silent cache invalidator is
@@ -204,7 +192,9 @@ impl Provider for Anthropic {
                 match outcome {
                     Ok(events) => return events,
                     Err(failure) => {
-                        let retry = attempt < RETRIES
+                        // Retries cover an overloaded or rate-limited reply before any
+                        // content: HTTP 429/503/529, or a first `overloaded_error` event.
+                        let retry = attempt < crate::RETRIES
                             && match &failure {
                                 ProviderEvent::Error(ProviderError::Http { status, .. }) => {
                                     retryable_status(*status)
@@ -216,7 +206,7 @@ impl Provider for Anthropic {
                                 Box::pin(futures_util::stream::once(async move { failure }));
                             return stream;
                         }
-                        tokio::time::sleep(BACKOFF[attempt]).await;
+                        tokio::time::sleep(crate::BACKOFF[attempt]).await;
                         attempt += 1;
                     }
                 }

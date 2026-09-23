@@ -144,6 +144,19 @@ pub struct StreamOptions {
 
 type EventStream<'a> = Pin<Box<dyn Stream<Item = ProviderEvent> + Send + 'a>>;
 
+/// Whether a failure before any content is worth another attempt: the
+/// connection failed or stalled, the server was rate-limited or broke.
+/// A 4xx other than 429 is our request's fault and would fail again.
+fn retryable(failure: &ProviderEvent) -> bool {
+    match failure {
+        ProviderEvent::Error(ProviderError::Transport(_)) => true,
+        ProviderEvent::Error(ProviderError::Http { status, .. }) => {
+            *status == 429 || *status >= 500
+        }
+        _ => false,
+    }
+}
+
 impl Provider for OpenAiCompat {
     fn complete(&self, request: &CompletionRequest<'_>) -> EventStream<'_> {
         let body = self.build_request(request);
@@ -151,26 +164,52 @@ impl Provider for OpenAiCompat {
             "{}/chat/completions",
             self.config.base_url.trim_end_matches('/')
         );
-        let mut request = self.client.post(url).json(&body);
-        if let Some(key) = &self.config.api_key {
-            request = request.bearer_auth(key);
-        }
+        let client = self.client.clone();
+        let api_key = self.config.api_key.clone();
 
         let response = async move {
-            let events: EventStream<'static> = match request.send().await {
-                Err(e) => Box::pin(futures_util::stream::once(async move {
-                    ProviderEvent::Error(ProviderError::Transport(e.to_string()))
-                })),
-                Ok(resp) if !resp.status().is_success() => {
-                    let status = resp.status().as_u16();
-                    let body = resp.text().await.unwrap_or_default();
-                    Box::pin(futures_util::stream::once(async move {
-                        ProviderEvent::Error(ProviderError::Http { status, body })
-                    }))
+            let mut attempt = 0;
+            loop {
+                let mut request = client.post(&url).json(&body);
+                if let Some(key) = &api_key {
+                    request = request.bearer_auth(key);
                 }
-                Ok(resp) => Box::pin(parse_stream(resp.bytes_stream())),
-            };
-            events
+                let outcome: Result<EventStream<'static>, ProviderEvent> =
+                    match request.send().await {
+                        Err(e) => Err(ProviderEvent::Error(ProviderError::Transport(
+                            e.to_string(),
+                        ))),
+                        Ok(resp) if !resp.status().is_success() => {
+                            let status = resp.status().as_u16();
+                            let body = resp.text().await.unwrap_or_default();
+                            Err(ProviderEvent::Error(ProviderError::Http { status, body }))
+                        }
+                        Ok(resp) => {
+                            // A stream that dies before its first event has
+                            // shown nothing, so it is as safe to retry as a
+                            // refused request.
+                            let mut events = Box::pin(parse_stream(resp.bytes_stream()).peekable());
+                            match events.as_mut().peek().await {
+                                Some(first @ ProviderEvent::Error(ProviderError::Transport(_))) => {
+                                    Err(first.clone())
+                                }
+                                _ => Ok(Box::pin(events) as EventStream<'static>),
+                            }
+                        }
+                    };
+                match outcome {
+                    Ok(events) => return events,
+                    Err(failure) => {
+                        if attempt >= crate::RETRIES || !retryable(&failure) {
+                            let stream: EventStream<'static> =
+                                Box::pin(futures_util::stream::once(async move { failure }));
+                            return stream;
+                        }
+                        tokio::time::sleep(crate::BACKOFF[attempt]).await;
+                        attempt += 1;
+                    }
+                }
+            }
         };
         Box::pin(futures_util::stream::once(response).flatten())
     }
@@ -249,5 +288,59 @@ mod tests {
         let caps = provider.capabilities();
         assert!(caps.supports_tools && caps.supports_images);
         assert_eq!(caps.max_context_tokens, 8192);
+    }
+
+    /// A server that answers the first request 503 and the second with a
+    /// one-word stream: the adapter retries and the caller sees only text.
+    #[tokio::test]
+    async fn a_failure_before_content_is_retried() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let replies = [
+                "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 4\r\nconnection: close\r\n\r\nbusy".to_owned(),
+                {
+                    let body = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                },
+            ];
+            for reply in replies {
+                let (mut conn, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 65536];
+                let _ = conn.read(&mut buf);
+                conn.write_all(reply.as_bytes()).unwrap();
+            }
+        });
+        let provider = OpenAiCompat::new(OpenAiCompatConfig::new(format!("http://{addr}/v1"), "m"));
+        let request = CompletionRequest {
+            messages: &[],
+            tools: &[],
+            max_output_tokens: None,
+        };
+        let events: Vec<ProviderEvent> = provider.complete(&request).collect().await;
+        assert!(
+            matches!(events.first(), Some(ProviderEvent::TextDelta(t)) if t == "hi"),
+            "{events:?}"
+        );
+        assert!(!events.iter().any(|e| matches!(e, ProviderEvent::Error(_))));
+    }
+
+    #[test]
+    fn only_transient_failures_are_retried() {
+        let http = |status| {
+            ProviderEvent::Error(ProviderError::Http {
+                status,
+                body: String::new(),
+            })
+        };
+        assert!(retryable(&ProviderEvent::Error(ProviderError::Transport(
+            "stalled".into()
+        ))));
+        assert!(retryable(&http(429)) && retryable(&http(502)));
+        assert!(!retryable(&http(400)) && !retryable(&http(403)));
     }
 }

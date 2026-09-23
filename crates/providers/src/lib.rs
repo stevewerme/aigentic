@@ -11,6 +11,22 @@ pub mod sse;
 pub use anthropic::{Anthropic, AnthropicConfig, Thinking};
 pub use openai_compat::{OpenAiCompat, OpenAiCompatConfig};
 
+/// How long a response may go without a byte before it counts as dead.
+/// Reasoning models stream thinking deltas throughout, so two minutes of
+/// silence is a stall, not a slow answer.
+pub(crate) const STALL: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Retries for a reply that failed before any content streamed. Backoff
+/// 1s, 3s, 8s. Overload waves observed during the phase 2 acceptance
+/// lasted minutes; anything longer belongs to the user, who sees the
+/// error as a turn_ended event and can re-ask.
+pub(crate) const RETRIES: usize = 3;
+pub(crate) const BACKOFF: [std::time::Duration; RETRIES] = [
+    std::time::Duration::from_secs(1),
+    std::time::Duration::from_secs(3),
+    std::time::Duration::from_secs(8),
+];
+
 /// A call's arguments as the wire must carry them on replay: an object.
 /// A model that emitted malformed JSON leaves its raw text in the log as a
 /// string (the tool already answered with an error quoting it), and both
@@ -30,9 +46,14 @@ pub(crate) fn replay_args(args: &serde_json::Value) -> serde_json::Value {
 /// longer than a server's keep-alive timeout, and reusing a connection the
 /// server has already closed fails the next request with a transport
 /// error instead of a reply.
+///
+/// Every read, headers or a body chunk, must arrive within [`STALL`]: a
+/// stream that goes silent fails as a transport error instead of hanging
+/// the turn (a TensorX stream once sat silent for fifteen minutes).
 pub(crate) fn http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .pool_idle_timeout(std::time::Duration::from_secs(5))
+        .read_timeout(STALL)
         .build()
         .expect("a default TLS backend is compiled in")
 }
