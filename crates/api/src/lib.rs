@@ -277,11 +277,40 @@ pub enum ThreadState {
         class: RiskClass,
         reason: String,
     },
-    /// `ask_human` waits for someone with `write`.
+    /// `ask_human` waits for someone with `write`. `question` is the
+    /// questions as one plain text, the fallback for a client that does
+    /// not know `questions` (an old one, or an old daemon's frame).
     AwaitingHuman {
         call_id: String,
         question: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        questions: Vec<AskedQuestion>,
     },
+}
+
+/// One `ask_human` question on the wire; mirrors the runtime's
+/// `HumanQuestion` rather than take an edge to it (AGENTS.md).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AskedQuestion {
+    pub question: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<AskedOption>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub multi: bool,
+}
+
+/// One option of an `ask_human` question.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AskedOption {
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -505,7 +534,16 @@ mod tests {
                 thread: thread(),
                 state: ThreadState::AwaitingHuman {
                     call_id: "c2".into(),
-                    question: "Ship it?".into(),
+                    question: "Ship it? When?".into(),
+                    questions: vec![AskedQuestion {
+                        question: "Ship it?".into(),
+                        header: Some("ship".into()),
+                        options: vec![AskedOption {
+                            label: "Yes".into(),
+                            description: Some("merge and tag".into()),
+                        }],
+                        multi: false,
+                    }],
                 },
             },
             Notice::Mode {
@@ -567,6 +605,47 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// A waiting human's questions ride the state; a daemon that does
+    /// not know them yet sends no field, and an old frame parses with
+    /// the plain question as the fallback.
+    #[test]
+    fn a_waiting_humans_questions_default_to_none() {
+        let line = encode(&Frame::notice(Notice::State {
+            thread: thread(),
+            state: ThreadState::AwaitingHuman {
+                call_id: "c2".into(),
+                question: "Ship it?".into(),
+                questions: vec![AskedQuestion {
+                    question: "Ship it?".into(),
+                    header: Some("ship".into()),
+                    options: vec![AskedOption {
+                        label: "Yes".into(),
+                        description: Some("merge and tag".into()),
+                    }],
+                    multi: false,
+                }],
+            },
+        }));
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["notice"]["state"]["state"], "awaiting_human");
+        assert_eq!(v["notice"]["state"]["questions"][0]["question"], "Ship it?");
+        assert_eq!(v["notice"]["state"]["questions"][0]["header"], "ship");
+        assert_eq!(
+            v["notice"]["state"]["questions"][0]["options"][0]["label"],
+            "Yes"
+        );
+        assert!(v["notice"]["state"]["questions"][0].get("multi").is_none());
+        let old = r#"{"notice":{"kind":"state","thread":"01ARZ3NDEKTSV4RRFFQ69G5FAV","state":{"state":"awaiting_human","call_id":"c2","question":"Ship it?"}}}"#;
+        let f = decode(old).unwrap();
+        match f.body {
+            Body::Notice(Notice::State {
+                state: ThreadState::AwaitingHuman { questions, .. },
+                ..
+            }) => assert!(questions.is_empty()),
+            other => panic!("wrong body: {other:?}"),
+        }
     }
 
     #[test]

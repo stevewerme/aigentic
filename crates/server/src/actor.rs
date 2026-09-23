@@ -14,7 +14,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use aigentic_api::{Notice, ReportKind, Response, ThreadState};
+use aigentic_api::{AskedOption, AskedQuestion, Notice, ReportKind, Response, ThreadState};
 use aigentic_runtime::aigentic_core::{Author, ContentBlock, Event, EventKind};
 use aigentic_runtime::aigentic_log::{PermissionRequestedPayload, UserMessagePayload};
 use aigentic_runtime::{
@@ -245,9 +245,29 @@ impl Shared {
                         reason,
                     }
                 }
-                Pending::Human { call_id, question } => ThreadState::AwaitingHuman {
+                Pending::Human {
+                    call_id,
+                    question,
+                    questions,
+                } => ThreadState::AwaitingHuman {
                     call_id: call_id.clone(),
                     question: question.clone(),
+                    questions: questions
+                        .iter()
+                        .map(|q| AskedQuestion {
+                            question: q.question.clone(),
+                            header: q.header.clone(),
+                            options: q
+                                .options
+                                .iter()
+                                .map(|o| AskedOption {
+                                    label: o.label.clone(),
+                                    description: o.description.clone(),
+                                })
+                                .collect(),
+                            multi: q.multi,
+                        })
+                        .collect(),
                 },
             }),
         }

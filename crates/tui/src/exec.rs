@@ -266,7 +266,9 @@ impl Follow {
                         })
                         .await?;
                 }
-                ThreadState::AwaitingHuman { call_id, question } => {
+                ThreadState::AwaitingHuman {
+                    call_id, question, ..
+                } => {
                     self.running = true;
                     self.end_line(err)?;
                     self.denied += 1;

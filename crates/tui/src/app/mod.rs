@@ -306,10 +306,20 @@ fn block_lines(menu: &Menu, width: usize) -> Vec<Line<'static>> {
         } else {
             Style::default()
         };
-        let mut rows = wrap_line(&Line::from(Span::styled(row.label.clone(), style)), inner);
+        let mark = if menu.multi && row.pick != Pick::Other {
+            if menu.picked[i] { "[x] " } else { "[ ] " }
+        } else {
+            ""
+        };
+        let mut label = Span::styled(format!("{mark}{}", row.label), style);
+        let mut spans = vec![std::mem::replace(&mut label, Span::raw(""))];
+        if let Some(d) = &row.desc {
+            spans.push(Span::styled(format!("  {d}"), dim));
+        }
+        let mut rows = wrap_line(&Line::from(spans), inner);
         for (r, line) in rows.iter_mut().enumerate() {
             let lead = if r > 0 {
-                Span::raw(" ".repeat(6))
+                Span::raw(" ".repeat(6 + mark.len()))
             } else if selected {
                 Span::styled(format!(" ❯ {}. ", i + 1), head)
             } else {
@@ -445,9 +455,10 @@ async fn run_shell(
     let mut armed: Option<(Action, Instant)> = None;
     // The last message sent (not a command), for Esc-Esc and Alt-Up.
     let mut last_sent: Option<String> = None;
-    // Esc on a permission prompt: the composer takes the reason; the
-    // draft it held comes back after.
-    let mut reason_draft: Option<String> = None;
+    // Esc on a permission prompt, or Other on a question: the composer
+    // becomes the prompt's text input; the draft it held comes back
+    // after.
+    let mut prompt_draft: Option<String> = None;
     // When the current prompt block first showed: single-key answers wait
     // PROMPT_GRACE so a key meant for the draft does not answer it.
     let mut block_since: Option<Instant> = None;
@@ -490,8 +501,8 @@ async fn run_shell(
         };
         // The prompt went away while its reason input was open: the
         // draft comes back (the reason is moot).
-        if reason_draft.is_some() && engine.menu().is_none() {
-            let draft = reason_draft.take().unwrap();
+        if prompt_draft.is_some() && engine.menu().is_none() {
+            let draft = prompt_draft.take().unwrap();
             composer.set_text(&draft);
         }
         let mut block: Vec<Line<'static>> = if engine.tasks().is_empty() {
@@ -519,7 +530,7 @@ async fn run_shell(
         popup = {
             let (line, col) = composer.current_line();
             match completion::token_at(line, col) {
-                Some(_) if reason_draft.is_none() => {
+                Some(_) if prompt_draft.is_none() => {
                     let index = files.as_ref();
                     match index {
                         Some(index) => {
@@ -541,9 +552,13 @@ async fn run_shell(
         };
         let popup_lines = popup.as_ref().map(popup_lines).unwrap_or_default();
         let hint = match (&armed, &state) {
-            _ if reason_draft.is_some() => {
-                Some("deny with a reason · Enter sends · Esc cancels".to_owned())
-            }
+            _ if prompt_draft.is_some() => Some(
+                match engine.menu().map(|m| m.kind) {
+                    Some(crate::app::menu::Kind::Question) => "answer: Enter sends · Esc cancels",
+                    _ => "deny with a reason · Enter sends · Esc cancels",
+                }
+                .to_owned(),
+            ),
             (Some((Action::QuitArm, _)), _) => Some("Ctrl-C again to quit".to_owned()),
             (Some((Action::RecallArm, _)), _) => {
                 Some("Esc again to recall the last message".to_owned())
@@ -585,7 +600,7 @@ async fn run_shell(
                     Event::Key(key) if key.kind != KeyEventKind::Release => {
                         // The prompt's reason input takes Enter and Esc;
                         // everything else types.
-                        if let Some(draft) = reason_draft.clone() {
+                        if let Some(draft) = prompt_draft.clone() {
                             match key.code {
                                 K::Enter => {
                                     let reason = composer
@@ -593,13 +608,13 @@ async fn run_shell(
                                         .map(|r| r.trim().to_owned())
                                         .filter(|r| !r.is_empty());
                                     composer.set_text(&draft);
-                                    reason_draft = None;
+                                    prompt_draft = None;
                                     engine.prompt_text(reason, &mut out).await;
                                     continue;
                                 }
                                 K::Esc => {
                                     composer.set_text(&draft);
-                                    reason_draft = None;
+                                    prompt_draft = None;
                                     continue;
                                 }
                                 _ => {}
@@ -645,8 +660,8 @@ async fn run_shell(
                             {
                                 MenuKey::Passed => {}
                                 MenuKey::Used => continue,
-                                MenuKey::Reason => {
-                                    reason_draft = Some(composer.text());
+                                MenuKey::Text => {
+                                    prompt_draft = Some(composer.text());
                                     composer.clear();
                                     continue;
                                 }
@@ -822,12 +837,77 @@ mod tests {
         );
     }
 
-    /// A question in the pre-options shape: the question, and the
-    /// composer takes the answer. A rule's own reason is a dim line
-    /// under the options; a class-generated one is not shown.
+    /// A question with options on the same widget: Other last, the
+    /// description dim, and a multi question's rows as checkboxes.
+    #[test]
+    fn a_question_with_options_renders_as_the_issue_draws_it() {
+        let mut menu = Menu::asking(vec![
+            aigentic_api::AskedQuestion {
+                question: "Which colour?".into(),
+                header: Some("colour".into()),
+                options: vec![
+                    aigentic_api::AskedOption {
+                        label: "Red".into(),
+                        description: Some("the warm one".into()),
+                    },
+                    aigentic_api::AskedOption {
+                        label: "Green".into(),
+                        description: None,
+                    },
+                ],
+                multi: false,
+            },
+            aigentic_api::AskedQuestion {
+                question: "Which tests?".into(),
+                header: None,
+                options: vec![
+                    aigentic_api::AskedOption {
+                        label: "unit".into(),
+                        description: None,
+                    },
+                    aigentic_api::AskedOption {
+                        label: "integration".into(),
+                        description: None,
+                    },
+                ],
+                multi: true,
+            },
+        ]);
+        assert_eq!(
+            text(&block_lines(&menu, 60)),
+            vec![
+                " Which colour?",
+                " ❯ 1. Red  the warm one",
+                "   2. Green",
+                "   3. Other: type your own",
+            ]
+        );
+        // The next question, multi: checkboxes, one picked.
+        menu.answer("colour: Red");
+        menu.picked[1] = true;
+        assert_eq!(
+            text(&block_lines(&menu, 60)),
+            vec![
+                " Which tests?",
+                " ❯ 1. [ ] unit",
+                "   2. [x] integration",
+                "   3. Other: type your own",
+                "   space toggles · enter sends · a pipe: `1 2`",
+            ]
+        );
+    }
+
+    /// A question without options: the question, and the composer takes
+    /// the answer. A rule's own reason is a dim line under the options;
+    /// a class-generated one is not shown.
     #[test]
     fn a_question_is_the_question_and_a_rules_reason_stays() {
-        let menu = Menu::question("which colour?");
+        let menu = Menu::asking(vec![aigentic_api::AskedQuestion {
+            question: "which colour?".into(),
+            header: None,
+            options: vec![],
+            multi: false,
+        }]);
         assert_eq!(
             text(&block_lines(&menu, 40)),
             vec![" which colour?", "   type the answer"]

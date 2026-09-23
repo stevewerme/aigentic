@@ -275,8 +275,18 @@ magnus]` or `[denied by magnus]`. Every decision is
 a `permission_decided` event with the decider's user id; a session grant
 is still an event each time it is used. Rule decisions are recorded on
 the tool result. An `ask_human` question works the same way through
-`AwaitingHuman`: a `write` user gets `[question] ...` and the next plain
-line answers it, a `read` user sees `[waiting for an answer: ...]`, and a
+`AwaitingHuman`: the model puts every question in the call (1–4, each
+with options when the answer is a choice — the client adds the
+"Other: type your own" row, so it never lists one), and a `write` user
+answers them on the same menu, one after another: a digit or arrows and
+Enter pick an option, Space toggles several on a multi question, and
+free text answers anything (an "Other" pick or plain typing; Enter
+sends). The answer stays text — one line per question, `header: label`
+when the question has one — so the result reads the same to the model
+and in old clients, and the choice echoes into the scrollback as
+`↳ colour: Red`. A call in the old `{question}` shape is one question
+with no options: the composer takes the answer, as it always did. A
+`read` user sees `[waiting for an answer: ...]`, and a
 question answered elsewhere prints `[answered by magnus]`: the answer is
 the call's `tool_result` event, authored by the person who gave it, as a
 `permission_decided` is. A thread opened while it waits shows

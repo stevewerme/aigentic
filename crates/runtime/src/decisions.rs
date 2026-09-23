@@ -19,8 +19,15 @@ pub enum Pending {
         call_id: String,
         request: PermissionRequestedPayload,
     },
-    /// The `ask_human` tool; anyone with `write` answers.
-    Human { call_id: String, question: String },
+    /// The `ask_human` tool; anyone with `write` answers. `question`
+    /// is the questions as one plain text (old clients, waiting lines);
+    /// `questions` is the parsed call, so every attached client renders
+    /// the same menu.
+    Human {
+        call_id: String,
+        question: String,
+        questions: Vec<crate::harness_tools::HumanQuestion>,
+    },
 }
 
 impl Pending {
@@ -357,6 +364,7 @@ mod tests {
         let _rx = d.register(Pending::Human {
             call_id: "c2".into(),
             question: "?".into(),
+            questions: Vec::new(),
         });
         d.withdraw("c2");
         assert_eq!(

@@ -35,9 +35,9 @@ pub enum MenuKey {
     Passed,
     /// Handled: the selection moved, or the decision went out.
     Used,
-    /// The composer should take the deny's reason; the draft it held
-    /// comes back after.
-    Reason,
+    /// The composer should take the prompt's text (a deny's reason, a
+    /// question's free text); the draft it held comes back after.
+    Text,
 }
 
 /// A running turn's figures, from the provider's reported usage on the
@@ -347,16 +347,10 @@ impl ClientRepl {
             ThreadState::AwaitingHuman { call_id, .. }
                 if self.prompted.as_deref() == Some(call_id) && !line.trim().starts_with('/') =>
             {
-                let call_id = call_id.clone();
-                let r = self
-                    .request(Request::AnswerHuman {
-                        thread: self.thread,
-                        call_id,
-                        text: line.trim().to_owned(),
-                    })
-                    .await;
-                self.answered(r, out);
-                return;
+                if let Some(keyed) = self.menu.as_ref().and_then(|m| m.line(line)) {
+                    self.apply(keyed, out).await;
+                    return;
+                }
             }
             ThreadState::AwaitingApproval { call_id, .. }
                 if self.prompted.as_deref() == Some(call_id) =>
@@ -372,6 +366,7 @@ impl ClientRepl {
                         Pick::Deny => {
                             self.decide(false, false, None, reason, out).await;
                         }
+                        Pick::Answer | Pick::Other => {}
                     }
                     return;
                 }
@@ -597,8 +592,8 @@ impl ClientRepl {
     /// A key while the menu is up: the selection, the digits, the hidden
     /// accelerators and Enter, sending the decision with the echo of
     /// what was chosen. `composer_empty` and `settled` as `Menu::key`
-    /// takes them. `Reason` says the composer should take the deny's
-    /// reason.
+    /// takes them. `Text` says the composer should take the prompt's
+    /// text.
     pub async fn menu_key(
         &mut self,
         key: &crossterm::event::KeyEvent,
@@ -614,8 +609,19 @@ impl ClientRepl {
         };
         match menu.key(key, composer_empty, settled) {
             Keyed::Passed => MenuKey::Passed,
+            Keyed::Text => MenuKey::Text,
             Keyed::Used => MenuKey::Used,
-            Keyed::Reason => MenuKey::Reason,
+            keyed @ (Keyed::Decide { .. } | Keyed::Answer { .. }) => {
+                self.apply(keyed, out).await;
+                MenuKey::Used
+            }
+        }
+    }
+
+    /// What the menu came to: a decision, or an answer to the current
+    /// question — echoed, and sent when it was the last.
+    async fn apply(&mut self, keyed: Keyed, out: &mut dyn Printer) {
+        match keyed {
             Keyed::Decide { pick, reason, echo } => {
                 out.line(&echo);
                 match pick {
@@ -625,30 +631,77 @@ impl ClientRepl {
                     Pick::Deny => {
                         self.decide(false, false, None, reason, out).await;
                     }
+                    Pick::Answer | Pick::Other => {}
                 }
-                MenuKey::Used
+            }
+            Keyed::Answer { text, echo } => {
+                out.line(&echo);
+                self.answer_menu(&text, out).await;
+            }
+            Keyed::Passed | Keyed::Used | Keyed::Text => {}
+        }
+    }
+
+    /// Answer the current question with `contribution` (the echo is the
+    /// caller's): the next one is prompted, or the whole answer goes
+    /// out in one `AnswerHuman`.
+    async fn answer_menu(&mut self, contribution: &str, out: &mut dyn Printer) {
+        let all = self.menu.as_mut().and_then(|m| m.answer(contribution));
+        match all {
+            Some(all) => self.answer_human(all, out).await,
+            None => {
+                if let Some(menu) = self.menu.as_ref() {
+                    out.prompt(menu);
+                }
             }
         }
     }
 
-    /// The composer's text for the prompt, Enter on the reason input:
-    /// a deny's reason, with none when it was empty. A prompt answered
+    /// Send the composed answer to the question this client is prompted
+    /// for.
+    async fn answer_human(&mut self, text: String, out: &mut dyn Printer) {
+        let Some(call_id) = self.prompted.clone() else {
+            return;
+        };
+        let r = self
+            .request(Request::AnswerHuman {
+                thread: self.thread,
+                call_id,
+                text,
+            })
+            .await;
+        self.answered(r, out);
+    }
+
+    /// The composer's text for the prompt, Enter on its text input: a
+    /// deny's reason, with none when it was empty, or a question's
+    /// free-text answer, headed like any other. A prompt answered
     /// elsewhere first is gone; the text goes nowhere.
-    pub async fn prompt_text(&mut self, reason: Option<String>, out: &mut dyn Printer) {
+    pub async fn prompt_text(&mut self, text: Option<String>, out: &mut dyn Printer) {
         if self.menu().is_none() {
             return;
         }
-        if self
-            .menu
-            .as_ref()
-            .is_some_and(|m| m.kind == Kind::Permission)
-        {
-            let echo = match &reason {
-                Some(r) => format!("↳ No: {r}"),
-                None => "↳ No".into(),
-            };
-            out.line(&echo);
-            self.decide(false, false, None, reason, out).await;
+        match self.menu.as_ref().map(|m| m.kind) {
+            Some(Kind::Permission) => {
+                let echo = match &text {
+                    Some(r) => format!("↳ No: {r}"),
+                    None => "↳ No".into(),
+                };
+                out.line(&echo);
+                self.decide(false, false, None, text, out).await;
+            }
+            Some(Kind::Question) => {
+                if let Some(t) = text.map(|t| t.trim().to_owned()).filter(|t| !t.is_empty()) {
+                    let contribution = self
+                        .menu
+                        .as_ref()
+                        .map(|m| m.free_text(&t))
+                        .unwrap_or(t.clone());
+                    out.line(&format!("↳ {contribution}"));
+                    self.answer_menu(&contribution, out).await;
+                }
+            }
+            None => {}
         }
     }
 
@@ -838,9 +891,25 @@ impl ClientRepl {
                     ));
                 }
             }
-            ThreadState::AwaitingHuman { call_id, question } => {
+            ThreadState::AwaitingHuman {
+                call_id,
+                question,
+                questions,
+            } => {
                 if self.may_write() {
-                    let menu = Menu::question(question);
+                    // An old daemon's frame carries no questions: the
+                    // plain text is the one.
+                    let all = if questions.is_empty() {
+                        vec![aigentic_api::AskedQuestion {
+                            question: question.clone(),
+                            header: None,
+                            options: Vec::new(),
+                            multi: false,
+                        }]
+                    } else {
+                        questions.clone()
+                    };
+                    let menu = Menu::asking(all);
                     out.prompt(&menu);
                     self.menu = Some(menu);
                     self.prompted = Some(call_id.clone());
@@ -1429,6 +1498,96 @@ mod tests {
             lines.iter().any(|l| l == "unknown command: /nope"),
             "{lines:#?}"
         );
+        drop(embedded);
+    }
+
+    /// An `ask_human` call with questions (issue #13): every question
+    /// renders on the menu, one after another — a number picks an
+    /// option, free text answers one without — and the whole call is
+    /// answered in one go: the composed lines are the call's result.
+    #[tokio::test]
+    async fn ask_human_questions_are_answered_one_after_another_in_one_go() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = project(dir.path(), "proj", "");
+        let cfg_dir = dir.path().join("cfg");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        let script = vec![
+            vec![
+                call(
+                    "q1",
+                    "ask_human",
+                    serde_json::json!({"questions": [
+                        {"question": "Which colour?", "header": "colour",
+                         "options": [{"label": "Red", "description": "the warm one"},
+                                     {"label": "Green"}]},
+                        {"question": "Ship it?"}
+                    ]}),
+                ),
+                tool_use(),
+            ],
+            vec![text("done"), done()],
+        ];
+        let embedded = Server::embed_with(
+            config(dir.path()),
+            cfg_dir.clone(),
+            root,
+            "steve",
+            None,
+            Factory::scripted(script),
+            Arc::new(DefaultReports {
+                global_instructions: cfg_dir.join("instructions.md"),
+            }),
+        )
+        .await
+        .unwrap();
+        let addr = Addr::Unix(embedded.socket.clone());
+        let (client, welcome) = Client::connect(&addr, &embedded.token).await.unwrap();
+        let role = welcome.projects[0].role.clone();
+        let (thread, state, mode) = open(&client, "proj", None).await;
+        let notices = client.take_notices().unwrap();
+        let mut repl = ClientRepl::new(client, thread, "steve", role, state, mode);
+        let (pacer, _) = Client::connect(&addr, &embedded.token).await.unwrap();
+        open(&pacer, "proj", Some(thread)).await;
+        let mut paced = pacer.take_notices().unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let feeder = async move {
+            tx.send("pick one".into()).unwrap();
+            until_state(
+                &mut paced,
+                |s| matches!(s, ThreadState::AwaitingHuman { call_id, .. } if call_id == "q1"),
+            )
+            .await;
+            // The first question, by number; the second, without
+            // options, as free text. No state notice separates them: the
+            // menu holds the questions.
+            tx.send("1".into()).unwrap();
+            tx.send("yes, friday".into()).unwrap();
+            until_state(&mut paced, |s| *s == ThreadState::Idle).await;
+            tx.send("/quit".into()).unwrap();
+        };
+        let mut out = Lines::default();
+        let ((), ()) = tokio::join!(repl.run(rx, notices, &mut out), feeder);
+        let lines = out.0;
+        let at = |needle: &str| {
+            lines
+                .iter()
+                .position(|l| l == needle)
+                .unwrap_or_else(|| panic!("no line {needle:?} in {lines:#?}"))
+        };
+        let first = at("[question] Which colour?");
+        assert_eq!(lines[first + 1], "  1. Red · the warm one");
+        assert_eq!(lines[first + 2], "  2. Green");
+        assert_eq!(lines[first + 3], "  3. Other: type your own");
+        // The choice is echoed, the second question follows, its free
+        // text too, and the whole answer is the call's result.
+        let echo = at("↳ colour: Red");
+        let second = at("[question] Ship it?");
+        let free = at("↳ yes, friday");
+        assert!(first < echo && echo < second && second < free, "{lines:#?}");
+        assert_eq!(lines[second + 1], "  type the answer");
+        assert!(lines.contains(&"  └ colour: Red".to_owned()), "{lines:#?}");
+        assert!(lines.contains(&"  └ yes, friday".to_owned()), "{lines:#?}");
+        assert!(lines.contains(&"done".to_owned()), "{lines:#?}");
         drop(embedded);
     }
 

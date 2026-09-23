@@ -162,6 +162,7 @@ mod tests {
         s.apply_state(&ThreadState::AwaitingHuman {
             call_id: "c".into(),
             question: "q".into(),
+            questions: vec![],
         });
         assert_eq!(s.waiting, Some("awaiting an answer"));
         s.apply_state(&ThreadState::Idle);

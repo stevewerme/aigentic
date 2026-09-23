@@ -23,7 +23,87 @@ pub const UPDATE_TASKS: &str = "update_tasks";
 /// person's global ones. A tool description alone did not make GLM 5.3
 /// keep the checklist (zero calls on an explicit four-step task); this
 /// line did (four and five calls in two runs).
-pub const HARNESS_INSTRUCTIONS: &str = "For any request of three or more steps, call update_tasks before anything else with every step, then again as each step starts and finishes. Work one step at a time.";
+pub const HARNESS_INSTRUCTIONS: &str = "For any request of three or more steps, call update_tasks before anything else with every step, then again as each step starts and finishes. Work one step at a time. Ask the human only through ask_human, with every question in the call (never \"answer the questions above\") and options when the answer is a choice; the client adds an Other row, so never list one yourself.";
+
+/// One option an `ask_human` question offers.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]
+pub struct HumanOption {
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// One question an `ask_human` call asks.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]
+pub struct HumanQuestion {
+    pub question: String,
+    /// A short name for the answer line, e.g. `colour`, so a
+    /// multi-question answer reads as `colour: red`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<HumanOption>,
+    /// Allow picking several options.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub multi: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// The questions as one plain text, for the waiting lines and for a
+/// client that does not know the shape.
+pub fn plain_question(questions: &[HumanQuestion]) -> String {
+    questions
+        .iter()
+        .map(|q| q.question.as_str())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// An `ask_human` call's arguments: every question in the call, or the
+/// old single `question`, which normalises to one question with no
+/// options so old logs and old models parse the same.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AskHumanArgs {
+    pub questions: Vec<HumanQuestion>,
+}
+
+impl<'de> Deserialize<'de> for AskHumanArgs {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Raw {
+            #[serde(default)]
+            question: Option<String>,
+            #[serde(default)]
+            questions: Option<Vec<HumanQuestion>>,
+        }
+        let raw = Raw::deserialize(d)?;
+        let questions = match raw.questions {
+            Some(qs) if !qs.is_empty() => qs,
+            _ => match raw.question {
+                Some(q) => vec![HumanQuestion {
+                    question: q,
+                    header: None,
+                    options: Vec::new(),
+                    multi: false,
+                }],
+                None => {
+                    return Err(serde::de::Error::custom(
+                        "send 1-4 questions in `questions`, or the old `question`",
+                    ));
+                }
+            },
+        };
+        if questions.len() > 4 {
+            return Err(serde::de::Error::custom(
+                "at most 4 questions per call; ask the rest in the next one",
+            ));
+        }
+        Ok(Self { questions })
+    }
+}
 
 /// One checklist item as the model sends it.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]
@@ -53,11 +133,6 @@ struct PinArgs {
 }
 
 #[derive(Debug, Deserialize)]
-struct AskHumanArgs {
-    question: String,
-}
-
-#[derive(Debug, Deserialize)]
 struct LoadSkillArgs {
     name: String,
 }
@@ -68,11 +143,38 @@ pub fn harness_specs(offer_load_skill: bool) -> Vec<ToolSpec> {
     let mut specs = vec![
         ToolSpec {
             name: ASK_HUMAN.into(),
-            description: "Ask the human a question and wait for their typed answer. Use it when you cannot proceed without a decision only they can make.".into(),
+            description: "Ask the human and wait for their answer. Use it when you cannot proceed without a decision only they can make. Put every question in the call (1-4, never \"answer the questions above\"), each with options when the answer is a choice; the client adds an \"Other: type your own\" row, so never list one yourself.".into(),
             schema: json!({
                 "type": "object",
-                "properties": {"question": {"type": "string", "description": "The question, with the options if there are any."}},
-                "required": ["question"]
+                "properties": {
+                    "question": {"type": "string", "description": "One question (the old shape)."},
+                    "questions": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 4,
+                        "description": "Every question in the call, 1-4.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "question": {"type": "string", "description": "The question, in full."},
+                                "header": {"type": "string", "description": "A short name for the answer line, e.g. 'colour'."},
+                                "options": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "label": {"type": "string", "description": "What picking this option answers."},
+                                            "description": {"type": "string", "description": "One line on what it means."}
+                                        },
+                                        "required": ["label"]
+                                    }
+                                },
+                                "multi": {"type": "boolean", "description": "Allow picking several options."}
+                            },
+                            "required": ["question"]
+                        }
+                    }
+                }
             }),
         },
         ToolSpec {
@@ -179,40 +281,44 @@ impl Runtime {
                 Err(e) => err(format!("invalid arguments: {e}")),
             },
             ASK_HUMAN => match serde_json::from_value::<AskHumanArgs>(call.args.clone()) {
-                Ok(args) => match self.decisions.clone() {
-                    Some(decisions) => {
-                        let pending = crate::Pending::Human {
-                            call_id: call.id.clone(),
-                            question: args.question.clone(),
-                        };
-                        let rx = decisions.register(pending.clone());
-                        observe(Signal::Waiting(&pending));
-                        tokio::select! {
-                            biased;
-                            by = cancel.cancelled() => {
-                                decisions.withdraw(&call.id);
-                                err(format!(
-                                    "the turn was interrupted by {} before an answer",
-                                    crate::seams::author_name(&by)
-                                ))
-                            }
-                            decided = rx => match decided {
-                                Ok(crate::Answered::Human { text, by: who }) => {
-                                    by = who;
-                                    ok(text)
+                Ok(args) => {
+                    let question = plain_question(&args.questions);
+                    match self.decisions.clone() {
+                        Some(decisions) => {
+                            let pending = crate::Pending::Human {
+                                call_id: call.id.clone(),
+                                question: question.clone(),
+                                questions: args.questions.clone(),
+                            };
+                            let rx = decisions.register(pending.clone());
+                            observe(Signal::Waiting(&pending));
+                            tokio::select! {
+                                biased;
+                                by = cancel.cancelled() => {
+                                    decisions.withdraw(&call.id);
+                                    err(format!(
+                                        "the turn was interrupted by {} before an answer",
+                                        crate::seams::author_name(&by)
+                                    ))
                                 }
-                                _ => err("no human available; treat this as a no".into()),
-                            },
+                                decided = rx => match decided {
+                                    Ok(crate::Answered::Human { text, by: who }) => {
+                                        by = who;
+                                        ok(text)
+                                    }
+                                    _ => err("no human available; treat this as a no".into()),
+                                },
+                            }
                         }
+                        None => match self.approver.ask_human(&question) {
+                            Some(answer) => {
+                                by = self.approver.author();
+                                ok(answer)
+                            }
+                            None => err("no human available; treat this as a no".into()),
+                        },
                     }
-                    None => match self.approver.ask_human(&args.question) {
-                        Some(answer) => {
-                            by = self.approver.author();
-                            ok(answer)
-                        }
-                        None => err("no human available; treat this as a no".into()),
-                    },
-                },
+                }
                 Err(e) => err(format!("invalid arguments: {e}")),
             },
             LOAD_SKILL => match serde_json::from_value::<LoadSkillArgs>(call.args.clone()) {

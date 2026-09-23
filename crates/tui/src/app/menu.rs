@@ -20,12 +20,18 @@ pub enum Pick {
     },
     /// Deny the call, with a reason when one follows.
     Deny,
+    /// Answer the current question with this row's label.
+    Answer,
+    /// Free text for the current question: the composer takes it.
+    Other,
 }
 
 /// One row of the menu.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
     pub label: String,
+    /// A dim line after the label (an option's description).
+    pub desc: Option<String>,
     pub pick: Pick,
 }
 
@@ -50,8 +56,22 @@ pub enum Keyed {
         reason: Option<String>,
         echo: String,
     },
-    /// The composer should take the deny's reason (Esc does the same).
-    Reason,
+    /// An answer to the current question, its contribution to the
+    /// composed answer, and the echo of it.
+    Answer { text: String, echo: String },
+    /// The composer should take the prompt's text: a deny's reason
+    /// (Esc does the same) or a question's free text.
+    Text,
+}
+
+/// An `ask_human` call's questions: the one being answered and the
+/// answers so far, one contribution each.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Questions {
+    pub all: Vec<aigentic_api::AskedQuestion>,
+    pub at: usize,
+    /// The contribution per answered question, `header: answer` lines.
+    pub answers: Vec<String>,
 }
 
 /// The prompt as a menu: what is asked, the rows to pick from and the
@@ -75,6 +95,8 @@ pub struct Menu {
     pub multi: bool,
     /// Which rows are picked, in multi mode.
     pub picked: Vec<bool>,
+    /// The questions, while the menu is a question's.
+    pub questions: Option<Questions>,
 }
 
 /// The header in plain words, per risk class; an MCP tool by name.
@@ -160,6 +182,7 @@ impl Menu {
             rows: vec![
                 Row {
                     label: "Yes".into(),
+                    desc: None,
                     pick: Pick::Allow {
                         session: false,
                         prefix: None,
@@ -167,31 +190,122 @@ impl Menu {
                 },
                 Row {
                     label: more,
+                    desc: None,
                     pick: more_pick,
                 },
                 Row {
                     label: "No, and tell the agent why".into(),
+                    desc: None,
                     pick: Pick::Deny,
                 },
             ],
             selected: 0,
             multi: false,
             picked: Vec::new(),
+            questions: None,
         }
     }
 
-    /// A question from `ask_human`, in the pre-options shape: the
-    /// composer takes the answer.
-    pub fn question(question: &str) -> Self {
-        Self {
+    /// A question from `ask_human`: the first of the call's questions
+    /// on the widget, the rest one after another as each is answered.
+    /// A question without options has no rows: the composer takes the
+    /// answer. An old daemon's frame has no questions, so the engine
+    /// wraps its plain text as one.
+    pub fn asking(all: Vec<aigentic_api::AskedQuestion>) -> Self {
+        let mut menu = Self {
             kind: Kind::Question,
-            title: question.to_owned(),
+            title: String::new(),
             body: String::new(),
-            note: Some("type the answer".into()),
+            note: None,
             rows: Vec::new(),
             selected: 0,
             multi: false,
             picked: Vec::new(),
+            questions: Some(Questions {
+                all,
+                at: 0,
+                answers: Vec::new(),
+            }),
+        };
+        let first = menu
+            .questions
+            .as_ref()
+            .and_then(|q| q.all.first().cloned())
+            .unwrap_or(aigentic_api::AskedQuestion {
+                question: String::new(),
+                header: None,
+                options: Vec::new(),
+                multi: false,
+            });
+        menu.show(&first);
+        menu
+    }
+
+    /// Render `q` as the current question.
+    fn show(&mut self, q: &aigentic_api::AskedQuestion) {
+        self.title = q.question.clone();
+        self.multi = q.multi;
+        self.selected = 0;
+        self.picked = vec![false; q.options.len() + 1];
+        self.rows = q
+            .options
+            .iter()
+            .map(|o| Row {
+                label: o.label.clone(),
+                desc: o.description.clone(),
+                pick: Pick::Answer,
+            })
+            .collect();
+        if !q.options.is_empty() {
+            self.rows.push(Row {
+                label: "Other: type your own".into(),
+                desc: None,
+                pick: Pick::Other,
+            });
+        }
+        self.note = if q.multi && !q.options.is_empty() {
+            Some("space toggles · enter sends · a pipe: `1 2`".to_owned())
+        } else if q.options.is_empty() {
+            Some("type the answer".to_owned())
+        } else {
+            None
+        };
+    }
+
+    /// The answer's line for the current question: `header: answer`
+    /// when it has one, the answer alone when not.
+    fn line_of(&self, answer: &str) -> String {
+        let header = self
+            .questions
+            .as_ref()
+            .and_then(|q| q.all.get(q.at))
+            .and_then(|a| a.header.clone());
+        match header {
+            Some(h) => format!("{h}: {answer}"),
+            None => answer.to_owned(),
+        }
+    }
+
+    /// A free-text answer to the current question, headed like any
+    /// other.
+    pub fn free_text(&self, text: &str) -> String {
+        self.line_of(text)
+    }
+
+    /// Record `contribution` as the current question's answer and move
+    /// to the next; `Some` with the whole answer when that was the
+    /// last, for the `AnswerHuman` request.
+    pub fn answer(&mut self, contribution: &str) -> Option<String> {
+        let q = self.questions.as_mut()?;
+        q.answers.push(contribution.to_owned());
+        q.at += 1;
+        match q.all.get(q.at) {
+            Some(next) => {
+                let next = next.clone();
+                self.show(&next);
+                None
+            }
+            None => Some(q.answers.join("\n")),
         }
     }
 
@@ -199,13 +313,16 @@ impl Menu {
     /// never type); the answering keys wait for `settled`, the shell's
     /// grace, so keys meant for the composer do not answer the prompt.
     /// Enter picks the selected row only on an empty composer: a draft
-    /// is a message, and an accidental Yes is the one wrong answer.
+    /// is a message, and an accidental Yes is the one wrong answer. A
+    /// question's composer is its free-text answer, so a question's
+    /// answering keys want an empty composer too.
     pub fn key(&mut self, key: &KeyEvent, composer_empty: bool, settled: bool) -> Keyed {
         let plain = key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT;
         if self.rows.is_empty() {
-            // A question in the pre-options shape: the composer answers.
+            // A question without options: the composer answers.
             return Keyed::Passed;
         }
+        let typing_safe = self.kind == Kind::Permission || composer_empty;
         match key.code {
             KeyCode::Up => {
                 self.select(self.selected + self.rows.len() - 1);
@@ -216,11 +333,29 @@ impl Menu {
                 Keyed::Used
             }
             // Esc opens the reason input on the deny row, at once.
-            KeyCode::Esc if self.kind == Kind::Permission => Keyed::Reason,
+            KeyCode::Esc if self.kind == Kind::Permission => Keyed::Text,
             _ if !settled => Keyed::Passed,
-            KeyCode::Enter if composer_empty => self.pick(self.selected),
+            KeyCode::Char(' ') if plain && self.multi && typing_safe => {
+                self.toggle(self.selected);
+                Keyed::Used
+            }
+            KeyCode::Enter if composer_empty => self.enter(),
             KeyCode::Char(c) if plain && c.is_ascii_digit() => match c.to_digit(10) {
-                Some(n) if n >= 1 && (n as usize) <= self.rows.len() => self.pick(n as usize - 1),
+                Some(n) if n >= 1 && (n as usize) <= self.rows.len() => {
+                    let i = n as usize - 1;
+                    if self.multi {
+                        if !typing_safe {
+                            Keyed::Passed
+                        } else {
+                            self.toggle(i);
+                            Keyed::Used
+                        }
+                    } else if !typing_safe {
+                        Keyed::Passed
+                    } else {
+                        self.pick(i)
+                    }
+                }
                 _ => Keyed::Passed,
             },
             // The hidden accelerators, a permission only.
@@ -238,6 +373,39 @@ impl Menu {
         }
     }
 
+    /// Enter: single-select picks the selected row; multi submits the
+    /// picked ones, or the selected row when none are.
+    fn enter(&self) -> Keyed {
+        if !self.multi {
+            return self.pick(self.selected);
+        }
+        let labels: Vec<&str> = self
+            .rows
+            .iter()
+            .zip(&self.picked)
+            .filter(|(r, p)| **p && r.pick == Pick::Answer)
+            .map(|(r, _)| r.label.as_str())
+            .collect();
+        if labels.is_empty() {
+            // Nothing picked: the selected row — Other hands the
+            // composer the free text.
+            return self.pick(self.selected);
+        }
+        let answer = labels.join(", ");
+        let text = self.line_of(&answer);
+        Keyed::Answer {
+            echo: format!("↳ {text}"),
+            text,
+        }
+    }
+
+    /// Toggle a row in multi mode; Other is free text, not a choice.
+    fn toggle(&mut self, i: usize) {
+        if self.rows[i].pick == Pick::Answer {
+            self.picked[i] = !self.picked[i];
+        }
+    }
+
     /// Move the selection, wrapping.
     fn select(&mut self, i: usize) {
         if !self.rows.is_empty() {
@@ -245,20 +413,42 @@ impl Menu {
         }
     }
 
-    /// Row `i` picked, single-select: the decision and its echo.
+    /// Row `i` picked, single-select: what it does and the echo of it.
     fn pick(&self, i: usize) -> Keyed {
         let row = &self.rows[i];
-        Keyed::Decide {
-            pick: row.pick.clone(),
-            reason: None,
-            echo: format!("↳ {}", row.label),
+        match &row.pick {
+            Pick::Allow { session, prefix } => Keyed::Decide {
+                pick: Pick::Allow {
+                    session: *session,
+                    prefix: prefix.clone(),
+                },
+                reason: None,
+                echo: format!("↳ {}", row.label),
+            },
+            Pick::Deny => Keyed::Decide {
+                pick: Pick::Deny,
+                reason: None,
+                echo: format!("↳ {}", row.label),
+            },
+            Pick::Answer => {
+                let text = self.line_of(&row.label);
+                Keyed::Answer {
+                    echo: format!("↳ {text}"),
+                    text,
+                }
+            }
+            Pick::Other => Keyed::Text,
         }
     }
 
     /// A plain line as an answer: a number picks that row, the old
-    /// letters still work, and a reason may follow a deny. `None` when
-    /// the line is not an answer, so it goes on as whatever it was.
+    /// permission letters still work, a reason may follow a deny, and
+    /// for a question anything else is free text. `None` when the line
+    /// is not an answer, so it goes on as whatever it was.
     pub fn line(&self, text: &str) -> Option<Keyed> {
+        if self.kind == Kind::Question {
+            return Some(self.question_line(text.trim()));
+        }
         if self.rows.is_empty() {
             return None;
         }
@@ -286,6 +476,49 @@ impl Menu {
         })
     }
 
+    /// A line for a question: numbers pick rows (several, space or
+    /// comma separated, when the question allows it) and anything else
+    /// is free text; the old single-question shape takes every line.
+    fn question_line(&self, t: &str) -> Keyed {
+        let numbers: Option<Vec<usize>> = t
+            .split([',', ' '])
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                s.parse::<usize>()
+                    .ok()
+                    .filter(|&n| n >= 1 && n <= self.rows.len())
+            })
+            .collect();
+        match numbers {
+            Some(ns) if !ns.is_empty() && self.multi && ns.len() > 1 => {
+                let labels: Vec<&str> = ns
+                    .iter()
+                    .map(|&i| self.rows[i - 1].label.as_str())
+                    .collect();
+                let answer = labels.join(", ");
+                let text = self.line_of(&answer);
+                Keyed::Answer {
+                    echo: format!("↳ {text}"),
+                    text,
+                }
+            }
+            Some(ns) if ns.len() == 1 && !self.rows.is_empty() => self.pick(ns[0] - 1),
+            _ => {
+                // Free text; an empty line answers with an empty
+                // line, as it always did.
+                let text = if t.is_empty() {
+                    String::new()
+                } else {
+                    self.line_of(t)
+                };
+                Keyed::Answer {
+                    echo: format!("↳ {text}"),
+                    text,
+                }
+            }
+        }
+    }
+
     /// Plain lines, for a pipe: the options numbered, read a number or
     /// text.
     pub fn plain(&self) -> Vec<String> {
@@ -300,7 +533,12 @@ impl Menu {
             }
         }
         for (i, row) in self.rows.iter().enumerate() {
-            lines.push(format!("  {}. {}", i + 1, row.label));
+            let desc = row
+                .desc
+                .as_ref()
+                .map(|d| format!(" · {d}"))
+                .unwrap_or_default();
+            lines.push(format!("  {}. {}{}", i + 1, row.label, desc));
         }
         if let Some(note) = &self.note {
             lines.push(format!("  {note}"));
@@ -330,6 +568,63 @@ mod tests {
             RiskClass::Exec,
             "class exec: anything else in a shell",
         )
+    }
+
+    fn plain_question(text: &str) -> Menu {
+        Menu::asking(vec![aigentic_api::AskedQuestion {
+            question: text.into(),
+            header: None,
+            options: vec![],
+            multi: false,
+        }])
+    }
+
+    fn asked() -> Vec<aigentic_api::AskedQuestion> {
+        vec![
+            aigentic_api::AskedQuestion {
+                question: "Which colour?".into(),
+                header: Some("colour".into()),
+                options: vec![
+                    aigentic_api::AskedOption {
+                        label: "Red".into(),
+                        description: Some("the warm one".into()),
+                    },
+                    aigentic_api::AskedOption {
+                        label: "Green".into(),
+                        description: None,
+                    },
+                ],
+                multi: false,
+            },
+            aigentic_api::AskedQuestion {
+                question: "Which tests?".into(),
+                header: None,
+                options: vec![
+                    aigentic_api::AskedOption {
+                        label: "unit".into(),
+                        description: None,
+                    },
+                    aigentic_api::AskedOption {
+                        label: "integration".into(),
+                        description: None,
+                    },
+                ],
+                multi: true,
+            },
+            aigentic_api::AskedQuestion {
+                question: "Ship it?".into(),
+                header: None,
+                options: vec![],
+                multi: false,
+            },
+        ]
+    }
+
+    fn answer(text: &str) -> Keyed {
+        Keyed::Answer {
+            text: text.into(),
+            echo: format!("\u{21b3} {text}"),
+        }
     }
 
     fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
@@ -463,9 +758,9 @@ mod tests {
         // Esc opens the reason input, without waiting for the grace.
         assert_eq!(
             menu.key(&key(KeyCode::Esc, KeyModifiers::NONE), true, false),
-            Keyed::Reason
+            Keyed::Text
         );
-        let mut menu = Menu::question("which colour?");
+        let mut menu = plain_question("which colour?");
         assert_eq!(
             menu.key(&key(KeyCode::Char('y'), KeyModifiers::NONE), true, true),
             Keyed::Passed
@@ -501,7 +796,10 @@ mod tests {
         );
         assert_eq!(menu.line("hello there"), None);
         assert_eq!(menu.line(""), None);
-        assert_eq!(Menu::question("which colour?").line("blue"), None);
+        assert_eq!(
+            plain_question("which colour?").line("blue"),
+            Some(answer("blue"))
+        );
     }
 
     /// The issue's correction of 2026-09-24: option two must say what a
@@ -585,10 +883,108 @@ mod tests {
         assert_eq!(menu.plain()[0], "[permission] Call this MCP tool?");
         assert_eq!(menu.plain()[1], "  mcp.docs.search {\"query\":\"phase 6\"}");
         assert_eq!(menu.plain()[5], "  mcp.docs: the plan says ask");
-        let menu = Menu::question("which colour?");
+        let menu = plain_question("which colour?");
         assert_eq!(
             menu.plain(),
             vec!["[question] which colour?", "  type the answer"]
         );
+    }
+
+    /// A question with options renders on the same widget: the options,
+    /// Other last, the description dim; a digit answers and the menu
+    /// moves to the next question; the composed answer is one line per
+    /// question.
+    #[test]
+    fn a_question_with_options_answers_one_after_another() {
+        let mut menu = Menu::asking(asked());
+        assert_eq!(menu.title, "Which colour?");
+        let labels: Vec<&str> = menu.rows.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(labels, vec!["Red", "Green", "Other: type your own"]);
+        assert_eq!(
+            menu.plain(),
+            vec![
+                "[question] Which colour?",
+                "  1. Red · the warm one",
+                "  2. Green",
+                "  3. Other: type your own",
+            ]
+        );
+        // A digit picks a row; the answer is the contribution, headed.
+        assert_eq!(
+            menu.key(&key(KeyCode::Char('2'), KeyModifiers::NONE), true, true),
+            answer("colour: Green")
+        );
+        // The engine applies it: the next question shows, multi this time.
+        assert_eq!(menu.answer("colour: Green"), None);
+        assert_eq!(menu.title, "Which tests?");
+        assert!(menu.multi);
+        assert_eq!(
+            menu.note.as_deref(),
+            Some("space toggles · enter sends · a pipe: `1 2`")
+        );
+        // Space toggles the selected row; digits toggle too.
+        assert_eq!(
+            menu.key(&key(KeyCode::Char(' '), KeyModifiers::NONE), true, true),
+            Keyed::Used
+        );
+        assert!(menu.picked[0]);
+        assert_eq!(
+            menu.key(&key(KeyCode::Char('2'), KeyModifiers::NONE), true, true),
+            Keyed::Used
+        );
+        assert!(menu.picked[1]);
+        // Enter submits the picked rows.
+        assert_eq!(
+            menu.key(&key(KeyCode::Enter, KeyModifiers::NONE), true, true),
+            answer("unit, integration")
+        );
+        assert_eq!(menu.answer("unit, integration"), None);
+        // A question without options: the composer takes it, free text.
+        assert_eq!(menu.title, "Ship it?");
+        assert!(menu.rows.is_empty());
+        assert_eq!(menu.line("yes, friday"), Some(answer("yes, friday")));
+        assert_eq!(
+            menu.answer("yes, friday").unwrap(),
+            "colour: Green\nunit, integration\nyes, friday"
+        );
+    }
+
+    /// A pipe reads numbers for a question: one number picks a row,
+    /// several (space or comma separated) pick several when the question
+    /// allows it, and anything else is free text.
+    #[test]
+    fn a_pipe_answers_a_question_by_number_or_text() {
+        let mut menu = Menu::asking(asked());
+        assert_eq!(menu.line("1"), Some(answer("colour: Red")));
+        assert_eq!(menu.line("red please"), Some(answer("colour: red please")));
+        assert_eq!(menu.answer("colour: red please"), None);
+        assert_eq!(menu.line("2 1"), Some(answer("integration, unit")));
+        assert_eq!(menu.line("2,1"), Some(answer("integration, unit")));
+        assert_eq!(
+            menu.line("9"),
+            Some(answer("9")),
+            "a number past the rows is free text"
+        );
+        assert_eq!(menu.line("both please"), Some(answer("both please")));
+        assert_eq!(menu.answer("both please"), None, "the third question waits");
+        // The whole call is answered in one go: one line per question.
+        assert_eq!(
+            menu.answer("friday"),
+            Some("colour: red please\nboth please\nfriday".to_owned())
+        );
+        // A number is not an answer while a draft is being typed: the
+        // composer is the free-text answer.
+        let mut menu = Menu::asking(asked());
+        assert_eq!(
+            menu.key(&key(KeyCode::Char('1'), KeyModifiers::NONE), false, true),
+            Keyed::Passed
+        );
+        // Picking Other hands the composer to the question.
+        let mut menu = Menu::asking(asked());
+        assert_eq!(
+            menu.key(&key(KeyCode::Char('3'), KeyModifiers::NONE), true, true),
+            Keyed::Text
+        );
+        assert_eq!(menu.free_text("magenta"), "colour: magenta");
     }
 }

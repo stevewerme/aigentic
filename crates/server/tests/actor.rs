@@ -400,6 +400,73 @@ fn ask(id: &str) -> ProviderEvent {
     })
 }
 
+/// A call with questions puts them on the state, so every attached
+/// client renders the same menu; the old shape arrives as one plain
+/// question with no questions.
+#[tokio::test]
+async fn ask_human_questions_ride_the_state() {
+    let asked = ProviderEvent::ToolCall(ToolCall {
+        id: "q9".into(),
+        name: "ask_human".into(),
+        args: json!({"questions": [
+            {"question": "Which colour?", "header": "colour",
+             "options": [{"label": "Red"}, {"label": "Green"}]},
+            {"question": "Which tests?", "multi": true,
+             "options": [{"label": "unit"}, {"label": "integration"}]}
+        ]}),
+    });
+    let rig = rig(
+        vec![
+            Some(vec![asked, tool_use()]),
+            Some(vec![text("done"), done()]),
+        ],
+        false,
+    );
+    let (_, _, mut notices) = rig.subscribe(0).await;
+    rig.post(steve(), "pick", false).await;
+    let seen = Rig::until_state(
+        &mut notices,
+        |s| matches!(s, ThreadState::AwaitingHuman { call_id, .. } if call_id == "q9"),
+    )
+    .await;
+    let state = seen
+        .into_iter()
+        .rev()
+        .find_map(|n| match n {
+            Notice::State {
+                state: s @ ThreadState::AwaitingHuman { .. },
+                ..
+            } => Some(s),
+            _ => None,
+        })
+        .unwrap();
+    let ThreadState::AwaitingHuman {
+        question,
+        questions,
+        ..
+    } = state
+    else {
+        unreachable!();
+    };
+    assert_eq!(question, "Which colour? Which tests?");
+    assert_eq!(questions.len(), 2);
+    assert_eq!(questions[0].header.as_deref(), Some("colour"));
+    assert_eq!(questions[0].options[0].label, "Red");
+    assert!(!questions[0].multi);
+    assert!(questions[1].multi);
+    // Answering ends the wait and the turn goes on.
+    let r = rig
+        .send(|reply| Mail::Answer {
+            by: steve(),
+            call_id: "q9".into(),
+            text: "colour: Red\nWhich tests?: unit, integration".into(),
+            reply,
+        })
+        .await;
+    assert_eq!(r, Response::Ok);
+    Rig::until_state(&mut notices, |s| *s == ThreadState::Idle).await;
+}
+
 #[tokio::test]
 async fn an_answer_to_ask_human_is_the_answerers_event() {
     let rig = rig(

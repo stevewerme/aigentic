@@ -20,6 +20,7 @@ use aigentic_log::{
     ToolResultPayload, TurnEndedPayload,
 };
 use aigentic_policy::{Decision, Policy, Rule};
+use aigentic_runtime::harness_tools::HumanQuestion;
 use aigentic_runtime::{
     ASKED_HUMAN, Answered, CancelToken, DecisionError, Decisions, INTERRUPTED, Inbox, Pending,
     Runtime, Signal,
@@ -313,7 +314,15 @@ async fn an_answer_to_ask_human_is_the_result_and_splits_the_turn() {
             p,
             &Pending::Human {
                 call_id: "q1".into(),
-                question: "Ship it?".into()
+                question: "Ship it?".into(),
+                // The old single-question shape normalises to one
+                // question with no options.
+                questions: vec![HumanQuestion {
+                    question: "Ship it?".into(),
+                    header: None,
+                    options: Vec::new(),
+                    multi: false,
+                }],
             }
         );
         Answered::Human {
