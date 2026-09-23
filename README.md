@@ -1,10 +1,4 @@
-```text
-      _              _   _
- __ _(_)__ _ ___ _ _| |_(_)__
-/ _` | / _` / -_) ' \  _| / _|
-\__,_|_\__, \___|_||_\__|_\__|
-       |___/
-```
+<p align="center"><img src="docs/assets/banner.png" alt="aigentic: an open source agent harness for open-weight models" width="100%"></p>
 
 # Aigentic
 
