@@ -1,84 +1,113 @@
 # Aigentic
 
-An open source agent harness in Rust that runs open-weight models on EU
-infrastructure and ships as a single terminal binary. The harness owns the
-loop, the tools, the event log, and later skills, permissions and projects.
-The model is a swappable backend behind one trait.
+An open source agent harness in Rust that runs open-weight models, on EU
+infrastructure or any OpenAI-compatible or Anthropic endpoint, and ships
+as a single terminal binary. The harness owns everything around the model,
+from the loop and the tools to skills, permissions and the client; the
+model is a swappable backend behind one trait. One append-only event log per
+thread is the source of truth, with model context, the terminal view, costs
+and resume all projections of it; humans and agents share threads on equal
+terms, every event attributed, and projects carry instructions, knowledge
+and memory across threads.
 
-Three ideas shape it. **Monothreading:** one ordered event log per thread is
-the source of truth; model context and the UI are projections of it.
-**Multiplayer:** several humans and agents share a thread on equal terms,
-with every event attributed. **Projects:** a scoping layer that carries
-instructions, knowledge and memory across threads.
+## What works today
 
-The design is in [docs/PRD.md](docs/PRD.md); the current phase's plan is in
-[docs/PLAN-phase4.md](docs/PLAN-phase4.md); conventions for contributors
-and agents are in [AGENTS.md](AGENTS.md).
+- A streaming terminal client: an inline shell, not a full screen —
+  markdown replies, tool calls with truncated output, a file picker,
+  command completion, a transcript pager and a turn line while it works
+- Two provider adapters (OpenAI-compatible, Anthropic with thinking and
+  effort control), config profiles, and a utility profile for side jobs
+  such as thread titles and memory extraction
+- The event log: resume any thread by id, compaction near the window,
+  `/cost` over long threads, attributed permission decisions
+- Built-in tools — read, write and edit files (edits report diffs), list,
+  grep, bash, knowledge search — plus MCP servers
+- A policy you own: reads and an allow-list of build and test commands run
+  without asking, everything else prompts inline; permission modes when you
+  want less asking
+- Skills as versioned folders with a `SKILL.md`, run as slash commands,
+  vendored and hashed before they load
+- Projects: `aigentic.toml`, layered instructions (global, workspace,
+  project), knowledge, memory; workspaces, and `/project use` to move a
+  thread between projects without losing the conversation
+- The multiplayer daemon: `aigentic serve`, sessions over a Unix socket or
+  TCP, per-user roles checked on every request
+- `aigentic exec` for scripting (exit 0 done, 1 failed, 3 a human was
+  needed) and `aigentic doctor` for setup checks
 
-## Status
+## Getting started
 
-| Phase | Builds | State |
-| --- | --- | --- |
-| 0 Loop | Canonical types, OpenAI-compatible adapter, three tools, streaming REPL | Done, accepted live 2026-09-21 |
-| 1 Two providers | Anthropic adapter, capability struct, caching contract | Done, accepted live 2026-09-21 |
-| 2 Event log | Resume, compaction, `/cost` over long threads | Done, accepted live 2026-09-21 |
-| 3 Skills and policy | Skill loader, risk classes, permission prompts, MCP client | Done, accepted live 2026-09-21 |
-| 4 Projects | `project.toml`, instruction layering, knowledge, memory | Next |
-| 5 Server and multiplayer | Daemon, socket API, turn queue, per-user permissions | |
-| 6 Orchestrator | Portfolio project coordinating work across projects | |
+Needs a stable Rust toolchain.
 
-Every tool call passes a policy you own: reads and an allow-list of
-build and test commands run without asking, writes, other shell commands
-and MCP tools prompt inline, and every decision is an attributed event in
-the thread log. Skills are vendored, hashed and reviewed before they
-load; `aigentic.toml` in a repository enables them.
-
-## Quick start
-
-Needs a stable Rust toolchain and any OpenAI-compatible endpoint. Hosted EU
-providers and a local llama.cpp server both work.
-
-1. Configure the endpoint. The API key is never in this file, only the
-   name of the environment variable that holds it:
+1. Install:
 
    ```bash
-   mkdir -p ~/.config/aigentic && cat > ~/.config/aigentic/config.toml <<'TOML'
+   git clone https://github.com/stevewerme/aigentic && cd aigentic
+   cargo install --path crates/tui          # installs the `aigentic` binary
+   ```
+
+2. Configure the endpoint in `~/.config/aigentic/config.toml` (override
+   with `--config`). The key itself is never in this file: each profile
+   names the environment variable that holds it.
+
+   ```toml
+   default_profile = "tensorx"
+
+   [profiles.tensorx]
+   provider = "openai_compat"
    base_url = "https://api.tensorx.ai/v1"
    model = "z-ai/glm-5.3"
    api_key_env = "TENSORX_API_KEY"
-   TOML
+
+   [profiles.anthropic]
+   provider = "anthropic"
+   model = "claude-opus-5"
+   api_key_env = "ANTHROPIC_API_KEY"
    ```
 
-2. Provide the key, either exported in your shell or in a `.env` file in
-   the directory you run from (see [.env.example](.env.example)).
+   Anthropic options (`thinking`, `effort`, …), budgets, compaction tuning
+   and `utility_profile` are covered in the
+   [configuration reference](crates/tui/README.md#configuration).
 
-3. Run it from inside the repository you want to work on:
+3. Put the key in `.env` in the directory you run from — it is loaded at
+   startup and gitignored; see [.env.example](.env.example) — or export it:
 
    ```bash
-   cargo run -p aigentic-tui --
+   echo 'TENSORX_API_KEY=…' >> .env
    ```
 
-   A new thread id is printed. `--thread <id>` resumes it later by
-   replaying its log. `/cost` shows tokens, `/quit` exits.
+4. Check the setup:
 
-## Layout
+   ```bash
+   aigentic doctor            # add --probe for one tiny completion per profile
+   ```
 
-One Cargo workspace. `core` holds the canonical types and traits and depends
-on nothing; every other crate depends on `core`; `runtime` is the only crate
-that knows the rest; `tui` talks to the runtime API only. Details, the
-dependency rule and the event-log rule are in [AGENTS.md](AGENTS.md).
+5. Run it inside the repository you want to work on:
 
-```
-crates/core       canonical message, event and tool types; Provider and Tool traits
-crates/log        append-only JSONL event store and projection
-crates/providers  OpenAI-compatible and Anthropic adapters
-crates/tools      read_file, write_file, edit_file, list_dir, grep, bash; the registry; MCP client
-crates/runtime    the agent loop, policy in the loop, harness tools, skills in the prefix
-crates/tui        the `aigentic` binary: streaming REPL, permission prompt, skills CLI
-crates/skills     SKILL.md manifests, skills.lock.toml, discovery, the static check
-crates/policy     rules, defaults, bash allow patterns
-skills/           the vendored Pocock set; skills.lock.toml and docs/skills-review.md beside it
-```
+   ```bash
+   cd ~/Projects/my-repo && aigentic
+   ```
+
+   A new thread starts and its id is printed; resume it later with
+   `aigentic --thread <id>`. With no `--server` a daemon is embedded in the
+   process for that directory; pass `--server unix:/path` or
+   `tcp:host:port` to work against a shared daemon instead.
+
+6. Bring in a new project with the guided setup — the config, the project
+   file, `AGENTS.md`, GitHub issue labels through `gh`, knowledge links;
+   every file is shown before it is written:
+
+   ```bash
+   cd ~/Projects/new-repo && aigentic init
+   ```
+
+## Depth
+
+- [docs/PRD.md](docs/PRD.md) — the design: purpose, principles, architecture
+- [AGENTS.md](AGENTS.md) — crate layout, the dependency rule, the event-log
+  rule, conventions for contributors and agents
+- [crates/tui/README.md](crates/tui/README.md) — the full client manual:
+  keys, slash commands, policy modes, the config reference
 
 ## Developing
 
