@@ -5,7 +5,7 @@
 //! or text. The answering keys wait for the shell's `PROMPT_GRACE`.
 
 use aigentic_runtime::aigentic_core::{RiskClass, ToolCall};
-use aigentic_runtime::aigentic_policy::prefix_of;
+use aigentic_runtime::aigentic_policy::{prefix_of, riskiest_segment};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::app::commands::truncate_for_display;
@@ -136,17 +136,23 @@ impl Menu {
     /// what is asked, the full command under it, and one "allow more"
     /// row — a prefix from now on when `prefix_of` gives one, else a
     /// session grant (for `bash`, the exact command; the issue's
-    /// correction of 2026-09-24).
+    /// correction of 2026-09-24). A `bash` chain names its riskiest
+    /// segment in the header and grants that segment, never the whole
+    /// chain (issue #16).
     pub fn permission(call: &ToolCall, class: RiskClass, reason: &str) -> Self {
-        let prefix = (call.name == "bash")
-            .then(|| {
-                call.args
-                    .get("command")
-                    .and_then(|c| c.as_str())
-                    .map(prefix_of)
-            })
-            .flatten()
-            .filter(|p| !p.is_empty());
+        let command = (call.name == "bash")
+            .then(|| call.args.get("command").and_then(|c| c.as_str()))
+            .flatten();
+        let prefix = command.map(prefix_of).filter(|p| !p.is_empty());
+        // A chain asks as its riskiest segment, and the header says
+        // which one: `git add && git commit && git push` asks as
+        // "includes git push".
+        let title = match command.and_then(riskiest_segment) {
+            Some(r) if r.chain && !r.words.is_empty() => {
+                format!("Run this command? (includes {})", r.words.join(" "))
+            }
+            _ => title(&call.name, class),
+        };
         let more = match &prefix {
             Some(p) => format!(
                 "Yes, and don't ask again for `{}` in this project",
@@ -174,7 +180,7 @@ impl Menu {
         };
         Self {
             kind: Kind::Permission,
-            title: title(&call.name, class),
+            title,
             body: truncate_for_display(&body, 40, 4000),
             // The class-generated reasons say what the title already
             // does; a rule's own words are worth their line.
@@ -561,10 +567,10 @@ mod tests {
     }
 
     fn approval() -> Menu {
-        // Compound, so `prefix_of` gives nothing and row two is the
-        // session one.
+        // A chain that is not all read-only: it asks as its riskiest
+        // segment, `git push` here, and that is what a grant covers.
         Menu::permission(
-            &bash("echo hi && echo bye"),
+            &bash("git add src/lib.rs && git commit -m 'x' && git push"),
             RiskClass::Exec,
             "class exec: anything else in a shell",
         )
@@ -645,11 +651,11 @@ mod tests {
     fn more() -> Keyed {
         Keyed::Decide {
             pick: Pick::Allow {
-                session: true,
-                prefix: None,
+                session: false,
+                prefix: Some(vec!["git".into(), "push".into()]),
             },
             reason: None,
-            echo: "↳ Yes, and don't ask again for this exact command this session".into(),
+            echo: "↳ Yes, and don't ask again for `git push` in this project".into(),
         }
     }
 
@@ -813,6 +819,7 @@ mod tests {
             RiskClass::Exec,
             "class exec: anything else in a shell",
         );
+        assert_eq!(menu.title, "Run this command?");
         assert_eq!(
             menu.rows[1].label,
             "Yes, and don't ask again for `curl -s` in this project"
@@ -824,6 +831,49 @@ mod tests {
                 prefix: Some(vec!["curl".into(), "-s".into()]),
             }
         );
+        // A chain asks as its riskiest segment (issue #16): the header
+        // names it, and a grant covers that segment, never the whole
+        // chain.
+        let menu = Menu::permission(
+            &bash("git add && git commit -m 'x' && git push"),
+            RiskClass::Exec,
+            "class exec: anything else in a shell",
+        );
+        assert_eq!(menu.title, "Run this command? (includes git push)");
+        assert_eq!(
+            menu.rows[1].label,
+            "Yes, and don't ask again for `git push` in this project"
+        );
+        assert_eq!(
+            menu.rows[1].pick,
+            Pick::Allow {
+                session: false,
+                prefix: Some(vec!["git".into(), "push".into()]),
+            }
+        );
+        // The risk is a redirection's: no command prefix covers it, so
+        // the header names nothing and the grant is the session's.
+        let menu = Menu::permission(
+            &bash("cargo test && echo done > log.txt"),
+            RiskClass::Exec,
+            "class exec: anything else in a shell",
+        );
+        assert_eq!(menu.title, "Run this command?");
+        assert_eq!(
+            menu.rows[1].label,
+            "Yes, and don't ask again for this exact command this session"
+        );
+        // A read-only chain never asks, so what it would grant is moot;
+        // its own command keeps its plain header.
+        let menu = Menu::permission(
+            &bash("cargo fmt && cargo test --workspace"),
+            RiskClass::Exec,
+            "class exec: anything else in a shell",
+        );
+        assert_eq!(menu.title, "Run this command?");
+        // Read-only through and through, so it would not ask; either
+        // way there is no prefix to grant and row two is the session
+        // one.
         let menu = Menu::permission(
             &bash("echo hi && echo bye"),
             RiskClass::Exec,

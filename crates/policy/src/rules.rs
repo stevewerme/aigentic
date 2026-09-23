@@ -220,13 +220,48 @@ pub fn default_bash_allow() -> Vec<String> {
     .collect()
 }
 
+/// What a command line that is not all read-only asks about (issue
+/// #16).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Riskiest {
+    /// The riskiest segment's leading words — `git push` in
+    /// `git add && git commit && git push` — so a grant covers that
+    /// segment, never the whole chain. Empty when a redirection
+    /// carries the risk: no command prefix covers that.
+    pub words: Vec<String>,
+    /// More than one segment has words or redirections: the line is a
+    /// chain, and it asks once, as this segment.
+    pub chain: bool,
+}
+
+/// What a `bash` command line that is not all read-only asks about
+/// (issue #16): its riskiest segment — the worst kind a segment has,
+/// the last of the worst — read against the default allow patterns.
+/// `None` when every segment is read-only or harmless, so the line
+/// runs without asking.
+pub fn riskiest_segment(command: &str) -> Option<Riskiest> {
+    let classified = crate::shell::classify(command, &default_bash_allow(), &[]);
+    classified.riskiest.map(|words| Riskiest {
+        words,
+        chain: classified.compound,
+    })
+}
+
 /// The words of `command` a person is asked to allow "from now on": the
 /// command and its bare words (subcommands, flags) up to the first that
 /// looks like a value (a path, a URL, a number, a quote, an assignment).
 /// `curl -s https://x` gives `curl -s`; `cargo test --workspace` gives
-/// all three. Empty for a compound command: no single prefix stands for
-/// a chain.
+/// all three. A line that is not all read-only gives its riskiest
+/// segment's words (issue #16), so the grant covers that segment and
+/// never the whole chain; a redirection carrying the risk gives nothing,
+/// for no command prefix covers that.
 pub fn prefix_of(command: &str) -> Vec<String> {
+    if let Some(riskiest) = riskiest_segment(command) {
+        return riskiest.words;
+    }
+    // The line runs without asking; a grant is moot, but its own first
+    // segment's words still name it. A chain names nothing: no single
+    // prefix stands for one.
     if crate::shell::is_compound(command) {
         return Vec::new();
     }
@@ -307,6 +342,28 @@ mod prefix_tests {
         assert_eq!(prefix_of("git log -n 5"), vec!["git", "log", "-n"]);
         assert_eq!(prefix_of("./run.sh now"), vec!["./run.sh", "now"]);
         assert!(prefix_of("ls | wc -l").is_empty());
+    }
+
+    #[test]
+    fn a_chain_grants_its_riskiest_segment() {
+        assert_eq!(prefix_of("curl -s https://example.com"), vec!["curl", "-s"]);
+        assert_eq!(
+            prefix_of("git add && git commit -m 'x' && git push"),
+            vec!["git", "push"]
+        );
+        // The riskiest is the worst kind, the last of the worst, and a
+        // redirection carries no prefix at all. The prefix stops at the
+        // script, which is a value.
+        assert_eq!(
+            prefix_of("cargo test && sed -i 's/x/y/' f && git push"),
+            vec!["sed", "-i"]
+        );
+        assert_eq!(
+            prefix_of("cargo test && echo done > log.txt"),
+            Vec::<String>::new()
+        );
+        assert!(prefix_of("ls | wc -l").is_empty());
+        assert_eq!(prefix_of("./run.sh now"), vec!["./run.sh", "now"]);
     }
 
     #[test]

@@ -26,7 +26,7 @@ allow
 allow
 allow
 allow
-ask -
+ask
 allow
 allow
 allow
@@ -173,7 +173,7 @@ ask git check-ignore
 allow
 allow
 allow
-ask -
+ask
 allow
 allow
 allow
@@ -200,7 +200,7 @@ allow
 allow
 allow
 allow
-ask -
+ask
 allow
 allow
 allow
@@ -241,7 +241,7 @@ allow
 allow
 allow
 ask python3 -
-ask -
+ask
 allow
 ask python3 -
 ask python3 -
@@ -266,7 +266,7 @@ allow
 allow
 allow
 allow
-ask -
+ask
 allow
 allow
 allow
@@ -319,18 +319,18 @@ allow
 allow
 ask git stash list
 ask git stash list
-ask -
+ask
 ask git fsck --unreachable
-ask -
+ask
 allow
 allow
 allow
-ask -
+ask
 ask git add
 ask git stash push --keep-index -m
 allow
 allow
-ask -
+ask
 allow
 ask git commit -m
 ask git stash pop

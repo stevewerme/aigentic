@@ -15,7 +15,8 @@ use serde::{Deserialize, Serialize};
 
 pub use roles::{Participants, Role, needs};
 pub use rules::{
-    Decision, MEMORY_PREFIX, MEMORY_REASON, Rule, default_bash_allow, default_rules, prefix_of,
+    Decision, MEMORY_PREFIX, MEMORY_REASON, Riskiest, Rule, default_bash_allow, default_rules,
+    prefix_of, riskiest_segment,
 };
 
 /// What policy says about one call.

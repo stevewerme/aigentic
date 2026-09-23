@@ -824,7 +824,9 @@ mod tests {
         assert_eq!(
             lines[..9],
             [
-                " Run this command?",
+                // The chain asks as its riskiest segment: the last line
+                // here (issue #16).
+                " Run this command? (includes line12)",
                 "   line1",
                 "   line2",
                 "   line3",

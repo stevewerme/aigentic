@@ -47,8 +47,6 @@ pub(crate) struct Classified {
     pub riskiest: Option<Vec<String>>,
     /// Two or more segments have words or redirections.
     pub compound: bool,
-    /// The riskiest ask is a substitution's, not a segment's own.
-    pub carried: bool,
 }
 
 /// A shell word: the text with quotes stripped, and what it hides.
@@ -138,7 +136,6 @@ fn classify_within(src: &str, allow: &[String], grants: &[String], depth: usize)
     let mut kind = Kind::Harmless;
     let mut patterns: Vec<String> = Vec::new();
     let mut riskiest: Option<Vec<String>> = None;
-    let mut carried = false;
     let mut worst = Kind::ReadOnly;
     for seg in &segs {
         let sc = classify_segment(seg, allow, grants, depth);
@@ -147,7 +144,6 @@ fn classify_within(src: &str, allow: &[String], grants: &[String], depth: usize)
         // the worst.
         if sc.kind > Kind::Harmless && sc.kind >= worst {
             worst = sc.kind;
-            carried = sc.sub.is_some();
             riskiest = Some(match sc.sub {
                 Some(name) => name,
                 None => sc.prefix,
@@ -165,7 +161,6 @@ fn classify_within(src: &str, allow: &[String], grants: &[String], depth: usize)
         patterns,
         riskiest,
         compound: occupied > 1,
-        carried,
     }
 }
 
@@ -1161,7 +1156,6 @@ mod tests {
         );
         assert_eq!(c.riskiest, Some(vec!["git".into(), "push".into()]));
         assert!(c.compound);
-        assert!(!c.carried);
         assert_eq!(
             riskiest("cargo test && sed -i 's/x/y/' file"),
             Some("sed -i".into())

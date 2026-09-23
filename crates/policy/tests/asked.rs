@@ -5,13 +5,13 @@
 //!
 //! The commands come from the `permission_requested` events in the
 //! thread logs, with `~` for the home directory and `\n` for a real
-//! newline; the verdicts are one per line, in the same order: `allow`
-//! or `ask`, with the words a "don't ask again" answer would grant
-//! after the `ask` (`-` when a redirection carries the risk, and no
-//! command prefix covers that).
+//! newline; the verdicts are one per line, in the same order: `allow`,
+//! or `ask` with the words a "don't ask again" answer would grant
+//! (nothing after the ask when a redirection carries the risk, since
+//! no command prefix covers that).
 
 use aigentic_core::{RiskClass, ToolCall};
-use aigentic_policy::{Outcome, Policy};
+use aigentic_policy::{Outcome, Policy, prefix_of};
 use serde_json::json;
 
 fn read(name: &str) -> Vec<String> {
@@ -71,17 +71,35 @@ fn the_asked_fixture_classifies_as_recorded() {
     let policy = Policy::configured(Vec::new(), None);
     let mut allowed = 0;
     for (i, line) in commands.iter().enumerate() {
-        let outcome = policy.decide(&bash(&unescape(line)), RiskClass::Exec);
+        let command = unescape(line);
+        let outcome = policy.decide(&bash(&command), RiskClass::Exec);
         let verdict = verdicts[i].as_str();
         let case = format!("#{}: {line}", i + 1);
-        match verdict.strip_prefix("ask") {
-            Some(_) => assert!(
-                !matches!(outcome, Outcome::Allow { .. }),
-                "should ask — {case}"
-            ),
-            None => {
-                assert_eq!(verdict, "allow", "allow or `ask <words>` — {case}");
+        match verdict.strip_prefix("allow") {
+            Some(rest) => {
+                assert!(rest.is_empty(), "allow has no words — {case}");
+                assert!(
+                    matches!(outcome, Outcome::Allow { .. }),
+                    "should run without asking — {case}"
+                );
                 allowed += 1;
+            }
+            None => {
+                assert!(
+                    !matches!(outcome, Outcome::Allow { .. }),
+                    "should ask — {case}"
+                );
+                // What a "don't ask again" would grant: the riskiest
+                // segment's prefix, never the whole chain (#16).
+                // Nothing after the ask when a redirection carries
+                // the risk: no command prefix covers that.
+                let expected: Vec<String> = verdict
+                    .strip_prefix("ask")
+                    .expect("allow or `ask <words>`")
+                    .split_whitespace()
+                    .map(str::to_owned)
+                    .collect();
+                assert_eq!(prefix_of(&command), expected, "the grant — {case}");
             }
         }
     }
