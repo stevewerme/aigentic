@@ -313,6 +313,14 @@ impl Config {
 
 impl Profile {
     fn validate(&self) -> Result<(), ConfigError> {
+        if let Some(b) = &self.budget
+            && let Some(r) = b.cache_read_price_ratio
+            && !(0.0..=1.0).contains(&r)
+        {
+            return Err(ConfigError::msg(format!(
+                "budget.cache_read_price_ratio must be between 0.0 and 1.0, got {r}"
+            )));
+        }
         if let Some(c) = &self.compaction {
             if let Some(f) = c.trigger_fraction
                 && !(0.05..=0.95).contains(&f)
@@ -542,6 +550,7 @@ context_ceiling_tokens = 96_000
         assert!(Config::parse("[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n[profiles.a.compaction]\nnope = 1\n").is_err());
         assert!(Config::parse("[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n[profiles.a.compaction]\ncontext_ceiling_tokens = 1024\n").is_err());
         assert!(Config::parse("[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n[profiles.a.budget]\nnope = 1\n").is_err());
+        assert!(Config::parse("[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n[profiles.a.budget]\ncache_read_price_ratio = 1.5\n").is_err());
         let c = Config::parse("[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n[global]\ninstructions = \"/x/i.md\"\n[tools]\ndenied = [\"mcp.*\"]\n[skills]\ndenied = [\"wizard\"]\n").unwrap();
         assert_eq!(
             c.global_instructions.as_deref(),
@@ -550,13 +559,15 @@ context_ceiling_tokens = 96_000
         assert_eq!(c.denied_tools, vec!["mcp.*"]);
         assert_eq!(c.denied_skills, vec!["wizard"]);
         assert!(Config::parse("[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n[tools]\nallow = []\n").is_err());
-        let c = Config::parse("[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n[profiles.a.budget]\nmax_tokens = 5\n").unwrap();
+        let c = Config::parse("[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n[profiles.a.budget]\nmax_tokens = 5\ncache_read_price_ratio = 0.19\n").unwrap();
         let b = c.profiles["a"].budget();
         assert_eq!(
             (b.max_iterations, b.max_tokens),
             (DEFAULT_BUDGET.max_iterations, 5)
         );
         assert_eq!(b.max_wall_time, DEFAULT_BUDGET.max_wall_time);
+        assert_eq!(b.cache_read_price_ratio, 0.19);
+        assert_eq!(DEFAULT_BUDGET.cache_read_price_ratio, 0.25);
     }
 
     #[test]

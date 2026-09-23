@@ -150,6 +150,7 @@ async fn run_turn(
             max_iterations: calls + 20,
             max_tokens: u64::MAX,
             max_wall_time: std::time::Duration::from_secs(300),
+            cache_read_price_ratio: 0.25,
         })
         .with_model_label("scripted");
     let mut sweeps = 0;

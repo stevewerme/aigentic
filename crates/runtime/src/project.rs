@@ -195,6 +195,11 @@ pub struct BudgetConfig {
     pub max_tokens: Option<u64>,
     #[serde(default)]
     pub max_wall_time_secs: Option<u64>,
+    /// What a cache read counts against `max_tokens`, as a fraction of
+    /// an uncached input token; a profile sets its own to what its
+    /// model actually charges. Missing takes the default quarter.
+    #[serde(default)]
+    pub cache_read_price_ratio: Option<f64>,
 }
 
 impl BudgetConfig {
@@ -206,6 +211,9 @@ impl BudgetConfig {
             max_wall_time: self
                 .max_wall_time_secs
                 .map_or(base.max_wall_time, std::time::Duration::from_secs),
+            cache_read_price_ratio: self
+                .cache_read_price_ratio
+                .unwrap_or(base.cache_read_price_ratio),
         }
     }
 

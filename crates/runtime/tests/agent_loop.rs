@@ -153,6 +153,7 @@ async fn budget_stop_is_an_event_with_the_reason() {
         max_iterations: 2,
         max_tokens: u64::MAX,
         max_wall_time: Duration::from_secs(60),
+        cache_read_price_ratio: 0.25,
     });
 
     let outcome = h
@@ -207,6 +208,7 @@ async fn token_budget_stops_after_the_call_that_crosses_it() {
         max_iterations: 10,
         max_tokens: 1000,
         max_wall_time: Duration::from_secs(60),
+        cache_read_price_ratio: 0.25,
     });
     let outcome = h
         .runtime
@@ -250,6 +252,7 @@ async fn wall_time_budget_is_named_in_the_turn_ended_event() {
         max_iterations: 10,
         max_tokens: u64::MAX,
         max_wall_time: Duration::ZERO,
+        cache_read_price_ratio: 0.25,
     });
     let outcome = h
         .runtime

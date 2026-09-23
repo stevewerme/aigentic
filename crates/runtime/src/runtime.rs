@@ -18,14 +18,15 @@ use crate::mode::Mode;
 use crate::seams::SessionGrant;
 
 /// Per-turn defaults. `max_tokens` counts every call's input and output
-/// over the turn (cache reads at a tenth, see `support::budget_tokens`),
-/// so a growing uncached context spends it fast: the phase 3
+/// over the turn, cache reads at `cache_read_price_ratio` (a quarter by
+/// default), so a growing uncached context spends it fast: the phase 3
 /// acceptance used 225k over eleven iterations on one small ticket.
 /// `[profiles.<name>.budget]` in the config overrides any field.
 pub const DEFAULT_BUDGET: Budget = Budget {
     max_iterations: 50,
     max_tokens: 2_000_000,
     max_wall_time: Duration::from_secs(1800),
+    cache_read_price_ratio: 0.25,
 };
 
 /// When and how the runtime compacts. See docs/PLAN-phase2.md section 4.

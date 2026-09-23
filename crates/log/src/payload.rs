@@ -86,6 +86,18 @@ impl Usage {
         Self::from_core(u, true)
     }
 
+    /// The same numbers as a core usage, for arithmetic that the
+    /// harness (not the log) owns, such as the budget.
+    pub fn to_core(&self) -> aigentic_core::Usage {
+        aigentic_core::Usage {
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            cache_read_tokens: self.cache_read_tokens,
+            cache_write_tokens: self.cache_write_tokens,
+            reasoning_tokens: self.reasoning_tokens,
+        }
+    }
+
     fn from_core(u: aigentic_core::Usage, estimated: bool) -> Self {
         Self {
             input_tokens: u.input_tokens,
