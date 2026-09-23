@@ -18,8 +18,9 @@ description = "Open source agent harness in Rust"
 # threshold_fraction = 0.4       # of the model's window; over it, index + search_knowledge
 # max_hits = 5
 
-# [memory]
-# enabled = true
+# Off until #14: extraction files one-off task instructions as memory.
+[memory]
+enabled = false
 # every_n_turns = 1
 
 [pocock]
