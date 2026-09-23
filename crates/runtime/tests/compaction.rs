@@ -130,6 +130,7 @@ async fn two_hundred_turns_stay_under_budget() {
         max_result_bytes: 500,
         summary_max_output_tokens: 256,
         keep_last_calls: 12,
+        context_ceiling_tokens: 128_000,
     };
     let registry: aigentic_tools::ToolRegistry =
         vec![Box::new(EchoTool(calls)) as Box<dyn aigentic_core::Tool>].into();

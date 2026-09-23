@@ -58,10 +58,18 @@ impl Runtime {
         self.append(EventKind::Pinned, author, payload, None, observe)
     }
 
-    /// Tokens at which compaction triggers.
+    /// Tokens at which compaction triggers: the fraction of the window,
+    /// capped by the profile's absolute ceiling (issue #30). On a 1M
+    /// window the fraction alone would sit at 734k and never run; the
+    /// ceiling is what we are willing to pay for per call.
     pub fn window_line(&self) -> u64 {
-        let window = self.provider.capabilities().max_context_tokens as f64;
-        (window * f64::from(self.compaction.trigger_fraction)).round() as u64
+        let line = (self.provider.capabilities().max_context_tokens as f64
+            * f64::from(self.compaction.trigger_fraction))
+        .round() as u64;
+        match self.compaction.context_ceiling_tokens {
+            0 => line,
+            ceiling => line.min(ceiling),
+        }
     }
 
     /// Window fill: the last call's reported prompt size plus an estimate of

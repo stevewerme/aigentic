@@ -43,6 +43,10 @@ pub struct CompactionSettings {
     /// stubs the rest (issue #30). Failed results and the last result of
     /// each distinct tool always stay on top of these.
     pub keep_last_calls: usize,
+    /// What one call's context may cost, whatever the model's window:
+    /// compaction's trigger line and the in-turn sweep both aim under
+    /// it (issue #30). Zero means no ceiling, only the fraction.
+    pub context_ceiling_tokens: u64,
 }
 
 pub const DEFAULT_COMPACTION: CompactionSettings = CompactionSettings {
@@ -51,6 +55,7 @@ pub const DEFAULT_COMPACTION: CompactionSettings = CompactionSettings {
     max_result_bytes: 4096,
     summary_max_output_tokens: 2048,
     keep_last_calls: 12,
+    context_ceiling_tokens: 128_000,
 };
 
 /// One thread's runtime: the provider, the tool registry and the single

@@ -12,7 +12,7 @@
 //! prefix between sweeps. The originals stay in the log; the model gets
 //! a stub that says how to bring a result back.
 
-use aigentic_core::{Author, ContentBlock, EventKind};
+use aigentic_core::{Author, ContentBlock, Event, EventKind};
 use aigentic_log::{AssistantMessagePayload, ContextEvictedPayload, ToolResultPayload};
 
 use crate::{Runtime, RuntimeError, Signal};
@@ -81,9 +81,35 @@ impl Runtime {
         };
         // How far to evict: all but the last `keep_last_calls`, cut to
         // the block line so the next sweep lands on the next block.
-        let target = (calls.len().saturating_sub(self.compaction.keep_last_calls)
+        let mut target = (calls.len().saturating_sub(self.compaction.keep_last_calls)
             / EVICT_BLOCK_CALLS)
             * EVICT_BLOCK_CALLS;
+        // The ceiling (issue #30): what we are willing to pay for per
+        // call, whatever the window. When even the projection with
+        // `target` stubbed does not fit, evict deeper, a block at a
+        // time and never past the last block — then stop: the boundary
+        // holds until the context passes the ceiling again, so the
+        // cached prefix survives between sweeps.
+        let ceiling = self.compaction.context_ceiling_tokens;
+        if ceiling > 0 {
+            let floor = calls.len().saturating_sub(EVICT_BLOCK_CALLS);
+            target = target.max(evicted);
+            // Probe, a block at a time and never past the last block.
+            // The whole walk shares one scratch projection: the
+            // synthetic event is the last, so rewriting its payload
+            // re-probes without re-cloning the log.
+            let mut scratch: Option<Vec<Event>> = None;
+            while target < floor
+                && self.over_the_ceiling(
+                    &events,
+                    ceiling,
+                    target.checked_sub(1).map(|i| calls[i]),
+                    &mut scratch,
+                )?
+            {
+                target = (target + EVICT_BLOCK_CALLS).min(floor);
+            }
+        }
         if target <= evicted {
             return Ok(false);
         }
@@ -100,5 +126,48 @@ impl Runtime {
             observe,
         )?;
         Ok(true)
+    }
+
+    /// Whether the context, projected as the sweep would leave it with
+    /// the boundary at `through` (as it stands now, when `None`), still
+    /// does not fit under `ceiling`. A probe: the synthetic event is
+    /// projected, never stored, and the projection takes a boundary's
+    /// deepest reach, so probing at or below the current one reads the
+    /// current context. `scratch` carries the one cloned projection the
+    /// walk reuses across rungs; a rung at or below the current boundary
+    /// reads the log as it stands, so it clones nothing.
+    fn over_the_ceiling(
+        &self,
+        events: &[Event],
+        ceiling: u64,
+        through: Option<u64>,
+        scratch: &mut Option<Vec<Event>>,
+    ) -> Result<bool, RuntimeError> {
+        let context = match through {
+            None => crate::build_context(&self.prefix(), events)?,
+            Some(through_seq) => {
+                let projected = scratch.get_or_insert_with(|| {
+                    let mut projected = events.to_vec();
+                    let last = projected.last().expect("a turn with calls has events");
+                    projected.push(Event {
+                        id: ulid::Ulid::generate(),
+                        thread_id: last.thread_id,
+                        seq: last.seq + 1,
+                        kind: EventKind::ContextEvicted,
+                        author: Author::System,
+                        payload: serde_json::to_value(ContextEvictedPayload { through_seq })
+                            .expect("serialisable"),
+                        parent_event: None,
+                        created_at: last.created_at,
+                    });
+                    projected
+                });
+                let last = projected.last_mut().expect("the synthetic event");
+                last.payload = serde_json::to_value(ContextEvictedPayload { through_seq })
+                    .expect("serialisable");
+                crate::build_context(&self.prefix(), projected)?
+            }
+        };
+        Ok(self.provider.count_tokens(&context) > ceiling)
     }
 }

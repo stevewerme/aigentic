@@ -24,6 +24,9 @@ struct Building {
     seen: Seen,
     iteration: Mutex<u32>,
     calls: u32,
+    /// Lines in the read fixture and in each written file; sizes the
+    /// turn's material.
+    lines: usize,
 }
 
 fn estimate(context: &[Message]) -> u64 {
@@ -59,7 +62,7 @@ impl Provider for Building {
                     "write_file",
                     serde_json::json!({
                         "path": format!("out/{i}.txt"),
-                        "content": format!("file {i} line 0\n{}", "filler line\n".repeat(400)),
+                        "content": format!("file {i} line 0\n{}", "filler line\n".repeat(self.lines)),
                     }),
                 ),
                 _ => (
@@ -120,49 +123,71 @@ impl Approver for Yes {
     }
 }
 
-#[tokio::test]
-async fn a_two_hundred_call_turn_with_large_results_and_edits_stays_under_128k() {
+/// Runs one `Building` turn and returns (requests, sweep count).
+async fn run_turn(
+    calls: u32,
+    lines: usize,
+    settings: aigentic_runtime::CompactionSettings,
+) -> (Seen, usize, aigentic_runtime::Runtime) {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("out")).unwrap();
-    std::fs::write(dir.path().join("big.txt"), "seed line\n".repeat(3_000)).unwrap();
+    std::fs::write(dir.path().join("big.txt"), "seed line\n".repeat(lines)).unwrap();
     let seen: Seen = Arc::new(Mutex::new(Vec::new()));
     let provider = Building {
         seen: seen.clone(),
         iteration: Mutex::new(0),
-        calls: 200,
+        calls,
+        lines,
     };
     let registry = aigentic_tools::ToolRegistry::builtin(aigentic_tools::Workdir::new(dir.path()));
     let log = ThreadLog::open(dir.path(), ulid::Ulid::generate()).unwrap();
+    // The log outlives the helper; the tempdir is kept, not dropped.
+    let _kept = dir.keep();
     let mut rt = Runtime::new(Box::new(provider), registry, log, AgentId("worker".into()))
         .with_approver(Box::new(Yes))
-        .with_compaction(DEFAULT_COMPACTION)
+        .with_compaction(settings)
         .with_budget(aigentic_core::Budget {
-            max_iterations: 220,
+            max_iterations: calls + 20,
             max_tokens: u64::MAX,
             max_wall_time: std::time::Duration::from_secs(300),
         })
         .with_model_label("scripted");
-
+    let mut sweeps = 0;
     let outcome = rt
         .run_turn(
             Author::User(aigentic_core::UserId("steve".into())),
             vec![ContentBlock::Text("build it".into())],
-            &mut |_| {},
+            &mut |s| {
+                if let aigentic_runtime::Signal::Event(e) = s
+                    && e.kind == EventKind::ContextEvicted
+                {
+                    sweeps += 1;
+                }
+            },
         )
         .await
         .unwrap();
-    assert_eq!(outcome.reason, "done");
-    assert_eq!(outcome.iterations, 201);
+    assert_eq!(outcome.reason, "done", "{} iterations", outcome.iterations);
+    (seen, sweeps, rt)
+}
 
-    let events = rt.log().read_all().unwrap();
-    let sweeps = events
+fn flat_text(messages: &[Message]) -> String {
+    messages
         .iter()
-        .filter(|e| e.kind == EventKind::ContextEvicted)
-        .count();
-    assert!(
-        (20..30).contains(&sweeps),
-        "one sweep per block of 8 calls past the last 12, got {sweeps}"
-    );
+        .flat_map(|m| m.blocks.iter())
+        .map(|b| match b {
+            ContentBlock::Text(t) => t.clone(),
+            ContentBlock::ToolResult(r) => r.content.clone(),
+            ContentBlock::ToolCall(c) => c.args.to_string(),
+            _ => String::new(),
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_two_hundred_call_turn_with_large_results_and_edits_stays_under_128k() {
+    let (seen, sweeps, mut rt) = run_turn(200, 400, DEFAULT_COMPACTION).await;
+    assert!((20..30).contains(&sweeps));
 
     // Every call stayed under the ceiling of tokens we are willing to
     // pay for, and the stubs did the shrinking.
@@ -173,17 +198,7 @@ async fn a_two_hundred_call_turn_with_large_results_and_edits_stays_under_128k()
             let size = estimate(messages);
             assert!(size < 128_000, "request {i} was {size} tokens");
         }
-        let last = requests.last().unwrap();
-        let flat: String = last
-            .iter()
-            .flat_map(|m| m.blocks.iter())
-            .map(|b| match b {
-                ContentBlock::Text(t) => t.clone(),
-                ContentBlock::ToolResult(r) => r.content.clone(),
-                ContentBlock::ToolCall(c) => c.args.to_string(),
-                _ => String::new(),
-            })
-            .collect();
+        let flat = flat_text(requests.last().unwrap());
         // Results stub to one line each; 200 calls leave at most the
         // last 12 plus the last of each distinct tool in full.
         let stubs = flat.matches("dropped from context; re-run it").count();
@@ -208,4 +223,52 @@ async fn a_two_hundred_call_turn_with_large_results_and_edits_stays_under_128k()
         assert!(size < 128_000, "the closed turn still projects at {size}");
         assert_eq!(last.last().map(|m| m.role), Some(Role::User));
     }
+}
+
+#[tokio::test]
+async fn the_ceiling_drives_the_sweep_deeper_than_the_last_calls_window() {
+    // A write costs about 8.5k tokens and a read about 3.9k, so the
+    // last 12 calls sit over a 44k ceiling while the last block of
+    // eight — which the sweep never stubs past — fits under it: the
+    // sweep must evict into the last-calls window, block by block,
+    // and never past the last block.
+    let (seen, _sweeps, _rt) = run_turn(
+        60,
+        1_400,
+        aigentic_runtime::CompactionSettings {
+            context_ceiling_tokens: 44_000,
+            ..DEFAULT_COMPACTION
+        },
+    )
+    .await;
+    let requests = seen.lock().unwrap();
+    for (i, messages) in requests.iter().enumerate() {
+        let size = estimate(messages);
+        assert!(size < 44_000, "request {i} was {size} tokens");
+    }
+    let flat = flat_text(requests.last().unwrap());
+    // Deeper than the last-calls rule alone would go (48 of 60): the
+    // ceiling pushed the boundary past it.
+    let stubs = flat.matches("dropped from context; re-run it").count();
+    assert!(stubs >= 50, "only {stubs} calls stubbed");
+}
+
+#[tokio::test]
+async fn the_cached_prefix_is_stable_between_sweeps() {
+    let (seen, sweeps, _rt) = run_turn(40, 300, DEFAULT_COMPACTION).await;
+    assert!(sweeps >= 3, "the turn must sweep to test stability");
+    let requests = seen.lock().unwrap();
+    // Between sweeps the context only grows at the end: each request is
+    // the previous one plus what the turn appended, so the provider's
+    // cached prefix survives. A sweep is the only thing allowed to break
+    // it, and it breaks exactly the one request that follows it.
+    let mut broken = 0;
+    for pair in requests.windows(2) {
+        let (before, after) = (&pair[0], &pair[1]);
+        let extends = after.len() >= before.len() && after[..before.len()] == before[..];
+        if !extends {
+            broken += 1;
+        }
+    }
+    assert_eq!(broken, sweeps, "only sweeps may break the prefix");
 }

@@ -313,13 +313,21 @@ impl Config {
 
 impl Profile {
     fn validate(&self) -> Result<(), ConfigError> {
-        if let Some(c) = &self.compaction
-            && let Some(f) = c.trigger_fraction
-            && !(0.05..=0.95).contains(&f)
-        {
-            return Err(ConfigError::msg(format!(
-                "compaction.trigger_fraction must be between 0.05 and 0.95, got {f}"
-            )));
+        if let Some(c) = &self.compaction {
+            if let Some(f) = c.trigger_fraction
+                && !(0.05..=0.95).contains(&f)
+            {
+                return Err(ConfigError::msg(format!(
+                    "compaction.trigger_fraction must be between 0.05 and 0.95, got {f}"
+                )));
+            }
+            if let Some(n) = c.context_ceiling_tokens
+                && n < 8_192
+            {
+                return Err(ConfigError::msg(
+                    "compaction.context_ceiling_tokens must be at least 8192",
+                ));
+            }
         }
         match self.provider {
             ProviderKind::OpenaiCompat => {
@@ -504,6 +512,8 @@ cache = false
 [profiles.only.compaction]
 trigger_fraction = 0.5
 keep_turns = 3
+keep_last_calls = 20
+context_ceiling_tokens = 96_000
 "#,
         )
         .unwrap();
@@ -512,18 +522,25 @@ keep_turns = 3
         assert!(!p.build_provider("k".into()).capabilities().supports_caching);
         let s = p.compaction_settings();
         assert_eq!((s.trigger_fraction, s.keep_turns), (0.5, 3));
+        assert_eq!((s.keep_last_calls, s.context_ceiling_tokens), (20, 96_000));
         assert_eq!(s.max_result_bytes, DEFAULT_COMPACTION.max_result_bytes);
+        let bare = Config::parse(FLAT)
+            .unwrap()
+            .select(None)
+            .unwrap()
+            .1
+            .compaction_settings();
         assert_eq!(
-            Config::parse(FLAT)
-                .unwrap()
-                .select(None)
-                .unwrap()
-                .1
-                .compaction_settings(),
-            DEFAULT_COMPACTION
+            (bare.keep_last_calls, bare.context_ceiling_tokens),
+            (
+                DEFAULT_COMPACTION.keep_last_calls,
+                DEFAULT_COMPACTION.context_ceiling_tokens
+            ),
+            "an absent [compaction] keeps the defaults"
         );
         assert!(Config::parse("[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n[profiles.a.compaction]\ntrigger_fraction = 2.0\n").is_err());
         assert!(Config::parse("[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n[profiles.a.compaction]\nnope = 1\n").is_err());
+        assert!(Config::parse("[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n[profiles.a.compaction]\ncontext_ceiling_tokens = 1024\n").is_err());
         assert!(Config::parse("[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n[profiles.a.budget]\nnope = 1\n").is_err());
         let c = Config::parse("[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n[global]\ninstructions = \"/x/i.md\"\n[tools]\ndenied = [\"mcp.*\"]\n[skills]\ndenied = [\"wizard\"]\n").unwrap();
         assert_eq!(

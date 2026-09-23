@@ -230,6 +230,9 @@ pub struct CompactionConfig {
     /// stubs the rest (issue #30).
     #[serde(default)]
     pub keep_last_calls: Option<usize>,
+    /// What one call's context may cost, whatever the window (issue #30).
+    #[serde(default)]
+    pub context_ceiling_tokens: Option<u64>,
 }
 
 impl CompactionConfig {
@@ -242,6 +245,9 @@ impl CompactionConfig {
                 .summary_max_output_tokens
                 .unwrap_or(base.summary_max_output_tokens),
             keep_last_calls: self.keep_last_calls.unwrap_or(base.keep_last_calls),
+            context_ceiling_tokens: self
+                .context_ceiling_tokens
+                .unwrap_or(base.context_ceiling_tokens),
         }
     }
 
@@ -464,6 +470,7 @@ max_tokens = 3000000
 
 [compaction]
 keep_turns = 4
+context_ceiling_tokens = 96_000
 
 [tools]
 allow = ["read_file", "bash"]
@@ -513,6 +520,14 @@ enabled = ["implement"]
             DEFAULT_BUDGET.max_iterations
         );
         assert_eq!(p.compaction.as_ref().unwrap().settings().keep_turns, 4);
+        assert_eq!(
+            p.compaction
+                .as_ref()
+                .unwrap()
+                .settings()
+                .context_ceiling_tokens,
+            96_000
+        );
         assert_eq!(p.tools.allow, vec!["read_file", "bash"]);
         assert_eq!(p.knowledge.threshold_fraction, 0.3);
         assert_eq!(p.knowledge.max_hits, 5);
