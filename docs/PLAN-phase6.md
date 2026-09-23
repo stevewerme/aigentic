@@ -587,6 +587,15 @@ projects, the same one a bare `/project use` opens.
     description alone got zero calls from GLM 5.3 on an explicit
     four-step task; the block got four and five). Its purpose is to keep a turn going until the
     work is finished and to show where it is.
+8d. `tui: the look` — added after a side-by-side with Claude Code and
+    Codex: the person's message as a shaded full-width block, replies
+    marked with a clay dot and hanging under it, a tool call as one line
+    with a green or red dot and a line count (a failure shows its last
+    three lines), reads listed as `Read <path> · N lines`, a blank line
+    between blocks of different kinds, the composer in a rounded box,
+    housekeeping (title, memory, mode) in the footer, word wrapping, and
+    a welcome with a clay ASCII logo. Pipes and the pager keep the
+    plain rendering.
 9. `runtime, server: utility profile and titles` — `utility_profile`
    in config, `Runtime::utility`, `title.rs`, `thread_renamed`,
    `/rename`, `Push::Titled`; memory extraction moved to the utility

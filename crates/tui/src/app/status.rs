@@ -11,6 +11,8 @@ use aigentic_api::ThreadState;
 pub struct Status {
     /// The thread's project.
     pub project: String,
+    /// The thread's title, when it has one.
+    pub title: Option<String>,
     pub mode: String,
     /// (tokens in the window, the window), from `Notice::Usage`.
     pub usage: Option<(u64, u64)>,
@@ -32,9 +34,18 @@ impl Status {
         Some((used.saturating_mul(100) / window).min(100))
     }
 
-    /// `manual · vendela · 31% context · 12s · queued 1`
+    /// `vendela · Crate count · manual · 31% of 98k context · queued 1`
     pub fn line(&self) -> String {
-        let mut parts = vec![self.mode.clone(), self.project.clone()];
+        let mut parts = vec![self.project.clone()];
+        if let Some(t) = &self.title {
+            let short: String = t.chars().take(TITLE_CHARS).collect();
+            parts.push(if t.chars().count() > TITLE_CHARS {
+                format!("{short}…")
+            } else {
+                short
+            });
+        }
+        parts.push(self.mode.clone());
         match (self.context_percent(), self.usage) {
             (Some(p), Some((_, window))) => {
                 parts.push(format!("{p}% of {} context", tokens_short(window)))
@@ -70,6 +81,9 @@ impl Status {
     }
 }
 
+/// How much of the title the footer shows.
+const TITLE_CHARS: usize = 40;
+
 /// `33k`, `1.0M`: the window size, so a defaulted window shows.
 pub fn tokens_short(n: u64) -> String {
     if n >= 1_000_000 {
@@ -101,6 +115,7 @@ mod tests {
     fn the_line_reads_left_to_right() {
         let mut s = Status {
             project: "vendela".into(),
+            title: None,
             mode: "manual".into(),
             usage: Some((31_000, 100_000)),
             elapsed: Some(Duration::from_secs(12)),
@@ -109,12 +124,14 @@ mod tests {
         };
         assert_eq!(
             s.line(),
-            "manual · vendela · 31% of 98k context · 12s · queued 1"
+            "vendela · manual · 31% of 98k context · 12s · queued 1"
         );
         s.elapsed = None;
         s.queued = 0;
         s.usage = None;
-        assert_eq!(s.line(), "manual · vendela · context ?");
+        assert_eq!(s.line(), "vendela · manual · context ?");
+        s.title = Some("A title".into());
+        assert_eq!(s.line(), "vendela · A title · manual · context ?");
         s.usage = Some((250_000, 100_000));
         assert_eq!(s.context_percent(), Some(100));
     }

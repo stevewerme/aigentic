@@ -23,15 +23,16 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::app::composer::{Composer, MAX_ROWS};
 
-/// The viewport's height starts here: the composer and the status line.
-pub const MIN_ROWS: u16 = 2;
+/// The viewport's height starts here: the boxed composer and the status.
+pub const MIN_ROWS: u16 = 4;
 /// Rows of the changing part (streaming text, a running tool, pending
 /// reads) the viewport shows at most; the rest is in the scrollback.
 pub const MAX_ACTIVE_ROWS: usize = 12;
 
 /// The rows the pane needs: what `layout` draws, the active part capped.
 pub fn needed_rows(pane: &Pane<'_>) -> u16 {
-    let composer = pane.composer.lines().len().min(MAX_ROWS);
+    // The draft's rows and the box's two borders.
+    let composer = pane.composer.lines().len().min(MAX_ROWS) + 2;
     let rows = pane.active.len().min(MAX_ACTIVE_ROWS)
         + pane.block.len()
         + pane.popup.len()
@@ -346,32 +347,42 @@ pub fn layout(pane: &Pane<'_>, area: Rect) -> (Vec<Line<'static>>, Option<(u16, 
     let height = area.height as usize;
     let mut rows: Vec<Line<'static>> = Vec::new();
 
-    // The composer: `> ` on the first line, two spaces after.
+    // The composer, in a rounded box: `> ` on the first line, two spaces
+    // after, the text between `│ ` and ` │`.
     let all = pane.composer.lines();
     let (crow, ccol) = pane.composer.cursor();
     let shown = all.len().min(MAX_ROWS);
     // Keep the cursor's row visible when the draft is taller than shown.
     let first = if crow >= shown { crow + 1 - shown } else { 0 };
-    let mut composer_rows: Vec<Line<'static>> = Vec::new();
+    let frame = Style::default().add_modifier(Modifier::DIM);
+    let inner = width.saturating_sub(6);
+    let rule = "─".repeat(width.saturating_sub(2));
+    let mut composer_rows: Vec<Line<'static>> =
+        vec![Line::from(Span::styled(format!("╭{rule}╮"), frame))];
     let mut cursor = None;
     for (i, line) in all.iter().enumerate().skip(first).take(shown) {
         let prefix = if i == 0 { "> " } else { "  " };
-        let visible: String = fit(line, width.saturating_sub(2));
+        let visible: String = fit(line, inner);
+        let pad = inner.saturating_sub(display_width(&visible));
         composer_rows.push(Line::from(vec![
+            Span::styled("│ ", frame),
             Span::styled(prefix, Style::default().fg(Color::Cyan)),
             Span::raw(visible),
+            Span::raw(" ".repeat(pad)),
+            Span::styled(" │", frame),
         ]));
         if i == crow {
-            let x = 2 + display_width(&line.chars().take(ccol).collect::<String>());
+            let x = 4 + display_width(&line.chars().take(ccol).collect::<String>());
             cursor = Some((
-                u16::try_from(x.min(width.saturating_sub(1))).unwrap_or(u16::MAX),
+                u16::try_from(x.min(width.saturating_sub(3))).unwrap_or(u16::MAX),
                 u16::try_from(composer_rows.len() - 1).unwrap_or(u16::MAX),
             ));
         }
     }
+    composer_rows.push(Line::from(Span::styled(format!("╰{rule}╯"), frame)));
 
     let status = Line::from(Span::styled(
-        fit(pane.status, width),
+        fit(&format!("  {}", pane.status), width),
         Style::default().add_modifier(Modifier::DIM),
     ));
     let hint = pane.hint.map(|h| {
@@ -463,32 +474,53 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
 }
 
 /// Wrap a styled line at the width, keeping each span's style across
-/// the break. An empty line is one empty row.
+/// the break. Breaks at the last space that fits, dropping it; a word
+/// longer than the width breaks where the column runs out. An empty line
+/// is one empty row.
 pub fn wrap_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
     let width = width.max(1);
-    let mut rows: Vec<Line<'static>> = Vec::new();
-    let mut current: Vec<Span<'static>> = Vec::new();
+    let cells: Vec<(char, Style)> = line
+        .spans
+        .iter()
+        .flat_map(|s| s.content.chars().map(move |c| (c, s.style)))
+        .collect();
+    let mut rows: Vec<Vec<(char, Style)>> = Vec::new();
+    let mut row: Vec<(char, Style)> = Vec::new();
     let mut w = 0;
-    for span in &line.spans {
-        let mut piece = String::new();
-        for c in span.content.chars() {
-            let cw = c.width().unwrap_or(0);
-            if w + cw > width && w > 0 {
-                if !piece.is_empty() {
-                    current.push(Span::styled(std::mem::take(&mut piece), span.style));
+    for cell in cells {
+        let cw = cell.0.width().unwrap_or(0);
+        if w + cw > width && !row.is_empty() {
+            match row.iter().rposition(|(c, _)| *c == ' ') {
+                // Break after the last word that fits; the space goes.
+                Some(space) if space > 0 && cell.0 != ' ' => {
+                    let rest = row.split_off(space + 1);
+                    row.pop();
+                    rows.push(std::mem::take(&mut row));
+                    row = rest;
                 }
-                rows.push(Line::from(std::mem::take(&mut current)));
-                w = 0;
+                _ => rows.push(std::mem::take(&mut row)),
             }
-            piece.push(c);
-            w += cw;
+            w = row.iter().map(|(c, _)| c.width().unwrap_or(0)).sum();
+            if cell.0 == ' ' && row.is_empty() {
+                continue; // a break at a space: no leading space
+            }
         }
-        if !piece.is_empty() {
-            current.push(Span::styled(piece, span.style));
-        }
+        row.push(cell);
+        w += cw;
     }
-    rows.push(Line::from(current));
-    rows
+    rows.push(row);
+    rows.into_iter()
+        .map(|cells| {
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            for (c, style) in cells {
+                match spans.last_mut() {
+                    Some(last) if last.style == style => last.content.to_mut().push(c),
+                    _ => spans.push(Span::styled(c.to_string(), style)),
+                }
+            }
+            Line::from(spans)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -544,13 +576,14 @@ mod tests {
             popup: &[],
             activity: None,
         };
-        let (rows, cursor) = render(&pane, 40, 5);
+        let (rows, cursor) = render(&pane, 20, 6);
         assert_eq!(rows[0], "");
         assert_eq!(rows[1], "");
-        assert_eq!(rows[2], "");
-        assert_eq!(rows[3], "> hello");
-        assert_eq!(rows[4], "manual · p · context ?");
-        assert_eq!(cursor, Some((7, 3)));
+        assert_eq!(rows[2], "╭──────────────────╮");
+        assert_eq!(rows[3], "│ > hello          │");
+        assert_eq!(rows[4], "╰──────────────────╯");
+        assert_eq!(rows[5], "  manual · p · conte");
+        assert_eq!(cursor, Some((9, 3)));
     }
 
     #[test]
@@ -569,13 +602,16 @@ mod tests {
             popup: &[],
             activity: None,
         };
-        // 4 rows: one tail row fits above hint, composer and status.
-        let (rows, cursor) = render(&pane, 10, 4);
+        // 6 rows: one tail row fits above the hint, the boxed composer
+        // and the status.
+        let (rows, cursor) = render(&pane, 10, 6);
         assert_eq!(rows[0], "xyz");
         assert_eq!(rows[1], "queued 1 ·");
-        assert_eq!(rows[2], ">");
-        assert_eq!(rows[3], "s");
-        assert_eq!(cursor, Some((2, 2)));
+        assert_eq!(rows[2], "╭────────╮");
+        assert_eq!(rows[3], "│ >      │");
+        assert_eq!(rows[4], "╰────────╯");
+        assert_eq!(rows[5], "  s");
+        assert_eq!(cursor, Some((4, 3)));
     }
 
     #[test]
@@ -593,10 +629,10 @@ mod tests {
             popup: &[],
             activity: None,
         };
-        let (rows, cursor) = render(&pane, 20, 4);
-        assert_eq!(rows[1], "> one");
-        assert_eq!(rows[2], "  two");
-        assert_eq!(cursor, Some((5, 1)));
+        let (rows, cursor) = render(&pane, 20, 5);
+        assert_eq!(rows[1], "│ > one            │");
+        assert_eq!(rows[2], "│   two            │");
+        assert_eq!(cursor, Some((7, 1)));
     }
 
     #[test]
@@ -611,7 +647,7 @@ mod tests {
             popup: &[],
             activity: None,
         };
-        assert_eq!(needed_rows(&idle), 2);
+        assert_eq!(needed_rows(&idle), 4, "one draft row, its box, the status");
         let active: Vec<Line<'static>> = (0..30).map(|i| Line::raw(i.to_string())).collect();
         let block = vec![Line::raw("b1"), Line::raw("b2")];
         let busy = Pane {
@@ -623,7 +659,7 @@ mod tests {
             popup: &[],
             activity: None,
         };
-        assert_eq!(needed_rows(&busy) as usize, MAX_ACTIVE_ROWS + 2 + 1 + 1 + 1);
+        assert_eq!(needed_rows(&busy) as usize, MAX_ACTIVE_ROWS + 2 + 1 + 3 + 1);
     }
 
     #[test]
@@ -641,6 +677,22 @@ mod tests {
         assert_eq!(texts, vec!["abcd", "efgh"]);
         assert_eq!(rows[1].spans[0].style.fg, Some(Color::Red));
         assert_eq!(wrap_line(&Line::raw(""), 4).len(), 1);
+    }
+
+    #[test]
+    fn wrap_line_breaks_at_words_and_long_words_by_column() {
+        let rows = |t: &str, w: usize| -> Vec<String> {
+            wrap_line(&Line::raw(t.to_owned()), w)
+                .iter()
+                .map(|r| r.spans.iter().map(|s| s.content.as_ref()).collect())
+                .collect()
+        };
+        assert_eq!(
+            rows("the current plan is", 12),
+            vec!["the current", "plan is"]
+        );
+        assert_eq!(rows("abcdefghij kl", 4), vec!["abcd", "efgh", "ij", "kl"]);
+        assert_eq!(rows("", 4), vec![""]);
     }
 
     #[test]

@@ -12,6 +12,7 @@ pub mod composer;
 pub mod diff;
 pub mod engine;
 pub mod keymap;
+pub mod look;
 pub mod markdown;
 pub mod pager;
 pub mod status;
@@ -103,6 +104,9 @@ struct ShellOut {
     fenced: bool,
     /// A text to page through as soon as the loop gets to it.
     page: Option<(String, String)>,
+    /// The kind of the last committed block, for spacing and the reply
+    /// marker.
+    last: Option<look::Group>,
 }
 
 impl ShellOut {
@@ -116,12 +120,20 @@ impl ShellOut {
             tail: String::new(),
             fenced: false,
             page: None,
+            last: None,
         }
     }
 
     fn commit(&mut self, cell: Cell) {
         let width = self.shell.width();
-        self.pending.extend(cell.styled(width));
+        let group = look::group(&cell);
+        // A blank line between blocks of different kinds.
+        if self.last.is_some_and(|last| last != group) {
+            self.pending.push(Line::raw(""));
+        }
+        let first = self.last != Some(look::Group::Assistant);
+        self.pending.extend(look::render(&cell, first, width));
+        self.last = Some(group);
         self.transcript.push(cell);
         if self.transcript.len() > TRANSCRIPT_KEEP {
             self.transcript.remove(0);
@@ -147,13 +159,25 @@ impl ShellOut {
         let width = self.shell.width();
         let mut lines = Vec::new();
         if !self.explored.is_empty() {
-            lines.extend(Cell::Explored(self.explored.clone()).styled(width));
+            lines.extend(look::render(
+                &Cell::Explored(self.explored.clone()),
+                false,
+                width,
+            ));
         }
-        if let Some(cell) = &self.running {
-            lines.extend(cell.styled(width));
+        if let Some(Cell::Tool { name, summary, .. }) = &self.running {
+            lines.extend(look::running(name, summary, width));
         }
         if !self.tail.is_empty() {
-            lines.extend(wrap_line(&markdown::line(&self.tail, self.fenced), width));
+            let first = self.last != Some(look::Group::Assistant);
+            let tail = Cell::Assistant {
+                text: self.tail.clone(),
+                fenced: self.fenced,
+            };
+            if first && self.last.is_some() && lines.is_empty() {
+                lines.push(Line::raw(""));
+            }
+            lines.extend(look::render(&tail, first, width));
         }
         lines
     }
@@ -163,6 +187,10 @@ impl Printer for ShellOut {
     fn line(&mut self, text: &str) {
         self.flush_explored();
         self.commit(Cell::Note(text.to_owned()));
+    }
+
+    fn quiet(&mut self, _text: &str) {
+        // Housekeeping (a title, memory written) lives in the footer.
     }
 
     fn tasks(&mut self, _tasks: &[aigentic_runtime::harness_tools::Task]) {
@@ -211,13 +239,14 @@ impl Printer for ShellOut {
                     name,
                     summary,
                     state,
-                    ..
+                    output,
                 },
                 true,
             ) => {
                 self.running = None;
                 if is_read_tool(name) && *state == ToolState::Ok {
-                    self.explored.push(format!("{name} {summary}"));
+                    self.explored
+                        .push(look::explored_entry(name, summary, output));
                 } else {
                     self.flush_explored();
                     self.commit(cell);
@@ -379,6 +408,7 @@ async fn run_shell(
         if let Some(p) = engine.project() {
             status.project = p.to_owned();
         }
+        status.title = engine.title().map(str::to_owned);
         status.usage = engine.usage();
         // The turn line carries the clock while a turn runs.
         status.elapsed = None;
@@ -386,7 +416,7 @@ async fn run_shell(
             let width = out.shell.width();
             let text = format!("{} · {} · esc interrupts", t.activity(), t.figures());
             let line = Line::from(vec![
-                Span::styled("◦ ", Style::default().fg(Color::Yellow)),
+                Span::styled("✻ ", Style::default().fg(look::CLAY)),
                 Span::styled(text, Style::default().add_modifier(Modifier::DIM)),
             ]);
             wrap_line(&line, width).into_iter().next().unwrap_or(line)

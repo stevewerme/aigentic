@@ -107,7 +107,7 @@ impl TurnStats {
         }
     }
 
-    /// `1m 12s · 4 tools · ↑ 42k (38k cached) · ↓ 1.8k`
+    /// `1m 12s · 4 tools · 42k in, 38k cached · 1.8k out`
     pub fn figures(&self) -> String {
         let mut parts = vec![crate::app::status::elapsed_short(self.started.elapsed())];
         match self.tools {
@@ -116,15 +116,17 @@ impl TurnStats {
             n => parts.push(format!("{n} tools")),
         }
         if self.prompt > 0 {
-            let cached = if self.cached > 0 {
-                format!(" ({} cached)", count_short(self.cached))
+            let cached = if self.cached >= self.prompt {
+                ", all cached".to_owned()
+            } else if self.cached > 0 {
+                format!(", {} cached", count_short(self.cached))
             } else {
                 String::new()
             };
-            parts.push(format!("↑ {}{cached}", count_short(self.prompt)));
+            parts.push(format!("{} in{cached}", count_short(self.prompt)));
         }
         if self.output > 0 {
-            parts.push(format!("↓ {}", count_short(self.output)));
+            parts.push(format!("{} out", count_short(self.output)));
         }
         parts.join(" · ")
     }
@@ -168,6 +170,11 @@ pub trait Printer {
         for l in block.plain() {
             self.line(&l);
         }
+    }
+    /// Housekeeping (a title, memory written): a pipe prints it, a shell
+    /// keeps it out of the transcript.
+    fn quiet(&mut self, text: &str) {
+        self.line(text);
     }
     /// The checklist changed. A pipe prints it; a shell draws it from
     /// the engine instead.
@@ -230,6 +237,8 @@ pub struct ClientRepl {
     /// The project the thread moved to, once it has; the shell's status
     /// line shows it over the one it started in.
     project: Option<String>,
+    /// The thread's title, once one is recorded while this client is on.
+    title: Option<String>,
     /// The model's checklist from its last `update_tasks`, until it is all
     /// done or the turn ends.
     tasks: Vec<aigentic_runtime::harness_tools::Task>,
@@ -267,6 +276,7 @@ impl ClientRepl {
             block: None,
             turn: None,
             project: None,
+            title: None,
             tasks: Vec::new(),
             task_calls: std::collections::HashSet::new(),
             usage: None,
@@ -595,6 +605,10 @@ impl ClientRepl {
         self.answered(r, out);
     }
 
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
+
     /// The project the thread last moved to, if it has.
     pub fn project(&self) -> Option<&str> {
         self.project.as_deref()
@@ -759,7 +773,7 @@ impl ClientRepl {
             }
             Notice::Mode { mode, .. } => {
                 self.mode = mode.clone();
-                out.line(&format!("[mode {mode}]"));
+                out.quiet(&format!("[mode {mode}]"));
             }
             Notice::State { state, .. } => {
                 self.flush_partial(out);
@@ -1018,7 +1032,7 @@ impl ClientRepl {
                     serde_json::from_value::<MemoryExtractedPayload>(event.payload.clone())
                     && !p.written.is_empty()
                 {
-                    out.line(&format!("[memory: {} lines written]", p.written.len()));
+                    out.quiet(&format!("[memory: {} lines written]", p.written.len()));
                 }
             }
             EventKind::ProjectSwitched => {
@@ -1048,7 +1062,8 @@ impl ClientRepl {
                     aigentic_runtime::aigentic_log::ThreadRenamedPayload,
                 >(event.payload.clone())
                 {
-                    out.line(&format!("[title: {}]", p.title));
+                    out.quiet(&format!("[title: {}]", p.title));
+                    self.title = Some(p.title);
                 }
             }
             EventKind::Pinned | EventKind::PermissionRequested | EventKind::ThreadStarted => {}
@@ -2000,7 +2015,10 @@ mod tests {
         t.output = 1_840;
         t.current = Some("bash cargo test".into());
         let f = t.figures();
-        assert!(f.ends_with("4 tools · ↑ 42k (38k cached) · ↓ 1.8k"), "{f}");
+        assert!(
+            f.ends_with("4 tools · 42k in, 38k cached · 1.8k out"),
+            "{f}"
+        );
         assert_eq!(t.activity(), "running bash cargo test");
         assert_eq!(count_short(950), "950");
         assert_eq!(count_short(1_300_000), "1.3M");

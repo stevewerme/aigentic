@@ -479,36 +479,76 @@ async fn main() -> anyhow::Result<()> {
         std::process::exit(outcome.code);
     }
 
-    println!(
-        "aigentic · {} · {} as {} ({}) · project {project_name}{}",
-        welcome.server,
-        embedded.as_ref().map_or_else(
-            || cli.server.clone().unwrap_or_default(),
-            |_| "embedded daemon".into()
-        ),
-        welcome.user,
-        role.as_deref().unwrap_or("no role"),
-        if mode == "manual" {
-            String::new()
-        } else {
-            format!(" · mode {mode}")
-        }
+    let where_ = embedded.as_ref().map_or_else(
+        || cli.server.clone().unwrap_or_default(),
+        |_| "embedded daemon".into(),
     );
-    if cli.thread.is_some() {
-        println!("thread {thread_id} resumed with {} events", events.len());
-        for line in app::engine::recent_lines(&events, 3) {
-            println!("  {line}");
-        }
+    let mode_part = if mode == "manual" {
+        String::new()
     } else {
-        println!("new thread {thread_id} (resume with --thread {thread_id})");
-    }
-    if let ThreadState::Running { by, queued } = &state {
-        println!(
-            "[a turn is running for {}; {queued} message(s) queued]",
+        format!(" · mode {mode}")
+    };
+    let running = match &state {
+        ThreadState::Running { by, queued } => Some(format!(
+            "a turn is running for {}; {queued} message(s) queued",
             app::engine::author_name(by)
+        )),
+        _ => None,
+    };
+    use std::io::IsTerminal;
+    if std::io::stdout().is_terminal() && std::io::stdin().is_terminal() {
+        // At a terminal: the logo and three short lines.
+        let mut lines = vec![format!(
+            "{} · {} ({}) · project {project_name}{mode_part}{}",
+            welcome.server,
+            welcome.user,
+            role.as_deref().unwrap_or("no role"),
+            if embedded.is_some() {
+                String::new()
+            } else {
+                format!(" · {where_}")
+            }
+        )];
+        if cli.thread.is_some() {
+            lines.push(format!("resumed {thread_id} · {} events", events.len()));
+            for line in app::engine::recent_lines(&events, 3) {
+                lines.push(format!("  {line}"));
+            }
+        } else {
+            lines.push(format!(
+                "new thread · resume later with --thread {thread_id}"
+            ));
+        }
+        if let Some(r) = &running {
+            lines.push(r.clone());
+        }
+        lines.push(
+            "/ commands · @ files · shift-enter new line · esc interrupts · ctrl-t transcript"
+                .into(),
+        );
+        print!("{}", app::look::welcome(&lines));
+    } else {
+        println!(
+            "aigentic · {} · {where_} as {} ({}) · project {project_name}{mode_part}",
+            welcome.server,
+            welcome.user,
+            role.as_deref().unwrap_or("no role"),
+        );
+        if cli.thread.is_some() {
+            println!("thread {thread_id} resumed with {} events", events.len());
+            for line in app::engine::recent_lines(&events, 3) {
+                println!("  {line}");
+            }
+        } else {
+            println!("new thread {thread_id} (resume with --thread {thread_id})");
+        }
+        if let Some(r) = &running {
+            println!("[{r}]");
+        }
+        println!(
+            "/help lists commands; /project shows the layers; /who the participants; /quit exits"
         );
     }
-    println!("/help lists commands; /project shows the layers; /who the participants; /quit exits");
 
     // User-invoked skills for slash dispatch: the daemon's skills report
     // lists them; the client keeps the names.
