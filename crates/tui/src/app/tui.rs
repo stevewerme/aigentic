@@ -24,14 +24,14 @@ use unicode_width::UnicodeWidthChar;
 use crate::app::composer::{Composer, MAX_ROWS};
 
 /// The viewport's height starts here: the boxed composer, the status
-/// and the rule that marks where the live area begins.
+/// and the blank row that ends the transcript.
 pub const MIN_ROWS: u16 = 5;
 /// Rows of the changing part (streaming text, a running tool, pending
 /// reads) the viewport shows at most; the rest is in the scrollback.
 pub const MAX_ACTIVE_ROWS: usize = 12;
 
 /// The rows the pane needs: what `layout` draws, the active part
-/// capped, plus the rule that ends the transcript.
+/// capped, plus the blank row that ends the transcript.
 pub fn needed_rows(pane: &Pane<'_>) -> u16 {
     // The draft's rows and the box's two borders.
     let composer = pane.composer.lines().len().min(MAX_ROWS) + 2;
@@ -41,7 +41,7 @@ pub fn needed_rows(pane: &Pane<'_>) -> u16 {
         + usize::from(pane.hint.is_some())
         + usize::from(pane.activity.is_some())
         + composer
-        // The rule that ends the transcript, and the status line.
+        // The blank row that ends the transcript, and the status line.
         + 2;
     u16::try_from(rows).unwrap_or(u16::MAX)
 }
@@ -412,17 +412,15 @@ pub fn layout(pane: &Pane<'_>, area: Rect) -> (Vec<Line<'static>>, Option<(u16, 
         pane.active.iter().skip(skip).cloned().collect()
     };
 
-    // Bottom-align: blank rows first, then the dim rule that ends the
-    // transcript, so the live area's top edge is a line, not a guess.
+    // Bottom-align: blank rows first, then the one blank row that
+    // ends the transcript (issue #21: a rule read as a separator
+    // between things that were already separate).
     let used = tail_rows.len() + fixed + 1;
     let blank = height.saturating_sub(used);
     for _ in 0..blank {
         rows.push(Line::raw(""));
     }
-    rows.push(Line::from(Span::styled(
-        "─".repeat(width),
-        Style::default().add_modifier(Modifier::DIM),
-    )));
+    rows.push(Line::raw(""));
     rows.extend(tail_rows);
     rows.extend(pane.block.iter().cloned());
     if let Some(a) = &pane.activity {
@@ -588,7 +586,7 @@ mod tests {
         };
         let (rows, cursor) = render(&pane, 20, 6);
         assert_eq!(rows[0], "");
-        assert_eq!(rows[1], "────────────────────");
+        assert_eq!(rows[1], "", "the one blank row off the transcript");
         assert_eq!(rows[2], "╭──────────────────╮");
         assert_eq!(rows[3], "│ > hello          │");
         assert_eq!(rows[4], "╰──────────────────╯");
@@ -612,10 +610,10 @@ mod tests {
             popup: &[],
             activity: None,
         };
-        // 7 rows: the rule that ends the transcript, one tail row above
-        // the hint, the boxed composer and the status.
+        // 7 rows: the blank row that ends the transcript, one tail row
+        // above the hint, the boxed composer and the status.
         let (rows, cursor) = render(&pane, 10, 7);
-        assert_eq!(rows[0], "──────────");
+        assert_eq!(rows[0], "");
         assert_eq!(rows[1], "xyz");
         assert_eq!(rows[2], "queued 1 ·");
         assert_eq!(rows[3], "╭────────╮");
@@ -641,7 +639,7 @@ mod tests {
             activity: None,
         };
         let (rows, cursor) = render(&pane, 20, 6);
-        assert_eq!(rows[0], "────────────────────");
+        assert_eq!(rows[0], "");
         assert_eq!(rows[1], "╭──────────────────╮");
         assert_eq!(rows[2], "│ > one            │");
         assert_eq!(rows[3], "│   two            │");
@@ -663,7 +661,7 @@ mod tests {
         assert_eq!(
             needed_rows(&idle),
             5,
-            "one draft row, its box, the status, the rule"
+            "one draft row, its box, the status, the blank row"
         );
         let active: Vec<Line<'static>> = (0..30).map(|i| Line::raw(i.to_string())).collect();
         let block = vec![Line::raw("b1"), Line::raw("b2")];
@@ -679,7 +677,7 @@ mod tests {
         assert_eq!(
             needed_rows(&busy) as usize,
             MAX_ACTIVE_ROWS + 2 + 1 + 3 + 1 + 1,
-            "the tail, two block rows, the hint, the box, the status, the rule"
+            "the tail, two block rows, the hint, the box, the status, the blank row"
         );
     }
 

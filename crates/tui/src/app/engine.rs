@@ -92,19 +92,6 @@ impl TurnStats {
     }
 }
 
-/// `950`, `1.8k`, `42k`, `1.3M`: token counts, decimal.
-pub fn count_short(n: u64) -> String {
-    if n < 1000 {
-        n.to_string()
-    } else if n < 10_000 {
-        format!("{:.1}k", n as f64 / 1000.0)
-    } else if n < 1_000_000 {
-        format!("{}k", n / 1000)
-    } else {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    }
-}
-
 /// Where rendered lines go.
 pub trait Printer {
     /// A finished line: committed, never redrawn.
@@ -742,7 +729,7 @@ impl ClientRepl {
             let calls_word = if calls == 1 { "call" } else { "calls" };
             out.line(&format!(
                 "turn: {} written · {} {calls_word}",
-                count_short(written),
+                crate::app::status::count_short(written),
                 calls
             ));
         }
@@ -2339,7 +2326,7 @@ mod tests {
         assert!(!f.contains("1.8k"), "{f}");
         t.tools = 1;
         assert!(t.figures().ends_with("1 tool"), "{}", t.figures());
-        assert_eq!(count_short(950), "950");
-        assert_eq!(count_short(1_300_000), "1.3M");
+        assert_eq!(crate::app::status::count_short(950), "950");
+        assert_eq!(crate::app::status::count_short(1_300_000), "1.3M");
     }
 }

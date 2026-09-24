@@ -26,7 +26,7 @@ pub struct Status {
 }
 
 impl Status {
-    /// `vendela · Crate count · manual · 58k / 96k context · queued 1`
+    /// `vendela · Crate count · manual · 58k / 128k context · queued 1`
     pub fn line(&self) -> String {
         let mut parts = vec![self.project.clone()];
         if let Some(t) = &self.title {
@@ -43,8 +43,8 @@ impl Status {
         match self.usage {
             Some((used, ceiling)) => parts.push(format!(
                 "{} / {} context",
-                tokens_short(used),
-                tokens_short(ceiling)
+                count_short(used),
+                count_short(ceiling)
             )),
             None => parts.push("context ?".into()),
         }
@@ -80,14 +80,18 @@ impl Status {
 /// How much of the title the footer shows.
 const TITLE_CHARS: usize = 40;
 
-/// `33k`, `1.0M`: the window size, so a defaulted window shows.
-pub fn tokens_short(n: u64) -> String {
-    if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_048_576.0)
-    } else if n >= 1000 {
-        format!("{}k", (n + 512) / 1024)
-    } else {
+/// `950`, `4.0k`, `128k`, `1.3M`: a size in decimal thousands — the
+/// one vocabulary for the footer's context and `/cost`'s counts
+/// (issue #21), so the 128,000 ceiling reads `128k`, not `125k`.
+pub fn count_short(n: u64) -> String {
+    if n < 1000 {
         n.to_string()
+    } else if n < 10_000 {
+        format!("{:.1}k", n as f64 / 1000.0)
+    } else if n < 1_000_000 {
+        format!("{}k", n / 1000)
+    } else {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
     }
 }
 
@@ -121,7 +125,7 @@ mod tests {
         // The two sizes, used against the ceiling, not a percentage.
         assert_eq!(
             s.line(),
-            "vendela · manual · 30k / 98k context · 12s · queued 1"
+            "vendela · manual · 31k / 100k context · 12s · queued 1"
         );
         s.elapsed = None;
         s.queued = 0;
@@ -131,15 +135,18 @@ mod tests {
         assert_eq!(s.line(), "vendela · A title · manual · context ?");
         // A fuller window than the ceiling still reads as itself.
         s.usage = Some((250_000, 100_000));
-        assert_eq!(s.line(), "vendela · A title · manual · 244k / 98k context");
+        assert_eq!(s.line(), "vendela · A title · manual · 250k / 100k context");
     }
 
     #[test]
-    fn window_sizes_read_short() {
-        assert_eq!(tokens_short(32_768), "32k");
-        assert_eq!(tokens_short(1_048_576), "1.0M");
-        assert_eq!(tokens_short(200_000), "195k");
-        assert_eq!(tokens_short(512), "512");
+    fn sizes_read_in_decimal_thousands() {
+        // The 128,000 ceiling reads 128k, not 125k (issue #21).
+        assert_eq!(count_short(128_000), "128k");
+        assert_eq!(count_short(32_768), "32k");
+        assert_eq!(count_short(1_048_576), "1.0M");
+        assert_eq!(count_short(200_000), "200k");
+        assert_eq!(count_short(4_000), "4.0k");
+        assert_eq!(count_short(512), "512");
     }
 
     #[test]

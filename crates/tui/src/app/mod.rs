@@ -170,9 +170,6 @@ impl ShellOut {
                 width,
             ));
         }
-        if let Some(Cell::Tool { name, summary, .. }) = &self.running {
-            lines.extend(look::running(name, summary, width));
-        }
         if !self.tail.is_empty() {
             let first = self.last != Some(look::Group::Assistant);
             let tail = Cell::Assistant {
@@ -413,6 +410,38 @@ fn transcript_lines(
     lines
 }
 
+/// The live area's rows (issue #21): the call in flight and the
+/// compact task list, held to [`LIVE_ROWS`] with blanks above —
+/// bottom-anchored, so the pane's height never changes as rows
+/// appear. Each row is one line: the reserve is a height, not a
+/// floor, and the full command is the pager's to show.
+fn live_rows(
+    running: Option<&Cell>,
+    tasks: &[aigentic_runtime::harness_tools::Task],
+    width: usize,
+) -> Vec<Line<'static>> {
+    let one = |l: Line<'static>| -> Line<'static> {
+        wrap_line(&l, width).into_iter().next().unwrap_or(l)
+    };
+    let mut live: Vec<Line<'static>> = Vec::new();
+    if let Some(Cell::Tool { name, summary, .. }) = running {
+        live.push(one(look::running(name, summary, width)
+            .into_iter()
+            .next()
+            .unwrap_or_default()));
+    }
+    live.extend(cells::task_compact(tasks).into_iter().map(one));
+    while live.len() < LIVE_ROWS {
+        live.insert(0, Line::raw(""));
+    }
+    live
+}
+
+/// The height a turn reserves for its live area: three task rows and
+/// the in-flight row. The blank row off the transcript and the turn
+/// line are counted where they render.
+const LIVE_ROWS: usize = 3 + 1;
+
 /// The pager over `lines` in the alternate screen until it is closed.
 fn page(shell: &mut Shell, title: &str, lines: Vec<Line<'static>>) -> anyhow::Result<()> {
     let mut pager = Pager::new(title, lines);
@@ -528,22 +557,19 @@ async fn run_shell(
             let draft = prompt_draft.take().unwrap();
             composer.set_text(&draft);
         }
-        let mut block: Vec<Line<'static>> =
-            if state == ThreadState::Idle || engine.tasks().is_empty() {
-                Vec::new()
-            } else {
-                // At most three rows, whatever the checklist does: the
-                // item in hand, the one after it, how far it has come.
-                cells::task_compact(engine.tasks())
-                    .into_iter()
-                    .map(|l| {
-                        wrap_line(&l, out.shell.width())
-                            .into_iter()
-                            .next()
-                            .unwrap_or(l)
-                    })
-                    .collect()
-            };
+        // The turn reserves its live height from its start (issue #21):
+        // the in-flight row, three task rows and the turn line,
+        // bottom-anchored, so rows fill in without anything below them
+        // moving. Blanks hold the place until they do; at idle there
+        // is nothing to reserve.
+        let mut block: Vec<Line<'static>> = Vec::new();
+        if !matches!(state, ThreadState::Idle) {
+            block.extend(live_rows(
+                out.running.as_ref(),
+                engine.tasks(),
+                out.shell.width(),
+            ));
+        }
         block.extend(
             engine
                 .menu()
@@ -842,6 +868,58 @@ mod tests {
         assert_eq!(
             text(&transcript_lines(&[Cell::User("one".into())], &[])),
             vec!["> one"]
+        );
+    }
+
+    /// A turn reserves its live height from its start (issue #21): the
+    /// in-flight row and three task rows, bottom-anchored, so rows
+    /// fill in without the pane's height ever moving.
+    #[test]
+    fn a_turn_reserves_its_live_height() {
+        use aigentic_runtime::harness_tools::{Task, TaskState};
+        let task = |text: &str, state: TaskState| Task {
+            text: text.into(),
+            state,
+        };
+        let bash = Cell::Tool {
+            name: "bash".into(),
+            summary: "cargo test --workspace".into(),
+            full: None,
+            state: ToolState::Running,
+            output: String::new(),
+        };
+        // The turn starts empty: the reserve is blank rows.
+        assert_eq!(text(&live_rows(None, &[], 80)), vec!["", "", "", ""]);
+        // Rows fill from the bottom — the count row comes with any
+        // list — and the height does not move.
+        let rows = live_rows(
+            Some(&bash),
+            &[task("write the code", TaskState::Active)],
+            80,
+        );
+        assert_eq!(
+            text(&rows),
+            vec![
+                "",
+                "◦ cargo test --workspace",
+                "▸ write the code",
+                "0/1 done · ctrl-t for the list",
+            ]
+        );
+        // Full: the call in flight and three task rows, no blanks.
+        let tasks = vec![
+            task("one", TaskState::Active),
+            task("two", TaskState::Pending),
+            task("three", TaskState::Pending),
+        ];
+        assert_eq!(
+            text(&live_rows(Some(&bash), &tasks, 80)),
+            vec![
+                "◦ cargo test --workspace",
+                "▸ one",
+                "○ two",
+                "0/3 done · ctrl-t for the list",
+            ]
         );
     }
 
