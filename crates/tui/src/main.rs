@@ -309,7 +309,7 @@ async fn main() -> anyhow::Result<()> {
             let log = ThreadLog::open(scratch.path(), Ulid::generate())?;
             let runtime = Runtime::new(
                 profile.build_provider(String::new()),
-                ToolRegistry::builtin(Workdir::new(&cwd)),
+                ToolRegistry::builtin(Workdir::new(&cwd), project.tools.bash_timeout()),
                 log,
                 AgentId("assistant".into()),
             )

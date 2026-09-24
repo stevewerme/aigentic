@@ -91,6 +91,7 @@ dependencies = [
  "aigentic-tools",
  "futures-core",
  "futures-util",
+ "nix 0.31.3",
  "schemars 0.8.22",
  "serde",
  "serde_json",

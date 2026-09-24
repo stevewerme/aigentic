@@ -11,8 +11,9 @@ description = "Open source agent harness in Rust"
 # [model]
 # profile = "tensorx"            # a profile in config.toml; --profile overrides
 
-# [tools]
+[tools]
 # allow = ["read_file", "bash"]  # empty or absent: every registered tool
+bash_timeout_secs = 600          # the bash default; a call's timeout_secs overrides (1–900)
 
 # [knowledge]
 # threshold_fraction = 0.4       # of the model's window; over it, index + search_knowledge

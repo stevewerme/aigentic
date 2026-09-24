@@ -16,6 +16,11 @@ use crate::workdir::Workdir;
 /// Default wall-clock limit for one command.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// The longest one command may run, whatever was asked; a per-call
+/// `timeout_secs` and the project's `bash_timeout_secs` are both capped
+/// at this.
+pub const MAX_TIMEOUT_SECS: u64 = 900;
+
 /// How long the process group gets after SIGTERM before it is SIGKILLed.
 const TERM_GRACE: Duration = Duration::from_secs(2);
 
@@ -24,6 +29,11 @@ struct BashArgs {
     /// Command to run with `bash -c`. The working directory persists between
     /// calls, so `cd` takes effect for later commands.
     command: String,
+    /// Wall-clock limit for this command in seconds, 1 to 900; anything
+    /// larger is capped at 900. Omitted takes the project's default
+    /// (`bash_timeout_secs` in aigentic.toml), else 120. Long builds and
+    /// test suites should pass a larger value.
+    timeout_secs: Option<u64>,
 }
 
 /// Run a shell command with a persistent working directory, a timeout and a
@@ -59,7 +69,16 @@ impl BashTool {
         self
     }
 
-    async fn run(&self, command: &str) -> Result<ToolOutput, ToolError> {
+    /// The call's wall-clock limit: its `timeout_secs`, capped at
+    /// [`MAX_TIMEOUT_SECS`], else the tool's default (the project's
+    /// `bash_timeout_secs`, else [`DEFAULT_TIMEOUT`]).
+    fn effective_timeout(&self, asked: Option<u64>) -> Duration {
+        asked.map_or(self.timeout, |secs| {
+            Duration::from_secs(secs.clamp(1, MAX_TIMEOUT_SECS))
+        })
+    }
+
+    async fn run(&self, command: &str, timeout: Duration) -> Result<ToolOutput, ToolError> {
         let cwd = self.workdir.current();
         // The shell reports its final directory so `cd` persists. It writes
         // a temp file in the same directory and renames it over the real
@@ -89,11 +108,14 @@ impl BashTool {
             .spawn()
             .map_err(|e| ToolError::Execution(format!("spawn bash: {e}")))?;
         let group = group::Group::of(&child);
+        // An interrupt drops the call's future mid-run; the group is torn
+        // down from `Drop` so it never outlives the call that way either.
+        let mut kill_on_drop = group::KillOnDrop::arm(group);
 
         let mut stdout = capture(child.stdout.take(), self.output_cap);
         let mut stderr = capture(child.stderr.take(), self.output_cap);
 
-        let status = match tokio::time::timeout(self.timeout, child.wait()).await {
+        let status = match tokio::time::timeout(timeout, child.wait()).await {
             Ok(Ok(status)) => Some(status),
             Ok(Err(e)) => return Err(ToolError::Execution(format!("wait: {e}"))),
             Err(_) => None,
@@ -117,6 +139,8 @@ impl BashTool {
             let _ = (&mut stdout.task).await;
             let _ = (&mut stderr.task).await;
         }
+        // This path has torn the group down itself.
+        kill_on_drop.disarm();
 
         if !timed_out && let Ok(reported) = std::fs::read_to_string(&cwd_file) {
             let reported = reported.trim_end();
@@ -146,9 +170,13 @@ impl BashTool {
                 true
             }
             None => {
+                // Name the fix, so the model passes a larger value next
+                // time instead of retrying the same 120 s death.
                 content.push_str(&format!(
-                    "[timed out after {} s; the command and everything it started were killed]\n",
-                    self.timeout.as_secs_f64()
+                    "[timed out after {} s; the command and everything it started were \
+                     killed. Pass timeout_secs (up to {MAX_TIMEOUT_SECS}) for long builds \
+                     or test suites]\n",
+                    timeout.as_secs_f64()
                 ));
                 true
             }
@@ -191,6 +219,42 @@ mod group {
             }
         }
     }
+
+    /// The interrupt path: the runtime drops the call's future mid-run,
+    /// so the group is torn down from `Drop`. SIGTERM now, SIGKILL after
+    /// TERM_GRACE, the same two steps the timeout path takes; every path
+    /// that tears the group down itself disarms the guard first.
+    pub(super) struct KillOnDrop(Option<Pid>);
+
+    impl KillOnDrop {
+        pub(super) fn arm(group: Group) -> Self {
+            Self(group.0)
+        }
+
+        pub(super) fn disarm(&mut self) {
+            self.0 = None;
+        }
+    }
+
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let Some(pgid) = self.0.take() else { return };
+            let _ = killpg(pgid, Signal::SIGTERM);
+            // The grace needs a runtime to sleep in; without one, kill
+            // at once rather than risk a survivor.
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => {
+                    handle.spawn(async move {
+                        tokio::time::sleep(super::TERM_GRACE).await;
+                        let _ = killpg(pgid, Signal::SIGKILL);
+                    });
+                }
+                Err(_) => {
+                    let _ = killpg(pgid, Signal::SIGKILL);
+                }
+            }
+        }
+    }
 }
 
 /// STUB for non-Unix platforms: no process groups, so only the shell itself
@@ -217,6 +281,19 @@ mod group {
         pub(super) fn kill(self, child: &mut Child) {
             let _ = child.start_kill();
         }
+    }
+
+    /// STUB: the shell itself is killed by `kill_on_drop` when the future
+    /// is dropped; there is no group to signal.
+    #[derive(Debug, Clone, Copy)]
+    pub(super) struct KillOnDrop;
+
+    impl KillOnDrop {
+        pub(super) fn arm(_group: Group) -> Self {
+            Self
+        }
+
+        pub(super) fn disarm(&mut self) {}
     }
 }
 
@@ -254,7 +331,8 @@ impl Tool for BashTool {
     fn description(&self) -> &str {
         "Run a shell command with bash. The working directory persists across calls. \
          Output is capped; long output keeps its head and tail. Background processes \
-         do not outlive the call."
+         do not outlive the call. The call ends after `timeout_secs` seconds (default \
+         120, at most 900); pass a larger value for long builds or test suites."
     }
 
     fn schema(&self) -> schemars::schema::RootSchema {
@@ -268,7 +346,8 @@ impl Tool for BashTool {
     fn call(&self, args: serde_json::Value) -> BoxFuture<'_, Result<ToolOutput, ToolError>> {
         Box::pin(async move {
             let args: BashArgs = parse_args(args)?;
-            self.run(&args.command).await
+            let timeout = self.effective_timeout(args.timeout_secs);
+            self.run(&args.command, timeout).await
         })
     }
 }
@@ -374,7 +453,54 @@ mod tests {
             "{}",
             out.content
         );
+        // The message names the fix, not just the death.
+        assert!(
+            out.content.contains("Pass timeout_secs (up to 900)"),
+            "{}",
+            out.content
+        );
         assert!(!out.content.contains("after\n"), "{}", out.content);
+    }
+
+    #[tokio::test]
+    async fn timeout_secs_raises_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        // The tool's own default would kill this command.
+        let t = tool(dir.path()).with_timeout(Duration::from_millis(300));
+        let out = t
+            .call(json!({"command": "sleep 1; echo done", "timeout_secs": 5}))
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(out.content, "done\n");
+
+        // Without the argument the small default applies.
+        let out = t
+            .call(json!({"command": "sleep 1; echo done"}))
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert!(
+            out.content.contains("timed out after 0.3 s"),
+            "{}",
+            out.content
+        );
+    }
+
+    #[test]
+    fn timeout_secs_is_capped_at_900() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = tool(dir.path()).with_timeout(Duration::from_millis(300));
+        assert_eq!(
+            t.effective_timeout(Some(10_000)),
+            Duration::from_secs(MAX_TIMEOUT_SECS)
+        );
+        // Zero is not a useful limit; one second is the floor.
+        assert_eq!(t.effective_timeout(Some(0)), Duration::from_secs(1));
+        // No argument: the project default the tool was built with.
+        assert_eq!(t.effective_timeout(None), Duration::from_millis(300));
+        let t = tool(dir.path());
+        assert_eq!(t.effective_timeout(None), DEFAULT_TIMEOUT);
     }
 
     #[cfg(unix)]
@@ -490,5 +616,42 @@ mod tests {
         assert!(out.content.ends_with("99999\n100000\n"), "{}", out.content);
         assert!(out.content.contains("bytes omitted"), "{}", out.content);
         assert!(out.content.len() < 1100, "{}", out.content.len());
+    }
+
+    /// An interrupt drops the call's future mid-run (the runtime does);
+    /// the group must be torn down from that path too.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_the_call_mid_run_kills_the_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("sleep.pid");
+        let t = tool(dir.path()).with_timeout(Duration::from_secs(600));
+        let mut fut = t.call(json!({"command": format!(
+            "sleep 300 & echo $! > {}; sleep 300",
+            pid_file.display()
+        )}));
+        let start = Instant::now();
+        let out = tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(100)) => None,
+            out = &mut fut => Some(out),
+        };
+        assert!(out.is_none(), "the call should still have been running");
+        drop(fut);
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            start.elapsed()
+        );
+
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while alive(pid) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!alive(pid), "backgrounded sleep {pid} survived the drop");
     }
 }

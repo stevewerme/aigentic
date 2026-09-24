@@ -6,7 +6,9 @@ use std::path::PathBuf;
 
 use aigentic_core::{RiskClass, Tool};
 use aigentic_tools::mcp::test_server::EchoServer;
-use aigentic_tools::{McpError, McpServer, McpServerConfig, McpTransport, ToolRegistry};
+use aigentic_tools::{
+    DEFAULT_TIMEOUT, McpError, McpServer, McpServerConfig, McpTransport, ToolRegistry,
+};
 use rmcp::ServiceExt;
 use serde_json::json;
 
@@ -91,7 +93,8 @@ async fn connect_list_and_call_over_duplex() {
 #[tokio::test]
 async fn registry_registers_server_tools_with_the_configured_class() {
     let dir = tempfile::tempdir().unwrap();
-    let mut registry = ToolRegistry::builtin(aigentic_tools::Workdir::new(dir.path()));
+    let mut registry =
+        ToolRegistry::builtin(aigentic_tools::Workdir::new(dir.path()), DEFAULT_TIMEOUT);
     let server = duplex_server("docs", RiskClass::Read).await;
     let specs = registry.register_mcp(server).await.unwrap();
     assert_eq!(

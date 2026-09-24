@@ -17,7 +17,7 @@ mod registry;
 mod truncate;
 mod workdir;
 
-pub use bash::BashTool;
+pub use bash::{BashTool, DEFAULT_TIMEOUT, MAX_TIMEOUT_SECS};
 pub use files::{ReadFileTool, WriteFileTool};
 pub use fs::{DEFAULT_GREP_MATCHES, EditFileTool, GrepTool, ListDirTool};
 pub use knowledge::{
@@ -32,5 +32,5 @@ pub use workdir::Workdir;
 /// `ToolRegistry::builtin` is the same set; this form feeds
 /// `Runtime::new` until phase 3 step 7 switches it to the registry.
 pub fn builtin_tools(workdir: Workdir) -> Vec<Box<dyn aigentic_core::Tool>> {
-    ToolRegistry::builtin(workdir).into_tools()
+    ToolRegistry::builtin(workdir, DEFAULT_TIMEOUT).into_tools()
 }

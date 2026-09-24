@@ -248,6 +248,7 @@ mod tests {
             file: ProjectFile {
                 tools: ToolsSection {
                     allow: names(allow),
+                    ..ToolsSection::default()
                 },
                 ..ProjectFile::default()
             },

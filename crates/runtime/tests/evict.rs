@@ -139,7 +139,10 @@ async fn run_turn(
         calls,
         lines,
     };
-    let registry = aigentic_tools::ToolRegistry::builtin(aigentic_tools::Workdir::new(dir.path()));
+    let registry = aigentic_tools::ToolRegistry::builtin(
+        aigentic_tools::Workdir::new(dir.path()),
+        aigentic_tools::DEFAULT_TIMEOUT,
+    );
     let log = ThreadLog::open(dir.path(), ulid::Ulid::generate()).unwrap();
     // The log outlives the helper; the tempdir is kept, not dropped.
     let _kept = dir.keep();

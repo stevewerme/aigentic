@@ -119,7 +119,7 @@ pub async fn project_context(
         .unwrap_or_else(|| config.default_profile.clone());
     let (provider, model) = providers.build(&profile_name)?;
 
-    let mut tools = ToolRegistry::builtin(Workdir::new(&root.root));
+    let mut tools = ToolRegistry::builtin(Workdir::new(&root.root), file.tools.bash_timeout());
     let mut mcp_skipped = Vec::new();
     for server in &file.mcp_servers {
         if let Err(e) = tools.connect_mcp(server).await {

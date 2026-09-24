@@ -75,10 +75,14 @@ cargo test
 
 - **Background processes never outlive a bash call.** The shell runs in its
   own process group, and the group is torn down (SIGTERM, then SIGKILL) when
-  the call ends, whether the command finished or timed out. The order on
-  normal exit is: wait for the shell to exit, kill the group, then drain
-  stdout and stderr to EOF. A `detach` mechanism for long-running processes
-  is a phase 3 addition alongside policy, not something to bolt on earlier.
+  the call ends, whether the command finished, timed out or was interrupted.
+  The order on normal exit is: wait for the shell to exit, kill the group,
+  then drain stdout and stderr to EOF. A `detach` mechanism for long-running
+  processes is a phase 3 addition alongside policy, not something to bolt
+  on earlier.
+- A bash call ends after `timeout_secs` seconds, at most 900. The default is
+  120; a project raises it with `[tools] bash_timeout_secs`. Pass a larger
+  `timeout_secs` for long builds or test suites rather than splitting them.
 - Every tool caps what it returns, keeping the head and the tail of long
   output and stating how many bytes were omitted.
 - The working directory is shared by the built-in tools and persists across

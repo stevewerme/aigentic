@@ -7,7 +7,7 @@ use aigentic_core::{ContentBlock, EventKind, ProviderEvent, RiskClass, ToolCall}
 use aigentic_log::{ThreadLog, TurnEndedPayload};
 use aigentic_policy::{Decision, Policy, Rule};
 use aigentic_runtime::{Layers, Runtime};
-use aigentic_tools::{ToolRegistry, Workdir};
+use aigentic_tools::{DEFAULT_TIMEOUT, ToolRegistry, Workdir};
 use common::{done, scripted, steve};
 use serde_json::json;
 
@@ -57,7 +57,7 @@ async fn the_turn_end_lists_files_written_without_error_once_each() {
     ]);
     let mut rt = Runtime::new(
         provider,
-        ToolRegistry::builtin(Workdir::new(&work)),
+        ToolRegistry::builtin(Workdir::new(&work), DEFAULT_TIMEOUT),
         log,
         aigentic_core::AgentId("w".into()),
     )

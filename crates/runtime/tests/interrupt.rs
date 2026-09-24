@@ -1,15 +1,16 @@
 //! Phase 5 step 4: decisions made outside the turn, and interrupts. A
 //! permission request or an `ask_human` question parks the turn on
 //! `Decisions`; a `CancelToken` ends a running turn cleanly: the model
-//! call is dropped, a running tool finishes, the rest of the batch gets
-//! synthetic results, `interrupted` names who, `turn_ended` says so.
+//! call is dropped, a running tool call is killed where it stands
+//! (whatever its timeout), the rest of the batch gets synthetic
+//! results, `interrupted` names who, `turn_ended` says so.
 
 mod common;
 
 use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use aigentic_core::{
     Author, BoxFuture, Capabilities, CompletionRequest, ContentBlock, EventKind, Message, Provider,
@@ -128,17 +129,29 @@ struct Rig {
 /// `slow` allowed outright when `allow_slow`, else the default rules ask
 /// for it (class write).
 fn rig(script: Vec<Option<Vec<ProviderEvent>>>, allow_slow: bool) -> Rig {
-    let dir = tempfile::tempdir().unwrap();
-    let log = ThreadLog::open(dir.path(), ulid::Ulid::generate()).unwrap();
     let ran = Arc::new(Mutex::new(Vec::new()));
     let mut registry = ToolRegistry::empty();
     registry.register(Box::new(Slow(ran.clone()))).unwrap();
-    let decisions = Arc::new(Decisions::new());
     let policy = if allow_slow {
         Policy::configured(vec![Rule::tool("slow", Decision::Allow, "test")], None)
     } else {
         Policy::defaults()
     };
+    let mut rig = rig_with(script, tempfile::tempdir().unwrap(), registry, policy);
+    rig.ran = ran;
+    rig
+}
+
+/// The rig body over a caller-built registry and policy; `dir` is where
+/// the log and the tools live, and it stays alive on the `Rig`.
+fn rig_with(
+    script: Vec<Option<Vec<ProviderEvent>>>,
+    dir: tempfile::TempDir,
+    registry: ToolRegistry,
+    policy: Policy,
+) -> Rig {
+    let log = ThreadLog::open(dir.path(), ulid::Ulid::generate()).unwrap();
+    let decisions = Arc::new(Decisions::new());
     let runtime = Runtime::new(
         Box::new(Gated {
             script: Mutex::new(script.into()),
@@ -153,7 +166,7 @@ fn rig(script: Vec<Option<Vec<ProviderEvent>>>, allow_slow: bool) -> Rig {
     Rig {
         runtime,
         decisions,
-        ran,
+        ran: Arc::new(Mutex::new(Vec::new())),
         waited: Arc::new(Mutex::new(Vec::new())),
         _dir: dir,
     }
@@ -379,18 +392,29 @@ async fn an_interrupt_during_the_model_call_leaves_no_partial_message() {
 }
 
 #[tokio::test]
-async fn an_interrupt_during_a_tool_records_it_and_gives_the_rest_synthetic_results() {
+async fn an_interrupt_kills_a_running_tool_and_gives_the_rest_synthetic_results() {
     let mut rig = rig(
-        vec![Some(vec![slow("c1", 120), slow("c2", 0), done("tool_use")])],
+        vec![Some(vec![
+            slow("c1", 60_000),
+            slow("c2", 0),
+            done("tool_use"),
+        ])],
         true,
     );
     let cancel = CancelToken::never();
+    let began = Instant::now();
     let canceller = async {
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
         cancel.cancel(magnus());
     };
     let (outcome, ()) = tokio::join!(start(&mut rig, &cancel), canceller);
     assert_eq!(outcome.reason, INTERRUPTED);
+    // The interrupt is not held hostage by the tool's own timeout.
+    assert!(
+        began.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        began.elapsed()
+    );
     assert_eq!(
         kinds(&rig),
         vec![
@@ -402,11 +426,21 @@ async fn an_interrupt_during_a_tool_records_it_and_gives_the_rest_synthetic_resu
             EventKind::TurnEnded
         ]
     );
-    // The running tool finished and its real result is recorded.
+    // The running tool was killed where it stood and its result says so.
     let r: ToolResultPayload = payload(&rig, 2, EventKind::ToolResult);
-    assert_eq!(r.result.content, "slept 120");
-    assert!(!r.result.is_error);
-    assert_eq!(*rig.ran.lock().unwrap(), vec!["slept 120".to_owned()]);
+    assert_eq!(r.result.id, "c1");
+    assert!(r.result.is_error);
+    assert!(
+        r.result
+            .content
+            .contains("interrupted by magnus while running: the call was killed"),
+        "{}",
+        r.result.content
+    );
+    assert!(
+        rig.ran.lock().unwrap().is_empty(),
+        "the tool never finished"
+    );
     // The second never ran and says why, with a rule record.
     let r: ToolResultPayload = payload(&rig, 3, EventKind::ToolResult);
     assert_eq!(r.result.id, "c2");
@@ -422,6 +456,85 @@ async fn an_interrupt_during_a_tool_records_it_and_gives_the_rest_synthetic_resu
     let i: InterruptedPayload = payload(&rig, 4, EventKind::Interrupted);
     assert_eq!(i.unanswered_calls, vec!["c2".to_owned()]);
     assert_eq!(i.by, Some(magnus()));
+    let events = rig.runtime.log().read_all().unwrap();
+    assert!(aigentic_runtime::audit_tool_results(&events).is_empty());
+}
+
+/// True while a process with this pid exists (zombies included).
+#[cfg(unix)]
+fn alive(pid: i32) -> bool {
+    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+}
+
+/// An interrupt kills a bash command however long its timeout is, and
+/// takes everything it started with it (issue #36: the interrupt must
+/// win over a 900 s command).
+#[cfg(unix)]
+#[tokio::test]
+async fn an_interrupt_kills_a_bash_command_with_a_long_timeout_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("sleep.pid");
+    let command = format!("sleep 300 & echo $! > {}; sleep 300", pid_file.display());
+    let mut registry = ToolRegistry::empty();
+    registry
+        .register(Box::new(
+            aigentic_tools::BashTool::new(aigentic_tools::Workdir::new(dir.path()))
+                .with_timeout(Duration::from_secs(600)),
+        ))
+        .unwrap();
+    let policy = Policy::configured(vec![Rule::tool("bash", Decision::Allow, "test")], None);
+    let mut rig = rig_with(
+        vec![Some(vec![
+            ProviderEvent::ToolCall(ToolCall {
+                id: "c1".into(),
+                name: "bash".into(),
+                args: json!({"command": command}),
+            }),
+            done("tool_use"),
+        ])],
+        dir,
+        registry,
+        policy,
+    );
+    let cancel = CancelToken::never();
+    let began = Instant::now();
+    let canceller = async {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        cancel.cancel(magnus());
+    };
+    let (outcome, ()) = tokio::join!(start(&mut rig, &cancel), canceller);
+    assert_eq!(outcome.reason, INTERRUPTED);
+    assert!(
+        began.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        began.elapsed()
+    );
+    let r: ToolResultPayload = payload(&rig, 2, EventKind::ToolResult);
+    assert_eq!(r.result.id, "c1");
+    assert!(r.result.is_error);
+    assert!(
+        r.result
+            .content
+            .contains("interrupted by magnus while running: the call was killed"),
+        "{}",
+        r.result.content
+    );
+
+    // The shell, the command and its background child are dead: not just
+    // unrecorded, actually torn down.
+    let pid: i32 = std::fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while alive(pid) && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        !alive(pid),
+        "the backgrounded sleep {pid} survived the interrupt"
+    );
     let events = rig.runtime.log().read_all().unwrap();
     assert!(aigentic_runtime::audit_tool_results(&events).is_empty());
 }

@@ -10,6 +10,8 @@ use crate::fs::{EditFileTool, GrepTool, ListDirTool};
 use crate::mcp::{McpError, McpServer, McpServerConfig};
 use crate::workdir::Workdir;
 
+use std::time::Duration;
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RegistryError {
     #[error("a tool named `{0}` is already registered")]
@@ -92,8 +94,10 @@ impl ToolRegistry {
     }
 
     /// `read_file`, `write_file`, `edit_file`, `list_dir`, `grep` and
-    /// `bash`, sharing one working directory.
-    pub fn builtin(workdir: Workdir) -> Self {
+    /// `bash`, sharing one working directory. `bash_timeout` is the bash
+    /// tool's default wall-clock limit: the project's
+    /// `[tools] bash_timeout_secs`, else 120 s.
+    pub fn builtin(workdir: Workdir, bash_timeout: Duration) -> Self {
         let mut registry = Self::empty();
         for tool in [
             Box::new(ReadFileTool::new(workdir.clone())) as Box<dyn Tool>,
@@ -101,7 +105,7 @@ impl ToolRegistry {
             Box::new(EditFileTool::new(workdir.clone())),
             Box::new(ListDirTool::new(workdir.clone())),
             Box::new(GrepTool::new(workdir.clone())),
-            Box::new(BashTool::new(workdir)),
+            Box::new(BashTool::new(workdir).with_timeout(bash_timeout)),
         ] {
             registry
                 .register(tool)
@@ -182,12 +186,13 @@ impl FromIterator<Box<dyn Tool>> for ToolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bash::DEFAULT_TIMEOUT;
     use aigentic_core::RiskClass;
 
     #[test]
     fn builtin_has_six_tools_with_sorted_specs_and_classes() {
         let dir = tempfile::tempdir().unwrap();
-        let r = ToolRegistry::builtin(Workdir::new(dir.path()));
+        let r = ToolRegistry::builtin(Workdir::new(dir.path()), DEFAULT_TIMEOUT);
         assert_eq!(
             r.names(),
             vec![
@@ -219,7 +224,7 @@ mod tests {
     fn duplicate_names_are_refused() {
         let dir = tempfile::tempdir().unwrap();
         let w = Workdir::new(dir.path());
-        let mut r = ToolRegistry::builtin(w.clone());
+        let mut r = ToolRegistry::builtin(w.clone(), DEFAULT_TIMEOUT);
         let err = r.register(Box::new(ReadFileTool::new(w))).unwrap_err();
         assert_eq!(err, RegistryError::Duplicate("read_file".into()));
         assert_eq!(r.len(), 6);

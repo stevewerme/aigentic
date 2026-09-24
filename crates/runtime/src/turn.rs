@@ -17,7 +17,7 @@ use aigentic_log::{Invoker, PolicyRecord};
 use crate::decisions::{CancelToken, Inbox, Queued};
 use crate::harness_tools::{ASK_HUMAN, HARNESS_CLASS, harness_specs, is_harness_tool};
 use crate::runtime::{ASKED_HUMAN, INTERRUPTED};
-use crate::seams::{Verdict, denial_text};
+use crate::seams::{Verdict, author_name, denial_text};
 use crate::support::{Spent, flush_text};
 use crate::{Runtime, RuntimeError, Signal, TurnOutcome, build_context};
 
@@ -332,9 +332,14 @@ impl Runtime {
 
     /// `run_tool`, appending what arrives in the inbox while the tool
     /// runs: the tool borrows the registry, the log is another field.
+    /// An interrupt kills the call where it stands. Waiting for it to
+    /// finish would make Esc's answer the tool's own timeout (now up
+    /// to 900 s), so the future is dropped — `bash` tears its process
+    /// group down from there — and the result records what happened.
     async fn run_tool_draining(
         &mut self,
         call: &ToolCall,
+        cancel: &CancelToken,
         inbox: &mut Inbox,
         observe: &mut (dyn FnMut(Signal<'_>) + Send),
     ) -> Result<ToolResult, RuntimeError> {
@@ -351,6 +356,17 @@ impl Runtime {
             tokio::select! {
                 out = &mut fut => break out,
                 queued = inbox.recv() => append_queued(&mut self.log, queued, observe, true)?,
+                by = cancel.cancelled() => {
+                    return Ok(ToolResult {
+                        id,
+                        content: format!(
+                            "interrupted by {} while running: the call was killed; \
+                             rerun it if needed",
+                            author_name(&by)
+                        ),
+                        is_error: true,
+                    });
+                }
             }
         };
         Ok(match out {
@@ -442,7 +458,7 @@ impl Runtime {
                     ran
                 } else {
                     (
-                        self.run_tool_draining(call, inbox, observe).await?,
+                        self.run_tool_draining(call, cancel, inbox, observe).await?,
                         Author::System,
                     )
                 };

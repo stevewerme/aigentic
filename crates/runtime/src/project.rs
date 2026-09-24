@@ -86,13 +86,29 @@ pub struct ModelSection {
     pub profile: String,
 }
 
-/// `[tools] allow`: what this project's model may see. Empty means every
-/// registered tool. The global layer narrows it further.
+/// `[tools]`: what this project's model may see and how the bash tool's
+/// calls are limited. An empty `allow` means every registered tool; the
+/// global layer narrows it further.
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ToolsSection {
     #[serde(default)]
     pub allow: Vec<String>,
+    /// The bash tool's default wall-clock limit in seconds when a call
+    /// passes no `timeout_secs`; 1 to 900, anything else is refused at
+    /// parse time. Missing falls back to 120.
+    #[serde(default)]
+    pub bash_timeout_secs: Option<u64>,
+}
+
+impl ToolsSection {
+    /// The bash tool's default wall-clock limit.
+    pub fn bash_timeout(&self) -> std::time::Duration {
+        self.bash_timeout_secs.map_or(
+            aigentic_tools::DEFAULT_TIMEOUT,
+            std::time::Duration::from_secs,
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -270,7 +286,16 @@ impl CompactionConfig {
 
 impl ProjectFile {
     pub fn parse(text: &str) -> Result<Self, String> {
-        toml::from_str(text).map_err(|e| e.to_string())
+        let file: ProjectFile = toml::from_str(text).map_err(|e| e.to_string())?;
+        if let Some(secs) = file.tools.bash_timeout_secs
+            && !(1..=aigentic_tools::MAX_TIMEOUT_SECS).contains(&secs)
+        {
+            return Err(format!(
+                "[tools] bash_timeout_secs must be 1 to {}, got {secs}",
+                aigentic_tools::MAX_TIMEOUT_SECS
+            ));
+        }
+        Ok(file)
     }
 
     pub fn load(path: &Path) -> Result<Self, ProjectError> {
@@ -295,6 +320,7 @@ impl ProjectFile {
             || self.budget.is_some()
             || self.compaction.is_some()
             || !self.tools.allow.is_empty()
+            || self.tools.bash_timeout_secs.is_some()
             || self.knowledge != KnowledgeSection::default()
             || self.memory != MemorySection::default()
             || self.pocock.is_some()
@@ -486,6 +512,7 @@ context_ceiling_tokens = 96_000
 
 [tools]
 allow = ["read_file", "bash"]
+bash_timeout_secs = 600
 
 [knowledge]
 threshold_fraction = 0.3
@@ -514,6 +541,8 @@ enabled = ["implement"]
         ));
         assert_eq!(p.mcp_servers[0].class, RiskClass::Read);
         assert!(!p.has_phase4_sections());
+        // No [tools] bash_timeout_secs: the bash default stays 120.
+        assert_eq!(p.tools.bash_timeout(), std::time::Duration::from_secs(120));
         assert_eq!(p.knowledge, KnowledgeSection::default());
         assert_eq!(p.memory.every_n_turns, 1);
         assert!(p.memory.enabled);
@@ -541,6 +570,7 @@ enabled = ["implement"]
             96_000
         );
         assert_eq!(p.tools.allow, vec!["read_file", "bash"]);
+        assert_eq!(p.tools.bash_timeout(), std::time::Duration::from_secs(600));
         assert_eq!(p.knowledge.threshold_fraction, 0.3);
         assert_eq!(p.knowledge.max_hits, 5);
         assert_eq!(p.memory.every_n_turns, 2);
@@ -561,6 +591,19 @@ enabled = ["implement"]
         assert!(ProjectFile::parse("[tools]\ndeny = []\n").is_err());
         assert!(ProjectFile::parse("[memory]\nevery = 1\n").is_err());
         assert!(ProjectFile::parse("").is_ok());
+    }
+
+    #[test]
+    fn bash_timeout_secs_is_validated() {
+        assert!(ProjectFile::parse("[tools]\nbash_timeout_secs = 0\n").is_err());
+        assert!(ProjectFile::parse("[tools]\nbash_timeout_secs = 901\n").is_err());
+        let p = ProjectFile::parse("[tools]\nbash_timeout_secs = 900\n").unwrap();
+        assert_eq!(p.tools.bash_timeout(), std::time::Duration::from_secs(900));
+        assert!(p.has_phase4_sections());
+        assert_eq!(
+            ProjectFile::default().tools.bash_timeout(),
+            std::time::Duration::from_secs(120)
+        );
     }
 
     #[test]

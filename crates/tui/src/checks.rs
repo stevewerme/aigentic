@@ -316,7 +316,8 @@ pub fn check_skills(
         workspace: None,
         project: Some(project.clone()),
     };
-    let mut available = ToolRegistry::builtin(Workdir::new(cwd)).names();
+    let mut available =
+        ToolRegistry::builtin(Workdir::new(cwd), project.file.tools.bash_timeout()).names();
     available.extend(aigentic_runtime::harness_tools::harness_names());
     let available = layers.allowed_tools(&available);
     let enabled = layers.allowed_skills(&project.file.skills.enabled);

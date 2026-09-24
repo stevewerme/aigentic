@@ -105,7 +105,10 @@ fn rig(script: Vec<Vec<ProviderEvent>>, answers: Vec<Answer>, policy: Policy) ->
     let (provider, _seen) = scripted(script);
     let touched = Arc::new(Mutex::new(Vec::new()));
     let asked = Arc::new(Mutex::new(Vec::new()));
-    let mut registry = ToolRegistry::builtin(aigentic_tools::Workdir::new(dir.path()));
+    let mut registry = ToolRegistry::builtin(
+        aigentic_tools::Workdir::new(dir.path()),
+        aigentic_tools::DEFAULT_TIMEOUT,
+    );
     registry.register(Box::new(Touch(touched.clone()))).unwrap();
     let runtime = Runtime::new(
         provider,
@@ -744,7 +747,10 @@ async fn time_waiting_on_a_prompt_does_not_count_against_the_wall_time_budget() 
         vec![text("ok"), done("stop")],
     ]);
     let touched = Arc::new(Mutex::new(Vec::new()));
-    let mut registry = ToolRegistry::builtin(aigentic_tools::Workdir::new(dir.path()));
+    let mut registry = ToolRegistry::builtin(
+        aigentic_tools::Workdir::new(dir.path()),
+        aigentic_tools::DEFAULT_TIMEOUT,
+    );
     registry.register(Box::new(Touch(touched.clone()))).unwrap();
     let mut runtime = Runtime::new(provider, registry, log, aigentic_core::AgentId("w".into()))
         .with_policy(Policy::defaults())

@@ -15,7 +15,8 @@ schemars-derived argument schema and a risk class.
 
 ## Registry
 
-`ToolRegistry::builtin(workdir)` holds the six; `register` adds more and
+`ToolRegistry::builtin(workdir, bash_timeout)` holds the six (the timeout is
+the bash default; see `DEFAULT_TIMEOUT`); `register` adds more and
 refuses a duplicate name; `specs()` is sorted by name so the request the
 model sees is byte-stable; `names()` is what a skill's `requires` is
 checked against.

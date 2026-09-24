@@ -118,6 +118,7 @@ pub struct ProjectFile { /* phase 3 fields */
     pub budget: Option<BudgetConfig>, // overrides the profile's
     pub compaction: Option<CompactionConfig>,
     pub tools: ToolsSection,          // allow: Vec<String>; empty means every registered tool
+                                      // bash_timeout_secs (default 120, 1-900)
     pub knowledge: KnowledgeSection,  // threshold_fraction (default 0.4), max_hits (default 5)
     pub memory: MemorySection,        // enabled (default true), every_n_turns (default 1)
     pub pocock: Option<PocockSection>,// issue_tracker, triage_labels (role -> label overrides),
@@ -207,8 +208,10 @@ profile's values field by field.
 
 **Tools and skills.** `[tools] allow = ["read_file", "bash", "mcp.docs.*"]`
 lists what this project's model may see; empty or absent means every
-registered tool. `[skills] enabled` is unchanged. Both are narrowed again
-by the global layer (section 5).
+registered tool. `[tools] bash_timeout_secs` (1-900; the default is 120)
+is the bash tool's default wall-clock limit, for projects whose builds
+and test suites outrun it. `[skills] enabled` is unchanged. Both are
+narrowed again by the global layer (section 5).
 
 **Pocock.** `[pocock] issue_tracker = "github" | "gitlab" | "local"`,
 `triage_labels = { needs-triage = "bug:triage" }` (overrides for the five
@@ -370,6 +373,7 @@ max_tokens = 3000000
 
 [tools]
 allow = ["read_file", "edit_file", "write_file", "list_dir", "grep", "bash"]
+bash_timeout_secs = 600      # the bash default; a call's timeout_secs overrides (1-900)
 
 [knowledge]
 threshold_fraction = 0.4       # of the model's window; over it, index + search_knowledge

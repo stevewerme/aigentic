@@ -345,15 +345,15 @@ them for the client.
 **Interrupt.** A `Post { interrupt: true }` while `Running` appends the
 message the same way, then fires the actor's cancel token. The runtime
 drops the in-flight model call (partial text is discarded, as a crash
-would discard it; nothing partial is appended), waits for a tool call
-that is already executing (the tool's own timeout bounds the wait, and
-`bash` tears its group down at the end as phase 3 made it), records
-that tool's result, appends `interrupted { reason: "interrupt", by }`,
-and ends the turn. The actor then starts a new turn whose context
-includes the interrupting message and any queued ones. An interrupt
-while `AwaitingApproval` or `AwaitingHuman` cancels the wait: the
-pending request is decided `deny` with the interrupter as author and the
-reason `interrupted`, so the log explains why the call never ran.
+would discard it; nothing partial is appended), kills a tool call that
+is already executing — waiting would bound the interrupt by the tool's
+own timeout, which `bash`'s `timeout_secs` can raise to 900 s — records
+that tool's result as interrupted, appends `interrupted { reason:
+"interrupt", by }`, and ends the turn. The actor then starts a new turn
+whose context includes the interrupting message and any queued ones. An
+interrupt while `AwaitingApproval` or `AwaitingHuman` cancels the wait:
+the pending request is decided `deny` with the interrupter as author and
+the reason `interrupted`, so the log explains why the call never ran.
 
 **Respond when addressed.** The PRD makes "respond to every message or
 only when addressed" a project setting. Phase 5 ships the default the
@@ -503,9 +503,9 @@ project show` over the API when a server is given, else as today.
   queues and the next turn's request holds both messages; an interrupt
   during a model call ends the turn with `interrupted { by }` and no
   partial assistant message, and the new turn's context holds the
-  interrupting message; an interrupt during a running tool records the
-  tool's result first; an interrupt while awaiting approval denies the
-  request with the interrupter as author and the reason `interrupted`.
+  interrupting message; an interrupt during a running tool kills it and
+  records its result first; an interrupt while awaiting approval denies
+  the request with the interrupter as author and the reason `interrupted`.
 - **Decisions** (runtime): an `Ask` parks the turn; `decide` from an
   approver resumes it with the right author on `permission_decided`; a
   second decision is `AlreadyDecided`; a session grant recorded through
@@ -602,11 +602,13 @@ and `server` in step 2 and 6.
    the message to everyone; the horizon rule is a projection rule, so
    replay reproduces the live context exactly. The alternative, holding
    mail in memory until the turn ends, would lose it on a crash.
-6. **An interrupt drops the model call and waits for a tool.** A model
+6. **An interrupt drops the model call and kills a running tool.** A model
    call has no side effects and its partial text is not worth an event;
-   a tool may have side effects and its outcome must be recorded, which
-   the PRD says in as many words. `bash`'s group teardown bounds the
-   wait to the tool's timeout.
+   a tool's outcome must be recorded, which the PRD says in as many
+   words — but waiting would bound the interrupt by the tool's own
+   timeout, and `bash`'s can be raised to 900 s. The call is dropped,
+   `bash` tears its process group down from the drop, and the result
+   event records the interrupt.
 7. **Roles are in the project file, tokens in the daemon's config.**
    Who may do what in a project is a project fact and belongs in git
    with the project; who a token belongs to is a deployment fact and
