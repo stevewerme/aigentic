@@ -192,31 +192,31 @@ impl Shell {
         })
     }
 
-    /// Size the viewport to `wanted` rows (clamped to the screen). It
-    /// grows at once; it shrinks only when `may_shrink`, so a streaming
-    /// reply does not make it jump. ratatui's inline viewport has a fixed
-    /// height, so a new one is made at the old one's top: the old area is
-    /// cleared first, and the new one scrolls the screen only when it
-    /// needs more room below.
+    /// Size the viewport to `wanted` rows (clamped to the screen): it
+    /// grows and shrinks with the pane's content (issue #39), so the
+    /// viewport tracks what the live area draws. ratatui's inline
+    /// viewport has a fixed height, so a new one is made at the old
+    /// one's top: the old area is cleared first, and the new one
+    /// scrolls the screen only when it needs more room below.
     /// The height `fit` would move to, or `None` when it would not.
-    fn target(&self, wanted: u16, may_shrink: bool) -> anyhow::Result<Option<u16>> {
+    fn target(&self, wanted: u16) -> anyhow::Result<Option<u16>> {
         let screen = crossterm::terminal::size()?.1;
         let wanted = wanted.clamp(MIN_ROWS, screen.saturating_sub(1).max(MIN_ROWS));
-        Ok((wanted != self.rows && (wanted > self.rows || may_shrink)).then_some(wanted))
+        Ok((wanted != self.rows).then_some(wanted))
     }
 
     /// Size the viewport to `wanted` rows (clamped to the screen).
-    /// During a turn it grows at once and never shrinks: a reply
-    /// streaming in, tools starting and finishing, do not make it
-    /// jump. It shrinks once, when the turn has ended (`may_shrink`).
-    /// A resized window is refitted at the same height. ratatui's
-    /// inline viewport has a fixed height, so a new one is made at the
-    /// old one's top: the old area is cleared first, and the new one
-    /// scrolls the screen only when it needs more room below.
-    pub fn fit(&mut self, wanted: u16, may_shrink: bool) -> anyhow::Result<()> {
+    /// The viewport tracks the pane's content (issue #39): it grows
+    /// and shrinks as rows come and go, so the layout's one blank row
+    /// above the live area stays one. A resized window is refitted at
+    /// the same height. ratatui's inline viewport has a fixed height,
+    /// so a new one is made at the old one's top: the old area is
+    /// cleared first, and the new one scrolls the screen only when it
+    /// needs more room below.
+    pub fn fit(&mut self, wanted: u16) -> anyhow::Result<()> {
         let size = crossterm::terminal::size()?;
         let resized = size != self.last_size;
-        let rows = match self.target(wanted, may_shrink)? {
+        let rows = match self.target(wanted)? {
             Some(rows) => rows,
             None if resized => self.rows.min(size.1.saturating_sub(1).max(MIN_ROWS)),
             None => return Ok(()),
@@ -621,6 +621,44 @@ mod tests {
         assert_eq!(rows[5], "╰────────╯");
         assert_eq!(rows[6], "  s");
         assert_eq!(cursor, Some((4, 4)));
+    }
+
+    #[test]
+    fn the_live_area_sits_one_blank_under_the_transcript() {
+        let composer = composer_with("");
+        let active: Vec<Line<'static>> = ["  five six", "  seven"]
+            .into_iter()
+            .map(|s| Line::raw(s.to_owned()))
+            .collect();
+        let block: Vec<Line<'static>> = ["◦ bash", "▸ code", "0/1 done"]
+            .into_iter()
+            .map(|s| Line::raw(s.to_owned()))
+            .collect();
+        let activity = Some(Line::raw("✻ running"));
+        let pane = Pane {
+            active: &active,
+            composer: &composer,
+            status: "s",
+            hint: None,
+            block: &block,
+            popup: &[],
+            activity: activity.clone(),
+        };
+        // The blank row that ends the transcript, the active rows, the
+        // block, the turn line, the empty boxed composer and the
+        // status (issue #39: the pane is its content, so the blank row
+        // above it is one, not the padding a peak height left).
+        let composer_rows = composer.lines().len().min(MAX_ROWS) + 2;
+        let wanted =
+            active.len() + block.len() + usize::from(activity.is_some()) + composer_rows + 2;
+        assert_eq!(usize::from(needed_rows(&pane)), wanted);
+        let (rows, _) = render(&pane, 30, needed_rows(&pane));
+        assert_eq!(rows.len(), wanted);
+        assert_eq!(rows[0], "", "exactly one blank row above the live rows");
+        assert_eq!(rows[1], "  five six");
+        assert_eq!(rows[2], "  seven");
+        assert_eq!(rows[3], "◦ bash");
+        assert_eq!(rows[6], "✻ running");
     }
 
     #[test]

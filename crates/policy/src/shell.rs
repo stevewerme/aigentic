@@ -45,9 +45,10 @@ pub(crate) struct Classified {
     /// ask again" grants, and the header names. `None` when nothing
     /// asks, empty when the ask is a redirection's.
     pub riskiest: Option<Vec<String>>,
-    /// One segment's words as the `bash` row's text (issue #21): the
-    /// riskiest asking segment's, or the first's when nothing asks —
-    /// redirections and a trailing bare fd fall away.
+    /// One segment's words as the `bash` row's text (issues #21, #38): the first
+    /// substantive segment's — allow-listed or worse than harmless, never a no-op — or
+    /// the first segment that has words when nothing is; redirections and a trailing
+    /// bare fd fall away. Later substantive segments not behind a pipe add a ` +N`.
     pub main: String,
     /// Two or more segments have words or redirections.
     pub compound: bool,

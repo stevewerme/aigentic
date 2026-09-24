@@ -179,10 +179,21 @@ impl ShellOut {
             if first && self.last.is_some() && lines.is_empty() {
                 lines.push(Line::raw(""));
             }
-            lines.extend(look::render(&tail, first, width));
+            lines.extend(tail_rows(&tail, first, width));
         }
         lines
     }
+}
+
+/// The assistant's unfinished text, as the viewport shows it: its last
+/// [`TAIL_ROWS`] rows only (issue #39). The paragraph's earlier rows
+/// are the scrollback's once its line completes, so keeping them in
+/// the pane would only hold its height up and, with the line gone,
+/// pad the difference with blanks.
+fn tail_rows(cell: &Cell, first: bool, width: usize) -> Vec<Line<'static>> {
+    let rendered = look::render(cell, first, width);
+    let skip = rendered.len().saturating_sub(TAIL_ROWS);
+    rendered.into_iter().skip(skip).collect()
 }
 
 impl Printer for ShellOut {
@@ -411,10 +422,9 @@ fn transcript_lines(
 }
 
 /// The live area's rows (issue #21): the call in flight and the
-/// compact task list, held to [`LIVE_ROWS`] with blanks above —
-/// bottom-anchored, so the pane's height never changes as rows
-/// appear. Each row is one line: the reserve is a height, not a
-/// floor, and the full command is the pager's to show.
+/// compact task list. The area is its content, so the pane's height
+/// moves by a row or three as rows come and go (issue #39). Each row
+/// is one line: the full command is the pager's to show.
 fn live_rows(
     running: Option<&Cell>,
     tasks: &[aigentic_runtime::harness_tools::Task],
@@ -431,16 +441,13 @@ fn live_rows(
             .unwrap_or_default()));
     }
     live.extend(cells::task_compact(tasks).into_iter().map(one));
-    while live.len() < LIVE_ROWS {
-        live.insert(0, Line::raw(""));
-    }
     live
 }
 
-/// The height a turn reserves for its live area: three task rows and
-/// the in-flight row. The blank row off the transcript and the turn
-/// line are counted where they render.
-const LIVE_ROWS: usize = 3 + 1;
+/// How many rows of the assistant's unfinished text the viewport keeps
+/// (issue #39): enough to read the line being written, not the
+/// paragraph behind it, which is already in the scrollback.
+const TAIL_ROWS: usize = 2;
 
 /// The pager over `lines` in the alternate screen until it is closed.
 fn page(shell: &mut Shell, title: &str, lines: Vec<Line<'static>>) -> anyhow::Result<()> {
@@ -557,11 +564,10 @@ async fn run_shell(
             let draft = prompt_draft.take().unwrap();
             composer.set_text(&draft);
         }
-        // The turn reserves its live height from its start (issue #21):
-        // the in-flight row, three task rows and the turn line,
-        // bottom-anchored, so rows fill in without anything below them
-        // moving. Blanks hold the place until they do; at idle there
-        // is nothing to reserve.
+        // The live area is its content (issue #39): the in-flight row
+        // and the compact task rows, nothing reserved. The pane's
+        // height moves by a row or three as rows come and go, and the
+        // one blank row the layout puts above them stays one.
         let mut block: Vec<Line<'static>> = Vec::new();
         if !matches!(state, ThreadState::Idle) {
             block.extend(live_rows(
@@ -635,8 +641,7 @@ async fn run_shell(
             popup: &popup_lines,
             activity,
         };
-        out.shell
-            .fit(needed_rows(&pane), matches!(state, ThreadState::Idle))?;
+        out.shell.fit(needed_rows(&pane))?;
         out.shell.draw(&pane)?;
         if let Some((title, text)) = out.page.take() {
             let lines = if title == "diff" {
@@ -871,11 +876,11 @@ mod tests {
         );
     }
 
-    /// A turn reserves its live height from its start (issue #21): the
-    /// in-flight row and three task rows, bottom-anchored, so rows
-    /// fill in without the pane's height ever moving.
+    /// The live area is its rows and nothing more (issue #39): the
+    /// in-flight row and the compact task list, so the pane's height
+    /// moves with them.
     #[test]
-    fn a_turn_reserves_its_live_height() {
+    fn the_live_area_is_only_its_rows() {
         use aigentic_runtime::harness_tools::{Task, TaskState};
         let task = |text: &str, state: TaskState| Task {
             text: text.into(),
@@ -888,25 +893,21 @@ mod tests {
             state: ToolState::Running,
             output: String::new(),
         };
-        // The turn starts empty: the reserve is blank rows.
-        assert_eq!(text(&live_rows(None, &[], 80)), vec!["", "", "", ""]);
-        // Rows fill from the bottom — the count row comes with any
-        // list — and the height does not move.
-        let rows = live_rows(
-            Some(&bash),
-            &[task("write the code", TaskState::Active)],
-            80,
-        );
+        // No reserve: nothing to show is no rows.
+        assert!(live_rows(None, &[], 80).is_empty());
+        // Rows are exactly what is in flight plus the list's rows.
         assert_eq!(
-            text(&rows),
+            text(&live_rows(
+                Some(&bash),
+                &[task("write the code", TaskState::Active)],
+                80
+            )),
             vec![
-                "",
                 "◦ cargo test --workspace",
                 "▸ write the code",
                 "0/1 done · ctrl-t for the list",
             ]
         );
-        // Full: the call in flight and three task rows, no blanks.
         let tasks = vec![
             task("one", TaskState::Active),
             task("two", TaskState::Pending),
@@ -921,6 +922,29 @@ mod tests {
                 "0/3 done · ctrl-t for the list",
             ]
         );
+    }
+
+    /// A streaming paragraph shows only its last two rows (issue #39):
+    /// the rows before them are already the scrollback's when the line
+    /// completes, so they stay there rather than holding the pane up.
+    #[test]
+    fn a_streaming_paragraph_shows_only_its_last_two_rows() {
+        let cell = Cell::Assistant {
+            text: "one two three four five six seven".into(),
+            fenced: false,
+        };
+        let full = text(&look::render(&cell, false, 12));
+        let last = tail_rows(&cell, false, 12);
+        assert_eq!(text(&last), full[full.len() - 2..].to_vec());
+        assert_eq!(last.len(), 2);
+        assert!(
+            text(&last).last().unwrap().ends_with("seven"),
+            "the newest row is the one kept: {:?}",
+            text(&last)
+        );
+        // The reply's first row marker is elision's business, not the
+        // cap's: the cap still keeps two rows.
+        assert_eq!(tail_rows(&cell, true, 12).len(), 2);
     }
 
     /// The rows the issue draws (issue #21), at 100 columns: a `bash`
