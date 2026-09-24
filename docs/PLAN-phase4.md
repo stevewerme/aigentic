@@ -296,12 +296,16 @@ transcript with one entry per message-bearing event tagged
 used as is; provider blobs are dropped and tool results shortened).
 
 **Three filters, two on the reply.** First the cue gate, in code, before
-the model runs (issue #14): a `user_message` enters the transcript only
-when it states something durable — it contains a remember cue (`for the
-record`, `remember`, `from now on`, `going forward`, `always`, `never`,
-`in this project`, `our convention`, `we decided`, `/remember`); the
-rest of the range is transcript as before. So an instruction the person
-gave for the task at hand is never even shown to the extraction model.
+the model runs (issue #14): a `user_message` is split into sentences, and
+only the sentences that state something durable — they contain a remember
+cue (`for the record`, `remember that`, `going forward`, `our convention`,
+`we decided`, `in this project we`, or `from now on` with a subject: we,
+you, I, the project) — enter the transcript; the rest of the range is
+transcript as before. A message over 600 characters, or one that starts
+with `/` (a command or a skill invocation), is a task and is skipped
+entirely unless a sentence in it opens with "For the record". So an
+instruction the person gave for the task at hand is never even shown to
+the extraction model.
 The model returns lines `<kind> @<seq> durable|task: <text>` with kind
 `decision`, `constraint` or `fact`. Second, attribution: the runtime
 keeps only lines whose `at_seq`, in the range considered, is a

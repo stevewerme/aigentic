@@ -392,7 +392,7 @@ async fn for_the_record_we_deploy_from_main_only_files_exactly_one_line() {
 }
 
 #[tokio::test]
-async fn from_now_on_dates_in_swedish_format_files_exactly_one_line() {
+async fn from_now_on_with_a_subject_files_exactly_one_line() {
     let dir = project_dir("");
     let mut script = one_turn();
     script.push(vec![text("fact @0 durable: Dates in Swedish format.\n")]);
@@ -400,7 +400,7 @@ async fn from_now_on_dates_in_swedish_format_files_exactly_one_line() {
     rt.run_turn(
         steve(),
         vec![ContentBlock::Text(
-            "From now on, dates in Swedish format.".into(),
+            "From now on, we write dates in Swedish format.".into(),
         )],
         &mut |_| {},
     )
@@ -417,6 +417,59 @@ async fn from_now_on_dates_in_swedish_format_files_exactly_one_line() {
         "{facts}"
     );
     assert_eq!(facts.lines().count(), 1, "{facts}");
+}
+
+/// Issue #14, reopened: a long task message is not memory, but the
+/// one sentence the person opened with "For the record" is — and it
+/// is the only sentence the model is offered.
+#[tokio::test]
+async fn a_long_message_with_one_for_the_record_sentence_files_only_that_sentence() {
+    let dir = project_dir("");
+    let mut script = one_turn();
+    script.push(vec![text(
+        "decision @0 durable: We deploy from main only.\n",
+    )]);
+    let (mut rt, seen) = rig(&dir, script);
+    let message = "Ship #12 today. Run the full gate locally first: cargo fmt, \
+cargo clippy --all-targets -- -D warnings, then cargo test. Fix whatever falls out \
+and add no new dependencies. Then rewrite the README opening: three sentences \
+without dashes, a short list of what works today, and Getting started covering \
+install, config.toml with a profile, the key in .env, aigentic doctor, aigentic \
+in a repo, and aigentic init for a new project. Drop the phase table and the \
+status narrative, linking docs/PRD.md and AGENTS.md for depth instead. For the \
+record, we deploy from main only. Label the bugs section next, cross-reference \
+items 2 and 3 in their bodies, then push everything as one commit and comment on \
+the issue with what changed.";
+    assert!(message.chars().count() > 600);
+    rt.run_turn(
+        steve(),
+        vec![ContentBlock::Text(message.into())],
+        &mut |_| {},
+    )
+    .await
+    .unwrap();
+    let p = rt.extract_memory(&mut |_| {}).await.unwrap().unwrap();
+    assert_eq!(p.written.len(), 1, "{:?}", p.written);
+    assert_eq!(p.written[0].file, "decisions.md");
+    assert_eq!(p.written[0].text, "We deploy from main only.");
+    // The model was offered the one sentence, and nothing else of the
+    // spec.
+    let request = seen.lock().unwrap()[2].clone();
+    let transcript = texts(&request[1]);
+    assert!(
+        transcript.contains("[seq 0] user steve: For the record, we deploy from main only.\n"),
+        "{transcript}"
+    );
+    assert!(!transcript.contains("README"), "{transcript}");
+    assert!(!transcript.contains("cargo fmt"), "{transcript}");
+    let decisions =
+        std::fs::read_to_string(dir.path().join(".aigentic/memory/decisions.md")).unwrap();
+    assert_eq!(
+        decisions.matches("We deploy from main only.").count(),
+        1,
+        "{decisions}"
+    );
+    assert_eq!(decisions.lines().count(), 1, "{decisions}");
 }
 
 /// The primary gate (issue #14): a user message with no cue is skipped

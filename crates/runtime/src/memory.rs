@@ -10,12 +10,16 @@
 //! assistant message, a tool result or nothing is dropped as inference.
 //!
 //! Issue #14 added two gates before and after that one. Before the model:
-//! the cue gate — a user message is extracted only when it states
-//! something durable ("for the record", "from now on", "always", …);
-//! every other user message, which is where one-off task instructions
-//! live, is skipped before the model sees the transcript. After the
-//! model: the scope tag — the model tags each line `durable` or `task`,
-//! and the runtime drops `task` lines, because a participant stating a
+//! the cue gate — a user message is offered sentence by sentence, and
+//! only a sentence that states something durable ("for the record",
+//! "we decided", …) reaches the model; a long task message, or one
+//! that opens with a `/` command, is skipped entirely unless a
+//! sentence in it opens with "For the record", because a spec quotes
+//! rules without stating any. Every other sentence, which is where
+//! one-off task instructions live, is skipped before the model sees
+//! the transcript. After the model: the scope tag — the model tags
+//! each line `durable` or `task`, and the runtime drops `task` lines,
+//! because a participant stating a
 //! task instruction ("Create ~/x, then run the tests") is attribution the
 //! seq filter passes but not memory: it is obsolete the moment the task
 //! is done. A line that restates the project's name or something the
@@ -66,27 +70,92 @@ pub const MEMORY_FILES: [(&str, &str); 3] = [
 ];
 
 /// The cue gate (issue #14, the primary filter): a user message is
-/// offered to the extraction model only when it states something
-/// durable — one of these cues, in any case. `/remember` needs no
-/// entry of its own: the word covers it. Everything else is skipped
-/// before the model runs, so an instruction for the current task
-/// ("Create ~/x, then run the tests") never even reaches it.
+/// offered to the extraction model sentence by sentence, and only the
+/// sentences that state something durable — one of these cues, in any
+/// case — are. "From now on" is not in the list: it counts only in a
+/// sentence that also names who the rule is about (we, you, I, the
+/// project), because a task spec says it about its own steps.
+/// `/remember` never reaches the gate: it is a command, handled with
+/// no model call. Everything else is skipped before the model runs,
+/// so an instruction for the current task ("Create ~/x, then run the
+/// tests") never even reaches it.
 pub const CUES: &[&str] = &[
     "for the record",
-    "remember",
-    "from now on",
+    "remember that",
     "going forward",
-    "always",
-    "never",
-    "in this project",
     "our convention",
     "we decided",
+    "in this project we",
 ];
+
+/// A user message past this many characters is a task, not a
+/// statement (issue #14, the follow-up): long specs say "never" and
+/// "from now on" about their own steps. So is one that opens with
+/// `/`, a command or a skill invocation. Only a sentence that opens
+/// with "For the record" is taken from either.
+const LONG_MESSAGE: usize = 600;
+
+/// The sentences of a user message that pass the cue gate: all the
+/// model is ever offered of the message, and nothing else. Empty when
+/// the message is a task — nothing in it states anything durable.
+pub(crate) fn eligible_sentences(text: &str) -> Vec<&str> {
+    // A long message or a command is a task; only an explicit "For
+    // the record" escapes it.
+    let task = text.trim_start().starts_with('/') || text.chars().count() > LONG_MESSAGE;
+    sentences(text)
+        .into_iter()
+        .filter(|s| {
+            if task {
+                opens_with(s, "for the record")
+            } else {
+                carries_a_cue(s)
+            }
+        })
+        .collect()
+}
 
 /// Does this user message state something durable, per the cue gate?
 pub(crate) fn eligible(text: &str) -> bool {
-    let lower = text.to_lowercase();
+    !eligible_sentences(text).is_empty()
+}
+
+/// Split a message into sentences — on `.`, `!`, `?` and line breaks,
+/// terminator kept — trimmed of bullets, quotes and other leading
+/// noise, since the gate judges a sentence, not where it sat.
+fn sentences(text: &str) -> Vec<&str> {
+    text.lines()
+        .flat_map(|line| line.split_inclusive(['.', '!', '?']))
+        .map(|s| s.trim().trim_start_matches(|c: char| !c.is_alphanumeric()))
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Does the sentence open with the cue?
+fn opens_with(sentence: &str, cue: &str) -> bool {
+    sentence
+        .get(..cue.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(cue))
+}
+
+/// Does the sentence state something durable? A cue phrase anywhere in
+/// it, or "from now on" with a subject: a task spec says "from now on"
+/// about its own steps, a rule says it about how we work.
+fn carries_a_cue(sentence: &str) -> bool {
+    let lower = sentence.to_lowercase();
     CUES.iter().any(|cue| lower.contains(cue))
+        || (lower.contains("from now on") && has_subject(&lower))
+}
+
+/// Is one of we, you, I or the project in the sentence — the subject a
+/// durable "from now on" rule is about?
+fn has_subject(lower: &str) -> bool {
+    let words: Vec<&str> = lower
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()))
+        .filter(|w| !w.is_empty())
+        .collect();
+    words.iter().any(|w| matches!(*w, "we" | "you" | "i"))
+        || words.windows(2).any(|w| w[0] == "the" && w[1] == "project")
 }
 
 /// What the project already carries outside memory: its name, and the
@@ -367,12 +436,16 @@ pub(crate) fn transcript(events: &[&Event]) -> String {
         let who = author_label(&e.author);
         let entry = match e.kind {
             EventKind::UserMessage => {
-                serde_json::from_value::<UserMessagePayload>(e.payload.clone())
+                let text = serde_json::from_value::<UserMessagePayload>(e.payload.clone())
                     .ok()
-                    // The cue gate: an ineligible user message is skipped
-                    // before the model sees the transcript at all.
-                    .filter(|p| eligible(&text_of(&p.blocks)))
-                    .map(|p| format!("user {who}: {}", text_of(&p.blocks)))
+                    .map(|p| text_of(&p.blocks));
+                // The cue gate: only the sentences that state
+                // something durable reach the model, never a whole
+                // task message.
+                text.as_deref()
+                    .map(eligible_sentences)
+                    .filter(|kept| !kept.is_empty())
+                    .map(|kept| format!("user {who}: {}", kept.join(" ")))
             }
             EventKind::AssistantMessage => {
                 serde_json::from_value::<AssistantMessagePayload>(e.payload.clone())
@@ -696,7 +769,7 @@ mod tests {
             0,
             EventKind::UserMessage,
             steve(),
-            json!({"blocks": [{"type": "text", "text": "Remember: create ~/Projects/aigentic-web, run aigentic project init, show the diff; don't commit."}]}),
+            json!({"blocks": [{"type": "text", "text": "Remember that you must create ~/Projects/aigentic-web, run aigentic project init, show the diff; don't commit."}]}),
         )];
         let refs: Vec<&Event> = events.iter().collect();
         let reply = "decision @0 task: Create ~/Projects/aigentic-web with Next.js + shadcn.\n\
@@ -713,15 +786,23 @@ fact @0 durable: The project is called aigentic.\n";
     #[test]
     fn the_cue_gate_admits_only_durable_statements() {
         assert!(eligible("For the record, we deploy from main only."));
-        assert!(eligible("From now on, dates in Swedish format."));
-        assert!(eligible("Always answer in Swedish."));
-        assert!(eligible("NEVER run git reset."));
-        assert!(eligible("Remember: no tokio in core."));
+        assert!(eligible("From now on, we write dates in Swedish format."));
+        assert!(eligible("Remember that core takes no new dependencies."));
         assert!(eligible("In this project we ship on Fridays."));
         assert!(eligible("Going forward, our convention is trunk-based."));
         assert!(eligible("We decided to ship on Fridays."));
-        // `/remember` is covered by the word "remember".
-        assert!(eligible("/remember we ship on Fridays"));
+        // Bare "always" and "never" were dropped (issue #14, reopened):
+        // task specs lean on both without stating anything.
+        assert!(!eligible("Always answer in Swedish."));
+        assert!(!eligible("NEVER run git reset."));
+        // "From now on" needs a subject: a spec schedules its own steps.
+        assert!(!eligible("From now on, dates in Swedish format."));
+        // And bare "Remember:" is how a task instruction opens.
+        assert!(!eligible("Remember: no tokio in core."));
+        // `/remember` is a command, handled with no model call; a
+        // message that opens with `/` is a command or a skill
+        // invocation, not a statement.
+        assert!(!eligible("/remember we ship on Fridays"));
         assert!(!eligible("Create ~/Projects/aigentic-web with Next.js."));
         assert!(!eligible("Show the diff; don't commit."));
         assert!(!eligible("Item 10 is already decided."));
@@ -783,6 +864,114 @@ fact @0 durable: The project is called aigentic.\n";
             );
             assert!(kept.is_empty(), "{source}");
         }
+    }
+
+    /// The follow-up (issue #14, reopened): the gate judges sentences,
+    /// so one durable sentence in a task message reaches the model
+    /// alone, and the model never sees the rest.
+    #[test]
+    fn only_cue_sentences_reach_the_model_never_the_whole_message() {
+        let text = "Create ~/Projects/aigentic-web with Next.js + shadcn. \
+                    For the record, we deploy from main only. \
+                    Run `aigentic project init` in that directory and show the diff.";
+        assert_eq!(
+            eligible_sentences(text),
+            vec!["For the record, we deploy from main only."]
+        );
+        let events = [event(
+            0,
+            EventKind::UserMessage,
+            steve(),
+            json!({"blocks": [{"type": "text", "text": text}]}),
+        )];
+        let refs: Vec<&Event> = events.iter().collect();
+        assert_eq!(
+            transcript(&refs),
+            "[seq 0] user steve: For the record, we deploy from main only.\n"
+        );
+    }
+
+    /// A long task message, or a command, is not memory at all —
+    /// unless a sentence in it opens with "For the record", and then
+    /// only that sentence (issue #14, reopened).
+    #[test]
+    fn long_task_messages_and_commands_yield_only_for_the_record_sentences() {
+        let mut long = String::new();
+        for _ in 0..12 {
+            long.push_str(
+                "Run the gate, fix what falls out, rewrite the README opening and push one commit. ",
+            );
+        }
+        long.push_str("For the record, we deploy from main only. ");
+        long.push_str("Then label the bugs and close the issue.");
+        assert!(long.chars().count() > 600);
+        assert_eq!(
+            eligible_sentences(&long),
+            vec!["For the record, we deploy from main only."]
+        );
+        // A command is skipped the same way, cue sentences or not.
+        assert!(eligible_sentences("/tdd implement the gate first").is_empty());
+        assert_eq!(
+            eligible_sentences("/deploy now. For the record, we deploy from main only."),
+            vec!["For the record, we deploy from main only."]
+        );
+        // A short message keeps every cue sentence it carries.
+        assert_eq!(
+            eligible_sentences("Ship it. We decided to ship on Fridays. Then rest."),
+            vec!["We decided to ship on Fridays."]
+        );
+    }
+
+    /// The #33 build prompt (issue #14, reopened): the long
+    /// implementation spec that slipped past the old gate, which
+    /// matched cue words anywhere in the message, offered the whole
+    /// spec to the model and filed three of its steps as decisions.
+    /// It says "from now on" and "never" mid-sentence, and yields
+    /// nothing.
+    #[test]
+    fn the_33_build_prompt_yields_nothing() {
+        const BUILD_PROMPT: &str = "Follow up #33 (gh issue view 33): a message sent mid-turn \
+is invisible until the turn ends. From the #30 build thread: a correction typed while the turn \
+ran (seq 68, 19:52) was appended to the log but the model never saw it; the turn ran 18 more \
+minutes and two commits without it. The horizon rule (crates/log/src/projection.rs:86, phase 5) \
+emits a mid_turn user_message only after the next turn_ended, so a person cannot steer a long \
+turn at all, only interrupt it. Keep what the rule protects (tool results must directly follow \
+their assistant message; a replay must give the live context exactly) and deliver steering at \
+the next safe point instead: after the last result of the current assistant message and before \
+the next model call, emit the mid-turn message into the projection, and record that point in \
+the log (e.g. a delivered_at_seq on the message, or a small event), so replay stays exact. The \
+client shows \"queued, delivered at the next step\", and with the bash tool's process group torn \
+down behind it, messages drained mid-turn from now on set it, so it never lands between an \
+assistant message and its results. Tests: a message queued during a tool call is in the very \
+next request; replay reproduces it; a message queued between an assistant message and its \
+results is not emitted inside that pair. Read crates/log/src/projection.rs and the runtime loop \
+first, keep the change small, and gate on cargo fmt, cargo clippy -- -D warnings, cargo test. \
+Commit as log: deliver mid-turn messages at the next safe point, push, then comment on #33 \
+with what changed and close it.";
+        assert!(BUILD_PROMPT.chars().count() > 600);
+        assert!(!eligible(BUILD_PROMPT));
+        let events = [event(
+            0,
+            EventKind::UserMessage,
+            steve(),
+            json!({"blocks": [{"type": "text", "text": BUILD_PROMPT}]}),
+        )];
+        let refs: Vec<&Event> = events.iter().collect();
+        // Skipped before the model: the transcript has no user entry.
+        assert!(transcript(&refs).is_empty());
+        // And through it: a line pointing at the spec is inference the
+        // model could only have invented.
+        let kept = filter_stated(
+            vec![Proposed {
+                file: "decisions.md".into(),
+                at_seq: 0,
+                durable: true,
+                text: "Deliver steering at the next safe point.".into(),
+            }],
+            &refs,
+            &AgentId("worker".into()),
+        );
+        assert!(kept.is_empty());
     }
 
     #[test]
