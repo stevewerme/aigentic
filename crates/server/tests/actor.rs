@@ -376,8 +376,8 @@ async fn a_post_during_a_model_call_waits_for_the_next_turn() {
         rig.kinds(),
         vec![
             EventKind::UserMessage,
-            EventKind::UserMessage, // magnus, mid-call, held for the next turn
-            EventKind::AssistantMessage,
+            EventKind::AssistantMessage, // the reply that never saw magnus's
+            EventKind::UserMessage,      // magnus, mid-call, after that reply
             EventKind::TurnEnded,
             EventKind::AssistantMessage,
             EventKind::TurnEnded,

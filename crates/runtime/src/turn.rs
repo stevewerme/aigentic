@@ -18,7 +18,7 @@ use crate::decisions::{CancelToken, Inbox, Queued};
 use crate::harness_tools::{ASK_HUMAN, HARNESS_CLASS, harness_specs, is_harness_tool};
 use crate::runtime::{ASKED_HUMAN, INTERRUPTED};
 use crate::seams::{Verdict, author_name, denial_text};
-use crate::support::{Spent, flush_text};
+use crate::support::{Spent, append_queued, flush_text};
 use crate::{Runtime, RuntimeError, Signal, TurnOutcome, build_context};
 
 impl Runtime {
@@ -42,8 +42,9 @@ impl Runtime {
     }
 
     /// `run_turn` with an interrupt token and an inbox (phase 5): the
-    /// daemon's actor calls this so a `Post` mid-turn is appended at once
-    /// and a `Post { interrupt: true }` can end the turn.
+    /// daemon's actor calls this so a `Post` mid-turn reaches the log
+    /// at the next safe point and a `Post { interrupt: true }` can end
+    /// the turn.
     pub async fn run_turn_until(
         &mut self,
         author: Author,
@@ -151,11 +152,16 @@ impl Runtime {
         self.refresh_knowledge()?;
         self.refresh_memory()?;
         let specs: Vec<ToolSpec> = self.tool_specs();
+        // What a stream held back (issue #33): a message posted mid-call
+        // waits here, and leaves the log only where the model can first
+        // read it — `steer` at the top of the loop below, `steer` unset
+        // in `end_turn`, before `turn_ended`, if the turn ends first.
+        let mut held: Vec<Queued> = Vec::new();
 
         loop {
             self.drain_inbox(inbox, observe)?;
             if let Some(by) = cancel.cancelled_by() {
-                return self.interrupt_turn(by, Vec::new(), &spent, observe);
+                return self.interrupt_turn(by, Vec::new(), &spent, &mut held, observe);
             }
             // The budget is checked here, before a model call, and never
             // between an assistant message and its tool results. Once an
@@ -164,7 +170,18 @@ impl Runtime {
             // conversation whose tool calls have no matching tool message,
             // so a log left in that state could not be resumed.
             if let Some(reason) = self.budget_reason(&spent) {
-                return self.end_turn(reason, &spent, observe);
+                return self.end_turn(reason, &spent, &mut held, observe);
+            }
+            // What a stream held, appended at the point of first sight:
+            // the reply that was streaming when it arrived had tool
+            // calls, and they are all answered now, so this is after
+            // that reply's last tool result and before the model call
+            // that reads it — never inside the assistant-and-results
+            // pair. The budget above has agreed, so no message is
+            // promised `steer` to a call that never happens, and nothing
+            // below can lose it.
+            for queued in std::mem::take(&mut held) {
+                append_queued(&mut self.log, queued, observe, true)?;
             }
             // Compaction, at an iteration boundary only: every tool call
             // already has its result, so no summary range splits a turn.
@@ -173,7 +190,7 @@ impl Runtime {
             self.evict_stale(observe)?;
             if let Err(e) = self.compact(observe).await {
                 if let RuntimeError::Provider(p) = &e {
-                    self.end_turn(&format!("provider_error: {p}"), &spent, observe)?;
+                    self.end_turn(&format!("provider_error: {p}"), &spent, &mut held, observe)?;
                 }
                 return Err(e);
             }
@@ -196,12 +213,17 @@ impl Runtime {
                         interrupted_by = Some(by);
                         break;
                     }
-                    // A message posted mid-call lands in the log now; the
-                    // stream borrows the provider, the log is another
-                    // field. This call is already out, so it cannot steer
-                    // it: the message waits for the next turn.
+                    // A message posted mid-call is held, not appended:
+                    // the stream borrows the provider, the log is
+                    // another field, and this call is already out, so
+                    // nothing can show the message to it. It leaves
+                    // `held` at the next safe point — after that reply's
+                    // last tool result and before the call that reads it
+                    // (`steer`), or before `turn_ended` if the turn ends
+                    // first (`steer` unset), so the next turn, which
+                    // the actor starts, picks it up.
                     queued = inbox.recv() => {
-                        append_queued(&mut self.log, queued, observe, false)?;
+                        held.push(queued);
                         continue;
                     }
                     event = stream.next() => event,
@@ -226,11 +248,15 @@ impl Runtime {
                 }
             }
             drop(stream);
-            self.drain_inbox(inbox, observe)?;
+            // What arrived in the instants the last polls of the stream
+            // raced past joins what the arm held — same rule, same point
+            // of first sight — rather than landing before the assistant
+            // message of the reply it interrupted.
+            held.extend(inbox.drain());
             if let Some(by) = interrupted_by {
                 // Dropped mid-call: no partial message, as a crash would
                 // leave none.
-                return self.interrupt_turn(by, Vec::new(), &spent, observe);
+                return self.interrupt_turn(by, Vec::new(), &spent, &mut held, observe);
             }
             flush_text(&mut text, &mut blocks);
             spent.iterations += 1;
@@ -245,7 +271,7 @@ impl Runtime {
             let usage = usage.unwrap_or_else(|| self.estimate_usage(&context, &agent, &blocks));
             spent.tokens += self.budget.spent_of(&usage.to_core());
             if let Some(e) = error {
-                self.end_turn(&format!("provider_error: {e}"), &spent, observe)?;
+                self.end_turn(&format!("provider_error: {e}"), &spent, &mut held, observe)?;
                 return Err(RuntimeError::Provider(e));
             }
 
@@ -264,7 +290,7 @@ impl Runtime {
             let assistant =
                 self.append(EventKind::AssistantMessage, agent, payload, None, observe)?;
             if calls.is_empty() {
-                return self.end_turn("done", &spent, observe);
+                return self.end_turn("done", &spent, &mut held, observe);
             }
 
             let mut answered = false;
@@ -320,12 +346,12 @@ impl Runtime {
                     )?;
                     synthetic.push(call.id);
                 }
-                return self.interrupt_turn(by, synthetic, &spent, observe);
+                return self.interrupt_turn(by, synthetic, &spent, &mut held, observe);
             }
             // A human's answer starts a turn: everything after it is new
             // work with its own budget. The client continues at once.
             if answered {
-                return self.end_turn(ASKED_HUMAN, &spent, observe);
+                return self.end_turn(ASKED_HUMAN, &spent, &mut held, observe);
             }
         }
     }
@@ -384,14 +410,23 @@ impl Runtime {
     }
 
     /// `interrupted` naming who, then `turn_ended` with reason
-    /// `interrupted`. `unanswered` lists the calls given synthetic results.
+    /// `interrupted`. `unanswered` lists the calls given synthetic
+    /// results. `held` — what a stream was holding — goes into the log
+    /// first, `steer` unset: it was posted before the interrupt, so it
+    /// belongs before the point `interrupted` marks, and before
+    /// `turn_ended`, which is what lets the projection emit it for the
+    /// turn that answers it.
     fn interrupt_turn(
         &mut self,
         by: Author,
         unanswered: Vec<String>,
         spent: &Spent,
+        held: &mut Vec<Queued>,
         observe: &mut (dyn FnMut(Signal<'_>) + Send),
     ) -> Result<TurnOutcome, RuntimeError> {
+        for queued in std::mem::take(held) {
+            append_queued(&mut self.log, queued, observe, false)?;
+        }
         let after_seq = self.log.len().saturating_sub(1);
         let payload = serde_json::to_value(InterruptedPayload {
             reason: "interrupt".into(),
@@ -407,7 +442,7 @@ impl Runtime {
             None,
             observe,
         )?;
-        self.end_turn(INTERRUPTED, spent, observe)
+        self.end_turn(INTERRUPTED, spent, held, observe)
     }
 
     /// The one call site for tool execution, behind `policy_check`. An
@@ -499,32 +534,4 @@ impl Runtime {
     pub fn tool_visible(&self, name: &str) -> bool {
         self.layers.decided_tool(name) == crate::Decided::Allowed
     }
-}
-
-/// One queued message into the log, as `append` would but on the log
-/// alone, so it can run while a stream borrows the provider. `steer`
-/// is set where the next model call will read the message — the safe
-/// points, between a tool result and that call — so the projection
-/// emits it where it sits; a call already in flight cannot be steered,
-/// so a message posted mid-call waits for the next turn, as every
-/// message did before issue #33.
-fn append_queued(
-    log: &mut aigentic_log::ThreadLog,
-    queued: Queued,
-    observe: &mut (dyn FnMut(Signal<'_>) + Send),
-    steer: bool,
-) -> Result<(), RuntimeError> {
-    let payload = UserMessagePayload {
-        blocks: queued.blocks,
-        mid_turn: true,
-        steer,
-    };
-    let event = log.append(aigentic_log::NewEvent {
-        kind: EventKind::UserMessage,
-        author: queued.author,
-        payload: serde_json::to_value(payload).expect("serialisable"),
-        parent_event: None,
-    })?;
-    observe(Signal::Event(&event));
-    Ok(())
 }

@@ -1,8 +1,12 @@
 //! Issue #33: a message posted while a turn runs reaches the agent at
-//! its next step. It is appended mid-turn with `steer`, the projection
-//! emits it where it sits — never between an assistant message and that
-//! message's own tool results — so the very next model call sees it, and
-//! replaying the log gives the live run's context.
+//! its next step. One posted while the model is replying is held, then
+//! appended where the model first reads it — after that reply's last
+//! tool result and before the next call, with `steer` — never between
+//! an assistant message and that message's own tool results. If the
+//! turn ends first (a final reply, an interrupt, a budget, a provider
+//! error) it is appended before `turn_ended` without `steer`, and the
+//! turn the actor starts next answers it. Replaying the log gives the
+//! live run its contexts.
 
 mod common;
 
@@ -10,15 +14,16 @@ use std::path::Path;
 use std::time::Duration;
 
 use aigentic_core::{
-    AgentId, Author, BoxFuture, ContentBlock, Event, EventKind, Message, ProviderEvent, RiskClass,
-    Tool, ToolCall, ToolError, ToolOutput, UserId,
+    AgentId, Author, BoxFuture, ContentBlock, Event, EventKind, Message, ProviderError,
+    ProviderEvent, RiskClass, Tool, ToolCall, ToolError, ToolOutput, UserId,
 };
-use aigentic_log::{ThreadLog, UserMessagePayload, project};
+use aigentic_log::{ThreadLog, TurnEndedPayload, UserMessagePayload};
 use aigentic_runtime::{
-    CancelToken, Layers, Outbox, Queued, Runtime, RuntimeError, TurnOutcome, inbox,
+    CancelToken, Layers, Outbox, Prefix, Queued, Runtime, RuntimeError, TurnOutcome, build_context,
+    inbox,
 };
 use aigentic_tools::ToolRegistry;
-use common::{Seen, done, scripted, steve};
+use common::{Seen, Step, done, gate, steve};
 use serde_json::json;
 
 /// Sleeps for its `ms` argument, so a message can be queued while the
@@ -63,39 +68,115 @@ struct Rig {
     dir: tempfile::TempDir,
     thread: ulid::Ulid,
     outbox: Outbox,
+    /// Fires the interrupt, as the actor does for `Post { interrupt:
+    /// true }`.
+    cancel: CancelToken,
     task: tokio::task::JoinHandle<Result<TurnOutcome, RuntimeError>>,
 }
 
 /// A turn on its own task with a live inbox: the test reads the log and
 /// posts while the turn runs.
 fn rig(script: Vec<Vec<ProviderEvent>>) -> Rig {
+    spawn_rig(steps(script), false)
+}
+
+/// `rig` over a gated script: a reply is a list of steps, and a
+/// [`common::gate`] step parks the stream mid-reply, so the test can
+/// post between two of its deltas.
+fn gated_rig(script: Vec<Vec<Step>>) -> Rig {
+    spawn_rig(script, false)
+}
+
+/// `gated_rig`, and when the first turn is over the task runs the turn
+/// the actor starts for a message no model call read (`after_turn`'s
+/// `Continue`), so the test sees the context that answers it.
+fn gated_rig_answering(script: Vec<Vec<Step>>) -> Rig {
+    spawn_rig(script, true)
+}
+
+fn steps(script: Vec<Vec<ProviderEvent>>) -> Vec<Vec<Step>> {
+    script
+        .into_iter()
+        .map(|reply| reply.into_iter().map(Step::Event).collect())
+        .collect()
+}
+
+fn spawn_rig(script: Vec<Vec<Step>>, answer_next: bool) -> Rig {
     let dir = tempfile::tempdir().unwrap();
     let thread = ulid::Ulid::generate();
     let log = ThreadLog::open(dir.path(), thread).unwrap();
-    let (provider, seen) = scripted(script);
+    let (provider, seen) = common::gated(script);
     let mut tools = ToolRegistry::empty();
     tools.register(Box::new(Slow)).unwrap();
     let mut runtime = Runtime::new(provider, tools, log, AgentId("worker".into()))
         .with_layers(Layers::global_instructions("Be terse."));
     let (outbox, mut inbox) = inbox();
     let cancel = CancelToken::never();
+    let token = cancel.clone();
     let task = tokio::spawn(async move {
-        runtime
+        let first = runtime
             .run_turn_until(
                 steve(),
                 vec![ContentBlock::Text("go".into())],
-                &cancel,
+                &token,
                 &mut inbox,
                 &mut |_| {},
             )
-            .await
+            .await;
+        if !answer_next {
+            return first;
+        }
+        // A fresh token, as the actor's per-turn one: a fired token
+        // stays fired.
+        let fresh = CancelToken::never();
+        let _ = runtime
+            .continue_turn_until(&fresh, &mut inbox, &mut |_| {})
+            .await;
+        first
     });
     Rig {
         seen,
         dir,
         thread,
         outbox,
+        cancel,
         task,
+    }
+}
+
+/// The log of a finished rig.
+fn log_of(dir: &Path, thread: ulid::Ulid) -> Vec<Event> {
+    ThreadLog::open(dir, thread).unwrap().read_all().unwrap()
+}
+
+/// Replaying the log gives the live run its contexts: for every model
+/// call that produced an assistant message, the context built from the
+/// log as it stood — everything before that message — is the request's
+/// tail. The prefix is empty (its system messages sit in front of the
+/// tail); the naming rule is `build_context`'s, the one the live run
+/// used. `requests` drops the calls that left no assistant message
+/// behind (an interrupt, a provider error) from the front.
+fn assert_replay(dir: &Path, thread: ulid::Ulid, requests: &[Vec<Message>]) {
+    let events = ThreadLog::open(dir, thread).unwrap().read_all().unwrap();
+    let ends: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.kind == EventKind::AssistantMessage)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        requests.len(),
+        ends.len(),
+        "one request per model call that answered"
+    );
+    for (i, end) in ends.iter().enumerate() {
+        let body = build_context(&Prefix::default(), &events[..*end]).unwrap();
+        let n = body.len();
+        assert_eq!(
+            &requests[i][requests[i].len() - n..],
+            &body[..],
+            "request {i} is the context the log as it stood builds"
+        );
     }
 }
 
@@ -267,27 +348,265 @@ async fn replaying_the_log_gives_the_live_run_its_context() {
     let outcome = rig.task.await.unwrap().unwrap();
     assert_eq!(outcome.reason, "done");
 
-    let events = ThreadLog::open(rig.dir.path(), rig.thread)
-        .unwrap()
-        .read_all()
-        .unwrap();
-    // The log as each request was built: everything before each
-    // assistant message.
-    let ends: Vec<usize> = events
-        .iter()
-        .enumerate()
-        .filter(|(_, e)| e.kind == EventKind::AssistantMessage)
-        .map(|(i, _)| i)
-        .collect();
     let seen = rig.seen.lock().unwrap();
-    assert_eq!(seen.len(), ends.len(), "one request per model call");
-    for (i, end) in ends.iter().enumerate() {
-        let body = project(&events[..*end]).unwrap().body;
-        let n = body.len();
-        assert_eq!(
-            &seen[i][seen[i].len() - n..],
-            &body[..],
-            "request {i} is the projection of the log as it stood"
+    assert_replay(rig.dir.path(), rig.thread, &seen);
+}
+
+#[tokio::test]
+async fn a_message_posted_mid_stream_of_a_reply_with_a_tool_call_steers_the_next_step() {
+    let (gate, mut parked) = gate();
+    let rig = gated_rig(vec![
+        vec![
+            Step::Event(ProviderEvent::TextDelta("working".into())),
+            Step::Gate(gate),
+            Step::Event(ProviderEvent::ToolCall(slow_call("c1", 0))),
+            Step::Event(done("tool_calls")),
+        ],
+        vec![
+            Step::Event(ProviderEvent::TextDelta("adjusted.".into())),
+            Step::Event(done("stop")),
+        ],
+    ]);
+
+    // magnus posts between two deltas of the reply.
+    parked.wait().await;
+    assert!(rig.outbox.send(magnus("use the other file")));
+    parked.open();
+
+    let outcome = rig.task.await.unwrap().unwrap();
+    assert_eq!(outcome.reason, "done");
+    assert_eq!(outcome.iterations, 2);
+
+    {
+        let seen = rig.seen.lock().unwrap();
+        // The call that was streaming could not have seen it.
+        assert!(
+            !texts(&seen[0])
+                .iter()
+                .any(|t| t.contains("use the other file"))
+        );
+        // The next call: the tool result, then the message, and
+        // nothing after it.
+        let msgs = &seen[1];
+        let n = msgs.len();
+        assert!(
+            matches!(&msgs[n - 2].blocks[0], ContentBlock::ToolResult(r) if r.id == "c1"),
+            "the tool result precedes the message"
+        );
+        assert!(
+            matches!(&msgs[n - 1].blocks[0], ContentBlock::Text(t) if t.contains("magnus")
+                && t.contains("use the other file")),
+            "the message is the last thing the model sees, {:?}",
+            texts(msgs)
         );
     }
+
+    // The log: after that reply's tool result and before the call that
+    // reads it, steering — where the model first sees it.
+    let events = log_of(rig.dir.path(), rig.thread);
+    let at = events
+        .iter()
+        .position(|e| e.kind == EventKind::UserMessage && e.author != steve())
+        .expect("magnus's message is in the log");
+    let result = events
+        .iter()
+        .position(|e| e.kind == EventKind::ToolResult)
+        .expect("the tool result is in the log");
+    let next_call = events
+        .iter()
+        .rposition(|e| e.kind == EventKind::AssistantMessage)
+        .expect("the second reply is in the log");
+    assert!(result < at, "after the reply's tool result");
+    assert!(at < next_call, "before the call that reads it");
+    let p: UserMessagePayload = serde_json::from_value(events[at].payload.clone()).unwrap();
+    assert!(p.mid_turn);
+    assert!(p.steer);
+
+    assert_replay(rig.dir.path(), rig.thread, &rig.seen.lock().unwrap());
+}
+
+#[tokio::test]
+async fn a_message_posted_mid_stream_of_a_final_reply_is_answered_by_the_next_turn() {
+    let (gate, mut parked) = gate();
+    let rig = gated_rig_answering(vec![
+        vec![
+            Step::Event(ProviderEvent::TextDelta("all done".into())),
+            Step::Gate(gate),
+            Step::Event(ProviderEvent::TextDelta(".".into())),
+            Step::Event(done("stop")),
+        ],
+        vec![
+            Step::Event(ProviderEvent::TextDelta("adjusted.".into())),
+            Step::Event(done("stop")),
+        ],
+    ]);
+
+    parked.wait().await;
+    assert!(rig.outbox.send(magnus("use the other file")));
+    parked.open();
+
+    let outcome = rig.task.await.unwrap().unwrap();
+    assert_eq!(outcome.reason, "done");
+
+    {
+        let seen = rig.seen.lock().unwrap();
+        // The reply that was streaming never saw it.
+        assert!(
+            !texts(&seen[0])
+                .iter()
+                .any(|t| t.contains("use the other file"))
+        );
+        // The turn the actor starts for it reads it as the last thing.
+        let msgs = &seen[1];
+        assert!(
+            matches!(&msgs.last().unwrap().blocks[0], ContentBlock::Text(t) if t.contains("magnus")
+                && t.contains("use the other file")),
+            "the message is the last thing the model sees, {:?}",
+            texts(msgs)
+        );
+    }
+
+    // The log: mid_turn without `steer`, before the turn_ended that
+    // ended the turn — so the existing next-turn path picks it up.
+    let events = log_of(rig.dir.path(), rig.thread);
+    let at = events
+        .iter()
+        .position(|e| e.kind == EventKind::UserMessage && e.author != steve())
+        .expect("magnus's message is in the log");
+    let end = events
+        .iter()
+        .position(|e| e.kind == EventKind::TurnEnded)
+        .expect("the turn ended");
+    assert!(at < end, "in the log before the turn ended");
+    let p: UserMessagePayload = serde_json::from_value(events[at].payload.clone()).unwrap();
+    assert!(p.mid_turn);
+    assert!(!p.steer);
+
+    assert_replay(rig.dir.path(), rig.thread, &rig.seen.lock().unwrap());
+}
+
+#[tokio::test]
+async fn a_message_posted_mid_stream_before_an_interrupt_is_not_lost() {
+    let (gate, mut parked) = gate();
+    let rig = gated_rig_answering(vec![
+        vec![
+            Step::Event(ProviderEvent::TextDelta("working".into())),
+            Step::Gate(gate),
+            Step::Event(ProviderEvent::TextDelta(" more".into())),
+            Step::Event(done("stop")),
+        ],
+        vec![
+            Step::Event(ProviderEvent::TextDelta("adjusted.".into())),
+            Step::Event(done("stop")),
+        ],
+    ]);
+
+    // magnus posts mid-stream, then steve interrupts before the reply
+    // finishes.
+    parked.wait().await;
+    assert!(rig.outbox.send(magnus("wait, use the other file")));
+    rig.cancel.cancel(steve());
+
+    let outcome = rig.task.await.unwrap().unwrap();
+    assert_eq!(outcome.reason, "interrupted");
+
+    // In the log, mid_turn without `steer`, before the turn_ended the
+    // interrupt wrote — not lost with the inbox.
+    let events = log_of(rig.dir.path(), rig.thread);
+    let at = events
+        .iter()
+        .position(|e| e.kind == EventKind::UserMessage && e.author != steve())
+        .expect("magnus's message is in the log");
+    let end = events
+        .iter()
+        .position(|e| e.kind == EventKind::TurnEnded)
+        .expect("the turn ended");
+    assert!(at < end, "in the log before the turn ended");
+    let p: UserMessagePayload = serde_json::from_value(events[at].payload.clone()).unwrap();
+    assert!(p.mid_turn);
+    assert!(!p.steer);
+
+    // And the turn the actor starts next answers it: the message is in
+    // its context, before the note the interrupt left.
+    let seen = rig.seen.lock().unwrap();
+    assert_eq!(seen.len(), 2, "the interrupted call, then the answer");
+    let msgs = &seen[1];
+    let at = msgs
+        .iter()
+        .position(|m| {
+            m.blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text(t) if t.contains("use the other file")))
+        })
+        .expect("the next turn reads it");
+    let note = msgs
+        .iter()
+        .position(|m| {
+            m.blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text(t) if t.contains("interrupted by steve")))
+        })
+        .expect("the interrupt's note is in it too");
+    assert!(at < note, "the message, then the note, {:?}", texts(msgs));
+    assert_replay(rig.dir.path(), rig.thread, &seen[1..]);
+}
+
+#[tokio::test]
+async fn a_message_posted_mid_stream_before_a_provider_error_is_not_lost() {
+    let (gate, mut parked) = gate();
+    let rig = gated_rig_answering(vec![
+        vec![
+            Step::Event(ProviderEvent::TextDelta("working".into())),
+            Step::Gate(gate),
+            Step::Event(ProviderEvent::Error(ProviderError::Transport(
+                "connection dropped".into(),
+            ))),
+        ],
+        vec![
+            Step::Event(ProviderEvent::TextDelta("adjusted.".into())),
+            Step::Event(done("stop")),
+        ],
+    ]);
+
+    parked.wait().await;
+    assert!(rig.outbox.send(magnus("use the other file")));
+    parked.open();
+
+    let error = rig.task.await.unwrap().unwrap_err();
+    assert!(
+        matches!(error, RuntimeError::Provider(ProviderError::Transport(_))),
+        "{error:?}"
+    );
+
+    // In the log before the turn_ended the error wrote, mid_turn
+    // without `steer`: no call of that turn read it.
+    let events = log_of(rig.dir.path(), rig.thread);
+    let at = events
+        .iter()
+        .position(|e| e.kind == EventKind::UserMessage && e.author != steve())
+        .expect("magnus's message is in the log");
+    let end = events
+        .iter()
+        .position(|e| e.kind == EventKind::TurnEnded)
+        .expect("the turn ended");
+    assert!(at < end, "in the log before the turn ended");
+    let p: UserMessagePayload = serde_json::from_value(events[at].payload.clone()).unwrap();
+    assert!(p.mid_turn);
+    assert!(!p.steer);
+    let ended: TurnEndedPayload = serde_json::from_value(events[end].payload.clone()).unwrap();
+    assert_eq!(
+        ended.reason,
+        "provider_error: transport error: connection dropped"
+    );
+
+    // And the turn the actor starts next answers it.
+    let seen = rig.seen.lock().unwrap();
+    assert_eq!(seen.len(), 2, "the call that errored, then the answer");
+    assert!(
+        matches!(&seen[1].last().unwrap().blocks[0], ContentBlock::Text(t) if t.contains("magnus")
+            && t.contains("use the other file")),
+        "the next turn reads it, {:?}",
+        texts(&seen[1])
+    );
+    assert_replay(rig.dir.path(), rig.thread, &seen[1..]);
 }

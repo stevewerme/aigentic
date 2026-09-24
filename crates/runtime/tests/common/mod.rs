@@ -3,6 +3,7 @@
 
 use std::collections::VecDeque;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use aigentic_core::{
@@ -14,17 +15,90 @@ use aigentic_runtime::{Layers, Runtime, audit_tool_results};
 use aigentic_tools::ToolRegistry;
 use futures_core::Stream;
 use serde_json::json;
+use tokio::sync::oneshot;
 
 /// Every request's messages, as the provider saw them.
 pub type Seen = Arc<Mutex<Vec<Vec<Message>>>>;
 
+/// One step of a `gated` script: an event, or a gate the stream parks
+/// at, so a test can post into the turn's inbox mid-call (issue #33).
+pub enum Step {
+    Event(ProviderEvent),
+    Gate(Gate),
+}
+
+/// The stream's side of a [`Step::Gate`]: signals its [`Parked`] when
+/// the stream reaches it, then holds until the test opens it.
+pub struct Gate {
+    parked: Mutex<Option<oneshot::Sender<()>>>,
+    open: Arc<AtomicBool>,
+}
+
+impl Gate {
+    /// Signal the test, then hold the stream until it opens.
+    async fn hold(&self) {
+        if let Some(parked) = self.parked.lock().unwrap().take() {
+            let _ = parked.send(());
+        }
+        while !self.open.load(Ordering::Relaxed) {
+            tokio::task::yield_now().await;
+        }
+    }
+}
+
+/// The test's side of a [`Gate`]: `wait` resolves once the stream has
+/// parked — the call is live, mid-reply — and `open` lets it resume.
+pub struct Parked {
+    parked: Option<oneshot::Receiver<()>>,
+    open: Arc<AtomicBool>,
+}
+
+impl Parked {
+    pub async fn wait(&mut self) {
+        if let Some(parked) = self.parked.take() {
+            let _ = parked.await;
+        }
+    }
+    pub fn open(&self) {
+        self.open.store(true, Ordering::Relaxed);
+    }
+}
+
+/// A gate and the test's handle on it.
+pub fn gate() -> (Gate, Parked) {
+    let (tx, rx) = oneshot::channel();
+    let open = Arc::new(AtomicBool::new(false));
+    (
+        Gate {
+            parked: Mutex::new(Some(tx)),
+            open: open.clone(),
+        },
+        Parked {
+            parked: Some(rx),
+            open,
+        },
+    )
+}
+
 /// Replays scripted responses in order and records every request's messages.
 pub struct ScriptedProvider {
-    script: Mutex<VecDeque<Vec<ProviderEvent>>>,
+    script: Mutex<VecDeque<Vec<Step>>>,
     seen: Seen,
 }
 
 pub fn scripted(script: Vec<Vec<ProviderEvent>>) -> (Box<dyn Provider>, Seen) {
+    gated(
+        script
+            .into_iter()
+            .map(|reply| reply.into_iter().map(Step::Event).collect())
+            .collect(),
+    )
+}
+
+/// `scripted`, but a reply is a list of steps, and a step can be a
+/// [`gate`]: the stream parks there until the test opens it, so a
+/// message can land between two deltas of one reply.
+pub fn gated(script: Vec<Vec<Step>>) -> (Box<dyn Provider>, Seen) {
     let seen: Seen = Arc::new(Mutex::new(Vec::new()));
     let p = ScriptedProvider {
         script: Mutex::new(script.into()),
@@ -39,13 +113,27 @@ impl Provider for ScriptedProvider {
         request: &CompletionRequest<'_>,
     ) -> Pin<Box<dyn Stream<Item = ProviderEvent> + Send + '_>> {
         self.seen.lock().unwrap().push(request.messages.to_vec());
-        let events = self
+        let steps: VecDeque<Step> = self
             .script
             .lock()
             .unwrap()
             .pop_front()
-            .expect("script exhausted");
-        Box::pin(futures_util::stream::iter(events))
+            .expect("script exhausted")
+            .into();
+        // One step per poll: a gate parks inside its own poll, yielding
+        // while it holds, so the turn keeps running around it.
+        Box::pin(futures_util::stream::unfold(
+            steps,
+            |mut steps| async move {
+                loop {
+                    match steps.pop_front() {
+                        None => return None,
+                        Some(Step::Gate(g)) => g.hold().await,
+                        Some(Step::Event(e)) => return Some((e, steps)),
+                    }
+                }
+            },
+        ))
     }
     fn count_tokens(&self, _: &[Message]) -> u64 {
         7

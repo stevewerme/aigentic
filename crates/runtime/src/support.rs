@@ -3,8 +3,9 @@
 use std::time::Instant;
 
 use aigentic_core::{Author, ContentBlock, Event, EventKind, Message, Role};
-use aigentic_log::{NewEvent, TurnEndedPayload, Usage};
+use aigentic_log::{NewEvent, TurnEndedPayload, Usage, UserMessagePayload};
 
+use crate::decisions::Queued;
 use crate::{Runtime, RuntimeError, Signal, TurnOutcome};
 
 /// What a turn has used so far, checked against the `Budget`.
@@ -53,12 +54,22 @@ impl Runtime {
         }
     }
 
+    /// `turn_ended`, with the reason a turn stopped. `held` is what a
+    /// stream held (issue #33): the turn is over, so no call of this
+    /// turn can read those messages where they sit. They go in first,
+    /// `steer` unset, before `turn_ended` — which is what lets the
+    /// projection emit them, so the turn the actor starts next answers
+    /// them — and nothing posted mid-stream is lost.
     pub(crate) fn end_turn(
         &mut self,
         reason: &str,
         spent: &Spent,
+        held: &mut Vec<Queued>,
         observe: &mut (dyn FnMut(Signal<'_>) + Send),
     ) -> Result<TurnOutcome, RuntimeError> {
+        for queued in std::mem::take(held) {
+            append_queued(&mut self.log, queued, observe, false)?;
+        }
         let touched = self.touched_this_turn()?;
         let payload = serde_json::to_value(TurnEndedPayload {
             reason: reason.to_owned(),
@@ -153,4 +164,32 @@ pub(crate) fn flush_text(text: &mut String, blocks: &mut Vec<ContentBlock>) {
     if !text.is_empty() {
         blocks.push(ContentBlock::Text(std::mem::take(text)));
     }
+}
+
+/// One queued message into the log, as `append` would but on the log
+/// alone, so it can run while a stream borrows the provider or the
+/// registry. `steer` is set where a model call will read the message —
+/// the safe points, after a reply's last tool result and before the
+/// call that reads it — so the projection emits it where it sits; a
+/// call already in flight cannot be steered, so a message that arrives
+/// mid-stream waits, `steer` unset, for the turn that answers it.
+pub(crate) fn append_queued(
+    log: &mut aigentic_log::ThreadLog,
+    queued: Queued,
+    observe: &mut (dyn FnMut(Signal<'_>) + Send),
+    steer: bool,
+) -> Result<(), RuntimeError> {
+    let payload = UserMessagePayload {
+        blocks: queued.blocks,
+        mid_turn: true,
+        steer,
+    };
+    let event = log.append(NewEvent {
+        kind: EventKind::UserMessage,
+        author: queued.author,
+        payload: serde_json::to_value(payload).expect("serialisable"),
+        parent_event: None,
+    })?;
+    observe(Signal::Event(&event));
+    Ok(())
 }
