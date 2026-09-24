@@ -27,6 +27,36 @@ pub(crate) const BACKOFF: [std::time::Duration; RETRIES] = [
     std::time::Duration::from_secs(8),
 ];
 
+/// Why a call is being retried, in words a user reads on the turn line:
+/// a dead connection is "not answering" (the stall case that looked like
+/// a slow model in the #38 review), a status is itself, and 429 gets its
+/// own label.
+pub(crate) fn retry_reason(failure: &aigentic_core::ProviderEvent) -> String {
+    use aigentic_core::{ProviderError, ProviderEvent};
+    match failure {
+        ProviderEvent::Error(ProviderError::Transport(_)) => "not answering".into(),
+        ProviderEvent::Error(ProviderError::Http { status, .. }) if *status == 429 => {
+            "rate limited".into()
+        }
+        ProviderEvent::Error(ProviderError::Http { status, .. }) if *status >= 500 => {
+            "overloaded".into()
+        }
+        ProviderEvent::Error(ProviderError::Http { status, .. }) => format!("http {status}"),
+        other => format!("{other:?}"),
+    }
+}
+
+/// The error out of an `Error` event; anything else is a protocol bug
+/// and says so rather than panicking.
+pub(crate) fn error_of(event: aigentic_core::ProviderEvent) -> aigentic_core::ProviderError {
+    match event {
+        aigentic_core::ProviderEvent::Error(e) => e,
+        other => {
+            aigentic_core::ProviderError::Protocol(format!("expected an error, got {other:?}"))
+        }
+    }
+}
+
 /// A call's arguments as the wire must carry them on replay: an object.
 /// A model that emitted malformed JSON leaves its raw text in the log as a
 /// string (the tool already answered with an error quoting it), and both

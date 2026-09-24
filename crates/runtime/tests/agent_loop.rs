@@ -361,3 +361,52 @@ async fn a_second_turn_resumes_from_the_log() {
     assert_eq!(roles, vec![Role::User, Role::Assistant, Role::User]);
     assert_eq!(h.runtime.log().len(), 6);
 }
+
+/// A retry the provider reports is appended where it happened
+/// (issue #31): between the user's message and the reply it delayed,
+/// system-authored, carrying the attempt, the total and the wait.
+#[tokio::test]
+async fn a_provider_retry_is_logged_as_it_arrives() {
+    let mut h = harness(
+        vec![vec![
+            ProviderEvent::Retried {
+                attempt: 1,
+                retries: 3,
+                reason: "not answering".into(),
+                wait: Duration::from_secs(1),
+            },
+            ProviderEvent::TextDelta("hi".into()),
+            usage(5, 1),
+            done("stop"),
+        ]],
+        None,
+    );
+    let mut signalled = Vec::new();
+    h.runtime
+        .run_turn(steve(), vec![ContentBlock::Text("hi".into())], &mut |s| {
+            if let Signal::Event(e) = s {
+                signalled.push(e.kind);
+            }
+        })
+        .await
+        .unwrap();
+
+    let events = h.runtime.log().read_all().unwrap();
+    let kinds: Vec<EventKind> = events.iter().map(|e| e.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            EventKind::UserMessage,
+            EventKind::ProviderRetried,
+            EventKind::AssistantMessage,
+            EventKind::TurnEnded,
+        ]
+    );
+    let retry = &events[1];
+    assert_eq!(retry.author, Author::System);
+    assert_eq!(retry.payload["attempt"], json!(1));
+    assert_eq!(retry.payload["retries"], json!(3));
+    assert_eq!(retry.payload["reason"], json!("not answering"));
+    assert_eq!(retry.payload["wait_ms"], json!(1000));
+    assert_eq!(signalled, kinds, "every appended event is signalled");
+}

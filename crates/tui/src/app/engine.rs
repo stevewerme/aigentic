@@ -55,6 +55,11 @@ pub struct TurnStats {
     pub current: Option<String>,
     /// Text is streaming.
     pub writing: bool,
+    /// The retry the call is waiting on (issue #31): `(attempt, retries,
+    /// reason)`. Set when `provider_retried` arrives, so the turn line
+    /// says `retrying 2/3 · tensorx · not answering` while the backoff
+    /// runs instead of a bare `thinking`. Cleared by the first content.
+    pub retry: Option<(u32, u32, String)>,
 }
 
 impl TurnStats {
@@ -65,6 +70,7 @@ impl TurnStats {
             output: 0,
             current: None,
             writing: false,
+            retry: None,
         }
     }
 
@@ -86,6 +92,12 @@ impl TurnStats {
     pub fn activity(&self) -> String {
         match (&self.current, self.writing) {
             (Some(_), _) => "running".into(),
+            // A retry outranks "thinking": the call is not thinking, it
+            // is waiting on a provider that has not answered (issue #31).
+            (None, _) if self.retry.is_some() => {
+                let (attempt, retries, reason) = self.retry.as_ref().expect("checked");
+                format!("retrying {attempt}/{retries} · {reason}")
+            }
             (None, true) => "writing".into(),
             (None, false) => "thinking".into(),
         }
@@ -779,6 +791,8 @@ impl ClientRepl {
             Notice::TextDelta { text, .. } => {
                 if let Some(t) = self.turn.as_mut() {
                     t.writing = true;
+                    // Content is arriving: the call recovered (issue #31).
+                    t.retry = None;
                 }
                 self.partial.push_str(&text);
                 while let Some(pos) = self.partial.find('\n') {
@@ -830,6 +844,7 @@ impl ClientRepl {
                 if let Some(t) = self.turn.as_mut() {
                     t.tools += 1;
                     t.writing = false;
+                    t.retry = None;
                     t.current = Some(format!("{} {summary}", call.name));
                 }
                 self.calls.insert(
@@ -949,6 +964,7 @@ impl ClientRepl {
                 self.flush_partial(out);
                 if let Some(t) = self.turn.as_mut() {
                     t.writing = false;
+                    t.retry = None;
                     if let Ok(AssistantMessagePayload { usage: Some(u), .. }) =
                         serde_json::from_value(event.payload.clone())
                     {
@@ -978,6 +994,7 @@ impl ClientRepl {
             EventKind::ToolResult => {
                 if let Some(t) = self.turn.as_mut() {
                     t.current = None;
+                    t.retry = None;
                 }
                 if let Ok(ToolResultPayload { result: r, .. }) =
                     serde_json::from_value(event.payload.clone())
@@ -1157,6 +1174,18 @@ impl ClientRepl {
                 {
                     out.quiet(&format!("[title: {}]", p.title));
                     self.title = Some(p.title);
+                }
+            }
+            // A retry (issue #31): set the turn line's reason, print no
+            // line of its own. The attempt is visible the moment the
+            // wait starts, so a dead endpoint never reads as a slow model.
+            EventKind::ProviderRetried => {
+                if let Ok(p) = serde_json::from_value::<
+                    aigentic_runtime::aigentic_log::ProviderRetriedPayload,
+                >(event.payload.clone())
+                    && let Some(t) = self.turn.as_mut()
+                {
+                    t.retry = Some((p.attempt, p.retries, p.reason));
                 }
             }
             EventKind::Pinned
@@ -2328,5 +2357,23 @@ mod tests {
         assert!(t.figures().ends_with("1 tool"), "{}", t.figures());
         assert_eq!(crate::app::status::count_short(950), "950");
         assert_eq!(crate::app::status::count_short(1_300_000), "1.3M");
+    }
+
+    /// A retry outranks "thinking" on the turn line (issue #31): a call
+    /// waiting on a dead provider says so, with the attempt and the
+    /// profile that will be tried again, and content clears it.
+    #[test]
+    fn a_retry_shows_on_the_turn_line() {
+        let mut t = TurnStats::new();
+        t.retry = Some((2, 3, "tensorx · not answering".into()));
+        assert_eq!(t.activity(), "retrying 2/3 · tensorx · not answering");
+        // Content arriving is the recovery: the reason goes away.
+        t.writing = true;
+        t.retry = None;
+        assert_eq!(t.activity(), "writing");
+        // And a running tool keeps the row above, not this line.
+        t.retry = Some((1, 3, "tensorx · not answering".into()));
+        t.current = Some("bash cargo test".into());
+        assert_eq!(t.activity(), "running");
     }
 }

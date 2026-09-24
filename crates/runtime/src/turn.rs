@@ -8,11 +8,12 @@ use aigentic_core::{
     ToolSpec,
 };
 use aigentic_log::{
-    AssistantMessagePayload, InterruptedPayload, ToolResultPayload, Usage, UserMessagePayload,
+    AssistantMessagePayload, InterruptedPayload, ProviderRetriedPayload, ToolResultPayload, Usage,
+    UserMessagePayload,
 };
 use futures_util::StreamExt;
 
-use aigentic_log::{Invoker, PolicyRecord};
+use aigentic_log::{Invoker, NewEvent, PolicyRecord};
 
 use crate::decisions::{CancelToken, Inbox, Queued};
 use crate::harness_tools::{ASK_HUMAN, HARNESS_CLASS, harness_specs, is_harness_tool};
@@ -239,6 +240,30 @@ impl Runtime {
                     ttft_ms = Some(requested.elapsed().as_millis() as u64);
                 }
                 match event {
+                    // Live retries (issue #31): appended as they arrive,
+                    // so the log and every client see the wait as it
+                    // happens rather than after the call recovers.
+                    ProviderEvent::Retried {
+                        attempt,
+                        retries,
+                        reason,
+                        wait,
+                    } => {
+                        let payload = serde_json::to_value(ProviderRetriedPayload {
+                            attempt,
+                            retries,
+                            reason: self.retry_reason(&reason),
+                            wait_ms: wait.as_millis() as u64,
+                        })
+                        .expect("serialisable");
+                        let event = self.log.append(NewEvent {
+                            kind: EventKind::ProviderRetried,
+                            author: Author::System,
+                            payload,
+                            parent_event: None,
+                        })?;
+                        observe(Signal::Event(&event));
+                    }
                     ProviderEvent::TextDelta(t) => {
                         observe(Signal::TextDelta(&t));
                         text.push_str(&t);

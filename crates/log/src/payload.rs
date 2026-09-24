@@ -289,6 +289,22 @@ pub struct ContextEvictedPayload {
     pub through_seq: u64,
 }
 
+/// Payload of a `provider_retried` event (issue #31): which retry is
+/// starting, out of how many, why the call is quiet, and how long the
+/// backoff waits before the next attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderRetriedPayload {
+    /// 1-based: the retry that is starting.
+    pub attempt: u32,
+    /// Total retries this call will make.
+    pub retries: u32,
+    /// `not answering`, `http 503`, `overloaded`, prefixed with the
+    /// profile label by the runtime.
+    pub reason: String,
+    /// The backoff before the next attempt.
+    pub wait_ms: u64,
+}
+
 /// Payload of an `interrupted` event: appended on resume after a crash
 /// (phase 2), or when a participant interrupts a running turn (phase 5).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

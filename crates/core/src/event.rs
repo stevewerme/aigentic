@@ -54,6 +54,11 @@ pub enum EventKind {
     /// originals stay in the log; the sweep appends one per block of
     /// calls, so the cached prefix is stable between sweeps.
     ContextEvicted,
+    /// A provider retry (issue #31), appended live as the adapter starts
+    /// waiting, so a turn that hangs on a dead endpoint reads as retries
+    /// and not as a slow model. Author `system`; the payload carries the
+    /// attempt, the total, why, and the wait in ms.
+    ProviderRetried,
 }
 
 /// One line of a thread's append-only log. The log is the source of truth;

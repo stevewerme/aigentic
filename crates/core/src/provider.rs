@@ -54,6 +54,16 @@ pub enum ProviderEvent {
     Done {
         finish_reason: String,
     },
+    /// A retry about to run, yielded before its backoff wait so a client
+    /// can show why the call is quiet (issue #31). `attempt` is the
+    /// 1-based number of the retry that is starting, `retries` the total
+    /// the adapter will make.
+    Retried {
+        attempt: u32,
+        retries: u32,
+        reason: String,
+        wait: std::time::Duration,
+    },
     /// The stream failed; no further items follow.
     Error(ProviderError),
 }
@@ -71,6 +81,25 @@ pub enum ProviderError {
     RateLimited,
     #[error("unsupported: {0}")]
     Unsupported(String),
+}
+
+impl ProviderError {
+    /// The same error, prefixed with how hard the adapter tried: the
+    /// turn line and the log then say a provider was given `attempts`
+    /// attempts over `tried`, not just that it failed.
+    pub fn with_attempts(self, attempts: u32, tried: std::time::Duration) -> Self {
+        let prefix = format!("gave up after {attempts} attempts over {tried:?}: ");
+        match self {
+            Self::Transport(m) => Self::Transport(prefix + &m),
+            Self::Http { status, body } => Self::Http {
+                status,
+                body: prefix + &body,
+            },
+            Self::Protocol(m) => Self::Protocol(prefix + &m),
+            Self::RateLimited => Self::Transport(format!("{prefix}rate limited")),
+            Self::Unsupported(m) => Self::Unsupported(m),
+        }
+    }
 }
 
 /// Everything one model call needs. Tools are per call because the

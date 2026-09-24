@@ -441,7 +441,10 @@ pub fn project(events: &[Event]) -> Result<Projection, LogError> {
             | EventKind::MemoryExtracted
             | EventKind::MemoryRemembered
             | EventKind::ThreadStarted
-            | EventKind::ThreadRenamed => {}
+            | EventKind::ThreadRenamed
+            // A retry is a UI fact (issue #31), not context: the model
+            // is told nothing about transport trouble.
+            | EventKind::ProviderRetried => {}
         }
     }
 

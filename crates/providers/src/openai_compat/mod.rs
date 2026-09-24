@@ -167,8 +167,14 @@ impl Provider for OpenAiCompat {
         let client = self.client.clone();
         let api_key = self.config.api_key.clone();
 
-        let response = async move {
+        // Live retries (issue #31): the attempt loop runs in its own
+        // task and sends each event into the channel, so a `Retried` is
+        // observed *before* the backoff it announces — the client shows
+        // `retrying 2/3` while it waits, not after the wait is over.
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
             let mut attempt = 0;
+            let started = std::time::Instant::now();
             loop {
                 let mut request = client.post(&url).json(&body);
                 if let Some(key) = &api_key {
@@ -198,20 +204,35 @@ impl Provider for OpenAiCompat {
                         }
                     };
                 match outcome {
-                    Ok(events) => return events,
+                    Ok(mut events) => {
+                        while let Some(event) = events.next().await {
+                            let _ = tx.send(event);
+                        }
+                        return;
+                    }
                     Err(failure) => {
                         if attempt >= crate::RETRIES || !retryable(&failure) {
-                            let stream: EventStream<'static> =
-                                Box::pin(futures_util::stream::once(async move { failure }));
-                            return stream;
+                            let attempts = attempt as u32 + 1;
+                            let _ = tx.send(ProviderEvent::Error(
+                                crate::error_of(failure).with_attempts(attempts, started.elapsed()),
+                            ));
+                            return;
                         }
+                        let _ = tx.send(ProviderEvent::Retried {
+                            attempt: attempt as u32 + 1,
+                            retries: crate::RETRIES as u32,
+                            reason: crate::retry_reason(&failure),
+                            wait: crate::BACKOFF[attempt],
+                        });
                         tokio::time::sleep(crate::BACKOFF[attempt]).await;
                         attempt += 1;
                     }
                 }
             }
-        };
-        Box::pin(futures_util::stream::once(response).flatten())
+        });
+        Box::pin(futures_util::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|event| (event, rx))
+        }))
     }
 
     fn count_tokens(&self, context: &[Message]) -> u64 {
@@ -323,10 +344,114 @@ mod tests {
         };
         let events: Vec<ProviderEvent> = provider.complete(&request).collect().await;
         assert!(
-            matches!(events.first(), Some(ProviderEvent::TextDelta(t)) if t == "hi"),
+            matches!(events.first(), Some(ProviderEvent::Retried { attempt: 1, retries, reason, wait })
+                if *retries == crate::RETRIES as u32 && reason == "overloaded" && *wait == crate::BACKOFF[0]),
+            "{events:?}"
+        );
+        assert!(
+            matches!(events.get(1), Some(ProviderEvent::TextDelta(t)) if t == "hi"),
             "{events:?}"
         );
         assert!(!events.iter().any(|e| matches!(e, ProviderEvent::Error(_))));
+    }
+
+    /// The retry is reported *while* the call waits (issue #31): the
+    /// second response is held for two seconds, and the `Retried` event
+    /// must arrive long before it is written, so a hanging provider
+    /// reads as retries on the turn line, not as a slow model.
+    #[tokio::test]
+    async fn a_retry_is_reported_before_its_wait_ends() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            // First request: 503 at once.
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 65536];
+            let _ = conn.read(&mut buf);
+            conn.write_all(
+                b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 4\r\nconnection: close\r\n\r\nbusy",
+            )
+            .unwrap();
+            drop(conn);
+            // Second request: take the request, then hold the reply for
+            // two seconds — the 1 s backoff plus the 8 s one are real
+            // sleeps here, so this is the wait the client must see.
+            let (mut conn, _) = listener.accept().unwrap();
+            let _ = conn.read(&mut buf);
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let body = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+            let _ = conn.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+        });
+        let provider = OpenAiCompat::new(OpenAiCompatConfig::new(format!("http://{addr}/v1"), "m"));
+        let request = CompletionRequest {
+            messages: &[],
+            tools: &[],
+            max_output_tokens: None,
+        };
+        let mut stream = provider.complete(&request);
+        // The 503 is answered at once, so the first item is the retry and
+        // it must be here well inside the backoff: 1.5 s is more than the
+        // 1 s sleep but far less than the 2 s the second reply is held.
+        let first = tokio::time::timeout(std::time::Duration::from_millis(1500), stream.next())
+            .await
+            .expect("the retry is reported before its wait ends")
+            .expect("a first event");
+        assert!(
+            matches!(first, ProviderEvent::Retried { attempt: 1, .. }),
+            "{first:?}"
+        );
+        let rest: Vec<ProviderEvent> = stream.collect().await;
+        assert!(
+            rest.iter()
+                .any(|e| matches!(e, ProviderEvent::TextDelta(t) if t == "hi")),
+            "{rest:?}"
+        );
+    }
+
+    /// Every attempt failing (503) ends in one error that says how hard
+    /// the adapter tried: the count and the wall time.
+    #[tokio::test]
+    async fn giving_up_says_how_long_it_tried() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for _ in 0..=crate::RETRIES {
+                let (mut conn, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 65536];
+                let _ = conn.read(&mut buf);
+                conn.write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 4\r\nconnection: close\r\n\r\nbusy",
+                )
+                .unwrap();
+            }
+        });
+        let provider = OpenAiCompat::new(OpenAiCompatConfig::new(format!("http://{addr}/v1"), "m"));
+        let request = CompletionRequest {
+            messages: &[],
+            tools: &[],
+            max_output_tokens: None,
+        };
+        let events: Vec<ProviderEvent> = provider.complete(&request).collect().await;
+        let retries = events
+            .iter()
+            .filter(|e| matches!(e, ProviderEvent::Retried { .. }))
+            .count();
+        assert_eq!(retries, crate::RETRIES);
+        let Some(ProviderEvent::Error(e)) = events.last() else {
+            panic!("expected a final error: {events:?}");
+        };
+        // The rule is `with_attempts`' own: prefix + the original text.
+        let expected_prefix = format!("gave up after {} attempts over ", crate::RETRIES + 1);
+        assert!(e.to_string().contains(&expected_prefix), "{e}");
+        assert!(e.to_string().contains("http 503"), "{e}");
     }
 
     #[test]

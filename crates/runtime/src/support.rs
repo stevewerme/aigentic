@@ -160,6 +160,18 @@ impl Runtime {
     }
 }
 
+impl Runtime {
+    /// A retry's reason as shown in the log: the profile label first, so
+    /// the turn line reads `retrying 2/3 · tensorx · not answering`
+    /// (issue #31). Without a profile it is the reason alone.
+    pub(crate) fn retry_reason(&self, reason: &str) -> String {
+        match &self.profile {
+            Some(profile) => format!("{profile} · {reason}"),
+            None => reason.to_owned(),
+        }
+    }
+}
+
 /// Whether an event is the call's first content: a delta, a tool call or
 /// a blob. Usage and done arrive after the content they describe, so a
 /// stream that only sends those never sets a time to first token.

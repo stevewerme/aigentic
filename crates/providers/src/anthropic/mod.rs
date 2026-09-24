@@ -161,8 +161,13 @@ impl Provider for Anthropic {
         let client = self.client.clone();
         let api_key = self.config.api_key.clone();
 
-        let response = async move {
+        // Live retries (issue #31), as in the OpenAI adapter: the loop
+        // runs in its own task so a `Retried` reaches the caller before
+        // the backoff it announces.
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
             let mut attempt = 0;
+            let started = std::time::Instant::now();
             loop {
                 let request = client
                     .post(&url)
@@ -190,7 +195,12 @@ impl Provider for Anthropic {
                         }
                     };
                 match outcome {
-                    Ok(events) => return events,
+                    Ok(mut events) => {
+                        while let Some(event) = events.next().await {
+                            let _ = tx.send(event);
+                        }
+                        return;
+                    }
                     Err(failure) => {
                         // Retries cover an overloaded or rate-limited reply before any
                         // content: HTTP 429/503/529, or a first `overloaded_error` event.
@@ -202,17 +212,27 @@ impl Provider for Anthropic {
                                 other => is_overloaded(other),
                             };
                         if !retry {
-                            let stream: EventStream<'static> =
-                                Box::pin(futures_util::stream::once(async move { failure }));
-                            return stream;
+                            let attempts = attempt as u32 + 1;
+                            let _ = tx.send(ProviderEvent::Error(
+                                crate::error_of(failure).with_attempts(attempts, started.elapsed()),
+                            ));
+                            return;
                         }
+                        let _ = tx.send(ProviderEvent::Retried {
+                            attempt: attempt as u32 + 1,
+                            retries: crate::RETRIES as u32,
+                            reason: crate::retry_reason(&failure),
+                            wait: crate::BACKOFF[attempt],
+                        });
                         tokio::time::sleep(crate::BACKOFF[attempt]).await;
                         attempt += 1;
                     }
                 }
             }
-        };
-        Box::pin(futures_util::stream::once(response).flatten())
+        });
+        Box::pin(futures_util::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|event| (event, rx))
+        }))
     }
 
     fn count_tokens(&self, context: &[Message]) -> u64 {
