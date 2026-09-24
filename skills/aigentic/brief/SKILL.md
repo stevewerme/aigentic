@@ -10,7 +10,8 @@ Write the prompts that build one issue. The person pastes them into fresh
 threads, or a lead thread starts them. You write prompts; you do not edit
 code.
 
-Read first: the issue with its comments (`gh issue view <n> --comments`),
+Read first: the issue with its comments
+(`gh issue view <n> --json body,comments`),
 `.aigentic/knowledge/lessons.md`, and `docs/agents/issue-tracker.md`.
 
 ## 1. Size the work
@@ -64,7 +65,9 @@ Each prompt starts with the command that opens its thread:
 - Commit per the plan with `git commit -F <file>`, files staged by name, a
   blank line, then exactly
   `Co-Authored-By: aigentic (<model>) <332865255+aigentic-bot@users.noreply.github.com>`,
-  where `<model>` is the implementer's model (e.g. `deepseek-v4.1-flash`).
+  with `<model>` filled in by you from the implementer's profile (the
+  `model` in its `[profiles.<name>]`, without the provider prefix: `flash`
+  is `deepseek-v4.1-flash`). A model may not know its own id.
   Push; `cargo install --path crates/tui --force`. Do not close the issue.
 - The safety line: never `git reset`, `git checkout -- <file>`,
   `git stash`, `git clean` or `git add -A`; commit nothing under

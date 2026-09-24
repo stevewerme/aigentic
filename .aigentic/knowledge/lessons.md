@@ -52,6 +52,8 @@ so the rule can be judged, not just obeyed. The `brief`, `plan-check` and
   wrong (or "nothing"). Ask for it as a done-when item; asked for loosely,
   models write one line.
 - Commit nothing under `.scratch/`; leave `.aigentic/rules.toml` alone.
+- `gh issue view <n> --comments` prints nothing without a terminal (as in
+  a bash tool call); use `gh issue view <n> --json body,comments`.
 
 ## Running builds
 

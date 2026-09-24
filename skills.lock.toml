@@ -618,7 +618,7 @@ name = "brief"
 path = "skills/aigentic/brief"
 source = "local"
 commit = ""
-sha256 = "d190c009af657468438b085b37237c0369c8e45eff9014d21032a4d0660a3e8e"
+sha256 = "74ff64b8fd546526c414b50595fbc605ceadbd7e199535ab36c3c3201ad1eb8c"
 invocation = "user"
 review = { by = "steve", on = "2026-09-24" }
 
