@@ -23,7 +23,7 @@ pub const UPDATE_TASKS: &str = "update_tasks";
 /// person's global ones. A tool description alone did not make GLM 5.3
 /// keep the checklist (zero calls on an explicit four-step task); this
 /// line did (four and five calls in two runs).
-pub const HARNESS_INSTRUCTIONS: &str = "For any request of three or more steps, call update_tasks before anything else with every step, then again as each step starts and finishes. Work one step at a time. A user message that arrives mid-turn is a correction or an addition from the person: read it before your next step and adjust your plan. Ask the human only through ask_human, with every question in the call (never \"answer the questions above\") and options when the answer is a choice; the client adds an Other row, so never list one yourself.";
+pub const HARNESS_INSTRUCTIONS: &str = "For any request of three or more steps, call update_tasks before anything else with every step, then again as each step starts and finishes. Work one step at a time. A user message that arrives mid-turn is a correction or an addition from the person: read it before your next step and adjust your plan. Ask the human only through ask_human, with every question in the call (never \"answer the questions above\") and options when the answer is a choice; the client adds an Other row, so never list one yourself. The shell already starts in the project root and keeps its working directory between calls: do not cd to a guessed path.";
 
 /// One option an `ask_human` question offers.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]

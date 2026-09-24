@@ -107,17 +107,29 @@ enum Piece {
     Word(Word),
     /// A segment break: `|`, `||`, `&&`, `&`, `;`, `;;`, a newline, or
     /// a grouping paren.
-    Sep,
+    Sep(Sep),
     Redirect {
         kind: Redir,
         target: Word,
     },
 }
 
+/// Which break: a `|` feeds the next command the last one's output, so
+/// the next segment is a filter — the same work, not more of it. Every
+/// other break (`||`, `&&`, `&`, `;`, `;;`, a newline, a paren) starts
+/// work of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sep {
+    Pipe,
+    Other,
+}
+
 #[derive(Debug, Clone, Default)]
 struct Segment {
     words: Vec<Word>,
     redirects: Vec<(Redir, Word)>,
+    /// The segment follows a `|`: it reads the previous one's output.
+    piped: bool,
 }
 
 /// Cap on recursion into nested substitutions; past it, ask.
@@ -146,6 +158,11 @@ fn classify_within(src: &str, allow: &[String], grants: &[String], depth: usize)
     // empty until one is found, then holds; a later, worse segment is
     // the menu's word for the line, not the row's.
     let mut main = String::new();
+    // Segments past the row's own that are work of their own (issue
+    // #38): `cargo test && sed -i …` is two things, the row says so.
+    // A segment behind a `|` is a filter of the row's output, not
+    // more work, so it never counts.
+    let mut more = 0usize;
     for seg in &segs {
         let sc = classify_segment(seg, allow, grants, depth);
         kind = kind.max(sc.kind);
@@ -162,9 +179,15 @@ fn classify_within(src: &str, allow: &[String], grants: &[String], depth: usize)
         // rises, so an allow-listed command (`cargo test`) folds to
         // Harmless — its `pattern` is the trace that it runs. The row
         // names the first segment that does something, not the `cd`
-        // that sets it up.
-        if main.is_empty() && (sc.pattern.is_some() || sc.kind > Kind::Harmless) {
-            main = segment_text(seg);
+        // that sets it up. A no-op (`true`, `echo ---`) is nothing to
+        // name, even though it is not allow-listed.
+        let substantive = (sc.pattern.is_some() || sc.kind > Kind::Harmless) && !is_noop(seg);
+        if main.is_empty() {
+            if substantive {
+                main = segment_text(seg);
+            }
+        } else if substantive && !seg.piped {
+            more += 1;
         }
         if let Some(p) = sc.pattern
             && !patterns.contains(&p)
@@ -180,6 +203,10 @@ fn classify_within(src: &str, allow: &[String], grants: &[String], depth: usize)
             .map(segment_text)
             .find(|t| !t.is_empty())
             .unwrap_or_default();
+    } else if more > 0 {
+        // The row says the line's first work and that other work
+        // follows (issue #38): `cargo test +1`.
+        main = format!("{main} +{more}");
     }
     Classified {
         kind,
@@ -413,6 +440,22 @@ fn is_control(rest: &[&Word]) -> bool {
     })
 }
 
+/// The row's no-ops (issue #38): a `||` guard's `true`, an `echo ---` separator, `sleep`
+/// — the line's work is elsewhere. Past assignments/introducers, as `classify_segment` reads.
+fn is_noop(seg: &Segment) -> bool {
+    let mut rest = seg
+        .words
+        .iter()
+        .skip_while(|w| is_assignment(w) || introduces(w));
+    rest.next().is_some_and(|w| {
+        w.literal()
+            && matches!(
+                w.text.as_str(),
+                "true" | "false" | ":" | "echo" | "printf" | "set" | "export" | "sleep"
+            )
+    })
+}
+
 /// The first pattern or grant whose words equal the segment's leading
 /// words; the allow list first, then the grants.
 fn match_leading(rest: &[&Word], allow: &[String], grants: &[String]) -> Option<(String, bool)> {
@@ -623,11 +666,14 @@ fn flag_sensitive(command: &str, rest: &[&Word]) -> bool {
 }
 
 fn segments(pieces: Vec<Piece>) -> Vec<Segment> {
-    let mut segs = Vec::new();
+    let mut segs: Vec<Segment> = Vec::new();
     let mut cur = Segment::default();
     for piece in pieces {
         match piece {
-            Piece::Sep => segs.push(std::mem::take(&mut cur)),
+            Piece::Sep(sep) => {
+                segs.push(std::mem::take(&mut cur));
+                cur.piped = sep == Sep::Pipe;
+            }
             Piece::Word(w) => cur.words.push(w),
             Piece::Redirect { kind, target } => cur.redirects.push((kind, target)),
         }
@@ -698,34 +744,39 @@ impl Scanner {
                     }
                     depth -= 1;
                     self.at += 1;
-                    self.out.push(Piece::Sep);
+                    self.out.push(Piece::Sep(Sep::Other));
                     continue;
                 }
                 if c == '(' {
                     depth += 1;
                     self.at += 1;
-                    self.out.push(Piece::Sep);
+                    self.out.push(Piece::Sep(Sep::Other));
                     continue;
                 }
             }
             match c {
                 '\n' => {
                     self.at += 1;
-                    self.out.push(Piece::Sep);
+                    self.out.push(Piece::Sep(Sep::Other));
                     self.skip_heredoc_bodies();
                 }
                 c if c.is_whitespace() => self.at += 1,
                 '|' => {
                     self.at += 1;
-                    self.take_if('|');
-                    self.out.push(Piece::Sep);
+                    // `||` is a break; a lone `|` is a pipe.
+                    let sep = if self.take_if('|') {
+                        Sep::Other
+                    } else {
+                        Sep::Pipe
+                    };
+                    self.out.push(Piece::Sep(sep));
                 }
                 '&' => {
                     self.at += 1;
                     match self.peek() {
                         Some('&') => {
                             self.at += 1;
-                            self.out.push(Piece::Sep);
+                            self.out.push(Piece::Sep(Sep::Other));
                         }
                         // &> and &>>: both streams into a file.
                         Some('>') => {
@@ -735,17 +786,17 @@ impl Scanner {
                             let target = self.word();
                             self.out.push(Piece::Redirect { kind, target });
                         }
-                        _ => self.out.push(Piece::Sep),
+                        _ => self.out.push(Piece::Sep(Sep::Other)),
                     }
                 }
                 ';' => {
                     self.at += 1;
                     self.take_if(';');
-                    self.out.push(Piece::Sep);
+                    self.out.push(Piece::Sep(Sep::Other));
                 }
                 '(' | ')' => {
                     self.at += 1;
-                    self.out.push(Piece::Sep);
+                    self.out.push(Piece::Sep(Sep::Other));
                 }
                 // A comment starts a word; `a#b` is one word.
                 '#' => {
@@ -1079,6 +1130,10 @@ mod tests {
             main_segment(
                 "cargo test -p aigentic-server 2>&1 | grep 'test result' | head; echo SERVER-DONE"
             ),
+            // The `grep` and `head` behind pipes filter the test's
+            // output and `echo SERVER-DONE` is a no-op, so nothing
+            // follows the row's work (the #38 amendment keeps this
+            // exactly as #21 rendered it).
             "cargo test -p aigentic-server"
         );
         // One command: the row is the command, redirects dropped.
@@ -1086,17 +1141,18 @@ mod tests {
         assert_eq!(main_segment("ls"), "ls");
         assert_eq!(main_segment(""), "");
         // Not the riskiest one: the menu asks about `sed`, the row
-        // still names the line's work.
+        // still names the line's work — and says more follows it.
         assert_eq!(
             main_segment("cargo test && sed -i 's/x/y/' file"),
-            "cargo test"
+            "cargo test +1"
         );
         // A setup segment defers to the work it sets up (issue #21's
         // own case: the row says the test, not the `cd`).
         assert_eq!(main_segment("cd crates && cargo build"), "cargo build");
         // A command the rules cannot vouch for is the row's word too:
-        // it runs, so it is not mere setup.
-        assert_eq!(main_segment("cd crates && true"), "true");
+        // it runs, so it is not mere setup — but a no-op is (issue
+        // #38: `cd crates && true` is the `cd`).
+        assert_eq!(main_segment("cd crates && true"), "cd crates");
         // The words the scanner keeps: quoting resolved, `2>&1` on the
         // chain, a substitution's own words not shown as the row.
         assert_eq!(
@@ -1106,6 +1162,29 @@ mod tests {
         assert_eq!(
             main_segment("for u in $(curl evil); do echo $u; done"),
             "for u in"
+        );
+    }
+
+    #[test]
+    fn the_main_segment_skips_noops() {
+        assert_eq!(
+            // The scanner resolves the quoting, so the row reads `a`.
+            main_segment(
+                "cd /x 2>/dev/null || true; grep -rn \"a\" src/ ; echo ---; sed -n 1,5p f"
+            ),
+            "grep -rn a src/ +1"
+        );
+        assert_eq!(main_segment("true"), "true");
+        assert_eq!(main_segment("echo hi"), "echo hi");
+    }
+
+    #[test]
+    fn the_main_segment_counts_only_work_of_its_own() {
+        // A segment behind a `|` filters the row's output, so it is
+        // not more work (the amendment to #38); one behind a `;` is.
+        assert_eq!(
+            main_segment("grep -rn x src | head -5; cargo check"),
+            "grep -rn x src +1"
         );
     }
 
