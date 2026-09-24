@@ -35,8 +35,12 @@ pub enum Cell {
     Assistant { text: String, fenced: bool },
     Tool {
         name: String,
-        /// The call's arguments, shown on the bullet line.
+        /// The row's text: the one value that names what the call is
+        /// about — for `bash`, the command's main segment.
         summary: String,
+        /// The whole command when the row shows less than all of it
+        /// (a `bash` chain): the pager's text.
+        full: Option<String>,
         state: ToolState,
         /// The result, whole; rendering cuts it.
         output: String,
@@ -131,7 +135,9 @@ pub fn is_read_tool(name: &str) -> bool {
 }
 
 /// The bullet line's argument text: the one value that names what the
-/// call is about when there is one, else the JSON.
+/// call is about when there is one, else the JSON. A `bash` line
+/// shows its main segment (issue #21) — the row says what the line
+/// is, the pager keeps the chain.
 pub fn summarise_args(call: &ToolCall) -> String {
     let key = match call.name.as_str() {
         "bash" => Some("command"),
@@ -142,7 +148,13 @@ pub fn summarise_args(call: &ToolCall) -> String {
     let text = key
         .and_then(|k| call.args.get(k))
         .and_then(|v| v.as_str())
-        .map(str::to_owned)
+        .map(|raw| {
+            if call.name == "bash" {
+                aigentic_runtime::aigentic_policy::main_segment(raw)
+            } else {
+                raw.to_owned()
+            }
+        })
         .unwrap_or_else(|| call.args.to_string());
     let one_line = text.replace('\n', " ");
     if one_line.chars().count() > ARGS_WIDTH {
@@ -151,6 +163,22 @@ pub fn summarise_args(call: &ToolCall) -> String {
     } else {
         one_line
     }
+}
+
+/// A `bash` call's whole command, for the pager; `None` for every
+/// other tool, whose one value is already the whole of it.
+pub fn full_command(call: &ToolCall) -> Option<String> {
+    if call.name != "bash" {
+        return None;
+    }
+    let full = call
+        .args
+        .get("command")
+        .and_then(|v| v.as_str())?
+        .replace('\n', " ")
+        .trim_end()
+        .to_owned();
+    (full != summarise_args(call)).then_some(full)
 }
 
 impl Cell {
@@ -186,6 +214,7 @@ impl Cell {
             Cell::Tool {
                 name,
                 summary,
+                full: _,
                 state,
                 output,
             } => {
@@ -264,10 +293,11 @@ impl Cell {
             Cell::Tool {
                 name,
                 summary,
+                full,
                 state,
                 output,
             } => {
-                let mut lines = vec![tool_head(name, summary, state)];
+                let mut lines = vec![tool_head(name, full.as_deref().unwrap_or(summary), state)];
                 let dim = Style::default().add_modifier(Modifier::DIM);
                 for r in output.lines() {
                     lines.push(Line::from(Span::styled(format!("  └ {r}"), dim)));
@@ -346,7 +376,7 @@ mod tests {
     fn args_summarise_to_the_one_value_that_matters() {
         assert_eq!(
             summarise_args(&call("bash", json!({"command": "cargo test\n"}))),
-            "cargo test "
+            "cargo test"
         );
         assert_eq!(
             summarise_args(&call("read_file", json!({"path": "src/x.rs"}))),
@@ -355,6 +385,49 @@ mod tests {
         assert_eq!(summarise_args(&call("other", json!({"a": 1}))), "{\"a\":1}");
         let long = "x".repeat(ARGS_WIDTH + 10);
         assert!(summarise_args(&call("bash", json!({"command": long}))).ends_with('…'));
+    }
+
+    /// The issue's own chain: the row says the main segment, the
+    /// pager the whole command (issue #21).
+    #[test]
+    fn a_bash_chain_says_its_main_segment_and_the_pager_the_whole() {
+        let command =
+            "cargo test -p aigentic-server 2>&1 | grep 'test result' | head; echo SERVER-DONE";
+        let cell = call("bash", json!({"command": command}));
+        assert_eq!(summarise_args(&cell), "cargo test -p aigentic-server");
+        assert_eq!(full_command(&cell).as_deref(), Some(command));
+        // The pager's first row is the whole command, the row's the
+        // segment.
+        let cell = Cell::Tool {
+            name: "bash".into(),
+            summary: summarise_args(&cell),
+            full: full_command(&cell),
+            state: ToolState::Ok,
+            output: "ok".into(),
+        };
+        let full = cell.full();
+        assert_eq!(plain_line(&full[0]), format!("• Ran bash {command}"));
+        assert_eq!(cell.plain()[0], "• Ran bash cargo test -p aigentic-server");
+        // `2>&1` the row leaves off is still the pager's to show; a
+        // command the row already says in full has nothing extra.
+        let plain = call("bash", json!({"command": "cargo test 2>&1"}));
+        assert_eq!(summarise_args(&plain), "cargo test");
+        assert_eq!(full_command(&plain).as_deref(), Some("cargo test 2>&1"));
+        assert_eq!(
+            full_command(&call("bash", json!({"command": "cargo test"}))),
+            None
+        );
+        // Another tool's one value is the whole of it.
+        assert_eq!(full_command(&call("read_file", json!({"path": "a"}))), None);
+        // Setup defers to the work it sets up (the pty dump's case:
+        // the row named the `cd`, not the test after it).
+        assert_eq!(
+            summarise_args(&call(
+                "bash",
+                json!({"command": "cd ~/Projects/aigentic && cargo test --workspace 2>&1"})
+            )),
+            "cargo test --workspace"
+        );
     }
 
     #[test]
@@ -366,6 +439,7 @@ mod tests {
         let cell = Cell::Tool {
             name: "bash".into(),
             summary: "ls".into(),
+            full: None,
             state: ToolState::Ok,
             output,
         };
@@ -381,6 +455,7 @@ mod tests {
         let short = Cell::Tool {
             name: "bash".into(),
             summary: "x".into(),
+            full: None,
             state: ToolState::Err,
             output: "a\nb".into(),
         };

@@ -238,6 +238,7 @@ impl Printer for ShellOut {
                 Cell::Tool {
                     name,
                     summary,
+                    full: _,
                     state,
                     output,
                 },
@@ -389,7 +390,9 @@ fn body_lines(menu: &Menu, width: usize) -> Vec<Line<'static>> {
 }
 
 /// The transcript pager's lines: the whole checklist while one lasts
-/// (the live block shows three rows of it), then every cell in full.
+/// (the live block shows three rows of it), then every cell in full —
+/// a blank row between blocks of different kinds, none inside one, as
+/// the scrollback reads (issue #21).
 fn transcript_lines(
     transcript: &[Cell],
     tasks: &[aigentic_runtime::harness_tools::Task],
@@ -399,7 +402,14 @@ fn transcript_lines(
         lines.extend(cells::task_lines(tasks));
         lines.push(Line::raw(""));
     }
-    lines.extend(transcript.iter().flat_map(Cell::full));
+    let mut last: Option<look::Group> = None;
+    for cell in transcript {
+        if last.is_some_and(|g| g != look::group(cell)) {
+            lines.push(Line::raw(""));
+        }
+        last = Some(look::group(cell));
+        lines.extend(cell.full());
+    }
     lines
 }
 
@@ -832,6 +842,61 @@ mod tests {
         assert_eq!(
             text(&transcript_lines(&[Cell::User("one".into())], &[])),
             vec!["> one"]
+        );
+    }
+
+    /// The rows the issue draws (issue #21), at 100 columns: a `bash`
+    /// row says its chain's main segment and the pager the whole
+    /// command; a checked-off task stays inside the tool group's rows;
+    /// one blank row between a reply and the next tool group, none
+    /// inside the group.
+    #[test]
+    fn rows_say_one_thing_each_with_one_blank_between_groups() {
+        let chain =
+            "cargo test -p aigentic-server 2>&1 | grep 'test result' | head; echo SERVER-DONE";
+        let tool = Cell::Tool {
+            name: "bash".into(),
+            summary: "cargo test -p aigentic-server".into(),
+            full: Some(chain.to_owned()),
+            state: ToolState::Ok,
+            output: "test result: ok".into(),
+        };
+        let done = Cell::Done("read the plan".into());
+        let reply = Cell::Assistant {
+            text: "Green.".into(),
+            fenced: false,
+        };
+        let lines = transcript_lines(
+            &[
+                Cell::User("gate it".into()),
+                reply.clone(),
+                tool.clone(),
+                done,
+                reply,
+            ],
+            &[],
+        );
+        assert_eq!(
+            text(&lines),
+            vec![
+                "> gate it",
+                "",
+                "Green.",
+                "",
+                // The pager's row says the whole chain (issue #21).
+                "• Ran bash cargo test -p aigentic-server 2>&1 | grep 'test result' | head; \
+                 echo SERVER-DONE",
+                "  └ test result: ok",
+                "✓ read the plan", // no blank before it: same group
+                "",
+                "Green.",
+            ]
+        );
+        // The pager's row for the chain says the whole command.
+        let full = tool.full();
+        assert!(
+            text(&full).iter().any(|l| l.contains("echo SERVER-DONE")),
+            "the whole chain, not the segment: {full:?}"
         );
     }
 

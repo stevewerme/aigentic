@@ -15,6 +15,9 @@ use crate::app::tui::wrap_line;
 /// Claude Code's reply marker, in clay.
 pub const MARK: &str = "⏺ ";
 pub const CLAY: Color = Color::Rgb(0xd8, 0x5a, 0x30);
+/// The assistant's bullet (issue #21): clay reads as red, and red is
+/// for failures alone, so a reply leans violet instead.
+pub const REPLY: Color = Color::Rgb(0x8b, 0x7b, 0xe0);
 const USER_BG: Color = Color::Rgb(0x30, 0x30, 0x2e);
 const USER_FG: Color = Color::Rgb(0xf1, 0xef, 0xe8);
 /// Diff lines an edit shows before `… +N lines`.
@@ -164,12 +167,13 @@ pub fn render(cell: &Cell, first: bool, width: usize) -> Vec<Line<'static>> {
         }
         Cell::Assistant { text, fenced } => {
             let line = crate::app::markdown::line(text, *fenced);
-            let lead = if first { dot(CLAY) } else { Span::raw("  ") };
+            let lead = if first { dot(REPLY) } else { Span::raw("  ") };
             hang(line, lead, width)
         }
         Cell::Tool {
             name,
             summary,
+            full: _,
             state,
             output,
         } => {
@@ -319,6 +323,22 @@ mod tests {
             text(&render(&cell, false, 40)),
             vec!["  one two three four five"]
         );
+        // The bullet is violet (issue #21): red is for failures
+        // alone, and clay reads as red.
+        let lines = render(&cell, true, 40);
+        assert_eq!(lines[0].spans[0].style.fg, Some(REPLY));
+        assert_ne!(REPLY, CLAY);
+        assert_ne!(REPLY, Color::Red);
+        // A failed tool's bullet stays red.
+        let failed = Cell::Tool {
+            name: "bash".into(),
+            summary: "cargo test".into(),
+            full: None,
+            state: ToolState::Err,
+            output: "error".into(),
+        };
+        let lines = render(&failed, true, 80);
+        assert_eq!(lines[0].spans[0].style.fg, Some(Color::Red));
     }
 
     #[test]
@@ -326,6 +346,7 @@ mod tests {
         let ok = Cell::Tool {
             name: "bash".into(),
             summary: "git log --oneline -15".into(),
+            full: None,
             state: ToolState::Ok,
             output: "a\nb\nc".into(),
         };
@@ -336,6 +357,7 @@ mod tests {
         let failed = Cell::Tool {
             name: "bash".into(),
             summary: "cargo test".into(),
+            full: None,
             state: ToolState::Err,
             output: "1\n2\n3\n4\nerror: 1 failed".into(),
         };

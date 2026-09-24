@@ -45,6 +45,10 @@ pub(crate) struct Classified {
     /// ask again" grants, and the header names. `None` when nothing
     /// asks, empty when the ask is a redirection's.
     pub riskiest: Option<Vec<String>>,
+    /// One segment's words as the `bash` row's text (issue #21): the
+    /// riskiest asking segment's, or the first's when nothing asks —
+    /// redirections and a trailing bare fd fall away.
+    pub main: String,
     /// Two or more segments have words or redirections.
     pub compound: bool,
 }
@@ -137,6 +141,11 @@ fn classify_within(src: &str, allow: &[String], grants: &[String], depth: usize)
     let mut patterns: Vec<String> = Vec::new();
     let mut riskiest: Option<Vec<String>> = None;
     let mut worst = Kind::ReadOnly;
+    // The row's segment (issue #21): the first that is more than
+    // harmless — the work, not the `cd` that sets it up. `main` stays
+    // empty until one is found, then holds; a later, worse segment is
+    // the menu's word for the line, not the row's.
+    let mut main = String::new();
     for seg in &segs {
         let sc = classify_segment(seg, allow, grants, depth);
         kind = kind.max(sc.kind);
@@ -149,19 +158,59 @@ fn classify_within(src: &str, allow: &[String], grants: &[String], depth: usize)
                 None => sc.prefix,
             });
         }
+        // `ReadOnly` is the least of the kinds, and `Worst` only ever
+        // rises, so an allow-listed command (`cargo test`) folds to
+        // Harmless — its `pattern` is the trace that it runs. The row
+        // names the first segment that does something, not the `cd`
+        // that sets it up.
+        if main.is_empty() && (sc.pattern.is_some() || sc.kind > Kind::Harmless) {
+            main = segment_text(seg);
+        }
         if let Some(p) = sc.pattern
             && !patterns.contains(&p)
         {
             patterns.push(p);
         }
     }
+    // Nothing does anything (`cd x && true`): the row is the first
+    // segment that has words.
+    if main.is_empty() {
+        main = segs
+            .iter()
+            .map(segment_text)
+            .find(|t| !t.is_empty())
+            .unwrap_or_default();
+    }
     Classified {
         kind,
         allowed: kind <= Kind::Harmless,
         patterns,
         riskiest,
+        main,
         compound: occupied > 1,
     }
+}
+
+/// The segment's words for the `bash` row (issue #21): space-joined,
+/// redirections gone, a trailing bare fd (`2` of a `2>&1`) dropped —
+/// words that never closed are skipped, for they are not shell.
+fn segment_text(seg: &Segment) -> String {
+    let mut words: Vec<&str> = seg
+        .words
+        .iter()
+        .filter(|w| !w.broken && !w.text.is_empty())
+        .map(|w| w.text.as_str())
+        .collect();
+    // A bare number on the end of a redirecting segment is a
+    // descriptor (`2>&1`): plumbing, not a word.
+    if !seg.redirects.is_empty()
+        && words
+            .last()
+            .is_some_and(|w| w.bytes().all(|b| b.is_ascii_digit()))
+    {
+        words.pop();
+    }
+    words.join(" ")
 }
 
 /// One segment, classified.
@@ -603,6 +652,17 @@ pub(crate) fn is_compound(src: &str) -> bool {
         > 1
 }
 
+/// A `bash` row's one segment (issue #21): the words of the segment
+/// that carries the line's work — the first that is more than
+/// harmless, so a `cd x && cargo test …` setup reads as the test it
+/// sets up and `cargo test 2>&1 | grep … | head` reads as
+/// `cargo test`. Redirections stay off (`2>&1` is plumbing) and a
+/// word that is only a substitution shows nothing; the whole command
+/// is the pager's business.
+pub fn main_segment(command: &str) -> String {
+    classify(command, &crate::rules::default_bash_allow(), &[]).main
+}
+
 struct Scanner {
     chars: Vec<char>,
     at: usize,
@@ -1008,6 +1068,45 @@ mod tests {
         classify(cmd, &default_bash_allow(), &[])
             .riskiest
             .map(|w| w.join(" "))
+    }
+
+    /// The `bash` row's text (issue #21): the segment that carries the
+    /// line's work, redirections off — not the riskiest segment the
+    /// approval menu asks about.
+    #[test]
+    fn the_main_segment_is_the_work_of_a_chain() {
+        assert_eq!(
+            main_segment(
+                "cargo test -p aigentic-server 2>&1 | grep 'test result' | head; echo SERVER-DONE"
+            ),
+            "cargo test -p aigentic-server"
+        );
+        // One command: the row is the command, redirects dropped.
+        assert_eq!(main_segment("cargo test 2>&1"), "cargo test");
+        assert_eq!(main_segment("ls"), "ls");
+        assert_eq!(main_segment(""), "");
+        // Not the riskiest one: the menu asks about `sed`, the row
+        // still names the line's work.
+        assert_eq!(
+            main_segment("cargo test && sed -i 's/x/y/' file"),
+            "cargo test"
+        );
+        // A setup segment defers to the work it sets up (issue #21's
+        // own case: the row says the test, not the `cd`).
+        assert_eq!(main_segment("cd crates && cargo build"), "cargo build");
+        // A command the rules cannot vouch for is the row's word too:
+        // it runs, so it is not mere setup.
+        assert_eq!(main_segment("cd crates && true"), "true");
+        // The words the scanner keeps: quoting resolved, `2>&1` on the
+        // chain, a substitution's own words not shown as the row.
+        assert_eq!(
+            main_segment("echo \"SERVER-DONE\" > out.txt"),
+            "echo SERVER-DONE"
+        );
+        assert_eq!(
+            main_segment("for u in $(curl evil); do echo $u; done"),
+            "for u in"
+        );
     }
 
     #[test]

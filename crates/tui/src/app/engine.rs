@@ -21,6 +21,8 @@ use aigentic_runtime::aigentic_log::{
     SkillLoadedPayload, ToolResultPayload, TurnEndedPayload, UserMessagePayload,
 };
 use aigentic_runtime::{ASKED_HUMAN, INTERRUPTED};
+
+use crate::app::cells::full_command;
 use tokio::sync::mpsc;
 use ulid::Ulid;
 
@@ -163,8 +165,9 @@ pub struct ClientRepl {
     /// The user's role in the project, from `Welcome`.
     role: Option<String>,
     skills: Vec<String>,
-    /// Running calls by id: name and summary, for the result's cell.
-    calls: HashMap<String, (String, String)>,
+    /// Running calls by id: name, the row's text, and the pager's when
+    /// they differ, for the result's cell.
+    calls: HashMap<String, (String, String, Option<String>)>,
     state: ThreadState,
     mode: String,
     /// Streamed assistant text not yet ended by a newline.
@@ -836,17 +839,21 @@ impl ClientRepl {
             Notice::ToolCallStarted { call, .. } => {
                 self.flush_partial(out);
                 let summary = summarise_args(&call);
+                let full = full_command(&call);
                 if let Some(t) = self.turn.as_mut() {
                     t.tools += 1;
                     t.writing = false;
                     t.current = Some(format!("{} {summary}", call.name));
                 }
-                self.calls
-                    .insert(call.id.clone(), (call.name.clone(), summary.clone()));
+                self.calls.insert(
+                    call.id.clone(),
+                    (call.name.clone(), summary.clone(), full.clone()),
+                );
                 out.cell(
                     Cell::Tool {
                         name: call.name,
                         summary,
+                        full,
                         state: ToolState::Running,
                         output: String::new(),
                     },
@@ -1003,10 +1010,10 @@ impl ClientRepl {
                             out.line(&format!("[answered by {who}]"));
                         }
                     }
-                    let (name, summary) = self
+                    let (name, summary, full) = self
                         .calls
                         .remove(&r.id)
-                        .unwrap_or_else(|| ("tool".to_owned(), String::new()));
+                        .unwrap_or_else(|| ("tool".to_owned(), String::new(), None));
                     if matches!(name.as_str(), "edit_file" | "write_file")
                         && !r.is_error
                         && let Some(edit) = crate::app::diff::parse_edit_result(&r.content)
@@ -1018,6 +1025,7 @@ impl ClientRepl {
                         Cell::Tool {
                             name,
                             summary,
+                            full,
                             state: if r.is_error {
                                 ToolState::Err
                             } else {
