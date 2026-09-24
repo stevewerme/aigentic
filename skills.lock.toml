@@ -627,7 +627,7 @@ name = "plan-check"
 path = "skills/aigentic/plan-check"
 source = "local"
 commit = ""
-sha256 = "0e3582953901b9c4c871f01fa4444db203056d240ca457a59ed6e0e12086f541"
+sha256 = "1d9916d274a5df0835d7a13d3e867fb1f12adfb01fbf32021e6fd86dc90bc323"
 invocation = "user"
 review = { by = "steve", on = "2026-09-24" }
 

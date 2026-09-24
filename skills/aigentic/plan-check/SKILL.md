@@ -20,7 +20,12 @@ description of them.
    what it says? Examples: retries must be visible *while* waiting, so the
    events are emitted as they happen, not collected and sent after (#31);
    the "main command" of a line is its work, so output filters after a `|`
-   are not extra work (#38).
+   are not extra work (#38). **For every existing test the plan moves,
+   flips or deletes, find out why it existed** (`git log -S '<test name>'`,
+   its comments) and say whether that reason still holds. On #37 a test
+   that refused a literal `api_key` in the config file was about keeping
+   secrets out of files; the plan turned it into a warning, and a
+   literals-only check missed it.
 2. **Regressions.** Does it undo a recent decision? Check
    `git log --oneline -20 -- <files>` and closed issues touching the same
    code. A plan that changes behaviour a recent issue set on purpose needs
