@@ -12,11 +12,17 @@ use ulid::Ulid;
 pub struct UserMessagePayload {
     pub blocks: Vec<ContentBlock>,
     /// Arrived while a turn was running (phase 5's queue). It is in the
-    /// log at once so every subscriber sees it, and in the model's
-    /// context only once a `turn_ended` follows it: the horizon rule in
-    /// the projection. Lines from before phase 5 read back as `false`.
+    /// log at once so every subscriber sees it. Lines from before phase 5
+    /// read back as `false`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub mid_turn: bool,
+    /// A mid-turn message that steers (issue #33): emitted where it sits
+    /// in the log, so the very next model call sees it. Without it the
+    /// horizon rule holds and the message waits for the next turn, which
+    /// is what every log from before steering did. `false` by default, so
+    /// old logs replay exactly as they ran.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub steer: bool,
 }
 
 impl UserMessagePayload {
@@ -24,6 +30,7 @@ impl UserMessagePayload {
         Self {
             blocks,
             mid_turn: false,
+            steer: false,
         }
     }
 }
@@ -395,6 +402,26 @@ mod tests {
             serde_json::from_value::<UserMessagePayload>(value).unwrap(),
             queued
         );
+
+        // A steered line (issue #33) carries the flag; one without it,
+        // including every pre-steering log line, reads back false.
+        let steered = UserMessagePayload {
+            mid_turn: true,
+            steer: true,
+            ..UserMessagePayload::new(vec![ContentBlock::Text("now".into())])
+        };
+        let value = serde_json::to_value(&steered).unwrap();
+        assert_eq!(value["steer"], true);
+        assert_eq!(
+            serde_json::from_value::<UserMessagePayload>(value).unwrap(),
+            steered
+        );
+        let p: UserMessagePayload = serde_json::from_value(
+            json!({"blocks": [{"type": "text", "text": "hi"}], "mid_turn": true}),
+        )
+        .unwrap();
+        assert!(p.mid_turn);
+        assert!(!p.steer);
 
         let p: InterruptedPayload = serde_json::from_value(
             json!({"reason": "process exited mid-turn", "after_seq": 5, "unanswered_calls": []}),

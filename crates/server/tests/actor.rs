@@ -1,9 +1,10 @@
 //! The thread actor with a scripted provider and no socket (phase 5 step
-//! 6): a post during a turn queues and the next turn holds both messages;
-//! an interrupt ends the turn with `interrupted { by }` and no partial
-//! message; a running tool's result is recorded first; an interrupt
-//! while awaiting approval denies with the interrupter; subscribers get
-//! every notice in order and a late one gets the events it missed.
+//! 6): a post during a tool run reaches the agent at its next step and a
+//! post during a model call waits for the next turn; an interrupt ends
+//! the turn with `interrupted { by }` and no partial message; a running
+//! tool's result is recorded first; an interrupt while awaiting approval
+//! denies with the interrupter; subscribers get every notice in order and
+//! a late one gets the events it missed.
 
 use std::collections::VecDeque;
 use std::pin::Pin;
@@ -23,14 +24,17 @@ use aigentic_runtime::aigentic_tools::ToolRegistry;
 use aigentic_runtime::{Mode, Runtime};
 use aigentic_server::{Mail, Mailbox, NoReports, ThreadActor};
 use futures_core::Stream;
+use futures_util::StreamExt;
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
 
 /// Scripted; a `None` entry pends until the turn is interrupted. Every
-/// request's messages are kept.
+/// request's messages are kept. Each stream waits `delay` first, so a
+/// post can land while a call is in flight.
 struct Gated {
     script: Mutex<VecDeque<Option<Vec<ProviderEvent>>>>,
     seen: Arc<Mutex<Vec<Vec<Message>>>>,
+    delay: Duration,
 }
 
 impl Provider for Gated {
@@ -40,7 +44,17 @@ impl Provider for Gated {
     ) -> Pin<Box<dyn Stream<Item = ProviderEvent> + Send + '_>> {
         self.seen.lock().unwrap().push(request.messages.to_vec());
         match self.script.lock().unwrap().pop_front().expect("script") {
-            Some(events) => Box::pin(futures_util::stream::iter(events)),
+            Some(events) => {
+                let delay = self.delay;
+                Box::pin(
+                    futures_util::stream::iter(events).then(move |e| async move {
+                        if matches!(e, ProviderEvent::TextDelta(_)) {
+                            tokio::time::sleep(delay).await;
+                        }
+                        e
+                    }),
+                )
+            }
             None => Box::pin(futures_util::stream::pending()),
         }
     }
@@ -122,6 +136,12 @@ struct Rig {
 }
 
 fn rig(script: Vec<Option<Vec<ProviderEvent>>>, allow_slow: bool) -> Rig {
+    rig_delayed(script, allow_slow, Duration::ZERO)
+}
+
+/// `rig`, with every stream held back `delay`: a post can land while a
+/// model call is in flight.
+fn rig_delayed(script: Vec<Option<Vec<ProviderEvent>>>, allow_slow: bool, delay: Duration) -> Rig {
     let dir = tempfile::tempdir().unwrap();
     let thread = ulid::Ulid::generate();
     let log = ThreadLog::open(dir.path(), thread).unwrap();
@@ -137,6 +157,7 @@ fn rig(script: Vec<Option<Vec<ProviderEvent>>>, allow_slow: bool) -> Rig {
         Box::new(Gated {
             script: Mutex::new(script.into()),
             seen: seen.clone(),
+            delay,
         }),
         registry,
         log,
@@ -251,7 +272,7 @@ fn texts(messages: &[Message]) -> Vec<String> {
 }
 
 #[tokio::test]
-async fn a_post_during_a_turn_queues_and_the_next_turn_holds_both() {
+async fn a_post_during_a_tool_run_reaches_the_agent_at_its_next_step() {
     let rig = rig(
         vec![
             Some(vec![slow("c1", 150), tool_use()]),
@@ -272,15 +293,23 @@ async fn a_post_during_a_turn_queues_and_the_next_turn_holds_both() {
         matches!(s, ThreadState::Running { queued: 1, .. })
     })
     .await;
-    // Magnus's message is an event at once, flagged mid-turn.
+    // Magnus's message is an event at once, flagged mid-turn and
+    // steering: the turn's next model call reads it.
     let queued_event = seen.iter().find_map(|n| match n {
         Notice::Event { event, .. } if event.author == magnus() => Some(event.clone()),
         _ => None,
     });
     let p: UserMessagePayload = serde_json::from_value(queued_event.unwrap().payload).unwrap();
     assert!(p.mid_turn);
+    assert!(p.steer);
+    // ... and when that call answers, the message has reached the
+    // agent: the queue empties within the same turn.
+    Rig::until_state(&mut notices, |s| {
+        matches!(s, ThreadState::Running { queued: 0, .. })
+    })
+    .await;
 
-    // Turn one ends, turn two starts by magnus, then idle.
+    // One turn: the second request answered both, then idle.
     Rig::until_state(&mut notices, |s| *s == ThreadState::Idle).await;
     assert_eq!(
         rig.kinds(),
@@ -291,20 +320,78 @@ async fn a_post_during_a_turn_queues_and_the_next_turn_holds_both() {
             EventKind::ToolResult,
             EventKind::AssistantMessage,
             EventKind::TurnEnded,
+        ]
+    );
+    {
+        let seen = rig.seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert!(
+            !texts(&seen[0]).iter().any(|t| t.contains("two")),
+            "{:?}",
+            texts(&seen[0])
+        );
+        let last = texts(&seen[1]);
+        assert!(last.iter().any(|t| t == "steve: one"), "{last:?}");
+        assert!(last.iter().any(|t| t == "magnus: two"), "{last:?}");
+    }
+    drop(rig.mailbox);
+    rig.task.await.unwrap();
+}
+
+#[tokio::test]
+async fn a_post_during_a_model_call_waits_for_the_next_turn() {
+    // The streams are held back 400ms, so the post lands while the
+    // call is in flight: nothing can show it to that call, and it
+    // steers nothing. The next turn — by magnus — holds both.
+    let rig = rig_delayed(
+        vec![
+            Some(vec![text("reply one"), done()]),
+            Some(vec![text("reply two"), done()]),
+        ],
+        true,
+        Duration::from_millis(400),
+    );
+    let (_, _, mut notices) = rig.subscribe(0).await;
+    assert_eq!(rig.post(steve(), "one", false).await, Response::Ok);
+    Rig::until_state(&mut notices, |s| matches!(s, ThreadState::Running { .. })).await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert_eq!(rig.post(magnus(), "two", false).await, Response::Ok);
+    let seen = Rig::until_state(&mut notices, |s| {
+        matches!(s, ThreadState::Running { queued: 1, .. })
+    })
+    .await;
+    let queued_event = seen.iter().find_map(|n| match n {
+        Notice::Event { event, .. } if event.author == magnus() => Some(event.clone()),
+        _ => None,
+    });
+    let p: UserMessagePayload = serde_json::from_value(queued_event.unwrap().payload).unwrap();
+    assert!(p.mid_turn);
+    assert!(!p.steer);
+
+    // The turn ends, the queue still holding magnus's message: it never
+    // reached the agent. The next turn is by magnus and holds both,
+    // then idle.
+    Rig::until_state(&mut notices, |s| *s == ThreadState::Idle).await;
+    assert_eq!(
+        rig.kinds(),
+        vec![
+            EventKind::UserMessage,
+            EventKind::UserMessage, // magnus, mid-call, held for the next turn
+            EventKind::AssistantMessage,
+            EventKind::TurnEnded,
             EventKind::AssistantMessage,
             EventKind::TurnEnded,
         ]
     );
-    // The first turn's second request did not see "two"; the next did.
     {
         let seen = rig.seen.lock().unwrap();
-        assert_eq!(seen.len(), 3);
+        assert_eq!(seen.len(), 2);
         assert!(
-            !texts(&seen[1]).iter().any(|t| t.contains("two")),
+            !texts(&seen[0]).iter().any(|t| t.contains("two")),
             "{:?}",
-            texts(&seen[1])
+            texts(&seen[0])
         );
-        let last = texts(&seen[2]);
+        let last = texts(&seen[1]);
         assert!(last.iter().any(|t| t == "steve: one"), "{last:?}");
         assert!(last.iter().any(|t| t == "magnus: two"), "{last:?}");
     }
@@ -634,6 +721,7 @@ async fn a_resumed_open_turn_is_continued_before_the_first_mail() {
         Box::new(Gated {
             script: Mutex::new(vec![Some(vec![text("recovered"), done()])].into()),
             seen: Arc::new(Mutex::new(Vec::new())),
+            delay: Duration::ZERO,
         }),
         ToolRegistry::empty(),
         log,

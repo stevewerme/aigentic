@@ -363,11 +363,11 @@ mod tests {
         assert_eq!(rows, vec![" hi       "]);
         assert_eq!(
             text(&render(
-                &Cell::Note("[queued for the next turn]".into()),
+                &Cell::Note("[sent: reaches the agent at its next step]".into()),
                 false,
                 80
             )),
-            vec!["  queued for the next turn"]
+            vec!["  sent: reaches the agent at its next step"]
         );
         assert_eq!(
             text(&render(&Cell::Summary("─ 3s · 1 tool".into()), false, 80)),

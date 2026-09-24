@@ -395,6 +395,50 @@ mod tests {
     }
 
     #[test]
+    fn a_steered_message_merges_into_the_tool_result_user_message() {
+        // Issue #33: a message posted mid-turn is emitted where it sits,
+        // after the results of the assistant message that ran the tools.
+        // This API requires alternation, so the text rides on the same
+        // user message as the tool results, after them.
+        let messages = vec![
+            msg(Role::User, vec![ContentBlock::Text("go".into())]),
+            msg(
+                Role::Assistant,
+                vec![ContentBlock::ToolCall(ToolCall {
+                    id: "toolu_1".into(),
+                    name: "bash".into(),
+                    args: json!({"command": "ls"}),
+                })],
+            ),
+            msg(
+                Role::Tool,
+                vec![ContentBlock::ToolResult(ToolResult {
+                    id: "toolu_1".into(),
+                    content: "Cargo.toml".into(),
+                    is_error: false,
+                })],
+            ),
+            msg(
+                Role::User,
+                vec![ContentBlock::Text("magnus: use the other file".into())],
+            ),
+        ];
+        let w = build(&messages, &AnthropicConfig::new("k", "m").with_cache(false));
+        let m = w["messages"].as_array().unwrap();
+        assert_eq!(m.len(), 3, "user, assistant, user: {m:#?}");
+        assert_eq!(m[2]["role"], "user");
+        assert_eq!(
+            m[2]["content"],
+            json!([
+                {"type": "tool_result", "tool_use_id": "toolu_1",
+                 "content": "Cargo.toml", "is_error": false},
+                {"type": "text", "text": "magnus: use the other file"},
+            ]),
+            "the steered text is in the tool-result user message, after the results"
+        );
+    }
+
+    #[test]
     fn thinking_off_omits_the_field_and_request_cap_wins() {
         let config = AnthropicConfig::new("k", "m").with_thinking(Thinking::Off);
         let messages = vec![msg(Role::User, vec![ContentBlock::Text("hi".into())])];

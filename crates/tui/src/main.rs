@@ -489,10 +489,13 @@ async fn main() -> anyhow::Result<()> {
         format!(" · mode {mode}")
     };
     let running = match &state {
-        ThreadState::Running { by, queued } => Some(format!(
-            "a turn is running for {}; {queued} message(s) queued",
-            app::engine::author_name(by)
-        )),
+        ThreadState::Running { by, queued } => Some(match queued {
+            0 => format!("a turn is running for {}", app::engine::author_name(by)),
+            n => format!(
+                "a turn is running for {}; {n} message(s) sent, reaching the agent at its next step",
+                app::engine::author_name(by)
+            ),
+        }),
         _ => None,
     };
     use std::io::IsTerminal;

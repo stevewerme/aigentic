@@ -336,6 +336,74 @@ mod tests {
     }
 
     #[test]
+    fn a_steered_message_after_tool_results_is_a_plain_user_message() {
+        // Issue #33: a message posted mid-turn is emitted where it sits,
+        // after the results of the assistant message that ran the tools:
+        // assistant, tool, tool, user.
+        let ctx = vec![
+            Message {
+                role: Role::Assistant,
+                author: Author::Agent(AgentId("worker".into())),
+                blocks: vec![
+                    ContentBlock::ToolCall(ToolCall {
+                        id: "call_1".into(),
+                        name: "read_file".into(),
+                        args: json!({"path": "Cargo.toml"}),
+                    }),
+                    ContentBlock::ToolCall(ToolCall {
+                        id: "call_2".into(),
+                        name: "read_file".into(),
+                        args: json!({"path": "Cargo.lock"}),
+                    }),
+                ],
+            },
+            Message {
+                role: Role::Tool,
+                author: Author::System,
+                blocks: vec![ContentBlock::ToolResult(ToolResult {
+                    id: "call_1".into(),
+                    content: "[workspace]".into(),
+                    is_error: false,
+                })],
+            },
+            Message {
+                role: Role::Tool,
+                author: Author::System,
+                blocks: vec![ContentBlock::ToolResult(ToolResult {
+                    id: "call_2".into(),
+                    content: "9 crates".into(),
+                    is_error: false,
+                })],
+            },
+            Message {
+                role: Role::User,
+                author: Author::User(UserId("magnus".into())),
+                blocks: vec![ContentBlock::Text("use the other file".into())],
+            },
+        ];
+        let wire = to_wire(&ctx);
+        let value = serde_json::to_value(&wire).unwrap();
+        assert_eq!(
+            value,
+            json!([
+                {"role": "assistant", "content": null, "name": "worker", "tool_calls": [
+                    {"id": "call_1", "type": "function", "function": {
+                        "name": "read_file", "arguments": r#"{"path":"Cargo.toml"}"#}},
+                    {"id": "call_2", "type": "function", "function": {
+                        "name": "read_file", "arguments": r#"{"path":"Cargo.lock"}"#}}
+                ]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "[workspace]"},
+                {"role": "tool", "tool_call_id": "call_2", "content": "9 crates"},
+                {"role": "user", "content": "use the other file", "name": "magnus"},
+            ])
+        );
+        // And back: only the `tool` messages are one-way.
+        let parsed: Vec<WireMessage> = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed, wire);
+        assert!(matches!(parsed[3], WireMessage::User { .. }));
+    }
+
+    #[test]
     fn tool_results_go_one_way_with_an_error_prefix() {
         let wire = to_wire(&[tool_results()]);
         assert_eq!(

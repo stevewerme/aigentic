@@ -442,10 +442,13 @@ impl ClientRepl {
                 self.report(ReportKind::Who, out).await;
             }
             Command::Queue => out.line(&match &self.state {
-                ThreadState::Running { by, queued } => format!(
-                    "turn running by {}; {queued} message(s) queued for the next turn",
-                    author_name(by)
-                ),
+                ThreadState::Running { by, queued } => match queued {
+                    0 => format!("turn running by {}", author_name(by)),
+                    n => format!(
+                        "turn running by {}; {n} message(s) sent, reaching the agent at its next step",
+                        author_name(by)
+                    ),
+                },
                 ThreadState::Idle => "idle; nothing queued".into(),
                 ThreadState::AwaitingApproval { call, .. } => {
                     format!("waiting for an approver: {}", describe_call(call))
@@ -535,7 +538,7 @@ impl ClientRepl {
         let ok = match (&self.state, interrupt) {
             (ThreadState::Idle, _) => "",
             (_, true) => "[interrupting]",
-            (_, false) => "[queued for the next turn]",
+            (_, false) => "[sent: reaches the agent at its next step]",
         };
         if matches!(r, Response::Ok) && matches!(self.state, ThreadState::Idle) {
             self.awaiting_turn = true;

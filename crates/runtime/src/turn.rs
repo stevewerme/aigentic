@@ -57,15 +57,17 @@ impl Runtime {
         self.continue_turn_until(cancel, inbox, observe).await
     }
 
-    /// Append what arrived mid-turn as `mid_turn` user messages: in the
-    /// log at once, in context from the next turn.
+    /// Append what arrived mid-turn as `mid_turn`, `steer` user messages
+    /// (issue #33): in the log at once, and projected where they sit so
+    /// the next model call sees them — never between an assistant
+    /// message and that message's own tool results.
     fn drain_inbox(
         &mut self,
         inbox: &mut Inbox,
         observe: &mut (dyn FnMut(Signal<'_>) + Send),
     ) -> Result<(), RuntimeError> {
         for queued in inbox.drain() {
-            append_queued(&mut self.log, queued, observe)?;
+            append_queued(&mut self.log, queued, observe, true)?;
         }
         Ok(())
     }
@@ -195,9 +197,11 @@ impl Runtime {
                         break;
                     }
                     // A message posted mid-call lands in the log now; the
-                    // stream borrows the provider, the log is another field.
+                    // stream borrows the provider, the log is another
+                    // field. This call is already out, so it cannot steer
+                    // it: the message waits for the next turn.
                     queued = inbox.recv() => {
-                        append_queued(&mut self.log, queued, observe)?;
+                        append_queued(&mut self.log, queued, observe, false)?;
                         continue;
                     }
                     event = stream.next() => event,
@@ -346,7 +350,7 @@ impl Runtime {
         let out = loop {
             tokio::select! {
                 out = &mut fut => break out,
-                queued = inbox.recv() => append_queued(&mut self.log, queued, observe)?,
+                queued = inbox.recv() => append_queued(&mut self.log, queued, observe, true)?,
             }
         };
         Ok(match out {
@@ -482,15 +486,22 @@ impl Runtime {
 }
 
 /// One queued message into the log, as `append` would but on the log
-/// alone, so it can run while a stream borrows the provider.
+/// alone, so it can run while a stream borrows the provider. `steer`
+/// is set where the next model call will read the message — the safe
+/// points, between a tool result and that call — so the projection
+/// emits it where it sits; a call already in flight cannot be steered,
+/// so a message posted mid-call waits for the next turn, as every
+/// message did before issue #33.
 fn append_queued(
     log: &mut aigentic_log::ThreadLog,
     queued: Queued,
     observe: &mut (dyn FnMut(Signal<'_>) + Send),
+    steer: bool,
 ) -> Result<(), RuntimeError> {
     let payload = UserMessagePayload {
         blocks: queued.blocks,
         mid_turn: true,
+        steer,
     };
     let event = log.append(aigentic_log::NewEvent {
         kind: EventKind::UserMessage,

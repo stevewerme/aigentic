@@ -83,10 +83,15 @@ struct CallResult {
 /// its results (a `skill_loaded` from `load_skill`, say) is held back and
 /// emitted after the last of those results.
 ///
-/// The horizon rule (phase 5): a `user_message` with `mid_turn` set
-/// arrived while a turn ran and is emitted only once a `turn_ended`
-/// follows it, so the model sees it from the next turn and a replay
-/// gives the live run's context exactly. `thread_started` emits nothing.
+/// The horizon rule (phase 5): a `user_message` with `mid_turn` set and
+/// `steer` unset arrived while a turn ran and is emitted only once a
+/// `turn_ended` follows it, so the model sees it from the next turn and a
+/// replay gives the live run's context exactly. With `steer` set (issue
+/// #33) the message is instead emitted where it sits in the log, so the
+/// very next model call sees it: a person can steer a running agent, not
+/// only interrupt it. The hold-back above still applies to it, so it
+/// never lands between an assistant message and that message's own
+/// results. `thread_started` emits nothing.
 pub fn project(events: &[Event]) -> Result<Projection, LogError> {
     let mut summaries: Vec<Summary> = Vec::new();
     let mut truncations: Vec<Truncation> = Vec::new();
@@ -264,7 +269,11 @@ pub fn project(events: &[Event]) -> Result<Projection, LogError> {
         match event.kind {
             EventKind::UserMessage => {
                 let p: UserMessagePayload = payload(event)?;
-                if p.mid_turn && last_turn_end.is_none_or(|end| event.seq >= end) {
+                // Steered (issue #33): emitted where it sits in the log,
+                // after the hold-back; the very next model call sees it.
+                // Without `steer` (every log from before steering), the
+                // horizon rule: it waits for the next turn.
+                if p.mid_turn && !p.steer && last_turn_end.is_none_or(|end| event.seq >= end) {
                     continue;
                 }
                 push(
@@ -732,6 +741,41 @@ mod tests {
         )
     }
 
+    /// A queued message from a thread that steers (issue #33).
+    fn steered(seq: u64, text: &str) -> Event {
+        ev(
+            seq,
+            EventKind::UserMessage,
+            Author::User(UserId("magnus".into())),
+            json!({"blocks": [{"type": "text", "text": text}], "mid_turn": true, "steer": true}),
+        )
+    }
+
+    /// An assistant message with two calls, both results pending.
+    fn two_calls(seq: u64) -> Event {
+        ev(
+            seq,
+            EventKind::AssistantMessage,
+            agent(),
+            serde_json::to_value(AssistantMessagePayload {
+                blocks: vec![
+                    ContentBlock::ToolCall(ToolCall {
+                        id: "c1".into(),
+                        name: "bash".into(),
+                        args: json!({"command": "ls"}),
+                    }),
+                    ContentBlock::ToolCall(ToolCall {
+                        id: "c2".into(),
+                        name: "bash".into(),
+                        args: json!({"command": "pwd"}),
+                    }),
+                ],
+                usage: None,
+            })
+            .unwrap(),
+        )
+    }
+
     #[test]
     fn a_mid_turn_message_waits_for_the_next_turn() {
         // Turn one runs; magnus posts while it does; the turn ends.
@@ -775,6 +819,53 @@ mod tests {
         events.push(user(6, "two"));
         let p = project(&events).unwrap();
         assert_eq!(texts(&p).last().map(String::as_str), Some("two"));
+    }
+
+    #[test]
+    fn a_steered_message_appears_only_after_the_last_pending_result() {
+        // magnus posts while both of an assistant message's results are
+        // still pending. The hold-back keeps the pair intact: the
+        // message lands after the last of them, never between.
+        let events = vec![
+            user(0, "one"),
+            two_calls(1),
+            steered(2, "use the other file"),
+            result(3, "c1", "r1"),
+            result(4, "c2", "r2"),
+        ];
+        let p = project(&events).unwrap();
+        assert_eq!(
+            results(&p),
+            vec![("c1".into(), "r1".into()), ("c2".into(), "r2".into())]
+        );
+        assert_eq!(
+            texts(&p).last().map(String::as_str),
+            Some("use the other file")
+        );
+        assert_eq!(
+            p.body.last().unwrap().author,
+            Author::User(UserId("magnus".into()))
+        );
+    }
+
+    #[test]
+    fn a_steered_message_after_the_last_result_lands_in_place() {
+        // Posted between a tool result and the next model call: exactly
+        // where it sits in the log, no `turn_ended` needed.
+        let events = vec![
+            user(0, "one"),
+            call(1, "c1", "bash", json!({"command": "ls"})),
+            result(2, "c1", "r1"),
+            steered(3, "use the other file"),
+            ended(4),
+        ];
+        let p = project(&events).unwrap();
+        assert_eq!(p.body.len(), 4);
+        assert_eq!(p.body.last().unwrap().role, Role::User);
+        assert_eq!(
+            texts(&p).last().map(String::as_str),
+            Some("use the other file")
+        );
     }
 
     #[test]

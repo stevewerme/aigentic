@@ -132,8 +132,14 @@ struct Shared {
     subscribers: Mutex<Vec<mpsc::UnboundedSender<Notice>>>,
     events: Mutex<Vec<Event>>,
     state: Mutex<ThreadState>,
-    /// Messages handed to the running turn; reported in `Running`.
+    /// Messages handed to the running turn and not yet read by a model
+    /// call; reported in `Running`.
     queued: Mutex<u32>,
+    /// Of those, the steered ones (issue #33): each is appended at a
+    /// point the turn's next model call reads, so the count — and
+    /// `queued` with it — drops when that call's message lands. A
+    /// message posted mid-call steers nothing and is not here.
+    steered: Mutex<u32>,
     /// Who posted last during the turn: the next turn is "by" them.
     last_queued_by: Mutex<Option<Author>>,
     /// The permission mode's name, for `Opened`.
@@ -199,15 +205,36 @@ impl Shared {
                     event: event.clone(),
                 });
                 // A message that arrived mid-turn: count it and say so,
-                // after its event, so subscribers see both in order.
+                // after its event, so subscribers see both in order. A
+                // steered one (issue #33) is read at the turn's next
+                // model call; one posted mid-call waits for the next
+                // turn.
                 if event.kind == EventKind::UserMessage
-                    && serde_json::from_value::<UserMessagePayload>(event.payload.clone())
-                        .is_ok_and(|p| p.mid_turn)
+                    && let Ok(p) =
+                        serde_json::from_value::<UserMessagePayload>(event.payload.clone())
+                    && p.mid_turn
                 {
                     *self.queued.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+                    if p.steer {
+                        *self.steered.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+                    }
                     self.running(turn_by.clone());
                     self.push_usage();
                     return;
+                }
+                // The assistant message just appended is the model's
+                // answer to a call that read every steered message so
+                // far (each sits in the log before the call that reads
+                // it), so those have reached the agent: they leave the
+                // queue, and the state says so.
+                if event.kind == EventKind::AssistantMessage {
+                    let steered = *self.steered.lock().unwrap_or_else(|e| e.into_inner());
+                    if steered > 0 {
+                        *self.steered.lock().unwrap_or_else(|e| e.into_inner()) = 0;
+                        *self.queued.lock().unwrap_or_else(|e| e.into_inner()) -= steered;
+                        self.running(turn_by.clone());
+                        self.push_usage();
+                    }
                 }
                 // A decision or a result ends a wait.
                 let waiting = !matches!(self.state(), ThreadState::Running { .. });
@@ -322,6 +349,7 @@ impl ThreadActor {
             events: Mutex::new(runtime.log().read_all()?),
             state: Mutex::new(ThreadState::Idle),
             queued: Mutex::new(0),
+            steered: Mutex::new(0),
             last_queued_by: Mutex::new(None),
             mode: Mutex::new(runtime.mode().name().to_owned()),
         });
@@ -589,6 +617,13 @@ impl ThreadActor {
                 Start::Post(a, _) | Start::Skill(a, _, _) | Start::Continue(a) => a.clone(),
             };
             *self.shared.queued.lock().unwrap_or_else(|e| e.into_inner()) = 0;
+            // A steered message the previous turn never read is in this
+            // one's context; when it answers, there is nothing to drop.
+            *self
+                .shared
+                .steered
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = 0;
             *self
                 .shared
                 .started
@@ -809,8 +844,10 @@ impl ThreadActor {
     }
 
     /// After a turn: an answered question continues at once (the phase 4
-    /// split), queued messages start the next turn, an error is left in
-    /// the log and reported by the state.
+    /// split), and so does a message no model call has read — one posted
+    /// mid-call, or a steered one the turn ended before reading (a
+    /// budget, say). An error is left in the log and reported by the
+    /// state.
     fn after_turn(
         &mut self,
         outcome: Result<TurnOutcome, aigentic_runtime::RuntimeError>,

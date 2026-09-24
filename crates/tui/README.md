@@ -85,9 +85,10 @@ after quitting. Enter sends; Shift-Enter or Ctrl-J adds a line; a paste over
 1000 characters shows as a placeholder until sent; Up and Down walk the
 history when the composer is empty. While a turn runs, Ctrl-C or Esc
 interrupts it (nothing is posted; `!text` interrupts and posts) and Enter
-queues the message for the next turn. Idle, Ctrl-C or Esc clears the draft;
-on an empty composer a second Ctrl-C within a second quits and a second Esc
-recalls the last message sent, as Alt-Up does at any time. Ctrl-D quits.
+sends the message to the agent, which reads it before its next step. Idle,
+Ctrl-C or Esc clears the draft; on an empty composer a second Ctrl-C
+within a second quits and a second Esc recalls the last message sent, as
+Alt-Up does at any time. Ctrl-D quits.
 `/keys` prints the table. After a thread's first finished turn the utility
 model proposes a title (`[title: …]`), which `/threads` lists; `/rename
 <title>` sets your own. After every turn the same model extracts memory for
@@ -834,10 +835,15 @@ folded into the items so the run does not trip on them.
     ...]` and no prompt.
 22. Done-when 2, queue and interrupt. Ask for a long answer; while it
     streams, the other person posts a line: it prints in both
-    terminals at once as `<name>: ...` with `[queued for the next
-    turn]` for the poster, `/queue` counts it, and the model does not
-    address it until the next turn starts (which it does on its own
-    when the running one ends). Then, during another long answer, post
+    terminals at once as `<name>: ...` with `[sent: reaches the agent at
+    its next step]` for the poster and `/queue` counts it, and when the
+    stream ends the agent answers it at once (a message that lands while
+    a call is already out cannot reach that call; the thread continues
+    into it). Ask for work with a tool in it; post while the tool runs
+    and the very next request holds the message after the tool's
+    results: the agent adjusts mid-turn (the harness instructions say a
+    mid-turn message is a correction or an addition). Then, during
+    another long answer, post
     `!stop, do X instead`: within a second the stream stops,
     `[interrupted by <name>]` prints, the log has `interrupted {
     reason: "interrupt", by }`, and the new turn answers the interrupt.
