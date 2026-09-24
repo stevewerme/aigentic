@@ -50,11 +50,12 @@ pub enum Cell {
     Note(String),
     /// A turn's figures when it ends, dim.
     Summary(String),
-    /// The model's checklist.
-    Tasks(Vec<Task>),
+    /// A checklist item finished: checked off into the scrollback, dim.
+    Done(String),
 }
 
 /// The checklist's lines: a head with the count, then one line a step.
+/// The transcript pager shows it; the live block shows [`task_compact`].
 pub fn task_lines(tasks: &[Task]) -> Vec<Line<'static>> {
     let done = tasks.iter().filter(|t| t.state == TaskState::Done).count();
     let mut lines = vec![Line::from(vec![
@@ -76,6 +77,48 @@ pub fn task_lines(tasks: &[Task]) -> Vec<Line<'static>> {
             style,
         )));
     }
+    lines
+}
+
+/// The live block's task rows, at most three (issue #21): the item
+/// now in hand, the one after it, and how far the list has come. What
+/// is finished reaches the scrollback one line at a time
+/// ([`Cell::Done`]); the whole list is a pager away.
+pub fn task_compact(tasks: &[Task]) -> Vec<Line<'static>> {
+    if tasks.is_empty() {
+        return Vec::new();
+    }
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let done = tasks.iter().filter(|t| t.state == TaskState::Done).count();
+    let mut lines: Vec<Line<'static>> = tasks
+        .iter()
+        .filter(|t| t.state != TaskState::Done)
+        .take(2)
+        .map(|t| {
+            let style = if t.state == TaskState::Active {
+                bold
+            } else {
+                dim
+            };
+            Line::from(Span::styled(
+                format!(
+                    "{} {}",
+                    if t.state == TaskState::Active {
+                        "▸"
+                    } else {
+                        "○"
+                    },
+                    t.text
+                ),
+                style,
+            ))
+        })
+        .collect();
+    lines.push(Line::from(Span::styled(
+        format!("{done}/{} done · ctrl-t for the list", tasks.len()),
+        dim,
+    )));
     lines
 }
 
@@ -195,7 +238,10 @@ impl Cell {
                 }
                 lines
             }
-            Cell::Tasks(tasks) => task_lines(tasks),
+            Cell::Done(text) => vec![Line::from(vec![
+                Span::styled("✓ ", Style::default().add_modifier(Modifier::DIM)),
+                Span::raw(text.clone()),
+            ])],
             Cell::Summary(text) => vec![Line::from(Span::styled(
                 text.clone(),
                 Style::default().add_modifier(Modifier::DIM),
@@ -291,6 +337,11 @@ mod tests {
         }
     }
 
+    /// What a line says with every style ignored, as the tests read it.
+    fn plain_line(l: &Line<'_>) -> String {
+        l.spans.iter().map(|s| s.content.to_string()).collect()
+    }
+
     #[test]
     fn args_summarise_to_the_one_value_that_matters() {
         assert_eq!(
@@ -353,7 +404,7 @@ mod tests {
 
     #[test]
     fn tasks_render_with_marks_and_a_count() {
-        let cell = Cell::Tasks(vec![
+        let tasks = vec![
             Task {
                 text: "read the plan".into(),
                 state: TaskState::Done,
@@ -366,9 +417,12 @@ mod tests {
                 text: "run the gate".into(),
                 state: TaskState::Pending,
             },
-        ]);
+        ];
         assert_eq!(
-            cell.plain(),
+            task_lines(&tasks)
+                .iter()
+                .map(|l| plain_line(l))
+                .collect::<Vec<_>>(),
             vec![
                 "• Tasks 1/3",
                 "  ✓ read the plan",
@@ -376,6 +430,48 @@ mod tests {
                 "  ○ run the gate"
             ]
         );
+        // The live block stays at three rows whatever the list does:
+        // the item in hand, the one after it, how far it has come.
+        assert_eq!(
+            task_compact(&tasks)
+                .iter()
+                .map(|l| plain_line(l))
+                .collect::<Vec<_>>(),
+            vec![
+                "▸ write the code",
+                "○ run the gate",
+                "1/3 done · ctrl-t for the list"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_compact_task_block_never_exceeds_three_rows() {
+        let many: Vec<Task> = (0..9)
+            .map(|i| Task {
+                text: format!("task {i}"),
+                state: if i < 3 {
+                    TaskState::Done
+                } else if i == 3 {
+                    TaskState::Active
+                } else {
+                    TaskState::Pending
+                },
+            })
+            .collect();
+        let rows = task_compact(&many);
+        assert_eq!(rows.len(), 3);
+        let plain: Vec<_> = rows.iter().map(|l| plain_line(l)).collect();
+        assert_eq!(plain[0], "▸ task 3");
+        assert_eq!(plain[1], "○ task 4");
+        assert_eq!(plain[2], "3/9 done · ctrl-t for the list");
+        assert!(task_compact(&[]).is_empty());
+    }
+
+    #[test]
+    fn a_finished_task_checks_off_into_the_scrollback() {
+        let cell = Cell::Done("read the plan".into());
+        assert_eq!(cell.plain(), vec!["✓ read the plan"]);
     }
 
     #[test]

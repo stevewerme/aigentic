@@ -140,13 +140,6 @@ pub trait Printer {
     fn quiet(&mut self, text: &str) {
         self.line(text);
     }
-    /// The checklist changed. A pipe prints it; a shell draws it from
-    /// the engine instead.
-    fn tasks(&mut self, tasks: &[aigentic_runtime::harness_tools::Task]) {
-        for l in Cell::Tasks(tasks.to_vec()).plain() {
-            self.line(&l);
-        }
-    }
     /// A long text to page through (`/diff`); a pipe prints it.
     fn pager(&mut self, _title: &str, text: &str) {
         for l in text.lines() {
@@ -586,13 +579,6 @@ impl ClientRepl {
         &self.tasks
     }
 
-    /// Commit the checklist to the transcript and clear it.
-    fn settle_tasks(&mut self, out: &mut dyn Printer) {
-        if !self.tasks.is_empty() {
-            out.cell(Cell::Tasks(std::mem::take(&mut self.tasks)), true);
-        }
-    }
-
     /// The running turn's figures, for the turn line.
     pub fn turn(&self) -> Option<&TurnStats> {
         self.turn.as_ref()
@@ -825,13 +811,24 @@ impl ClientRepl {
                 >(call.args.clone())
                 {
                     use aigentic_runtime::harness_tools::TaskState;
-                    self.tasks = args.tasks;
-                    out.tasks(&self.tasks);
-                    if !self.tasks.is_empty()
-                        && self.tasks.iter().all(|t| t.state == TaskState::Done)
-                    {
-                        self.settle_tasks(out);
+                    // What is done reaches the scrollback one line at a
+                    // time; the live block shows the rest.
+                    let done = args
+                        .tasks
+                        .iter()
+                        .filter(|t| {
+                            t.state == TaskState::Done
+                                && !self
+                                    .tasks
+                                    .iter()
+                                    .any(|o| o.text == t.text && o.state == TaskState::Done)
+                        })
+                        .map(|t| t.text.clone())
+                        .collect::<Vec<_>>();
+                    for text in done {
+                        out.cell(Cell::Done(text), true);
                     }
+                    self.tasks = args.tasks;
                 }
             }
             Notice::ToolCallStarted { call, .. } => {
@@ -865,6 +862,9 @@ impl ClientRepl {
                     self.awaiting_turn = false;
                     if self.turn.is_none() {
                         self.turn = Some(TurnStats::new());
+                        // A fresh checklist per turn: the last one's
+                        // items are already in the scrollback.
+                        self.tasks.clear();
                     }
                 }
                 self.state = state;
@@ -1061,7 +1061,6 @@ impl ClientRepl {
             }
             EventKind::TurnEnded => {
                 self.flush_partial(out);
-                self.settle_tasks(out);
                 if let Some(t) = self.turn.take() {
                     out.cell(Cell::Summary(format!("─ {}", t.figures())), true);
                 }
@@ -2193,6 +2192,100 @@ mod tests {
         );
         let rules = std::fs::read_to_string(root.join(".aigentic/rules.toml")).unwrap();
         assert!(rules.contains("\"curl -s\""), "{rules}");
+    }
+
+    /// The checklist (issue #21): a finished item checks off into the
+    /// scrollback, one line at a time — never the whole list at once,
+    /// which the live block shows three rows of.
+    #[tokio::test]
+    async fn finished_tasks_check_off_into_the_scrollback() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = project(dir.path(), "proj", "");
+        let cfg_dir = dir.path().join("cfg");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        let pending = |a: &str, b: &str, c: &str| {
+            serde_json::json!({"tasks": [
+                {"text": a, "state": "pending"},
+                {"text": b, "state": "pending"},
+                {"text": c, "state": "pending"},
+            ]})
+        };
+        let script = vec![
+            vec![
+                text("Three things.\n"),
+                call(
+                    "t1",
+                    "update_tasks",
+                    pending("read the plan", "write the code", "run the gate"),
+                ),
+                tool_use(),
+            ],
+            vec![
+                call(
+                    "t2",
+                    "update_tasks",
+                    serde_json::json!({"tasks": [
+                        {"text": "read the plan", "state": "done"},
+                        {"text": "write the code", "state": "active"},
+                        {"text": "run the gate", "state": "pending"},
+                    ]}),
+                ),
+                tool_use(),
+            ],
+            vec![
+                call(
+                    "t3",
+                    "update_tasks",
+                    serde_json::json!({"tasks": [
+                        {"text": "read the plan", "state": "done"},
+                        {"text": "write the code", "state": "done"},
+                        {"text": "run the gate", "state": "active"},
+                    ]}),
+                ),
+                tool_use(),
+            ],
+            vec![text("All set.\n"), done()],
+        ];
+        let embedded = Server::embed_with(
+            config(dir.path()),
+            cfg_dir.clone(),
+            root,
+            "steve",
+            None,
+            Factory::scripted(script),
+            Arc::new(DefaultReports {
+                global_instructions: cfg_dir.join("instructions.md"),
+            }),
+        )
+        .await
+        .unwrap();
+        let (client, welcome) =
+            Client::connect(&Addr::Unix(embedded.socket.clone()), &embedded.token)
+                .await
+                .unwrap();
+        let role = welcome.projects[0].role.clone();
+        let (thread, state, mode) = open(&client, "proj", None).await;
+        let notices = client.take_notices().unwrap();
+        let mut repl = ClientRepl::new(client, thread, "steve", role, state, mode);
+        let (tx, rx) = mpsc::unbounded_channel();
+        let feeder = async move {
+            tx.send("go".into()).unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+            tx.send("/quit".into()).unwrap();
+        };
+        let mut out = Lines::default();
+        let ((), ()) = tokio::join!(repl.run(rx, notices, &mut out), feeder);
+        let lines = out.0;
+        assert!(
+            lines.contains(&"✓ read the plan".to_owned())
+                && lines.contains(&"✓ write the code".to_owned()),
+            "each finished item, one line: {lines:#?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.starts_with("• Tasks")),
+            "the whole list is a pager away, not printed: {lines:#?}"
+        );
+        drop(embedded);
     }
 
     #[test]

@@ -23,13 +23,15 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::app::composer::{Composer, MAX_ROWS};
 
-/// The viewport's height starts here: the boxed composer and the status.
-pub const MIN_ROWS: u16 = 4;
+/// The viewport's height starts here: the boxed composer, the status
+/// and the rule that marks where the live area begins.
+pub const MIN_ROWS: u16 = 5;
 /// Rows of the changing part (streaming text, a running tool, pending
 /// reads) the viewport shows at most; the rest is in the scrollback.
 pub const MAX_ACTIVE_ROWS: usize = 12;
 
-/// The rows the pane needs: what `layout` draws, the active part capped.
+/// The rows the pane needs: what `layout` draws, the active part
+/// capped, plus the rule that ends the transcript.
 pub fn needed_rows(pane: &Pane<'_>) -> u16 {
     // The draft's rows and the box's two borders.
     let composer = pane.composer.lines().len().min(MAX_ROWS) + 2;
@@ -39,7 +41,8 @@ pub fn needed_rows(pane: &Pane<'_>) -> u16 {
         + usize::from(pane.hint.is_some())
         + usize::from(pane.activity.is_some())
         + composer
-        + 1;
+        // The rule that ends the transcript, and the status line.
+        + 2;
     u16::try_from(rows).unwrap_or(u16::MAX)
 }
 
@@ -202,13 +205,14 @@ impl Shell {
         Ok((wanted != self.rows && (wanted > self.rows || may_shrink)).then_some(wanted))
     }
 
-    /// Size the viewport to `wanted` rows (clamped to the screen). It
-    /// grows at once; it shrinks only when `may_shrink`, so a streaming
-    /// reply does not make it jump. A resized window is refitted at the
-    /// same height. ratatui's inline viewport has a fixed height, so a
-    /// new one is made at the old one's top: the old area is cleared
-    /// first, and the new one scrolls the screen only when it needs more
-    /// room below.
+    /// Size the viewport to `wanted` rows (clamped to the screen).
+    /// During a turn it grows at once and never shrinks: a reply
+    /// streaming in, tools starting and finishing, do not make it
+    /// jump. It shrinks once, when the turn has ended (`may_shrink`).
+    /// A resized window is refitted at the same height. ratatui's
+    /// inline viewport has a fixed height, so a new one is made at the
+    /// old one's top: the old area is cleared first, and the new one
+    /// scrolls the screen only when it needs more room below.
     pub fn fit(&mut self, wanted: u16, may_shrink: bool) -> anyhow::Result<()> {
         let size = crossterm::terminal::size()?;
         let resized = size != self.last_size;
@@ -392,14 +396,15 @@ pub fn layout(pane: &Pane<'_>, area: Rect) -> (Vec<Line<'static>>, Option<(u16, 
         ))
     });
 
-    // Rows left for the tail after the composer, the hint and the status.
+    // The rule and the fixed rows come first; the tail takes what is
+    // left, its last rows when that is little.
     let fixed = composer_rows.len()
         + usize::from(hint.is_some())
         + usize::from(pane.activity.is_some())
         + 1
         + pane.block.len()
         + pane.popup.len();
-    let tail_rows_avail = height.saturating_sub(fixed);
+    let tail_rows_avail = height.saturating_sub(fixed + 1);
     let skip = pane.active.len().saturating_sub(tail_rows_avail);
     let tail_rows: Vec<Line<'static>> = if tail_rows_avail == 0 {
         Vec::new()
@@ -407,12 +412,17 @@ pub fn layout(pane: &Pane<'_>, area: Rect) -> (Vec<Line<'static>>, Option<(u16, 
         pane.active.iter().skip(skip).cloned().collect()
     };
 
-    // Bottom-align: blank rows first.
-    let used = tail_rows.len() + fixed;
+    // Bottom-align: blank rows first, then the dim rule that ends the
+    // transcript, so the live area's top edge is a line, not a guess.
+    let used = tail_rows.len() + fixed + 1;
     let blank = height.saturating_sub(used);
     for _ in 0..blank {
         rows.push(Line::raw(""));
     }
+    rows.push(Line::from(Span::styled(
+        "─".repeat(width),
+        Style::default().add_modifier(Modifier::DIM),
+    )));
     rows.extend(tail_rows);
     rows.extend(pane.block.iter().cloned());
     if let Some(a) = &pane.activity {
@@ -578,7 +588,7 @@ mod tests {
         };
         let (rows, cursor) = render(&pane, 20, 6);
         assert_eq!(rows[0], "");
-        assert_eq!(rows[1], "");
+        assert_eq!(rows[1], "────────────────────");
         assert_eq!(rows[2], "╭──────────────────╮");
         assert_eq!(rows[3], "│ > hello          │");
         assert_eq!(rows[4], "╰──────────────────╯");
@@ -602,16 +612,17 @@ mod tests {
             popup: &[],
             activity: None,
         };
-        // 6 rows: one tail row fits above the hint, the boxed composer
-        // and the status.
-        let (rows, cursor) = render(&pane, 10, 6);
-        assert_eq!(rows[0], "xyz");
-        assert_eq!(rows[1], "queued 1 ·");
-        assert_eq!(rows[2], "╭────────╮");
-        assert_eq!(rows[3], "│ >      │");
-        assert_eq!(rows[4], "╰────────╯");
-        assert_eq!(rows[5], "  s");
-        assert_eq!(cursor, Some((4, 3)));
+        // 7 rows: the rule that ends the transcript, one tail row above
+        // the hint, the boxed composer and the status.
+        let (rows, cursor) = render(&pane, 10, 7);
+        assert_eq!(rows[0], "──────────");
+        assert_eq!(rows[1], "xyz");
+        assert_eq!(rows[2], "queued 1 ·");
+        assert_eq!(rows[3], "╭────────╮");
+        assert_eq!(rows[4], "│ >      │");
+        assert_eq!(rows[5], "╰────────╯");
+        assert_eq!(rows[6], "  s");
+        assert_eq!(cursor, Some((4, 4)));
     }
 
     #[test]
@@ -629,10 +640,12 @@ mod tests {
             popup: &[],
             activity: None,
         };
-        let (rows, cursor) = render(&pane, 20, 5);
-        assert_eq!(rows[1], "│ > one            │");
-        assert_eq!(rows[2], "│   two            │");
-        assert_eq!(cursor, Some((7, 1)));
+        let (rows, cursor) = render(&pane, 20, 6);
+        assert_eq!(rows[0], "────────────────────");
+        assert_eq!(rows[1], "╭──────────────────╮");
+        assert_eq!(rows[2], "│ > one            │");
+        assert_eq!(rows[3], "│   two            │");
+        assert_eq!(cursor, Some((7, 2)));
     }
 
     #[test]
@@ -647,7 +660,11 @@ mod tests {
             popup: &[],
             activity: None,
         };
-        assert_eq!(needed_rows(&idle), 4, "one draft row, its box, the status");
+        assert_eq!(
+            needed_rows(&idle),
+            5,
+            "one draft row, its box, the status, the rule"
+        );
         let active: Vec<Line<'static>> = (0..30).map(|i| Line::raw(i.to_string())).collect();
         let block = vec![Line::raw("b1"), Line::raw("b2")];
         let busy = Pane {
@@ -659,7 +676,11 @@ mod tests {
             popup: &[],
             activity: None,
         };
-        assert_eq!(needed_rows(&busy) as usize, MAX_ACTIVE_ROWS + 2 + 1 + 3 + 1);
+        assert_eq!(
+            needed_rows(&busy) as usize,
+            MAX_ACTIVE_ROWS + 2 + 1 + 3 + 1 + 1,
+            "the tail, two block rows, the hint, the box, the status, the rule"
+        );
     }
 
     #[test]

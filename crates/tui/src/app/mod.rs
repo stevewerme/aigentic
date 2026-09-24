@@ -127,6 +127,9 @@ impl ShellOut {
     }
 
     fn commit(&mut self, cell: Cell) {
+        // What was looked at so far comes first: the scrollback keeps
+        // the order the work happened in.
+        self.flush_explored();
         let width = self.shell.width();
         let group = look::group(&cell);
         // A blank line between blocks of different kinds.
@@ -193,11 +196,6 @@ impl Printer for ShellOut {
 
     fn quiet(&mut self, _text: &str) {
         // Housekeeping (a title, memory written) lives in the footer.
-    }
-
-    fn tasks(&mut self, _tasks: &[aigentic_runtime::harness_tools::Task]) {
-        // Drawn above the turn line from the engine's state.
-        self.flush_explored();
     }
 
     fn prompt(&mut self, _menu: &Menu) {
@@ -390,6 +388,21 @@ fn body_lines(menu: &Menu, width: usize) -> Vec<Line<'static>> {
     rows
 }
 
+/// The transcript pager's lines: the whole checklist while one lasts
+/// (the live block shows three rows of it), then every cell in full.
+fn transcript_lines(
+    transcript: &[Cell],
+    tasks: &[aigentic_runtime::harness_tools::Task],
+) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if !tasks.is_empty() {
+        lines.extend(cells::task_lines(tasks));
+        lines.push(Line::raw(""));
+    }
+    lines.extend(transcript.iter().flat_map(Cell::full));
+    lines
+}
+
 /// The pager over `lines` in the alternate screen until it is closed.
 fn page(shell: &mut Shell, title: &str, lines: Vec<Line<'static>>) -> anyhow::Result<()> {
     let mut pager = Pager::new(title, lines);
@@ -505,14 +518,22 @@ async fn run_shell(
             let draft = prompt_draft.take().unwrap();
             composer.set_text(&draft);
         }
-        let mut block: Vec<Line<'static>> = if engine.tasks().is_empty() {
-            Vec::new()
-        } else {
-            cells::task_lines(engine.tasks())
-                .iter()
-                .flat_map(|l| wrap_line(l, out.shell.width()))
-                .collect()
-        };
+        let mut block: Vec<Line<'static>> =
+            if state == ThreadState::Idle || engine.tasks().is_empty() {
+                Vec::new()
+            } else {
+                // At most three rows, whatever the checklist does: the
+                // item in hand, the one after it, how far it has come.
+                cells::task_compact(engine.tasks())
+                    .into_iter()
+                    .map(|l| {
+                        wrap_line(&l, out.shell.width())
+                            .into_iter()
+                            .next()
+                            .unwrap_or(l)
+                    })
+                    .collect()
+            };
         block.extend(
             engine
                 .menu()
@@ -721,8 +742,10 @@ async fn run_shell(
                             }
                             Action::Quit => break,
                             Action::Transcript => {
-                                let lines: Vec<Line<'static>> =
-                                    out.transcript.iter().flat_map(Cell::full).collect();
+                                let lines = transcript_lines(
+                                    &out.transcript,
+                                    engine.tasks(),
+                                );
                                 page(&mut out.shell, "transcript", lines)?;
                             }
                             Action::None => {}
@@ -777,6 +800,39 @@ mod tests {
             RiskClass::Exec,
             "class exec: anything else in a shell",
         )
+    }
+
+    /// The pager opens with the whole checklist — the live block shows
+    /// three rows of it — then the run in full.
+    #[test]
+    fn the_transcript_pager_opens_with_the_whole_checklist() {
+        use aigentic_runtime::harness_tools::{Task, TaskState};
+        let tasks = vec![
+            Task {
+                text: "read the plan".into(),
+                state: TaskState::Done,
+            },
+            Task {
+                text: "write the code".into(),
+                state: TaskState::Active,
+            },
+        ];
+        let lines = transcript_lines(&[Cell::User("one".into())], &tasks);
+        assert_eq!(
+            text(&lines),
+            vec![
+                "• Tasks 1/2",
+                "  ✓ read the plan",
+                "  ▸ write the code",
+                "",
+                "> one"
+            ]
+        );
+        // No checklist, no head: the pager is the run alone.
+        assert_eq!(
+            text(&transcript_lines(&[Cell::User("one".into())], &[])),
+            vec!["> one"]
+        );
     }
 
     /// The screen the issue draws: the header in plain words, the

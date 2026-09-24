@@ -8,7 +8,7 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::app::cells::{Cell, ToolState, task_lines};
+use crate::app::cells::{Cell, ToolState};
 use crate::app::diff;
 use crate::app::tui::wrap_line;
 
@@ -42,7 +42,7 @@ pub fn group(cell: &Cell) -> Group {
     match cell {
         Cell::User(_) => Group::User,
         Cell::Assistant { .. } => Group::Assistant,
-        Cell::Tool { .. } | Cell::Explored(_) | Cell::Edit(_) | Cell::Tasks(_) => Group::Tools,
+        Cell::Tool { .. } | Cell::Explored(_) | Cell::Edit(_) | Cell::Done(_) => Group::Tools,
         Cell::Summary(_) => Group::Summary,
         Cell::Note(_) => Group::Note,
     }
@@ -243,13 +243,10 @@ pub fn render(cell: &Cell, first: bool, width: usize) -> Vec<Line<'static>> {
             }
             lines
         }
-        Cell::Tasks(tasks) => {
-            let mut lines = task_lines(tasks);
-            if let Some(first) = lines.first_mut() {
-                first.spans[0] = dot(Color::Cyan);
-            }
-            lines
-        }
+        Cell::Done(text) => vec![Line::from(vec![
+            Span::styled("✓ ", dim()),
+            Span::raw(text.clone()),
+        ])],
         Cell::Summary(text) => vec![Line::from(Span::styled(
             format!("  {}", text.trim_start_matches("─ ")),
             dim(),

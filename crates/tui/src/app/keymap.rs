@@ -40,7 +40,8 @@ pub enum Action {
     /// Alt-Up: copy the last message sent into the composer (a queued
     /// message is already in the log, so it is copied, not withdrawn).
     Recall,
-    /// Ctrl-T: the transcript pager (step 5).
+    /// Ctrl-T: the transcript pager — the whole checklist at its top,
+    /// then the run so far.
     Transcript,
     None,
 }
@@ -102,7 +103,7 @@ Up / Down        move in the draft; on one line, walk the history; a prompt menu
 Space            a prompt menu: toggle a row (multi-select)
 Ctrl-A / Ctrl-E  start / end of the line
 Ctrl-U           clear the draft
-Ctrl-T           the transcript pager (step 5)
+Ctrl-T           the transcript pager: the whole checklist, then the run in full
 Ctrl-D           quit when the composer is empty
 y / a / n        a permission menu, hidden: once / allow more / no";
 
