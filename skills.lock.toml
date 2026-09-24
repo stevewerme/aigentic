@@ -612,3 +612,30 @@ invocation = "user"
 [skill.review]
 by = "steve"
 on = "2026-09-21"
+
+[[skill]]
+name = "brief"
+path = "skills/aigentic/brief"
+source = "local"
+commit = ""
+sha256 = "d190c009af657468438b085b37237c0369c8e45eff9014d21032a4d0660a3e8e"
+invocation = "user"
+review = { by = "steve", on = "2026-09-24" }
+
+[[skill]]
+name = "plan-check"
+path = "skills/aigentic/plan-check"
+source = "local"
+commit = ""
+sha256 = "0e3582953901b9c4c871f01fa4444db203056d240ca457a59ed6e0e12086f541"
+invocation = "user"
+review = { by = "steve", on = "2026-09-24" }
+
+[[skill]]
+name = "run-audit"
+path = "skills/aigentic/run-audit"
+source = "local"
+commit = ""
+sha256 = "9688967e333d79c085fa11b14f561b6ab103b6bc916b400ae4c054d40d70767c"
+invocation = "user"
+review = { by = "steve", on = "2026-09-24" }

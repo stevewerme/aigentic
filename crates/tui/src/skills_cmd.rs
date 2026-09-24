@@ -435,7 +435,9 @@ mod tests {
         // Pending entries with findings block until reviewed (step 10).
         let lock = paths.lock().unwrap();
         let manifests = discover_roots(&paths.roots()).unwrap();
-        assert_eq!(manifests.len(), 38);
+        // Every skill in the tree has exactly one lock entry: derived, not
+        // counted by hand, so adding a skill never breaks this test.
+        assert_eq!(manifests.len(), lock.skills.len());
         let expected = if blocking(&manifests, &lock).is_empty() {
             0
         } else {

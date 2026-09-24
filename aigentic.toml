@@ -35,6 +35,8 @@ enabled = [
   "grill-with-docs", "implement", "improve-codebase-architecture", "prototype",
   "research", "resolving-merge-conflicts", "tdd", "to-spec", "to-tickets",
   "triage", "wayfinder", "grilling",
+  # This project's own playbook (skills/aigentic), from the 2026-09-24 trials.
+  "brief", "plan-check", "run-audit",
 ]
 
 [policy]
