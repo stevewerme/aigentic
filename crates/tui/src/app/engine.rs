@@ -17,8 +17,8 @@ use aigentic_api::{Notice, ReportKind, Request, Response, ThreadState};
 use aigentic_runtime::aigentic_core::{Author, ContentBlock, EventKind, ToolCall};
 use aigentic_runtime::aigentic_log::{
     AssistantMessagePayload, CompactedPayload, CompactionStrategy, DecisionScope,
-    InterruptedPayload, MemoryExtractedPayload, PermissionDecidedPayload, SkillLoadedPayload,
-    ToolResultPayload, TurnEndedPayload, UserMessagePayload,
+    InterruptedPayload, MemoryExtractedPayload, MemoryRememberedPayload, PermissionDecidedPayload,
+    SkillLoadedPayload, ToolResultPayload, TurnEndedPayload, UserMessagePayload,
 };
 use aigentic_runtime::{ASKED_HUMAN, INTERRUPTED};
 use tokio::sync::mpsc;
@@ -478,6 +478,17 @@ impl ClientRepl {
                     })
                     .await;
                 self.show(r, "[pinned]", out);
+            }
+            Command::Remember(text) => {
+                let r = self
+                    .request(Request::Remember {
+                        thread: self.thread,
+                        text: text.to_owned(),
+                    })
+                    .await;
+                // The event is the one line of feedback, once it
+                // arrives as a notice.
+                self.show(r, "", out);
             }
             Command::Compact => {
                 let r = self
@@ -1098,9 +1109,21 @@ impl ClientRepl {
             EventKind::MemoryExtracted => {
                 if let Ok(p) =
                     serde_json::from_value::<MemoryExtractedPayload>(event.payload.clone())
-                    && !p.written.is_empty()
                 {
-                    out.quiet(&format!("[memory: {} lines written]", p.written.len()));
+                    for line in p.written {
+                        out.quiet(&format!("filed to memory: {} ({})", line.text, line.file));
+                    }
+                }
+            }
+            EventKind::MemoryRemembered => {
+                if let Ok(p) =
+                    serde_json::from_value::<MemoryRememberedPayload>(event.payload.clone())
+                {
+                    if p.written {
+                        out.quiet(&format!("filed to memory: {} ({})", p.text, p.file));
+                    } else {
+                        out.quiet(&format!("already in memory: {} ({})", p.text, p.file));
+                    }
                 }
             }
             EventKind::ProjectSwitched => {

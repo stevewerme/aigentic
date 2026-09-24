@@ -65,6 +65,11 @@ pub enum Mail {
         text: String,
         reply: oneshot::Sender<Response>,
     },
+    Remember {
+        author: Author,
+        text: String,
+        reply: oneshot::Sender<Response>,
+    },
     Rename {
         author: Author,
         title: String,
@@ -438,6 +443,26 @@ impl ThreadActor {
                 );
                 None
             }
+            Mail::Remember {
+                author,
+                text,
+                reply,
+            } => {
+                let shared = self.shared.clone();
+                let sys = Author::System;
+                let _ = reply.send(
+                    match self
+                        .runtime
+                        .remember(author, &text, &mut |s| shared.observe(s, &sys))
+                    {
+                        Ok(()) => Response::Ok,
+                        Err(e) => Response::Error {
+                            message: e.to_string(),
+                        },
+                    },
+                );
+                None
+            }
             Mail::Rename {
                 author,
                 title,
@@ -770,6 +795,7 @@ impl ThreadActor {
                 });
             }
             Mail::Pin { reply, .. }
+            | Mail::Remember { reply, .. }
             | Mail::Rename { reply, .. }
             | Mail::SwitchProject { reply, .. }
             | Mail::Compact { reply }

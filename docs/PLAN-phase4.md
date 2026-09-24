@@ -38,7 +38,8 @@ Done when:
    in which the user states a decision, a `memory_extracted` event is
    appended, `memory/decisions.md` gains the line, and the next turn's
    prefix contains it. A fact the model inferred but no participant
-   stated is not filed. Editing the file by hand changes the next prefix.
+   stated is not filed, and neither is a one-off task instruction.
+   Editing the file by hand changes the next prefix.
 5. **The Pocock setup is configuration.** `[pocock]` fields in
    `aigentic.toml` render the files upstream's skills read
    (`docs/agents/issue-tracker.md`, triage labels, doc location), so
@@ -155,6 +156,9 @@ impl Runtime {
     /// After a turn: ask the model for stated facts since the last extraction,
     /// write them, append memory_extracted, reload the prefix.
     pub async fn extract_memory(&mut self, observe) -> Result<Option<MemoryExtractedPayload>, RuntimeError>;
+    /// /remember: the person files a line themselves, no model call;
+    /// append memory_remembered, reload the prefix.
+    pub fn remember(&mut self, author, text, observe) -> Result<(), RuntimeError>;
 }
 
 // crates/runtime/src/context.rs
@@ -280,23 +284,43 @@ and a call to it anyway is the unknown-tool refusal from phase 3.
 ## 6. Memory
 
 **When.** After every `every_n_turns` turns that ended `done` (default 1),
-before the prompt returns to the user, and never during a turn. The REPL
-prints `[memory: 2 lines written]` or nothing.
+before the prompt returns to the user, and never during a turn. For each
+line filed, by extraction or by `/remember`, the client prints one line,
+`filed to memory: <text> (<file>)`; nothing is filed, nothing is printed.
 
 **What.** One model call with the project's own model, a fixed prompt
 (`MEMORY_PROMPT`, versioned like the summary prompt) and the events since
 the last `memory_extracted` event's `through_seq`, rendered as a
 transcript with one entry per message-bearing event tagged
 `[seq N] kind author:` (the projection carries no seqs, so it cannot be
-used as is; provider blobs are dropped and tool results shortened). The
-model returns lines `<kind> @<seq>: <text>` with kind `decision`,
-`constraint` or `fact`. The runtime keeps only lines whose `at_seq`, in
-the range considered, is a `user_message` or a `skill_loaded` by a user;
-anything else is dropped as inference, which is how "only what a
-participant stated" is enforced rather than hoped for. An
-`assistant_message` by a named agent participant joins the rule in phase
-5 with participants; in phase 4 the only agent is the thread's own and
-its messages are inference.
+used as is; provider blobs are dropped and tool results shortened).
+
+**Three filters, two on the reply.** First the cue gate, in code, before
+the model runs (issue #14): a `user_message` enters the transcript only
+when it states something durable — it contains a remember cue (`for the
+record`, `remember`, `from now on`, `going forward`, `always`, `never`,
+`in this project`, `our convention`, `we decided`, `/remember`); the
+rest of the range is transcript as before. So an instruction the person
+gave for the task at hand is never even shown to the extraction model.
+The model returns lines `<kind> @<seq> durable|task: <text>` with kind
+`decision`, `constraint` or `fact`. Second, attribution: the runtime
+keeps only lines whose `at_seq`, in the range considered, is a
+`user_message` or a `skill_loaded` by a user; anything else is dropped as
+inference, which is how "only what a participant stated" is enforced
+rather than hoped for. Third, scope: a `task` line is dropped even when
+a participant stated it, because an instruction for the current task is
+obsolete the moment the task is done; only `durable` files. A line that
+restates the project's name or a rule already in the instructions or
+knowledge layers is dropped too, since the prefix carries it already. An
+`assistant_message` by a named agent participant joins the attribution
+filter in phase 5 with participants; in phase 4 the only agent is the
+thread's own and its messages are inference.
+
+**`/remember <text>`.** The person files the line themselves: no model
+call and no filters, because the command is the statement. An optional
+first word (`decision`, `constraint`, `fact`) picks the file; without it
+the line lands in `facts.md`. A `memory_remembered` event is appended
+with the file, the text and whether the line landed; write users only.
 
 **Where.** `.aigentic/memory/decisions.md`, `constraints.md`, `facts.md`,
 one bullet per line with the date and the thread id in a trailing

@@ -357,6 +357,18 @@ pub struct MemoryExtractedPayload {
     pub usage: Usage,
 }
 
+/// Payload of a `memory_remembered` event (issue #14): a person ran
+/// `/remember` and the runtime appended a line directly, no model call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryRememberedPayload {
+    /// The file under `.aigentic/memory/` the line went to.
+    pub file: String,
+    pub text: String,
+    /// `false` when the line was already present and nothing was
+    /// written; the event still records the ask.
+    pub written: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

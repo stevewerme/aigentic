@@ -10,6 +10,9 @@ pub enum Command<'a> {
     Project,
     Threads,
     Pin(&'a str),
+    /// File a memory line directly: `/remember <text>`; an optional
+    /// first word (decision, constraint, fact) picks the file.
+    Remember(&'a str),
     Compact,
     /// Post as an interrupt: the running turn ends first (`!text` too).
     Interrupt(&'a str),
@@ -74,6 +77,7 @@ pub fn parse_line<'a>(line: &'a str, skills: &[String]) -> Command<'a> {
         ("policy", _) => Command::Policy,
         ("memory", _) => Command::Memory,
         ("pin", text) if !text.is_empty() => Command::Pin(text),
+        ("remember", text) if !text.is_empty() => Command::Remember(text),
         (name, args) if skills.iter().any(|s| s == name) => Command::Skill(name, args),
         _ => Command::Unknown(trimmed),
     }
@@ -86,6 +90,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "tokens for the thread, reported and estimated separately",
     ),
     ("pin", "pin a fact to the stable prefix: /pin <text>"),
+    (
+        "remember",
+        "file a memory line: /remember [decision|constraint|fact] <text>",
+    ),
     ("compact", "run compaction now"),
     (
         "mode",
@@ -121,6 +129,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
 pub const HELP: &str = "\
 /cost            tokens for the thread, reported and estimated separately
 /pin <text>      pin a fact to the stable prefix
+/remember <text> file a memory line; an optional first word picks the file: decision, constraint, fact
 /compact         run compaction now
 /mode [name]     show the permission mode, or set it: manual, accept-edits, auto
 /interrupt <text> end the running turn and start one with this (or `!text`)
@@ -206,6 +215,18 @@ mod tests {
             Command::Pin("Answer in Swedish.")
         );
         assert_eq!(parse_line("/pin", &none), Command::Unknown("/pin"));
+        assert_eq!(
+            parse_line("/remember decision We deploy from main only.", &none),
+            Command::Remember("decision We deploy from main only.")
+        );
+        assert_eq!(
+            parse_line("  /remember   dates in Swedish format  ", &none),
+            Command::Remember("dates in Swedish format")
+        );
+        assert_eq!(
+            parse_line("/remember", &none),
+            Command::Unknown("/remember")
+        );
         assert_eq!(
             parse_line("/nope arg", &none),
             Command::Unknown("/nope arg")

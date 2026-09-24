@@ -31,6 +31,11 @@ pub enum EventKind {
     /// Facts stated in the thread were written to the project's memory
     /// files; carries what was written and the cursor for the next run.
     MemoryExtracted,
+    /// `/remember <text>`: a person filed a memory line themselves, no
+    /// model call (issue #14's reliable path). The event's author is who
+    /// asked; the payload carries the file, the text and whether the
+    /// line landed or was already present.
+    MemoryRemembered,
     /// The first event of a thread created by the daemon (phase 5):
     /// which project it belongs to and the root its tools run in. Older
     /// logs have none and are grouped by their directory instead.

@@ -127,6 +127,12 @@ pub enum Request {
         thread: Ulid,
         text: String,
     },
+    /// `/remember <text>` (issue #14): file a memory line directly,
+    /// no model call.
+    Remember {
+        thread: Ulid,
+        text: String,
+    },
     /// Move the thread to another project (phase 6 step 10): needs
     /// `write` in both the thread's project and the target; refused while
     /// a turn runs.
@@ -442,6 +448,10 @@ mod tests {
             Request::Pin {
                 thread: thread(),
                 text: "Use Swedish.".into(),
+            },
+            Request::Remember {
+                thread: thread(),
+                text: "We deploy from main only.".into(),
             },
             Request::Compact { thread: thread() },
             Request::SetMode {

@@ -1,13 +1,14 @@
 //! Memory extraction in the loop (docs/PLAN-phase4.md section 9): a
-//! scripted reply with one stated decision, one inferred fact and one
-//! line pointing at a tool result; only the decision lands, once, and the
-//! next request's prefix carries it.
+//! scripted reply with one stated decision, one task instruction the
+//! user also stated, one inferred fact and one line pointing at a tool
+//! result; only the durable, stated decision lands, once, and the next
+//! request's prefix carries it. `/remember` skips the model entirely.
 
 mod common;
 
 use aigentic_core::{ContentBlock, EventKind, Message, ProviderEvent, Role, ToolCall};
-use aigentic_log::{MemoryExtractedPayload, ThreadLog};
-use aigentic_runtime::{Layers, MEMORY_PROMPT, Project, Runtime};
+use aigentic_log::{MemoryExtractedPayload, MemoryRememberedPayload, ThreadLog};
+use aigentic_runtime::{Layers, MEMORY_PROMPT, Project, Runtime, RuntimeError};
 use aigentic_tools::ToolRegistry;
 use common::{EchoTool, Seen, done, scripted, steve, usage};
 use serde_json::json;
@@ -77,11 +78,13 @@ fn one_turn() -> Vec<Vec<ProviderEvent>> {
     ]
 }
 
-/// The extraction reply: one decision the user stated, one fact the
-/// assistant inferred (seq 3), one line pointing at the tool result (2).
-const REPLY: &str = "decision @0: Use Swedish in the UI.\n\
-fact @3: The user prefers short answers.\n\
-fact @2: The tests are green.\n";
+/// The extraction reply: one decision the user stated, one task
+/// instruction they also stated (issue #14), one fact the assistant
+/// inferred (seq 3), one line pointing at the tool result (2).
+const REPLY: &str = "decision @0 durable: Use Swedish in the UI.\n\
+decision @0 task: Show the diff; don't commit.\n\
+fact @3 durable: The user prefers short answers.\n\
+fact @2 durable: The tests are green.\n";
 
 #[tokio::test]
 async fn only_the_stated_decision_lands_and_the_next_prefix_carries_it() {
@@ -93,7 +96,9 @@ async fn only_the_stated_decision_lands_and_the_next_prefix_carries_it() {
 
     rt.run_turn(
         steve(),
-        vec![ContentBlock::Text("Use Swedish in the UI.".into())],
+        vec![ContentBlock::Text(
+            "For the record, use Swedish in the UI.".into(),
+        )],
         &mut |_| {},
     )
     .await
@@ -114,7 +119,7 @@ async fn only_the_stated_decision_lands_and_the_next_prefix_carries_it() {
     assert_eq!(texts(&request[0]), MEMORY_PROMPT);
     let transcript = texts(&request[1]);
     assert!(
-        transcript.starts_with("[seq 0] user steve: Use Swedish in the UI.\n[seq 1] assistant worker: [calls echo]\n[seq 2] tool_result: echo: the tests are green\n[seq 3] assistant worker: Noted.\n"),
+        transcript.starts_with("[seq 0] user steve: For the record, use Swedish in the UI.\n[seq 1] assistant worker: [calls echo]\n[seq 2] tool_result: echo: the tests are green\n[seq 3] assistant worker: Noted.\n"),
         "{transcript}"
     );
 
@@ -158,12 +163,12 @@ async fn a_second_extraction_does_not_write_the_line_twice_and_moves_the_cursor(
     script.push(vec![text(REPLY)]);
     script.extend(one_turn());
     // The model repeats the decision, now pointing at the new user message.
-    script.push(vec![text("decision @6: Use Swedish in the UI.\n")]);
+    script.push(vec![text("decision @6 durable: Use Swedish in the UI.\n")]);
     let (mut rt, _) = rig(&dir, script);
-    say(&mut rt, "Use Swedish in the UI.").await;
+    say(&mut rt, "For the record, use Swedish in the UI.").await;
     let first = rt.extract_memory(&mut |_| {}).await.unwrap().unwrap();
     assert_eq!(first.written.len(), 1);
-    say(&mut rt, "Use Swedish in the UI.").await;
+    say(&mut rt, "For the record, use Swedish in the UI.").await;
     let second = rt.extract_memory(&mut |_| {}).await.unwrap().unwrap();
     assert_eq!(second.through_seq, 10);
     assert!(second.written.is_empty(), "{:?}", second.written);
@@ -182,7 +187,9 @@ async fn a_hand_edited_file_changes_the_next_prefix() {
     let (mut rt, seen) = rig(&dir, script);
     rt.run_turn(
         steve(),
-        vec![ContentBlock::Text("Use Swedish in the UI.".into())],
+        vec![ContentBlock::Text(
+            "For the record, use Swedish in the UI.".into(),
+        )],
         &mut |_| {},
     )
     .await
@@ -212,11 +219,13 @@ async fn every_n_turns_two_skips_a_turn_and_disabled_never_runs() {
     let dir = project_dir("[memory]\nevery_n_turns = 2\n");
     let mut script = one_turn();
     script.extend(one_turn());
-    script.push(vec![text("decision @0: Use Swedish in the UI.\n")]);
+    script.push(vec![text("decision @0 durable: Use Swedish in the UI.\n")]);
     let (mut rt, seen) = rig(&dir, script);
     rt.run_turn(
         steve(),
-        vec![ContentBlock::Text("Use Swedish in the UI.".into())],
+        vec![ContentBlock::Text(
+            "For the record, use Swedish in the UI.".into(),
+        )],
         &mut |_| {},
     )
     .await
@@ -258,4 +267,186 @@ async fn a_turn_that_did_not_end_done_is_not_extracted_on_its_own() {
         .await;
     assert!(rt.extract_memory(&mut |_| {}).await.unwrap().is_none());
     assert_eq!(seen.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn remember_files_a_line_directly_without_a_model_call() {
+    let dir = project_dir("");
+    let (mut rt, seen) = rig(&dir, one_turn());
+
+    rt.remember(steve(), "decision We ship on Fridays", &mut |_| {})
+        .unwrap();
+
+    // One event so far: the audit, whose seq the line itself points at.
+    let events = rt.log().read_all().unwrap();
+    let [e] = &events[..] else {
+        panic!("expected one event, got {}", events.len())
+    };
+    assert_eq!(e.kind, EventKind::MemoryRemembered);
+    assert_eq!(e.author, steve());
+    let p: MemoryRememberedPayload = serde_json::from_value(e.payload.clone()).unwrap();
+    assert_eq!(p.file, "decisions.md");
+    assert_eq!(p.text, "We ship on Fridays");
+    assert!(p.written);
+    let mem = dir.path().join(".aigentic/memory");
+    let decisions = std::fs::read_to_string(mem.join("decisions.md")).unwrap();
+    assert_eq!(decisions.lines().count(), 1);
+    assert!(decisions.contains("- We ship on Fridays"), "{decisions}");
+
+    // The same line again: no duplicate, and the event says so.
+    rt.remember(steve(), "decision We ship on Fridays", &mut |_| {})
+        .unwrap();
+    let events = rt.log().read_all().unwrap();
+    let p: MemoryRememberedPayload = serde_json::from_value(events[1].payload.clone()).unwrap();
+    assert!(!p.written);
+    let decisions = std::fs::read_to_string(mem.join("decisions.md")).unwrap();
+    assert_eq!(decisions.lines().count(), 1);
+
+    // No kind word: the line is a fact.
+    rt.remember(steve(), "The project is called aigentic.", &mut |_| {})
+        .unwrap();
+    assert!(mem.join("facts.md").exists());
+
+    // The next turn's prefix carries both, with no provider call spent:
+    // the turn is the only thing that talked to the model.
+    rt.run_turn(
+        steve(),
+        vec![ContentBlock::Text("next".into())],
+        &mut |_| {},
+    )
+    .await
+    .unwrap();
+    let ctx = seen.lock().unwrap()[0].clone();
+    let memory = ctx
+        .iter()
+        .find(|m| texts(m).starts_with("# Project memory"))
+        .expect("memory block in the prefix");
+    assert!(
+        texts(memory).contains("## decisions.md\n\n- We ship on Fridays"),
+        "{}",
+        texts(memory)
+    );
+    assert!(texts(memory).contains("- The project is called aigentic."));
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        2,
+        "the turn made both provider calls; /remember made none"
+    );
+}
+
+#[test]
+fn remember_without_a_project_is_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let (provider, _) = scripted(vec![]);
+    let log = ThreadLog::open(dir.path(), ulid::Ulid::generate()).unwrap();
+    let registry: ToolRegistry = Vec::<Box<dyn aigentic_core::Tool>>::new().into();
+    let mut rt = Runtime::new(
+        provider,
+        registry,
+        log,
+        aigentic_core::AgentId("worker".into()),
+    );
+    assert!(matches!(
+        rt.remember(steve(), "anything at all", &mut |_| {}),
+        Err(RuntimeError::NoProject)
+    ));
+}
+
+#[tokio::test]
+async fn for_the_record_we_deploy_from_main_only_files_exactly_one_line() {
+    let dir = project_dir("");
+    let mut script = one_turn();
+    script.push(vec![text(
+        "decision @0 durable: We deploy from main only.\n",
+    )]);
+    let (mut rt, seen) = rig(&dir, script);
+    rt.run_turn(
+        steve(),
+        vec![ContentBlock::Text(
+            "For the record, we deploy from main only.".into(),
+        )],
+        &mut |_| {},
+    )
+    .await
+    .unwrap();
+    let p = rt.extract_memory(&mut |_| {}).await.unwrap().unwrap();
+    assert_eq!(p.written.len(), 1, "{:?}", p.written);
+    assert_eq!(p.written[0].file, "decisions.md");
+    assert_eq!(p.written[0].text, "We deploy from main only.");
+    // The cue passed it to the model: the transcript carries the message.
+    let request = seen.lock().unwrap()[2].clone();
+    assert!(
+        texts(&request[1])
+            .contains("[seq 0] user steve: For the record, we deploy from main only."),
+        "{}",
+        texts(&request[1])
+    );
+    let decisions =
+        std::fs::read_to_string(dir.path().join(".aigentic/memory/decisions.md")).unwrap();
+    assert_eq!(
+        decisions.matches("We deploy from main only.").count(),
+        1,
+        "{decisions}"
+    );
+    assert_eq!(decisions.lines().count(), 1, "{decisions}");
+}
+
+#[tokio::test]
+async fn from_now_on_dates_in_swedish_format_files_exactly_one_line() {
+    let dir = project_dir("");
+    let mut script = one_turn();
+    script.push(vec![text("fact @0 durable: Dates in Swedish format.\n")]);
+    let (mut rt, _) = rig(&dir, script);
+    rt.run_turn(
+        steve(),
+        vec![ContentBlock::Text(
+            "From now on, dates in Swedish format.".into(),
+        )],
+        &mut |_| {},
+    )
+    .await
+    .unwrap();
+    let p = rt.extract_memory(&mut |_| {}).await.unwrap().unwrap();
+    assert_eq!(p.written.len(), 1, "{:?}", p.written);
+    assert_eq!(p.written[0].file, "facts.md");
+    assert_eq!(p.written[0].text, "Dates in Swedish format.");
+    let facts = std::fs::read_to_string(dir.path().join(".aigentic/memory/facts.md")).unwrap();
+    assert_eq!(
+        facts.matches("Dates in Swedish format.").count(),
+        1,
+        "{facts}"
+    );
+    assert_eq!(facts.lines().count(), 1, "{facts}");
+}
+
+/// The primary gate (issue #14): a user message with no cue is skipped
+/// before the model sees it, and a line the model files anyway is
+/// dropped after it.
+#[tokio::test]
+async fn an_instruction_without_a_cue_never_reaches_the_model_or_the_file() {
+    let dir = project_dir("");
+    let mut script = one_turn();
+    script.push(vec![text(
+        "decision @0 durable: Create ~/Projects/aigentic-web with Next.js + shadcn.\n",
+    )]);
+    let (mut rt, seen) = rig(&dir, script);
+    rt.run_turn(
+        steve(),
+        vec![ContentBlock::Text(
+            "Create ~/Projects/aigentic-web with Next.js + shadcn.".into(),
+        )],
+        &mut |_| {},
+    )
+    .await
+    .unwrap();
+    let p = rt.extract_memory(&mut |_| {}).await.unwrap().unwrap();
+    assert!(p.written.is_empty(), "{:?}", p.written);
+    // The model's transcript carried no user entry at all.
+    let request = seen.lock().unwrap()[2].clone();
+    assert!(
+        !texts(&request[1]).contains("aigentic-web"),
+        "{}",
+        texts(&request[1])
+    );
+    assert!(!dir.path().join(".aigentic/memory").exists());
 }

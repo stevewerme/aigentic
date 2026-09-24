@@ -11,6 +11,10 @@ pub enum RuntimeError {
     Provider(#[from] ProviderError),
     #[error("skill `{0}` is not enabled")]
     UnknownSkill(String),
+    /// `/remember` with no project loaded: the memory files live under
+    /// the project's `.aigentic/`, and this thread has none.
+    #[error("no project: no memory files to remember into")]
+    NoProject,
     #[error(transparent)]
     Project(#[from] crate::ProjectError),
 }

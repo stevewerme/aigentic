@@ -221,6 +221,7 @@ fn project_for(threads: &ThreadTable, request: &Request) -> Option<String> {
         | Request::Decide { thread, .. }
         | Request::AnswerHuman { thread, .. }
         | Request::Pin { thread, .. }
+        | Request::Remember { thread, .. }
         | Request::Rename { thread, .. }
         | Request::SwitchProject { thread, .. }
         | Request::Compact { thread }
@@ -366,6 +367,15 @@ async fn handle(
         Request::Pin { thread, text } => {
             let author = author.clone();
             ask_actor(threads, open, thread, |reply| Mail::Pin {
+                author,
+                text,
+                reply,
+            })
+            .await
+        }
+        Request::Remember { thread, text } => {
+            let author = author.clone();
+            ask_actor(threads, open, thread, |reply| Mail::Remember {
                 author,
                 text,
                 reply,

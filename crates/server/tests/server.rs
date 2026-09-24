@@ -652,3 +652,62 @@ async fn an_oversized_line_closes_only_that_session() {
     let (_, welcome) = d.connect("steve").await;
     assert_eq!(welcome.user, "steve");
 }
+
+/// `/remember` (issue #14): a write user files a line with no model
+/// call; the event is the audit and the file is the state.
+#[tokio::test]
+async fn remember_files_a_line_with_no_model_call() {
+    let d = daemon(vec![], 600).await;
+    let (magnus, _) = d.connect("magnus").await;
+    let Response::Thread { thread } = magnus
+        .request(Request::CreateThread {
+            project: "p".into(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("thread")
+    };
+    let r = magnus
+        .request(Request::Remember {
+            thread: thread.id,
+            text: "decision We deploy from main only.".into(),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(r, Response::Ok), "{r:?}");
+    assert_eq!(
+        d.log("p", thread.id),
+        vec![EventKind::ThreadStarted, EventKind::MemoryRemembered]
+    );
+    let events = ThreadLog::open(d.threads_base.join("p"), thread.id)
+        .unwrap()
+        .read_all()
+        .unwrap();
+    let p: aigentic_runtime::aigentic_log::MemoryRememberedPayload =
+        serde_json::from_value(events[1].payload.clone()).unwrap();
+    assert_eq!(p.file, "decisions.md");
+    assert_eq!(p.text, "We deploy from main only.");
+    assert!(p.written);
+    let root = d.threads_base.parent().unwrap().join("p");
+    let decisions = std::fs::read_to_string(root.join(".aigentic/memory/decisions.md")).unwrap();
+    assert!(
+        decisions.contains("- We deploy from main only"),
+        "{decisions}"
+    );
+
+    // A read user may not.
+    let (reviewer, _) = d.connect("reviewer").await;
+    let r = reviewer
+        .request(Request::Remember {
+            thread: thread.id,
+            text: "no matter".into(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(r, Response::Refused { ref reason } if reason.contains("needs write")),
+        "{r:?}"
+    );
+    assert_eq!(decisions.lines().count(), 1, "{decisions}");
+}
