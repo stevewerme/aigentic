@@ -29,6 +29,28 @@ pub const DEFAULT_BUDGET: Budget = Budget {
     cache_read_price_ratio: 0.25,
 };
 
+/// What a profile's tokens cost, in USD per 1M tokens. Kept in the
+/// runtime rather than derived here so a log line can carry the price of
+/// the call that was made, whatever the config says later.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Prices {
+    pub input: f64,
+    pub cache_read: f64,
+    pub cache_write: f64,
+    pub output: f64,
+}
+
+impl Prices {
+    /// What one call cost, cache kinds at their own rates.
+    pub fn cost_usd(&self, u: &aigentic_log::Usage) -> f64 {
+        (self.input * u.input_tokens as f64
+            + self.cache_read * u.cache_read_tokens as f64
+            + self.cache_write * u.cache_write_tokens as f64
+            + self.output * u.output_tokens as f64)
+            / 1_000_000.0
+    }
+}
+
 /// When and how the runtime compacts. See docs/PLAN-phase2.md section 4.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CompactionSettings {
@@ -88,6 +110,11 @@ pub struct Runtime {
     pub(crate) compaction: CompactionSettings,
     /// Label recorded on summaries; the provider trait has no name.
     pub(crate) model_label: String,
+    /// The profile and its prices, when the config sets them: stamped on
+    /// every `usage` line so a thread's spend is in the log itself
+    /// (issue #31).
+    pub(crate) profile: Option<String>,
+    pub(crate) prices: Option<Prices>,
     /// The last call's reported prompt size and the context length it was
     /// measured at, so window fill is exact plus the estimated growth.
     pub(crate) measured: Option<(u64, usize)>,
@@ -127,6 +154,8 @@ impl Runtime {
             knowledge_snapshot: KnowledgeSnapshot::default(),
             compaction: DEFAULT_COMPACTION,
             model_label: "unknown".into(),
+            profile: None,
+            prices: None,
             measured: None,
             harness_instructions: None,
             utility: None,
@@ -157,6 +186,8 @@ impl Runtime {
         self.registry = ctx.registry;
         self.provider = ctx.provider;
         self.model_label = ctx.model_label;
+        self.profile = ctx.profile;
+        self.prices = ctx.prices;
         self.session_grants.clear();
         self.measured = None;
         if self.layers.project.is_none() {
@@ -323,9 +354,13 @@ impl Runtime {
         &mut self,
         provider: Box<dyn Provider>,
         label: impl Into<String>,
+        profile: Option<String>,
+        prices: Option<Prices>,
     ) -> Result<(), crate::ProjectError> {
         self.provider = provider;
         self.model_label = label.into();
+        self.profile = profile;
+        self.prices = prices;
         self.measured = None;
         self.reload_knowledge()
     }
@@ -343,6 +378,15 @@ impl Runtime {
     /// Recorded on summary compactions so they are auditable.
     pub fn with_model_label(mut self, label: impl Into<String>) -> Self {
         self.model_label = label.into();
+        self
+    }
+
+    /// The profile and price table stamped on every `usage` line
+    /// (issue #31). Absent prices leave `cost_usd` unset, which is what
+    /// a thread on an unpriced endpoint should show.
+    pub fn with_pricing(mut self, profile: impl Into<String>, prices: Option<Prices>) -> Self {
+        self.profile = Some(profile.into());
+        self.prices = prices;
         self
     }
 
@@ -545,6 +589,8 @@ pub struct ProjectContext {
     pub registry: ToolRegistry,
     pub provider: Box<dyn Provider>,
     pub model_label: String,
+    pub profile: Option<String>,
+    pub prices: Option<Prices>,
 }
 
 impl std::fmt::Debug for ProjectContext {

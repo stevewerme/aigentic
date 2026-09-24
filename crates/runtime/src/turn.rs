@@ -18,7 +18,7 @@ use crate::decisions::{CancelToken, Inbox, Queued};
 use crate::harness_tools::{ASK_HUMAN, HARNESS_CLASS, harness_specs, is_harness_tool};
 use crate::runtime::{ASKED_HUMAN, INTERRUPTED};
 use crate::seams::{Verdict, author_name, denial_text};
-use crate::support::{Spent, append_queued, flush_text};
+use crate::support::{Spent, append_queued, block_start, flush_text};
 use crate::{Runtime, RuntimeError, Signal, TurnOutcome, build_context};
 
 impl Runtime {
@@ -204,6 +204,12 @@ impl Runtime {
 
             let (mut blocks, mut text, mut usage, mut error) =
                 (Vec::new(), String::new(), None, None);
+            // Issue #31: the call's waiting time, stamped on its usage
+            // line. `ttft_ms` is the first streamed block, so a slow
+            // model (thinking before any delta) reads separately from a
+            // slow transport.
+            let requested = Instant::now();
+            let mut ttft_ms = None;
             let mut stream = self.provider.complete(&request);
             let mut interrupted_by = None;
             loop {
@@ -229,6 +235,9 @@ impl Runtime {
                     event = stream.next() => event,
                 };
                 let Some(event) = event else { break };
+                if ttft_ms.is_none() && block_start(&event) {
+                    ttft_ms = Some(requested.elapsed().as_millis() as u64);
+                }
                 match event {
                     ProviderEvent::TextDelta(t) => {
                         observe(Signal::TextDelta(&t));
@@ -261,14 +270,19 @@ impl Runtime {
             flush_text(&mut text, &mut blocks);
             spent.iterations += 1;
             let agent = Author::Agent(self.agent.clone());
-            self.measured = usage.map(|u| {
+            self.measured = usage.as_ref().map(|u| {
                 (
                     u.input_tokens + u.cache_read_tokens + u.cache_write_tokens,
                     context.len(),
                 )
             });
             observe(Signal::Usage(self.window_usage(&context)));
-            let usage = usage.unwrap_or_else(|| self.estimate_usage(&context, &agent, &blocks));
+            let mut usage = usage.unwrap_or_else(|| self.estimate_usage(&context, &agent, &blocks));
+            usage.profile = self.profile.clone();
+            usage.model = Some(self.model_label.clone());
+            usage.latency_ms = Some(requested.elapsed().as_millis() as u64);
+            usage.ttft_ms = ttft_ms;
+            usage.cost_usd = self.prices.map(|p| p.cost_usd(&usage));
             spent.tokens += self.budget.spent_of(&usage.to_core());
             if let Some(e) = error {
                 self.end_turn(&format!("provider_error: {e}"), &spent, &mut held, observe)?;

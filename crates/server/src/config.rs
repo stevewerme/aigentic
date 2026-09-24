@@ -68,6 +68,35 @@ pub struct Profile {
     /// Per-turn budget; every field optional.
     #[serde(default)]
     pub budget: Option<BudgetConfig>,
+    /// USD per 1M tokens, for `/cost` and `aigentic stats` (issue #31).
+    /// Absent means the endpoint is unpriced and calls carry no cost.
+    #[serde(default)]
+    pub prices: Option<PricesConfig>,
+}
+
+/// `[profiles.<name>.prices]`: USD per 1M tokens. `input` and `output`
+/// are required; the cache rates default to them, so a config that knows
+/// one number per direction still prices correctly.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PricesConfig {
+    pub input: f64,
+    pub output: f64,
+    #[serde(default)]
+    pub cache_read: Option<f64>,
+    #[serde(default)]
+    pub cache_write: Option<f64>,
+}
+
+impl PricesConfig {
+    pub fn prices(&self) -> aigentic_runtime::Prices {
+        aigentic_runtime::Prices {
+            input: self.input,
+            cache_read: self.cache_read.unwrap_or(self.input),
+            cache_write: self.cache_write.unwrap_or(self.input),
+            output: self.output,
+        }
+    }
 }
 
 /// The file on disk. Either the phase 0 flat form (top-level `base_url`,
@@ -239,6 +268,7 @@ impl Config {
                     cache: None,
                     compaction: None,
                     budget: None,
+                    prices: None,
                 };
                 (
                     BTreeMap::from([("default".to_owned(), profile)]),

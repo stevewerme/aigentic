@@ -160,6 +160,14 @@ impl Runtime {
     }
 }
 
+/// Whether an event is the call's first content: a delta, a tool call or
+/// a blob. Usage and done arrive after the content they describe, so a
+/// stream that only sends those never sets a time to first token.
+pub(crate) fn block_start(e: &aigentic_core::ProviderEvent) -> bool {
+    use aigentic_core::ProviderEvent as P;
+    matches!(e, P::TextDelta(_) | P::ToolCall(_) | P::Blob(_))
+}
+
 pub(crate) fn flush_text(text: &mut String, blocks: &mut Vec<ContentBlock>) {
     if !text.is_empty() {
         blocks.push(ContentBlock::Text(std::mem::take(text)));

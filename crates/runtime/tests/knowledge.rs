@@ -226,7 +226,7 @@ async fn set_provider_re_decides_the_mode_for_the_new_window() {
         seen: Arc::new(Mutex::new(Vec::new())),
         window: 100,
     };
-    rt.set_provider(Box::new(small), "small").unwrap();
+    rt.set_provider(Box::new(small), "small", None, None).unwrap();
     assert_eq!(rt.knowledge_mode(), KnowledgeMode::Index);
     assert!(has_search(&rt), "search_knowledge registered on the swap");
     assert_eq!(rt.model_label(), "small");
@@ -235,7 +235,7 @@ async fn set_provider_re_decides_the_mode_for_the_new_window() {
         seen: Arc::new(Mutex::new(Vec::new())),
         window: 1000,
     };
-    rt.set_provider(Box::new(big), "big").unwrap();
+    rt.set_provider(Box::new(big), "big", None, None).unwrap();
     assert_eq!(rt.knowledge_mode(), KnowledgeMode::Inline);
     assert!(!has_search(&rt), "and removed on the swap back");
 }

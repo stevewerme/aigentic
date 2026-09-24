@@ -66,7 +66,7 @@ pub struct ThreadStartedPayload {
 /// Token usage for one model call, as persisted. The token fields mirror
 /// `aigentic_core::Usage`; older log lines without the cache fields read
 /// back as zero.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -80,6 +80,25 @@ pub struct Usage {
     /// the provider reported no usage. `/cost` shows that share separately.
     #[serde(default)]
     pub estimated: bool,
+    /// The profile the call ran on (`/profile` can change it mid-thread).
+    /// Absent on lines written before issue #31, so an old log replays
+    /// and shows no price.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    /// The model name of that profile, for per-model totals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Wall time from the request to the turn's end for the call, and
+    /// time to the first streamed block. Both absent on old lines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttft_ms: Option<u64>,
+    /// What the call cost, from the profile's `[prices]`, when the
+    /// profile sets them: `None` otherwise (and on every old line), so a
+    /// thread can be summed without a price table to look up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
 }
 
 impl Usage {
@@ -113,6 +132,11 @@ impl Usage {
             cache_write_tokens: u.cache_write_tokens,
             reasoning_tokens: u.reasoning_tokens,
             estimated,
+            profile: None,
+            model: None,
+            latency_ms: None,
+            ttft_ms: None,
+            cost_usd: None,
         }
     }
 
@@ -122,7 +146,7 @@ impl Usage {
 }
 
 /// Payload of an `assistant_message` event. Tool calls live in `blocks`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AssistantMessagePayload {
     pub blocks: Vec<ContentBlock>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -223,7 +247,7 @@ impl TurnEndedPayload {
 }
 
 /// What a `compacted` event does to its range in the projection.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CompactionStrategy {
     /// Tool results in the range are shortened to head and tail. Reclaims
@@ -239,7 +263,7 @@ pub enum CompactionStrategy {
 
 /// Payload of a `compacted` event. Originals stay in the log; only the
 /// projection changes.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CompactedPayload {
     /// Inclusive.
     pub from_seq: u64,
@@ -353,7 +377,7 @@ pub struct MemoryLine {
 /// Payload of a `memory_extracted` event, appended after a turn once the
 /// project's memory files were updated. `through_seq` is the cursor the
 /// next extraction starts after.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemoryExtractedPayload {
     /// Events considered, inclusive.
     pub through_seq: u64,

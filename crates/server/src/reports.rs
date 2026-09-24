@@ -478,6 +478,11 @@ mod cost_tests {
                 cache_write_tokens: if estimated { 0 } else { 5 },
                 reasoning_tokens: if estimated { None } else { Some(3) },
                 estimated,
+                profile: None,
+                model: None,
+                latency_ms: None,
+                ttft_ms: None,
+                cost_usd: None,
             }),
         };
         event(

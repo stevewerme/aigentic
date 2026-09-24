@@ -51,7 +51,7 @@ pub use mode::Mode;
 pub use project::{Project, ProjectError, ProjectFile};
 pub use resume::{INTERRUPTED_RESULT, Resumed};
 pub use runtime::{
-    ASKED_HUMAN, CompactionSettings, DEFAULT_BUDGET, DEFAULT_COMPACTION, INTERRUPTED,
+    ASKED_HUMAN, CompactionSettings, DEFAULT_BUDGET, DEFAULT_COMPACTION, INTERRUPTED, Prices,
     ProjectContext, Runtime, Signal, TurnOutcome, WindowUsage,
 };
 pub use seams::{SessionGrant, Verdict};

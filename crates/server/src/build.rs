@@ -174,6 +174,12 @@ pub async fn project_context(
             registry: tools,
             provider,
             model_label: model,
+            profile: Some(profile_name.clone()),
+            prices: config
+                .profiles
+                .get(&profile_name)
+                .and_then(|p| p.prices.as_ref())
+                .map(|p| p.prices()),
         },
         profile: profile_name,
         mcp_skipped,
@@ -212,6 +218,10 @@ pub async fn build_thread(
     let mut runtime = Runtime::new(ctx.provider, ctx.registry, log, AgentId("assistant".into()))
         .with_layers(ctx.layers)
         .with_model_label(&ctx.model_label)
+        .with_pricing(
+            &profile_name,
+            profile.and_then(|p| p.prices.as_ref()).map(|p| p.prices()),
+        )
         .with_policy(ctx.policy)
         .with_skills(ctx.skills)
         .with_harness_instructions();
