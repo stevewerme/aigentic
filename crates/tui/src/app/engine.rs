@@ -46,11 +46,8 @@ pub enum MenuKey {
 pub struct TurnStats {
     pub started: std::time::Instant,
     pub tools: u32,
-    /// The last call's prompt: input plus cache reads and writes.
-    pub prompt: u64,
-    /// Of that, read from the cache.
-    pub cached: u64,
-    /// Output across the turn's calls, reasoning included.
+    /// Output across the turn's calls, reasoning included: the turn's
+    /// cost in tokens, shown by `/cost`.
     pub output: u64,
     /// The running tool, `name argument`.
     pub current: Option<String>,
@@ -63,15 +60,15 @@ impl TurnStats {
         Self {
             started: std::time::Instant::now(),
             tools: 0,
-            prompt: 0,
-            cached: 0,
             output: 0,
             current: None,
             writing: false,
         }
     }
 
-    /// `1m 12s · 4 tools · 42k in, 38k cached · 1.8k out`
+    /// `1m 12s · 4 tools`: how long the turn has run and how many
+    /// calls it took. Sizes live in the footer, costs in `/cost`
+    /// (issue #21); this line says neither, so it says one thing.
     pub fn figures(&self) -> String {
         let mut parts = vec![crate::app::status::elapsed_short(self.started.elapsed())];
         match self.tools {
@@ -79,26 +76,14 @@ impl TurnStats {
             1 => parts.push("1 tool".into()),
             n => parts.push(format!("{n} tools")),
         }
-        if self.prompt > 0 {
-            let cached = if self.cached >= self.prompt {
-                ", all cached".to_owned()
-            } else if self.cached > 0 {
-                format!(", {} cached", count_short(self.cached))
-            } else {
-                String::new()
-            };
-            parts.push(format!("{} in{cached}", count_short(self.prompt)));
-        }
-        if self.output > 0 {
-            parts.push(format!("{} out", count_short(self.output)));
-        }
         parts.join(" · ")
     }
 
-    /// What the turn is doing now.
+    /// What the turn is doing now — the verb only. The in-flight row
+    /// above names the call; repeating its command here was noise.
     pub fn activity(&self) -> String {
         match (&self.current, self.writing) {
-            (Some(tool), _) => format!("running {tool}"),
+            (Some(_), _) => "running".into(),
             (None, true) => "writing".into(),
             (None, false) => "thinking".into(),
         }
@@ -202,9 +187,12 @@ pub struct ClientRepl {
     /// The `update_tasks` call ids, whose results draw nothing.
     task_calls: std::collections::HashSet<String>,
     quit: bool,
-    /// The last `Notice::Usage`: window fill and window, for the
-    /// status line (phase 6 step 3); kept, not yet shown.
+    /// The last `Notice::Usage`: window fill and the ceiling —
+    /// compaction's line — for the status line (phase 6 step 3).
     usage: Option<(u64, u64)>,
+    /// The turn that ran last (issue #21): tokens written and calls,
+    /// shown by `/cost` — the live line carries state and time only.
+    last_turn: Option<(u64, u32)>,
     /// A post went out while idle and its turn has not been seen
     /// running yet; input at its end waits for that turn.
     awaiting_turn: bool,
@@ -237,6 +225,7 @@ impl ClientRepl {
             tasks: Vec::new(),
             task_calls: std::collections::HashSet::new(),
             usage: None,
+            last_turn: None,
             awaiting_turn: false,
             quit: false,
         }
@@ -741,6 +730,19 @@ impl ClientRepl {
             })
             .await;
         self.show(r, "", out);
+        // The turn's own cost (issue #21), where token totals now
+        // live: what the turn wrote and how many calls it took. The
+        // live line carries state and time only.
+        if matches!(kind, ReportKind::Cost)
+            && let Some((written, calls)) = self.last_turn
+        {
+            let calls_word = if calls == 1 { "call" } else { "calls" };
+            out.line(&format!(
+                "turn: {} written · {} {calls_word}",
+                count_short(written),
+                calls
+            ));
+        }
     }
 
     fn flush_partial(&mut self, out: &mut dyn Printer) {
@@ -956,8 +958,6 @@ impl ClientRepl {
                     if let Ok(AssistantMessagePayload { usage: Some(u), .. }) =
                         serde_json::from_value(event.payload.clone())
                     {
-                        t.prompt = u.input_tokens + u.cache_read_tokens + u.cache_write_tokens;
-                        t.cached = u.cache_read_tokens;
                         t.output += u.output_tokens;
                     }
                 }
@@ -1063,6 +1063,11 @@ impl ClientRepl {
                 self.flush_partial(out);
                 if let Some(t) = self.turn.take() {
                     out.cell(Cell::Summary(format!("─ {}", t.figures())), true);
+                    // The turn's cost, for `/cost` (issue #21): the live
+                    // line no longer carries it.
+                    if t.output > 0 || t.tools > 0 {
+                        self.last_turn = Some((t.output, t.tools));
+                    }
                 }
                 if let Ok(p) = serde_json::from_value::<TurnEndedPayload>(event.payload.clone()) {
                     if p.reason == "done" || p.reason == ASKED_HUMAN || p.reason == INTERRUPTED {
@@ -1295,7 +1300,7 @@ mod tests {
     use crate::config::Config;
     use aigentic_api::client::Addr;
     use aigentic_runtime::aigentic_core::{
-        Capabilities, CompletionRequest, Message, Provider, ProviderEvent,
+        Capabilities, CompletionRequest, Message, Provider, ProviderEvent, Usage,
     };
     use aigentic_server::build::{BuildError, ProviderFactory};
     use aigentic_server::{DefaultReports, Server};
@@ -2221,6 +2226,7 @@ mod tests {
                 tool_use(),
             ],
             vec![
+                call("b1", "bash", serde_json::json!({"command": "echo hi"})),
                 call(
                     "t2",
                     "update_tasks",
@@ -2244,7 +2250,15 @@ mod tests {
                 ),
                 tool_use(),
             ],
-            vec![text("All set.\n"), done()],
+            vec![
+                ProviderEvent::Usage(Usage {
+                    input_tokens: 4_200,
+                    output_tokens: 4_000,
+                    ..Default::default()
+                }),
+                text("All set.\n"),
+                done(),
+            ],
         ];
         let embedded = Server::embed_with(
             config(dir.path()),
@@ -2271,6 +2285,8 @@ mod tests {
         let feeder = async move {
             tx.send("go".into()).unwrap();
             tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+            tx.send("/cost".into()).unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             tx.send("/quit".into()).unwrap();
         };
         let mut out = Lines::default();
@@ -2285,24 +2301,36 @@ mod tests {
             !lines.iter().any(|l| l.starts_with("• Tasks")),
             "the whole list is a pager away, not printed: {lines:#?}"
         );
+        // The turn's totals moved here (issue #21), off the live line:
+        // what was written, how many calls it took. Harness task
+        // updates are bookkeeping, not calls.
+        assert!(
+            lines.iter().any(|l| l == "turn: 4.0k written · 1 call"),
+            "the turn's cost is reported by /cost: {lines:#?}"
+        );
         drop(embedded);
     }
 
     #[test]
     fn turn_figures_read_short() {
         let mut t = TurnStats::new();
+        // State and time only (issue #21): the verb, the clock, the
+        // calls — the command stays on the in-flight row above, token
+        // totals move to `/cost`.
         assert_eq!(t.activity(), "thinking");
+        t.writing = true;
+        assert_eq!(t.activity(), "writing");
+        t.writing = false;
         t.tools = 4;
-        t.prompt = 42_310;
-        t.cached = 38_004;
         t.output = 1_840;
-        t.current = Some("bash cargo test".into());
+        t.current = Some("bash cargo test -p aigentic-server".into());
+        assert_eq!(t.activity(), "running");
         let f = t.figures();
-        assert!(
-            f.ends_with("4 tools · 42k in, 38k cached · 1.8k out"),
-            "{f}"
-        );
-        assert_eq!(t.activity(), "running bash cargo test");
+        assert!(f.ends_with("4 tools"), "{f}");
+        assert!(!f.contains("cargo"), "{f}");
+        assert!(!f.contains("1.8k"), "{f}");
+        t.tools = 1;
+        assert!(t.figures().ends_with("1 tool"), "{}", t.figures());
         assert_eq!(count_short(950), "950");
         assert_eq!(count_short(1_300_000), "1.3M");
     }

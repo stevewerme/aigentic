@@ -443,11 +443,13 @@ impl Runtime {
         &self.knowledge
     }
 
-    /// The window fill for `context`, and the provider's window.
+    /// The window fill for `context`, against the ceiling the client
+    /// shows: compaction's line, not the provider's full length (the
+    /// number that matters since #30 — how close compaction is).
     pub fn window_usage(&self, context: &[Message]) -> WindowUsage {
         WindowUsage {
             tokens_in_window: self.fill(context),
-            window: self.provider.capabilities().max_context_tokens,
+            window: self.window_line(),
         }
     }
 
@@ -557,7 +559,8 @@ impl std::fmt::Debug for ProjectContext {
 }
 
 /// How full the model's window is: the last call's reported prompt size
-/// plus what was appended since, against the provider's context length.
+/// plus what was appended since, against compaction's line (issue #21:
+/// the ceiling a client shows, not the provider's raw length).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WindowUsage {
     pub tokens_in_window: u64,

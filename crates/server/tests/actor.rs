@@ -763,7 +763,9 @@ async fn usage_is_pushed_after_the_call_and_again_when_the_turn_ends() {
     let (_, _, mut notices) = rig.subscribe(0).await;
     assert_eq!(rig.post(steve(), "one", false).await, Response::Ok);
     let seen = Rig::until_state(&mut notices, |s| *s == ThreadState::Idle).await;
-    // During the turn: a fill from the provider's window, timed.
+    // During the turn: a fill against the compaction line, timed. The
+    // line (70% of the 1k window, no absolute ceiling) is what the
+    // client shows as the ceiling (issue #21), not the raw window.
     let during: Vec<_> = seen
         .iter()
         .filter_map(|n| match n {
@@ -778,7 +780,7 @@ async fn usage_is_pushed_after_the_call_and_again_when_the_turn_ends() {
         })
         .collect();
     assert_eq!(during.len(), 1, "{during:?}");
-    assert_eq!(during[0].1, 1000);
+    assert_eq!(during[0].1, 700);
     assert!(during[0].0 > 0);
     assert!(during[0].2.is_some());
     assert_eq!(during[0].3, 0);

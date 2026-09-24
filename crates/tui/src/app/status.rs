@@ -1,7 +1,8 @@
 //! The status line (plan section 6): what the daemon reports, never
-//! what the client counts. Context fill is the runtime's measured
-//! window fill against the provider's window; elapsed is the running
-//! turn's clock; the queue is the daemon's.
+//! what the client counts. Context fill is the last call's tokens in
+//! the window against compaction's line — the ceiling we pay for, not
+//! the provider's raw window; the clock and the calls live on the
+//! turn line, the turn's cost in `/cost`; the queue is the daemon's.
 
 use std::time::Duration;
 
@@ -14,7 +15,8 @@ pub struct Status {
     /// The thread's title, when it has one.
     pub title: Option<String>,
     pub mode: String,
-    /// (tokens in the window, the window), from `Notice::Usage`.
+    /// (tokens in the window, the ceiling — compaction's line), from
+    /// `Notice::Usage`.
     pub usage: Option<(u64, u64)>,
     /// How long the running turn has run; `None` when idle.
     pub elapsed: Option<Duration>,
@@ -24,17 +26,7 @@ pub struct Status {
 }
 
 impl Status {
-    /// Context used, as a whole percentage, or `None` before the first
-    /// fill was reported.
-    pub fn context_percent(&self) -> Option<u64> {
-        let (used, window) = self.usage?;
-        if window == 0 {
-            return None;
-        }
-        Some((used.saturating_mul(100) / window).min(100))
-    }
-
-    /// `vendela · Crate count · manual · 31% of 98k context · queued 1`
+    /// `vendela · Crate count · manual · 58k / 96k context · queued 1`
     pub fn line(&self) -> String {
         let mut parts = vec![self.project.clone()];
         if let Some(t) = &self.title {
@@ -46,11 +38,15 @@ impl Status {
             });
         }
         parts.push(self.mode.clone());
-        match (self.context_percent(), self.usage) {
-            (Some(p), Some((_, window))) => {
-                parts.push(format!("{p}% of {} context", tokens_short(window)))
-            }
-            _ => parts.push("context ?".into()),
+        // The last call's context against the ceiling (issue #21): not
+        // a percentage — the two sizes, read as a fraction.
+        match self.usage {
+            Some((used, ceiling)) => parts.push(format!(
+                "{} / {} context",
+                tokens_short(used),
+                tokens_short(ceiling)
+            )),
+            None => parts.push("context ?".into()),
         }
         if let Some(elapsed) = self.elapsed {
             parts.push(elapsed_short(elapsed));
@@ -122,9 +118,10 @@ mod tests {
             queued: 1,
             waiting: None,
         };
+        // The two sizes, used against the ceiling, not a percentage.
         assert_eq!(
             s.line(),
-            "vendela · manual · 31% of 98k context · 12s · queued 1"
+            "vendela · manual · 30k / 98k context · 12s · queued 1"
         );
         s.elapsed = None;
         s.queued = 0;
@@ -132,8 +129,9 @@ mod tests {
         assert_eq!(s.line(), "vendela · manual · context ?");
         s.title = Some("A title".into());
         assert_eq!(s.line(), "vendela · A title · manual · context ?");
+        // A fuller window than the ceiling still reads as itself.
         s.usage = Some((250_000, 100_000));
-        assert_eq!(s.context_percent(), Some(100));
+        assert_eq!(s.line(), "vendela · A title · manual · 244k / 98k context");
     }
 
     #[test]

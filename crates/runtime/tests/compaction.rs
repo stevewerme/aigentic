@@ -141,6 +141,10 @@ async fn two_hundred_turns_stay_under_budget() {
         .with_model_label("scripted");
     let line = rt.window_line();
     assert_eq!(line, 5_600);
+    // The client's ceiling (issue #21) is the line compaction aims
+    // under, so the footer's `N / M context` is fill against what we
+    // are actually willing to pay for, not the provider's raw window.
+    assert_eq!(rt.window_usage(&[]).window, line);
 
     for i in 0..200 {
         let outcome = rt
