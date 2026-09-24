@@ -385,9 +385,15 @@ impl Runtime {
     /// (issue #31). Absent prices leave `cost_usd` unset, which is what
     /// a thread on an unpriced endpoint should show.
     pub fn with_pricing(mut self, profile: impl Into<String>, prices: Option<Prices>) -> Self {
+        self.set_pricing(profile, prices);
+        self
+    }
+
+    /// `with_pricing` in place, for a caller that already owns a
+    /// `&mut Runtime` (a `Drop` type, a live session).
+    pub fn set_pricing(&mut self, profile: impl Into<String>, prices: Option<Prices>) {
         self.profile = Some(profile.into());
         self.prices = prices;
-        self
     }
 
     pub fn compaction(&self) -> &CompactionSettings {

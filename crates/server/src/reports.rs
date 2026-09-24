@@ -3,6 +3,7 @@
 //! `/memory`, `/skills`, `/who`. Moved from the terminal binary in phase
 //! 5 step 9, where `project show` still uses them directly.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -38,7 +39,12 @@ impl Reports for DefaultReports {
 }
 
 /// Token totals for a thread, with the estimated share kept apart.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+///
+/// `spent`, `priced_calls`, `unpriced_calls` and `models` come from the
+/// `usage` lines' `model`/`cost_usd`, which only lines written since
+/// issue #31 carry: an old thread leaves them empty and prints exactly
+/// what it printed before.
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct Cost {
     pub input: u64,
     pub output: u64,
@@ -57,6 +63,15 @@ pub struct Cost {
     pub extraction_lines: u32,
     pub extraction_input: u64,
     pub extraction_output: u64,
+    /// Sum of `cost_usd` over the calls that carry one.
+    pub spent: Option<f64>,
+    /// Calls that carried a price / calls that did not.
+    pub priced_calls: u32,
+    pub unpriced_calls: u32,
+    /// Model name to (calls, spend) in name order, name-less lines under
+    /// the empty key. A model's spend is `None` while no call of it is
+    /// priced.
+    pub models: BTreeMap<String, (u32, Option<f64>)>,
 }
 
 /// Sum usage over every `assistant_message` in the log.
@@ -109,6 +124,28 @@ pub fn cost_of(events: &[Event]) -> Cost {
             cost.cache_write += u.cache_write_tokens;
             cost.reasoning += u.reasoning_tokens.unwrap_or(0);
             cost.calls += 1;
+            // The price the runtime stamped on the line (issue #31): a
+            // thread on an unpriced endpoint, or one written before this
+            // existed, counts as unpriced rather than as free.
+            match u.cost_usd {
+                Some(usd) => {
+                    cost.spent = Some(cost.spent.unwrap_or(0.0) + usd);
+                    cost.priced_calls += 1;
+                    let entry = cost
+                        .models
+                        .entry(u.model.clone().unwrap_or_default())
+                        .or_insert((0, None));
+                    entry.0 += 1;
+                    entry.1 = Some(entry.1.unwrap_or(0.0) + usd);
+                }
+                None => {
+                    cost.unpriced_calls += 1;
+                    cost.models
+                        .entry(u.model.clone().unwrap_or_default())
+                        .or_insert((0, None))
+                        .0 += 1;
+                }
+            }
         }
     }
     cost
@@ -158,6 +195,36 @@ impl fmt::Display for Cost {
                 self.extraction_input,
                 self.extraction_output
             )?;
+        }
+        // Only when the thread has prices to report, so a thread without
+        // them is byte-identical to before (issue #31).
+        if self.priced_calls + self.unpriced_calls > 0
+            && (self.priced_calls > 0 || !self.models.is_empty())
+        {
+            match self.spent {
+                Some(usd) => writeln!(
+                    f,
+                    "cost       ${usd:.4} ({} of {} calls priced)",
+                    self.priced_calls,
+                    self.priced_calls + self.unpriced_calls
+                )?,
+                None => writeln!(
+                    f,
+                    "cost       unpriced ({} calls, no usable price)",
+                    self.unpriced_calls
+                )?,
+            }
+            for (model, (calls, usd)) in &self.models {
+                let name = if model.is_empty() {
+                    "(no model)"
+                } else {
+                    model
+                };
+                match usd {
+                    Some(usd) => writeln!(f, "  {name:<28} {calls:>5} calls  ${usd:.4}")?,
+                    None => writeln!(f, "  {name:<28} {calls:>5} calls  unpriced")?,
+                }
+            }
         }
         write!(
             f,
@@ -535,6 +602,15 @@ mod cost_tests {
                 extraction_lines: 2,
                 extraction_input: 300,
                 extraction_output: 20,
+                // No usage line in this fixture carries a model or a
+                // price, so nothing is claimed about spend (issue #31)
+                // and the text report stays what it always was. The two
+                // calls are counted under the empty model name: the
+                // lines predate the field.
+                spent: None,
+                priced_calls: 0,
+                unpriced_calls: 2,
+                models: BTreeMap::from([(String::new(), (2, None))]),
             }
         );
         assert!(
@@ -557,6 +633,85 @@ mod cost_tests {
         );
         assert!(text.contains("reasoning             6"), "{text}");
         assert!(text.contains("total      in      1717"), "{text}");
+    }
+
+    /// Issue #31: a stamped thread's `/cost` shows the spend the usage
+    /// lines carry, the split of priced and unpriced calls, and one row
+    /// per model. Every figure here is the fixture summed in-test.
+    #[test]
+    fn a_priced_thread_reports_its_spend_and_models() {
+        let stamped = |model: &str, cost: f64| {
+            let mut e = assistant(100, 10, false);
+            let mut payload: AssistantMessagePayload =
+                serde_json::from_value(e.payload.clone()).unwrap();
+            let u = payload.usage.as_mut().unwrap();
+            u.model = Some(model.to_owned());
+            u.cost_usd = Some(cost);
+            e.payload = serde_json::to_value(payload).unwrap();
+            e
+        };
+        // Two model names — one twice for a summed row — and one more
+        // line with a price but no model, which the report must count
+        // and call "(no model)". An estimated line is neither: its
+        // tokens are a guess, so it carries no price and no model row.
+        let events = vec![
+            stamped("gpt-4o", 0.25),
+            stamped("gpt-4o", 0.50),
+            stamped("claude-sonnet", 1.25),
+            stamped("", 0.10),
+            assistant(100, 10, true),
+        ];
+        let cost = cost_of(&events);
+
+        // Recomputed from the fixture, not read off the code: the three
+        // real calls are all priced here, the estimated one is neither
+        // priced nor unpriced (it is counted as `estimated_calls`).
+        let priced: u32 = 4;
+        let unpriced: u32 = 0;
+        let spent: f64 = 0.25 + 0.50 + 1.25 + 0.10;
+        assert_eq!(cost.priced_calls, priced);
+        assert_eq!(cost.unpriced_calls, unpriced);
+        assert_eq!(cost.estimated_calls, 1);
+        assert!((cost.spent.unwrap() - spent).abs() < 1e-9, "{cost:?}");
+        let models: Vec<&str> = cost.models.keys().map(String::as_str).collect();
+        assert_eq!(models, vec!["", "claude-sonnet", "gpt-4o"], "{models:?}");
+        assert_eq!(cost.models["gpt-4o"], (2, Some(0.75)));
+        assert_eq!(cost.models["claude-sonnet"], (1, Some(1.25)));
+        assert_eq!(cost.models[""], (1, Some(0.10)));
+
+        let text = cost.to_string();
+        assert!(text.contains(&format!("cost       ${spent:.4}")), "{text}");
+        assert!(
+            text.contains(&format!("({priced} of {} calls priced)", priced + unpriced)),
+            "{text}"
+        );
+        for name in ["gpt-4o", "claude-sonnet"] {
+            assert!(text.contains(name), "{name} is missing: {text}");
+        }
+        assert!(text.contains("(no model)"), "{text}");
+    }
+
+    /// A line that predates the stamping fields is counted and called
+    /// unpriced, never priced at a guess: its `/cost` keeps the old
+    /// lines and adds one honest `unpriced` row.
+    #[test]
+    fn an_unstamped_line_is_counted_but_not_priced() {
+        let cost = cost_of(&[assistant(100, 10, false), assistant(100, 10, false)]);
+        assert_eq!(
+            (cost.calls, cost.priced_calls, cost.unpriced_calls),
+            (2, 0, 2)
+        );
+        assert_eq!(cost.spent, None);
+        let text = cost.to_string();
+        assert!(
+            text.contains("cost       unpriced (2 calls, no usable price)"),
+            "{text}"
+        );
+        assert!(text.contains("(2 calls)"), "{text}");
+        // And an estimated-only thread says nothing about spend at all.
+        let estimated = cost_of(&[assistant(100, 10, true)]);
+        assert_eq!(estimated.spent, None);
+        assert!(!estimated.to_string().contains("cost "), "{estimated}");
     }
 }
 

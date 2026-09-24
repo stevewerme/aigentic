@@ -7,7 +7,7 @@ use aigentic_core::{
     AgentId, Author, Budget, ContentBlock, EventKind, ProviderError, ProviderEvent, Role, ToolCall,
 };
 use aigentic_log::{AssistantMessagePayload, ToolResultPayload, TurnEndedPayload};
-use aigentic_runtime::{RuntimeError, Signal};
+use aigentic_runtime::{Prices, RuntimeError, Signal};
 use serde_json::json;
 
 mod common;
@@ -409,4 +409,89 @@ async fn a_provider_retry_is_logged_as_it_arrives() {
     assert_eq!(retry.payload["reason"], json!("not answering"));
     assert_eq!(retry.payload["wait_ms"], json!(1000));
     assert_eq!(signalled, kinds, "every appended event is signalled");
+}
+
+/// Issue #31: with prices set, the logged call carries the profile, the
+/// model label, a measured latency and a cost that the formula
+/// reproduces from the recorded numbers; the runtime does not invent a
+/// price when none is set.
+#[tokio::test]
+async fn a_priced_call_is_stamped_and_recomputable() {
+    let prices = Prices {
+        input: 3.0,
+        cache_read: 0.3,
+        cache_write: 3.75,
+        output: 15.0,
+    };
+    let mut h = harness(
+        vec![vec![
+            // Content first, so the call has a time-to-first-token: a
+            // usage-only stream never starts a block (issue #31).
+            ProviderEvent::TextDelta("hi".into()),
+            // 1M of each kind: the cost must be the per-million sum.
+            ProviderEvent::Usage(aigentic_core::Usage {
+                input_tokens: 1_000_000,
+                output_tokens: 1_000_000,
+                cache_read_tokens: 1_000_000,
+                cache_write_tokens: 1_000_000,
+                ..Default::default()
+            }),
+            done("stop"),
+        ]],
+        None,
+    );
+    h.runtime.set_pricing("tensorx", Some(prices));
+    h.runtime
+        .run_turn(steve(), vec![ContentBlock::Text("hi".into())], &mut |_| {})
+        .await
+        .unwrap();
+
+    let events = h.runtime.log().read_all().unwrap();
+    let message = events
+        .iter()
+        .find(|e| e.kind == EventKind::AssistantMessage)
+        .expect("an assistant message");
+    let u = serde_json::from_value::<AssistantMessagePayload>(message.payload.clone())
+        .unwrap()
+        .usage
+        .expect("a usage line");
+
+    assert_eq!(u.profile.as_deref(), Some("tensorx"));
+    assert!(!u.model.as_deref().unwrap_or_default().is_empty());
+    assert!(u.latency_ms.is_some(), "latency is measured");
+    assert!(u.ttft_ms.is_some(), "a scripted stream has a first event");
+
+    // The formula, recomputed from the numbers that were recorded: the
+    // answer the test asserts is the rule `Prices::cost_usd` states, not
+    // a literal copied out of the implementation.
+    let expected = prices.cost_usd(&u);
+    assert_eq!(u.cost_usd, Some(expected));
+    let per_million = (3.0 + 15.0 + 0.3 + 3.75) * 1_000_000.0 / 1_000_000.0;
+    assert!(
+        (expected - per_million).abs() < 1e-9,
+        "{expected} != {per_million}"
+    );
+}
+
+/// Without a price table nothing is claimed: `cost_usd` is `None` even
+/// though the call is stamped in every other way.
+#[tokio::test]
+async fn an_unpriced_call_has_no_cost() {
+    let mut h = harness(vec![vec![usage(10, 2), done("stop")]], None);
+    h.runtime.set_pricing("free", None);
+    h.runtime
+        .run_turn(steve(), vec![ContentBlock::Text("hi".into())], &mut |_| {})
+        .await
+        .unwrap();
+    let events = h.runtime.log().read_all().unwrap();
+    let message = events
+        .iter()
+        .find(|e| e.kind == EventKind::AssistantMessage)
+        .unwrap();
+    let u = serde_json::from_value::<AssistantMessagePayload>(message.payload.clone())
+        .unwrap()
+        .usage
+        .unwrap();
+    assert_eq!(u.profile.as_deref(), Some("free"));
+    assert_eq!(u.cost_usd, None);
 }

@@ -38,9 +38,11 @@ pub(crate) fn retry_reason(failure: &aigentic_core::ProviderEvent) -> String {
         ProviderEvent::Error(ProviderError::Http { status, .. }) if *status == 429 => {
             "rate limited".into()
         }
-        ProviderEvent::Error(ProviderError::Http { status, .. }) if *status >= 500 => {
-            "overloaded".into()
-        }
+        // The statuses Anthropic names "overloaded"; any other 5xx is
+        // its own number, which is more use than a guess.
+        ProviderEvent::Error(ProviderError::Http {
+            status: 503 | 529, ..
+        }) => "overloaded".into(),
         ProviderEvent::Error(ProviderError::Http { status, .. }) => format!("http {status}"),
         other => format!("{other:?}"),
     }

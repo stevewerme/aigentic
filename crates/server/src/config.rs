@@ -520,6 +520,46 @@ api_key_env = "TENSORX_API_KEY"
         assert!(c.select(Some("anthropic")).is_err());
     }
 
+    /// Issue #31: a profile's price table parses field for field, and
+    /// absent cache rates default to the input rate so one number per
+    /// direction still prices.
+    #[test]
+    fn a_price_table_parses_and_defaults_the_cache_rates() {
+        // The named-profile form: `[profiles]` and the phase 0 flat form
+        // are exclusive, so a price table needs profiles.
+        let text = r#"
+default_profile = "tensorx"
+
+[profiles.tensorx]
+provider = "openai_compat"
+base_url = "https://api.tensorx.ai/v1"
+model = "z-ai/glm-5.3"
+api_key_env = "TENSORX_API_KEY"
+
+[profiles.tensorx.prices]
+input = 0.25
+output = 1.5
+cache_read = 0.05
+"#;
+        let c = Config::parse(text).unwrap();
+        let (_, p) = c.select(Some("tensorx")).unwrap();
+        let prices = p.prices.as_ref().expect("a price table").prices();
+        assert_eq!(prices.input, 0.25);
+        assert_eq!(prices.output, 1.5);
+        assert_eq!(prices.cache_read, 0.05);
+        // Not given, so the input rate prices it.
+        assert_eq!(prices.cache_write, 0.25);
+    }
+
+    /// A profile without a table is `None`, not a zero price: nothing is
+    /// claimed about a call whose cost is unknown.
+    #[test]
+    fn a_profile_without_prices_has_none() {
+        let c = Config::parse(EXAMPLE).unwrap();
+        let (_, p) = c.select(Some("anthropic")).unwrap();
+        assert!(p.prices.is_none());
+    }
+
     #[test]
     fn profiles_parse_select_and_build() {
         let c = Config::parse(EXAMPLE).unwrap();

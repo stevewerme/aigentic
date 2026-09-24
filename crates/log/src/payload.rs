@@ -642,4 +642,82 @@ mod tests {
             decided
         );
     }
+
+    /// Issue #31: a `usage` line written before the five stamping fields
+    /// existed still parses — all five are `None` — and none of them is
+    /// written back, so an old log re-serialises as it always did (the
+    /// only other absent lines are the pre-existing optional ones).
+    #[test]
+    fn a_pre_stamp_usage_line_gains_no_new_fields() {
+        let line = json!({
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "cache_read_tokens": 5,
+            "cache_write_tokens": 0,
+            "estimated": false
+        });
+        let usage: Usage = serde_json::from_value(line.clone()).unwrap();
+        assert_eq!(usage.profile, None);
+        assert_eq!(usage.model, None);
+        assert_eq!(usage.latency_ms, None);
+        assert_eq!(usage.ttft_ms, None);
+        assert_eq!(usage.cost_usd, None);
+        let back = serde_json::to_value(&usage).unwrap();
+        for absent in ["profile", "model", "latency_ms", "ttft_ms", "cost_usd"] {
+            assert!(
+                back.get(absent).is_none(),
+                "{absent} is absent from a pre-stamp line: {back}"
+            );
+        }
+        for (key, value) in line.as_object().unwrap() {
+            assert_eq!(back.get(key), Some(value), "{key} is unchanged");
+        }
+    }
+
+    /// And a stamped one round-trips field for field.
+    #[test]
+    fn a_stamped_usage_line_round_trips() {
+        let usage = Usage {
+            input_tokens: 1,
+            output_tokens: 2,
+            cache_read_tokens: 3,
+            cache_write_tokens: 4,
+            reasoning_tokens: Some(5),
+            estimated: false,
+            profile: Some("tensorx".into()),
+            model: Some("deepseek-v4".into()),
+            latency_ms: Some(1500),
+            ttft_ms: Some(250),
+            cost_usd: Some(0.25),
+        };
+        let value = serde_json::to_value(&usage).unwrap();
+        assert_eq!(value["profile"], "tensorx");
+        assert_eq!(value["cost_usd"], 0.25);
+        assert_eq!(serde_json::from_value::<Usage>(value).unwrap(), usage);
+    }
+
+    /// The retry payload's wire shape: snake_case keys, no surprises.
+    #[test]
+    fn a_provider_retried_payload_round_trips() {
+        let payload = ProviderRetriedPayload {
+            attempt: 2,
+            retries: 3,
+            reason: "tensorx · not answering".into(),
+            wait_ms: 3000,
+        };
+        let value = serde_json::to_value(&payload).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "attempt": 2,
+                "retries": 3,
+                "reason": "tensorx · not answering",
+                "wait_ms": 3000
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<ProviderRetriedPayload>(value).unwrap(),
+            payload
+        );
+    }
 }

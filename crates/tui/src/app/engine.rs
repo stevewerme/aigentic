@@ -1555,6 +1555,84 @@ mod tests {
         drop(embedded);
     }
 
+    /// A retry (issue #31) is a UI fact, not a transcript line: the
+    /// turn line says `retrying 2/3 · not answering` while the call
+    /// waits, and the paged transcript holds only the reply. The event
+    /// is still in the log, so a later reader sees the retry here too.
+    #[tokio::test]
+    async fn a_retry_changes_the_turn_line_and_not_the_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = project(dir.path(), "proj", "");
+        let cfg_dir = dir.path().join("cfg");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        let script = vec![vec![
+            ProviderEvent::Retried {
+                attempt: 1,
+                retries: 3,
+                reason: "proj · not answering".into(),
+                wait: std::time::Duration::from_secs(1),
+            },
+            text("Hej"),
+            done(),
+        ]];
+        let embedded = Server::embed_with(
+            config(dir.path()),
+            cfg_dir.clone(),
+            root,
+            "steve",
+            None,
+            Factory::scripted(script),
+            Arc::new(DefaultReports {
+                global_instructions: cfg_dir.join("instructions.md"),
+            }),
+        )
+        .await
+        .unwrap();
+        let (client, welcome) =
+            Client::connect(&Addr::Unix(embedded.socket.clone()), &embedded.token)
+                .await
+                .unwrap();
+        let role = welcome.projects[0].role.clone();
+        let (thread, state, mode) = open(&client, "proj", None).await;
+        let notices = client.take_notices().unwrap();
+        let mut repl = ClientRepl::new(client, thread, "steve", role, state, mode);
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (pacer, _) = Client::connect(&Addr::Unix(embedded.socket.clone()), &embedded.token)
+            .await
+            .unwrap();
+        open(&pacer, "proj", Some(thread)).await;
+        let mut paced = pacer.take_notices().unwrap();
+        let feeder = async move {
+            tx.send("hello".into()).unwrap();
+            until_state(&mut paced, |s| *s == ThreadState::Idle).await;
+            tx.send("/quit".into()).unwrap();
+        };
+        let mut out = Lines::default();
+        let (_done, ()) = tokio::join!(repl.run(rx, notices, &mut out), feeder);
+        let lines = out.0;
+        assert!(
+            lines.iter().any(|l| l.contains("Hej")),
+            "the reply is in the transcript: {lines:#?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("not answering")),
+            "a retry draws no transcript line: {lines:#?}"
+        );
+        // And the retry is in the log the transcript was built from.
+        let events = aigentic_runtime::aigentic_log::ThreadLog::open(
+            dir.path().join("threads/proj"),
+            thread,
+        )
+        .unwrap()
+        .read_all()
+        .unwrap();
+        assert!(
+            events.iter().any(|e| e.kind == EventKind::ProviderRetried),
+            "the retry is logged: {events:#?}"
+        );
+        drop(embedded);
+    }
+
     /// An `ask_human` call with questions (issue #13): every question
     /// renders on the menu, one after another — a number picks an
     /// option, free text answers one without — and the whole call is

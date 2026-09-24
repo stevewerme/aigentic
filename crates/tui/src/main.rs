@@ -11,6 +11,7 @@ mod pocock;
 mod pocock_templates;
 mod project_cmd;
 mod skills_cmd;
+mod stats;
 
 use std::path::PathBuf;
 
@@ -80,6 +81,17 @@ enum Command {
     },
     /// List this project's threads, newest first.
     Threads,
+    /// What the thread logs spent: cost, calls, context, cache and
+    /// retries, by day and project. Reads local logs only.
+    Stats {
+        /// A window: `7d` is the last seven days, `2026-09-23` that day
+        /// onwards. Without it, every thread on this machine.
+        #[arg(long)]
+        since: Option<String>,
+        /// The same report as one JSON object.
+        #[arg(long)]
+        json: bool,
+    },
     /// Guided setup: config, project file and AGENTS.md, GitHub issues
     /// and labels through `gh`, knowledge links. Shows every file first.
     Init,
@@ -275,6 +287,20 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Threads) => {
             let threads = project_cmd::list_threads(&threads_dir)?;
             println!("{}", project_cmd::render_threads(&threads, &threads_dir));
+            std::process::exit(0);
+        }
+        // Stats read this machine's logs: a daemon holds threads of other
+        // users and other projects, and would answer about its own disk.
+        Some(Command::Stats { .. }) if cli.server.is_some() => {
+            bail!("stats reads this machine's logs; drop --server and run it locally");
+        }
+        Some(Command::Stats { since, json }) => {
+            stats::run(
+                &threads_base,
+                cli.project.as_deref(),
+                since.as_deref(),
+                json,
+            )?;
             std::process::exit(0);
         }
         Some(Command::Project {
@@ -577,4 +603,41 @@ async fn main() -> anyhow::Result<()> {
     app::run(repl, notices, history, project_name, project_root).await?;
     drop(embedded);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    /// Issue #31: `stats` takes its own `--since` and `--json`, and the
+    /// global `--project` still reaches it.
+    #[test]
+    fn stats_parses_since_and_json() {
+        let cli = Cli::try_parse_from(["aigentic", "stats", "--since", "7d", "--json"]).unwrap();
+        match cli.command {
+            Some(Command::Stats { since, json }) => {
+                assert_eq!(since.as_deref(), Some("7d"));
+                assert!(json);
+            }
+            other => panic!("expected stats: {other:?}"),
+        }
+
+        // Bare `stats` is every thread, text.
+        let cli = Cli::try_parse_from(["aigentic", "stats"]).unwrap();
+        match cli.command {
+            Some(Command::Stats { since, json }) => {
+                assert_eq!(since, None);
+                assert!(!json);
+            }
+            other => panic!("expected stats: {other:?}"),
+        }
+
+        // `--project` is global, so it comes before or after the
+        // subcommand and lands in the same field.
+        let cli = Cli::try_parse_from(["aigentic", "stats", "--project", "alpha", "--since", "1d"])
+            .unwrap();
+        assert_eq!(cli.project.as_deref(), Some("alpha"));
+        assert!(matches!(cli.command, Some(Command::Stats { .. })));
+    }
 }

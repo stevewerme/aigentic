@@ -162,7 +162,7 @@ fn summarise(dir: &Path, id: Ulid) -> ThreadSummary {
 
 const FIRST_LINE_CHARS: usize = 72;
 
-fn first_line_of(text: &str) -> String {
+pub fn first_line_of(text: &str) -> String {
     let line = text
         .lines()
         .find(|l| !l.trim().is_empty())
