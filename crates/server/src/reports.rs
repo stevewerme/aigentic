@@ -547,6 +547,7 @@ mod cost_tests {
                 estimated,
                 profile: None,
                 model: None,
+                effort: None,
                 latency_ms: None,
                 ttft_ms: None,
                 cost_usd: None,

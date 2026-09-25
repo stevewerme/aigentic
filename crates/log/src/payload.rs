@@ -88,6 +88,12 @@ pub struct Usage {
     /// The model name of that profile, for per-model totals.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The reasoning effort that call ran at, as the profile names it
+    /// (`50`, `high`), so output tokens and cost can be compared by
+    /// effort (issue #44). Absent when the profile sets none, and on
+    /// every older line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
     /// Wall time from the request to the turn's end for the call, and
     /// time to the first streamed block. Both absent on old lines.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -134,6 +140,7 @@ impl Usage {
             estimated,
             profile: None,
             model: None,
+            effort: None,
             latency_ms: None,
             ttft_ms: None,
             cost_usd: None,
@@ -659,11 +666,19 @@ mod tests {
         let usage: Usage = serde_json::from_value(line.clone()).unwrap();
         assert_eq!(usage.profile, None);
         assert_eq!(usage.model, None);
+        assert_eq!(usage.effort, None);
         assert_eq!(usage.latency_ms, None);
         assert_eq!(usage.ttft_ms, None);
         assert_eq!(usage.cost_usd, None);
         let back = serde_json::to_value(&usage).unwrap();
-        for absent in ["profile", "model", "latency_ms", "ttft_ms", "cost_usd"] {
+        for absent in [
+            "profile",
+            "model",
+            "effort",
+            "latency_ms",
+            "ttft_ms",
+            "cost_usd",
+        ] {
             assert!(
                 back.get(absent).is_none(),
                 "{absent} is absent from a pre-stamp line: {back}"
@@ -686,12 +701,14 @@ mod tests {
             estimated: false,
             profile: Some("tensorx".into()),
             model: Some("deepseek-v4".into()),
+            effort: Some("50".into()),
             latency_ms: Some(1500),
             ttft_ms: Some(250),
             cost_usd: Some(0.25),
         };
         let value = serde_json::to_value(&usage).unwrap();
         assert_eq!(value["profile"], "tensorx");
+        assert_eq!(value["effort"], "50");
         assert_eq!(value["cost_usd"], 0.25);
         assert_eq!(serde_json::from_value::<Usage>(value).unwrap(), usage);
     }
