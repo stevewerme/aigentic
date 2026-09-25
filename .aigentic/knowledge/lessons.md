@@ -33,6 +33,10 @@ so the rule can be judged, not just obeyed. The `brief`, `plan-check` and
 - **An implementer that disagrees with a plan literal** checks which side
   matches the issue's rule, fixes that side, and says so. It never changes
   an assertion just to make it pass.
+- **The implementer posts its report on the issue** as `## Implementation`
+  (changes per commit, tests, corrected plan literals, pty dumps). On #43
+  the reviewer searched the disk for the implementer's thread to find its
+  dumps: everything a later step needs goes on the issue.
 - **Visual changes need a pty check** (`~/.local/share/aigentic/devtools/drive.py`,
   a venv with `pyte`); the implementer pastes dumps, and the reviewer
   repeats the check for UI work. Code-only work gets a lean review.

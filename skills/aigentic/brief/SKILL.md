@@ -74,13 +74,19 @@ prompt block. When asked, also save each prompt to
   is `deepseek-v4.1-flash`). A model may not know its own id.
   Push, then `cargo install --path crates/tui --force` (every implementer
   prompt says both). Do not close the issue.
+- Last step: post the final report as one comment headed
+  `## Implementation` (`gh issue comment N --body-file <file>`): what
+  changed per commit, tests added, any plan literal corrected and why, and
+  the pty dumps for UI work. The reviewer reads the issue, not the
+  implementer's thread.
 - The safety line: never `git reset`, `git checkout -- <file>`,
   `git stash`, `git clean` or `git add -A`; commit nothing under
   `.scratch/`; leave `.aigentic/rules.toml` alone.
 
 **Reviewer** (profile `kimi`):
-- "Do not edit any file." Read the issue, plan, amendment, the
-  implementer's pasted evidence, and each commit (`git show`).
+- "Do not edit any file." Read the issue, plan, amendments, the
+  `## Implementation` comment (the implementer's evidence), and each
+  commit (`git show`).
 - Run the tests for the touched crates (`timeout_secs: 600`) and the
   reference check; for UI work, repeat the pty check.
 - Post one comment headed `## Review`: does it do what the issue and plan
