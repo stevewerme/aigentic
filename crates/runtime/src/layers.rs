@@ -254,6 +254,7 @@ mod tests {
             },
             instructions: Some("project rules".into()),
             memory: vec![],
+            unknown: vec![],
         }
     }
 

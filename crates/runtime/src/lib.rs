@@ -19,6 +19,7 @@ pub use aigentic_tools;
 mod approver;
 mod audit;
 mod compaction;
+pub mod config_keys;
 mod context;
 mod decisions;
 mod error;

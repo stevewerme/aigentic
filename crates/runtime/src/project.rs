@@ -9,6 +9,7 @@ use aigentic_policy::{Policy, Rule};
 use aigentic_tools::McpServerConfig;
 use serde::Deserialize;
 
+use crate::config_keys::Table;
 use crate::{CompactionSettings, DEFAULT_BUDGET, DEFAULT_COMPACTION};
 
 pub const FILE_NAME: &str = "aigentic.toml";
@@ -21,6 +22,99 @@ pub const MEMORY_DIR: &str = "memory";
 /// does not (phase 4 step 9).
 pub const MEMORY_HEADING: &str = "# Project memory\n\nWritten by the harness after each turn from what participants \
 stated. Edit these files outside the thread; a tool call that writes them is refused.\n";
+
+/// The keys of each table in `aigentic.toml`, in one place so a struct
+/// that gains a field has one line to add here. The walk in
+/// `config_keys` reads them; the spec tree below is built from them.
+pub const PROJECT_SECTION_KEYS: &[&str] = &["name", "description"];
+pub const MODEL_SECTION_KEYS: &[&str] = &["profile"];
+// BUDGET_KEYS and COMPACTION_KEYS live beside the shared structs below:
+// `[budget]` and `[compaction]` appear in `aigentic.toml` and in a
+// `config.toml` profile alike.
+pub const BUDGET_KEYS: &[&str] = &[
+    "max_iterations",
+    "max_tokens",
+    "max_wall_time_secs",
+    "cache_read_price_ratio",
+];
+pub const COMPACTION_KEYS: &[&str] = &[
+    "trigger_fraction",
+    "keep_turns",
+    "max_result_bytes",
+    "summary_max_output_tokens",
+    "keep_last_calls",
+    "context_ceiling_tokens",
+    "evict_above_tokens",
+];
+pub const TOOLS_SECTION_KEYS: &[&str] = &["allow", "bash_timeout_secs"];
+pub const KNOWLEDGE_SECTION_KEYS: &[&str] = &["threshold_fraction", "max_hits"];
+pub const MEMORY_SECTION_KEYS: &[&str] = &["enabled", "every_n_turns"];
+pub const POCOCK_SECTION_KEYS: &[&str] = &[
+    "issue_tracker",
+    "triage_labels",
+    "docs_dir",
+    "prs_as_requests",
+];
+pub const SKILLS_SECTION_KEYS: &[&str] = &["enabled"];
+pub const POLICY_SECTION_KEYS: &[&str] = &["rules", "bash_allow"];
+/// One `[[mcp_servers]]` entry, shared by `aigentic.toml` and
+/// `config.toml`; `crates/tools/src/mcp.rs` parses it in both.
+pub const MCP_SERVER_KEYS: &[&str] = &[
+    "name",
+    "transport",
+    "class",
+    "enabled",
+    "command",
+    "args",
+    "env",
+];
+
+/// `[budget]`, in `aigentic.toml` and in a config profile.
+pub static BUDGET_SPEC: Table = Table::new(BUDGET_KEYS);
+/// `[compaction]`, in both files.
+pub static COMPACTION_SPEC: Table = Table::new(COMPACTION_KEYS);
+/// A `[[mcp_servers]]` entry, shared by both files; its keys are the
+/// struct's, which `crates/tools/src/mcp.rs` parses.
+pub static MCP_SERVER_SPEC: Table = Table::new(MCP_SERVER_KEYS);
+
+/// `[participants]`: a map of user names to roles. A role is a string,
+/// not a table, so nothing under a name is ever judged or reported.
+pub static PARTICIPANTS_SPEC: Table = Table::open();
+
+/// The spec `aigentic.toml` is checked against.
+pub fn project_spec() -> Table {
+    static TABLES: &[(&str, Table)] = &[
+        ("project", Table::new(PROJECT_SECTION_KEYS)),
+        ("model", Table::new(MODEL_SECTION_KEYS)),
+        ("budget", BUDGET_SPEC),
+        ("compaction", COMPACTION_SPEC),
+        ("tools", Table::new(TOOLS_SECTION_KEYS)),
+        ("knowledge", Table::new(KNOWLEDGE_SECTION_KEYS)),
+        ("memory", Table::new(MEMORY_SECTION_KEYS)),
+        ("pocock", Table::new(POCOCK_SECTION_KEYS)),
+        ("skills", Table::new(SKILLS_SECTION_KEYS)),
+        ("policy", Table::new(POLICY_SECTION_KEYS)),
+        ("mcp_servers", MCP_SERVER_SPEC),
+        ("participants", PARTICIPANTS_SPEC),
+    ];
+    Table::with(
+        &[
+            "project",
+            "model",
+            "budget",
+            "compaction",
+            "tools",
+            "knowledge",
+            "memory",
+            "pocock",
+            "skills",
+            "policy",
+            "mcp_servers",
+            "participants",
+        ],
+        TABLES,
+    )
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProjectError {
@@ -37,9 +131,10 @@ pub enum ProjectError {
 }
 
 /// `aigentic.toml`. Every section is optional so a phase 3 file still
-/// parses; unknown fields are rejected.
+/// parses. Unknown fields are collected, not refused (issue #37):
+/// [`ProjectFile::parse_with`] returns them beside the file, and a
+/// wrapper `parse` drops them. Keys here are listed in `PROJECT_SPEC`.
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ProjectFile {
     #[serde(default)]
     pub project: Option<ProjectSection>,
@@ -66,21 +161,22 @@ pub struct ProjectFile {
     #[serde(default)]
     pub mcp_servers: Vec<McpServerConfig>,
     /// `[participants]`: user name to role (phase 5). Empty means the
-    /// daemon's owner alone, as `admin`.
+    /// daemon's owner alone, as `admin`. An open map: `PROJECT_OPEN`
+    /// keeps every name out of the unknown-key report.
     #[serde(default)]
     pub participants: aigentic_policy::Participants,
 }
 
+/// Keys in `PROJECT_SECTION_KEYS`.
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ProjectSection {
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
 }
 
+/// Keys in `MODEL_SECTION_KEYS`.
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ModelSection {
     /// A profile in `config.toml`; `--profile` on the command line wins.
     pub profile: String,
@@ -88,9 +184,8 @@ pub struct ModelSection {
 
 /// `[tools]`: what this project's model may see and how the bash tool's
 /// calls are limited. An empty `allow` means every registered tool; the
-/// global layer narrows it further.
+/// global layer narrows it further. Keys in `TOOLS_SECTION_KEYS`.
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ToolsSection {
     #[serde(default)]
     pub allow: Vec<String>,
@@ -111,8 +206,8 @@ impl ToolsSection {
     }
 }
 
+/// Keys in `KNOWLEDGE_SECTION_KEYS`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct KnowledgeSection {
     /// Of the model's window; over it the folder is indexed, not inlined.
     #[serde(default = "default_threshold")]
@@ -137,8 +232,8 @@ impl Default for KnowledgeSection {
     }
 }
 
+/// Keys in `MEMORY_SECTION_KEYS`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct MemorySection {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -165,7 +260,6 @@ impl Default for MemorySection {
 /// What upstream's `setup-matt-pocock-skills` asks; `aigentic project
 /// setup` renders the files its skills read from these.
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct PocockSection {
     /// `github`, `gitlab` or `local`.
     pub issue_tracker: String,
@@ -182,15 +276,15 @@ pub struct PocockSection {
     pub prs_as_requests: bool,
 }
 
+/// Keys in `SKILLS_SECTION_KEYS`.
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct SkillsSection {
     #[serde(default)]
     pub enabled: Vec<String>,
 }
 
+/// Keys in `POLICY_SECTION_KEYS`.
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct PolicySection {
     /// Prepended to the defaults.
     #[serde(default)]
@@ -201,9 +295,9 @@ pub struct PolicySection {
 }
 
 /// A per-turn budget, every field optional. Used by `[profiles.<name>.budget]`
-/// in the config and `[budget]` in the project file.
+/// in the config and `[budget]` in the project file. Keys in
+/// `BUDGET_KEYS`, which both files share.
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct BudgetConfig {
     #[serde(default)]
     pub max_iterations: Option<u32>,
@@ -238,9 +332,9 @@ impl BudgetConfig {
     }
 }
 
-/// Compaction settings, every field optional; same two homes as `BudgetConfig`.
+/// Compaction settings, every field optional; same two homes as
+/// `BudgetConfig`. Keys in `COMPACTION_KEYS`.
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct CompactionConfig {
     #[serde(default)]
     pub trigger_fraction: Option<f32>,
@@ -285,7 +379,9 @@ impl CompactionConfig {
 }
 
 impl ProjectFile {
-    pub fn parse(text: &str) -> Result<Self, String> {
+    /// The file and the dotted path of every key it set that
+    /// `PROJECT_SPEC` does not list (issue #37: ignored, not refused).
+    pub fn parse_with(text: &str) -> Result<(Self, Vec<String>), String> {
         let file: ProjectFile = toml::from_str(text).map_err(|e| e.to_string())?;
         if let Some(secs) = file.tools.bash_timeout_secs
             && !(1..=aigentic_tools::MAX_TIMEOUT_SECS).contains(&secs)
@@ -295,18 +391,37 @@ impl ProjectFile {
                 aigentic_tools::MAX_TIMEOUT_SECS
             ));
         }
-        Ok(file)
+        let unknown = match toml::from_str::<toml::Value>(text) {
+            Ok(value) => project_spec().unknown(&value),
+            // The typed parse above already failed on a syntax error, so
+            // an unparsable value here is unreachable; say nothing about
+            // keys rather than fail a file that parsed fine.
+            Err(_) => Vec::new(),
+        };
+        Ok((file, unknown))
     }
 
-    pub fn load(path: &Path) -> Result<Self, ProjectError> {
+    /// A file on its own, for callers with no line to report on.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        Self::parse_with(text).map(|(file, _)| file)
+    }
+
+    /// The file and the dotted path of every key it set that
+    /// `project_spec` does not list.
+    pub fn load_with(path: &Path) -> Result<(Self, Vec<String>), ProjectError> {
         let text = std::fs::read_to_string(path).map_err(|source| ProjectError::Io {
             path: path.to_path_buf(),
             source,
         })?;
-        Self::parse(&text).map_err(|message| ProjectError::Parse {
+        let (file, unknown) = Self::parse_with(&text).map_err(|message| ProjectError::Parse {
             path: path.to_path_buf(),
             message,
-        })
+        })?;
+        Ok((file, unknown))
+    }
+
+    pub fn load(path: &Path) -> Result<Self, ProjectError> {
+        Self::load_with(path).map(|(file, _)| file)
     }
 
     pub fn policy(&self) -> Policy {
@@ -340,9 +455,18 @@ pub struct Project {
     pub instructions: Option<String>,
     /// `.aigentic/memory/*.md` as `(file name, contents)`, sorted by name.
     pub memory: Vec<(String, String)>,
+    /// Dotted paths of keys in `aigentic.toml` that `PROJECT_SPEC` does
+    /// not list. Ignored, not refused (issue #37); reported at start.
+    pub unknown: Vec<String>,
 }
 
 impl Project {
+    /// The listed key a dotted path in `aigentic.toml` was probably meant
+    /// to be.
+    pub fn suggest_key(dotted: &str) -> Option<String> {
+        project_spec().suggest(dotted)
+    }
+
     /// The nearest `aigentic.toml` at or above `cwd`, or `None`.
     pub fn open(cwd: &Path) -> Result<Option<Self>, ProjectError> {
         let Some(root) = find_root(cwd) else {
@@ -354,7 +478,7 @@ impl Project {
     /// Open the project whose `aigentic.toml` is in `root`.
     pub fn open_root(root: &Path) -> Result<Self, ProjectError> {
         let path = root.join(FILE_NAME);
-        let file = ProjectFile::load(&path)?;
+        let (file, unknown) = ProjectFile::load_with(&path)?;
         let name = match &file.project {
             Some(p) if !p.name.trim().is_empty() => p.name.trim().to_owned(),
             Some(_) => return Err(ProjectError::NameRequired { path }),
@@ -372,6 +496,7 @@ impl Project {
             file,
             instructions: None,
             memory: Vec::new(),
+            unknown,
         };
         project.instructions = load_instructions(root)?;
         project.reload_memory()?;
@@ -585,12 +710,173 @@ enabled = ["implement"]
     }
 
     #[test]
-    fn unknown_fields_are_rejected_in_every_section() {
-        assert!(ProjectFile::parse("[nope]\n").is_err());
-        assert!(ProjectFile::parse("[project]\nname = \"x\"\nbogus = 1\n").is_err());
-        assert!(ProjectFile::parse("[tools]\ndeny = []\n").is_err());
-        assert!(ProjectFile::parse("[memory]\nevery = 1\n").is_err());
-        assert!(ProjectFile::parse("").is_ok());
+    fn unknown_fields_are_collected_not_refused() {
+        // The shape this replaces ("unknown fields are rejected in every
+        // section") is issue #37's whole point: a newer file must load.
+        for text in [
+            "[nope]\n",
+            "[project]\nname = \"x\"\nbogus = 1\n",
+            "[tools]\ndeny = []\n",
+            "[memory]\nevery = 1\n",
+            "",
+        ] {
+            assert!(ProjectFile::parse(text).is_ok(), "{text}");
+        }
+        let (_, unknown) = ProjectFile::parse_with("[nope]\n").unwrap();
+        assert_eq!(unknown, vec!["nope"]);
+        let (_, unknown) = ProjectFile::parse_with(
+            "[project]\nname = \"x\"\nbogus = 1\n[tools]\nbash_timout_secs = 5\n",
+        )
+        .unwrap();
+        assert_eq!(unknown, vec!["project.bogus", "tools.bash_timout_secs"]);
+    }
+
+    #[test]
+    fn a_typo_gets_a_suggestion_from_the_same_table() {
+        let spec = project_spec();
+        assert_eq!(
+            spec.suggest("tools.bash_timout_secs").as_deref(),
+            Some("tools.bash_timeout_secs")
+        );
+        assert_eq!(spec.suggest("porject").as_deref(), Some("project"));
+        assert_eq!(spec.suggest("nope"), None);
+        // A key the spec cannot place at all has nothing to suggest.
+        assert_eq!(spec.suggest("nope.bash_timout_secs"), None);
+    }
+
+    #[test]
+    fn settings_and_services_are_never_reported() {
+        // `[participants]` is a map of user names: no name in it may warn,
+        // whatever it holds (issue #37's scope guard).
+        let (_, unknown) = ProjectFile::parse_with(
+            "[project]\nname = \"p\"\n[participants]\nsteve = \"admin\"\nmagnus = \"approve\"\n",
+        )
+        .unwrap();
+        assert_eq!(unknown, Vec::<String>::new());
+        // A `[[mcp_servers]]` entry answers to `mcp.rs`'s struct, so its
+        // own key list is the one that judges it.
+        let (_, unknown) = ProjectFile::parse_with(
+            "[[mcp_servers]]\nname = \"docs\"\ntransport = { stdio = { command = \"npx\" } }\nclass = \"read\"\n",
+        )
+        .unwrap();
+        assert_eq!(unknown, Vec::<String>::new());
+    }
+
+    /// Every key in `aigentic.toml`'s own spec, so a fixture can turn the
+    /// walk's silence into evidence: a clean fixture means one of the two
+    /// lists is missing a key, and this test says which.
+    fn spec_paths() -> Vec<String> {
+        let mut out = Vec::new();
+        project_spec().paths("", &mut out);
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn the_spec_lists_every_key_a_file_can_set() {
+        // The dotted paths, from the spec itself rather than hand-written
+        // (a hand-written list would only repeat the spec's own mistake).
+        let paths = spec_paths();
+        for expected in [
+            "budget.cache_read_price_ratio",
+            "budget.max_iterations",
+            "budget.max_tokens",
+            "budget.max_wall_time_secs",
+            "compaction.context_ceiling_tokens",
+            "compaction.evict_above_tokens",
+            "compaction.keep_last_calls",
+            "compaction.keep_turns",
+            "compaction.max_result_bytes",
+            "compaction.summary_max_output_tokens",
+            "compaction.trigger_fraction",
+            "knowledge.max_hits",
+            "knowledge.threshold_fraction",
+            "mcp_servers.args",
+            "mcp_servers.class",
+            "mcp_servers.command",
+            "mcp_servers.enabled",
+            "mcp_servers.env",
+            "mcp_servers.name",
+            "mcp_servers.transport",
+            "memory.enabled",
+            "memory.every_n_turns",
+            "model.profile",
+            "participants",
+            "pocock.docs_dir",
+            "pocock.issue_tracker",
+            "pocock.prs_as_requests",
+            "pocock.triage_labels",
+            "policy.bash_allow",
+            "policy.rules",
+            "project.description",
+            "project.name",
+            "skills.enabled",
+            "tools.allow",
+            "tools.bash_timeout_secs",
+        ] {
+            assert!(paths.contains(&expected.to_owned()), "missing {expected}");
+        }
+    }
+
+    /// Every key `aigentic.toml`'s structs have, in one file. This is the
+    /// checklist: a struct that gains a field without a line here and in
+    /// `PROJECT_SPEC` fails `the_full_fixture_is_clean_under_the_spec`.
+    const FULL_PROJECT: &str = "\
+[project]
+name = \"vendela\"
+description = \"d\"
+[model]
+profile = \"tensorx\"
+[budget]
+max_iterations = 5
+max_tokens = 1000
+max_wall_time_secs = 60
+cache_read_price_ratio = 0.25
+[compaction]
+trigger_fraction = 0.8
+keep_turns = 2
+max_result_bytes = 100
+summary_max_output_tokens = 10
+keep_last_calls = 3
+context_ceiling_tokens = 90000
+evict_above_tokens = 64000
+[tools]
+allow = [\"bash\"]
+bash_timeout_secs = 30
+[knowledge]
+threshold_fraction = 0.5
+max_hits = 2
+[memory]
+enabled = false
+every_n_turns = 3
+[pocock]
+issue_tracker = \"local\"
+triage_labels = { a = \"b\" }
+docs_dir = \"docs\"
+prs_as_requests = true
+[skills]
+enabled = [\"tdd\"]
+[policy]
+rules = [{ class = \"write\", decision = \"allow\" }]
+bash_allow = [\"cargo\"]
+[[mcp_servers]]
+name = \"docs\"
+transport = { stdio = { command = \"npx\" } }
+class = \"read\"
+[participants]
+steve = \"admin\"
+";
+
+    #[test]
+    fn the_full_fixture_is_clean_under_the_spec() {
+        let (file, unknown) = ProjectFile::parse_with(FULL_PROJECT).unwrap();
+        assert_eq!(unknown, Vec::<String>::new(), "{FULL_PROJECT}");
+        // The fixture really is the whole struct, not a subset: a key the
+        // struct has but the file leaves out would go unnoticed above.
+        assert!(file.project.is_some() && file.model.is_some());
+        assert!(file.budget.is_some() && file.compaction.is_some());
+        assert!(file.pocock.is_some());
+        assert!(file.has_phase4_sections());
     }
 
     #[test]

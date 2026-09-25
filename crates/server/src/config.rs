@@ -10,7 +10,10 @@ use aigentic_runtime::aigentic_core::{Budget, Provider};
 use aigentic_runtime::aigentic_providers::{
     Anthropic, AnthropicConfig, OpenAiCompat, OpenAiCompatConfig, Thinking,
 };
-use aigentic_runtime::project::{BudgetConfig, CompactionConfig};
+use aigentic_runtime::config_keys::Table;
+use aigentic_runtime::project::{
+    BUDGET_SPEC, BudgetConfig, COMPACTION_SPEC, CompactionConfig, MCP_SERVER_KEYS,
+};
 use aigentic_runtime::{CompactionSettings, DEFAULT_BUDGET, DEFAULT_COMPACTION};
 use serde::Deserialize;
 
@@ -38,7 +41,6 @@ pub enum ProviderKind {
 /// One backend. The API key is deliberately absent: only its environment
 /// variable's name is configured here.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Profile {
     #[serde(default)]
     pub provider: ProviderKind,
@@ -78,7 +80,6 @@ pub struct Profile {
 /// are required; the cache rates default to them, so a config that knows
 /// one number per direction still prices correctly.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct PricesConfig {
     pub input: f64,
     pub output: f64,
@@ -102,7 +103,6 @@ impl PricesConfig {
 /// The file on disk. Either the phase 0 flat form (top-level `base_url`,
 /// `model`, `api_key_env`) or named `[profiles.<name>]` tables; not both.
 #[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ConfigFile {
     #[serde(default)]
     base_url: Option<String>,
@@ -136,7 +136,6 @@ struct ConfigFile {
 
 /// `[global]`: the owner's instructions file.
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct GlobalSection {
     /// Defaults to `instructions.md` beside the config file.
     #[serde(default)]
@@ -145,7 +144,6 @@ pub struct GlobalSection {
 
 /// `[tools] denied` and `[skills] denied`: what no project may offer.
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct DeniedSection {
     #[serde(default)]
     pub denied: Vec<String>,
@@ -153,7 +151,6 @@ pub struct DeniedSection {
 
 /// `[display]`: how much of a tool result the terminal shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct DisplaySection {
     /// Lines of tool output shown before truncating.
     #[serde(default = "default_result_lines")]
@@ -200,6 +197,77 @@ pub struct Config {
     pub denied_skills: Vec<String>,
     /// `[display]`: the tool-result caps; defaults when absent.
     pub display: DisplaySection,
+    /// Dotted paths of keys `config_spec` does not list, as the last
+    /// parse found them (issue #37). Empty for a `Config` built by hand.
+    pub unknown: Vec<String>,
+}
+
+/// The keys of `config.toml`, in one place so a struct that gains a
+/// field has one line to add. The walk in `config_keys` reads them.
+pub const TOP_KEYS: &[&str] = &[
+    "base_url",
+    "model",
+    "api_key_env",
+    "max_context_tokens",
+    "default_profile",
+    "utility_profile",
+    "profiles",
+    "user",
+    "threads_dir",
+    "bundled_dir",
+    "global",
+    "tools",
+    "skills",
+    "display",
+];
+pub const FLAT_KEYS: &[&str] = &["base_url", "model", "api_key_env", "max_context_tokens"];
+pub const PROFILE_KEYS: &[&str] = &[
+    "provider",
+    "base_url",
+    "model",
+    "api_key_env",
+    "max_context_tokens",
+    "thinking",
+    "effort",
+    "max_output_tokens",
+    "cache",
+    "compaction",
+    "budget",
+    "prices",
+];
+pub const PRICES_KEYS: &[&str] = &["input", "output", "cache_read", "cache_write"];
+pub const GLOBAL_KEYS: &[&str] = &["instructions"];
+pub const DENIED_KEYS: &[&str] = &["denied"];
+pub const DISPLAY_KEYS: &[&str] = &["result_lines", "result_bytes"];
+
+/// The spec `config.toml` is checked against (issue #37). `[profiles]` is
+/// a map of user-chosen names, each holding a table of `PROFILE_KEYS`.
+pub fn config_spec() -> Table {
+    static PROFILE: Table = Table::with(
+        PROFILE_KEYS,
+        &[
+            ("budget", BUDGET_SPEC),
+            ("compaction", COMPACTION_SPEC),
+            ("prices", Table::new(PRICES_KEYS)),
+        ],
+    );
+    static PROFILES: Table = Table::named(&PROFILE);
+    static GLOBAL: Table = Table::new(GLOBAL_KEYS);
+    static DENIED: Table = Table::new(DENIED_KEYS);
+    static DISPLAY: Table = Table::new(DISPLAY_KEYS);
+    static MCP_SERVERS: Table = Table::new(MCP_SERVER_KEYS);
+    static TOP: Table = Table::with(
+        TOP_KEYS,
+        &[
+            ("profiles", PROFILES),
+            ("global", GLOBAL),
+            ("tools", DENIED),
+            ("skills", DENIED),
+            ("display", DISPLAY),
+            ("mcp_servers", MCP_SERVERS),
+        ],
+    );
+    TOP
 }
 
 pub const EXAMPLE: &str = r#"default_profile = "tensorx"
@@ -219,20 +287,66 @@ api_key_env = "ANTHROPIC_API_KEY"
 "#;
 
 impl Config {
-    pub fn load(path: &Path) -> Result<Self, ConfigError> {
+    /// The config and the table of its keys, so a caller can name the
+    /// ones it ignored (issue #37).
+    pub fn load_with(path: &Path) -> Result<(Self, Vec<String>), ConfigError> {
         let text = std::fs::read_to_string(path).map_err(|e| {
             ConfigError::msg(format!(
                 "reading config {}: {e}\n\nCreate it with, for example:\n\n{EXAMPLE}",
                 path.display()
             ))
         })?;
-        Self::parse(&text).map_err(|e| ConfigError::msg(format!("parsing {}: {e}", path.display())))
+        Self::parse_with(&text)
+            .map_err(|e| ConfigError::msg(format!("parsing {}: {e}", path.display())))
+    }
+
+    pub fn load(path: &Path) -> Result<Self, ConfigError> {
+        Self::load_with(path).map(|(config, _)| config)
     }
 
     /// Parse, reporting only the message and position on failure. The
     /// parser's default error quotes the offending line, which could echo a
     /// secret someone pasted into the file.
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
+        Self::parse_with(text).map(|(config, _)| config)
+    }
+
+    /// Parse and collect the dotted path of every key `config_spec` does
+    /// not list. Unknown keys are ignored, not refused (issue #37): the
+    /// caller reports them where a human will see them.
+    pub fn parse_with(text: &str) -> Result<(Self, Vec<String>), ConfigError> {
+        let mut config = parse_config(text)?;
+        let unknown = match toml::from_str::<toml::Value>(text) {
+            Ok(value) => config_spec().unknown(&value),
+            Err(_) => Vec::new(),
+        };
+        config.unknown = unknown.clone();
+        Ok((config, unknown))
+    }
+
+    /// The listed top-level key a dotted path was probably meant to be.
+    pub fn suggest_key(dotted: &str) -> Option<String> {
+        config_spec().suggest(dotted)
+    }
+}
+
+fn parse_config(text: &str) -> Result<Config, ConfigError> {
+    {
+        // A key in the file is refused by name, not ignored: `api_key`
+        // is not in `config_spec`, so a file that sets it would otherwise
+        // travel on as a silent no-op while the adapter builds with no
+        // key at all.
+        if let Ok(value) = toml::from_str::<toml::Value>(text)
+            && let Some(found) = config_spec()
+                .unknown(&value)
+                .into_iter()
+                .find(|path| path.ends_with("api_key"))
+        {
+            return Err(ConfigError::msg(format!(
+                "{found}: the key itself is never read from a file, only from the \
+                 environment variable named by api_key_env"
+            )));
+        }
         let file: ConfigFile = toml::from_str(text).map_err(|e| {
             let at = e
                 .span()
@@ -240,7 +354,6 @@ impl Config {
                 .unwrap_or_default();
             ConfigError::msg(format!("{}{at}", e.message()))
         })?;
-
         let flat = file.base_url.is_some() || file.model.is_some() || file.api_key_env.is_some();
         let (profiles, default_profile) = match (flat, file.profiles.is_empty()) {
             (true, false) => {
@@ -307,7 +420,7 @@ impl Config {
                 "utility_profile {u:?} is not a defined profile"
             )));
         }
-        Ok(Self {
+        Ok(Config {
             profiles,
             default_profile,
             utility_profile: file.utility_profile,
@@ -318,9 +431,12 @@ impl Config {
             denied_tools: file.tools.denied,
             denied_skills: file.skills.denied,
             display: file.display,
+            unknown: Vec::new(),
         })
     }
+}
 
+impl Config {
     /// The named profile, or the default.
     pub fn select(&self, name: Option<&str>) -> Result<(&str, &Profile), ConfigError> {
         let name = name.unwrap_or(&self.default_profile);
@@ -551,113 +667,91 @@ cache_read = 0.05
         assert_eq!(prices.cache_write, 0.25);
     }
 
-    /// A profile without a table is `None`, not a zero price: nothing is
-    /// claimed about a call whose cost is unknown.
-    #[test]
-    fn a_profile_without_prices_has_none() {
-        let c = Config::parse(EXAMPLE).unwrap();
-        let (_, p) = c.select(Some("anthropic")).unwrap();
-        assert!(p.prices.is_none());
-    }
+    /// Every key `config.toml`'s structs have, in one file. Amendment
+    /// 2.2: this is the checklist — a struct that gains a field without
+    /// a line here and in `config_spec()` fails the test below.
+    const FULL_CONFIG: &str = r#"
+default_profile = "tensorx"
+utility_profile = "tensorx"
+user = "steve"
+threads_dir = "/tmp/t"
+bundled_dir = "/tmp/b"
 
-    #[test]
-    fn profiles_parse_select_and_build() {
-        let c = Config::parse(EXAMPLE).unwrap();
-        assert_eq!(c.default_profile, "tensorx");
-        assert_eq!(c.select(None).unwrap().0, "tensorx");
-        let (_, a) = c.select(Some("anthropic")).unwrap();
-        assert_eq!(a.provider, ProviderKind::Anthropic);
-        assert_eq!(a.base_url, None);
-        assert_eq!(a.endpoint(), "api.anthropic.com");
-        let provider = a.build_provider("k".into());
-        assert!(provider.capabilities().supports_caching);
-        assert_eq!(provider.capabilities().max_context_tokens, 1_000_000);
-        let (_, t) = c.select(Some("tensorx")).unwrap();
-        assert!(!t.build_provider("k".into()).capabilities().supports_caching);
-    }
+[profiles.tensorx]
+provider = "openai_compat"
+base_url = "https://api.tensorx.ai/v1"
+model = "z-ai/glm-5.3"
+api_key_env = "TENSORX_API_KEY"
+max_context_tokens = 200000
 
-    #[test]
-    fn single_profile_needs_no_default() {
-        let c = Config::parse(
-            r#"[profiles.only]
+[profiles.tensorx.budget]
+max_iterations = 5
+max_tokens = 1000
+max_wall_time_secs = 60
+cache_read_price_ratio = 0.25
+
+[profiles.tensorx.compaction]
+trigger_fraction = 0.8
+keep_turns = 2
+max_result_bytes = 100
+summary_max_output_tokens = 10
+keep_last_calls = 3
+context_ceiling_tokens = 90000
+evict_above_tokens = 64000
+
+[profiles.tensorx.prices]
+input = 0.25
+output = 1.5
+cache_read = 0.05
+cache_write = 0.3
+
+# The anthropic-only keys, in their own profile: they are refused under
+# `openai_compat` (see `Profile::validate`).
+[profiles.sonnet]
 provider = "anthropic"
 model = "claude-opus-5"
 api_key_env = "ANTHROPIC_API_KEY"
-thinking = "off"
-effort = "low"
-cache = false
+thinking = "adaptive"
+effort = "high"
+max_output_tokens = 4096
+cache = true
 
-[profiles.only.compaction]
-trigger_fraction = 0.5
-keep_turns = 3
-keep_last_calls = 20
-context_ceiling_tokens = 96_000
-"#,
-        )
-        .unwrap();
-        assert_eq!(c.default_profile, "only");
-        let (_, p) = c.select(None).unwrap();
-        assert!(!p.build_provider("k".into()).capabilities().supports_caching);
-        let s = p.compaction_settings();
-        assert_eq!((s.trigger_fraction, s.keep_turns), (0.5, 3));
-        assert_eq!((s.keep_last_calls, s.context_ceiling_tokens), (20, 96_000));
-        assert_eq!(s.max_result_bytes, DEFAULT_COMPACTION.max_result_bytes);
-        let bare = Config::parse(FLAT)
-            .unwrap()
-            .select(None)
-            .unwrap()
-            .1
-            .compaction_settings();
-        assert_eq!(
-            (bare.keep_last_calls, bare.context_ceiling_tokens),
-            (
-                DEFAULT_COMPACTION.keep_last_calls,
-                DEFAULT_COMPACTION.context_ceiling_tokens
-            ),
-            "an absent [compaction] keeps the defaults"
-        );
-        assert!(Config::parse("[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n[profiles.a.compaction]\ntrigger_fraction = 2.0\n").is_err());
-        assert!(Config::parse("[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n[profiles.a.compaction]\nnope = 1\n").is_err());
-        assert!(Config::parse("[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n[profiles.a.compaction]\ncontext_ceiling_tokens = 1024\n").is_err());
-        assert!(Config::parse("[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n[profiles.a.budget]\nnope = 1\n").is_err());
-        assert!(Config::parse("[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n[profiles.a.budget]\ncache_read_price_ratio = 1.5\n").is_err());
-        let c = Config::parse("[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n[global]\ninstructions = \"/x/i.md\"\n[tools]\ndenied = [\"mcp.*\"]\n[skills]\ndenied = [\"wizard\"]\n").unwrap();
-        assert_eq!(
-            c.global_instructions.as_deref(),
-            Some(std::path::Path::new("/x/i.md"))
-        );
-        assert_eq!(c.denied_tools, vec!["mcp.*"]);
-        assert_eq!(c.denied_skills, vec!["wizard"]);
-        assert!(Config::parse("[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n[tools]\nallow = []\n").is_err());
-        let c = Config::parse("[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n[profiles.a.budget]\nmax_tokens = 5\ncache_read_price_ratio = 0.19\n").unwrap();
-        let b = c.profiles["a"].budget();
-        assert_eq!(
-            (b.max_iterations, b.max_tokens),
-            (DEFAULT_BUDGET.max_iterations, 5)
-        );
-        assert_eq!(b.max_wall_time, DEFAULT_BUDGET.max_wall_time);
-        assert_eq!(b.cache_read_price_ratio, 0.19);
-        assert_eq!(DEFAULT_BUDGET.cache_read_price_ratio, 0.25);
-    }
+[global]
+instructions = "/tmp/i.md"
 
+[tools]
+denied = ["mcp.*"]
+
+[skills]
+denied = ["wizard"]
+
+[display]
+result_lines = 4
+result_bytes = 800
+
+[[mcp_servers]]
+name = "docs"
+transport = { stdio = { command = "npx" } }
+"#;
+
+    /// `FULL_CONFIG` is clean, and a typo among its keys is reported with
+    /// the dotted path and a suggestion from the same table.
     #[test]
-    fn display_caps_default_override_and_reject_the_unknown() {
-        let c = Config::parse(FLAT).unwrap();
-        assert_eq!(
-            (c.display.result_lines, c.display.result_bytes),
-            (3, 600),
-            "an absent [display] keeps the defaults"
-        );
-        let c = Config::parse(
-            "[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n\
-             [display]\nresult_lines = 10\nresult_bytes = 2000\n",
+    fn a_full_config_is_clean_and_a_typo_is_named() {
+        let (_, unknown) = Config::parse_with(FULL_CONFIG).unwrap();
+        assert_eq!(unknown, Vec::<String>::new(), "{FULL_CONFIG}");
+        assert_eq!(unknown, Vec::<String>::new(), "{FULL_CONFIG}");
+
+        let (_, unknown) = Config::parse_with(
+            "[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n[profiles.a.compaction]\ntrigger_fraction = 0.8\ndefault_profile = \"x\"\n",
         )
         .unwrap();
-        assert_eq!((c.display.result_lines, c.display.result_bytes), (10, 2000));
-        assert!(Config::parse(
-            "[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n[display]\nnope = 1\n"
-        )
-        .is_err());
+        assert_eq!(unknown, vec!["profiles.a.compaction.default_profile"]);
+        assert_eq!(
+            Config::suggest_key("profiles.a.compaction.default_profile"),
+            None,
+            "no key of that table is close enough"
+        );
     }
 
     #[test]
@@ -675,6 +769,30 @@ context_ceiling_tokens = 96_000
         for text in cases {
             let err = Config::parse(&text).unwrap_err().to_string();
             assert!(!err.contains("sk-oops"), "value echoed: {err}");
+        }
+    }
+
+    /// Amendment 2.1: a literal `api_key` is a hard error wherever it
+    /// appears — root or inside a profile — and the message names the
+    /// dotted path, never the value. This test existed before issue #37
+    /// to keep a pasted secret out of a file; it keeps that purpose.
+    #[test]
+    fn a_literal_api_key_is_refused_by_path_and_never_echoed() {
+        for (text, expected) in [
+            (format!("{EXAMPLE}\napi_key = \"sk-oops\"\n"), "profiles.anthropic.api_key"),
+            (
+                "[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\napi_key = \"sk-oops\"\n".to_owned(),
+                "profiles.a.api_key",
+            ),
+        ] {
+            let err = Config::parse(&text).unwrap_err().to_string();
+            assert!(err.contains(expected), "{expected} not in {err}");
+            assert!(err.contains("api_key_env"), "{err}");
+            assert!(!err.contains("sk-oops"), "value echoed: {err}");
+            assert!(
+                Config::parse_with(&text).is_err(),
+                "the collect path refuses it too"
+            );
         }
     }
 
