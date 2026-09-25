@@ -5,13 +5,14 @@
 mod stream;
 mod wire;
 
+use std::collections::BTreeMap;
 use std::pin::Pin;
 
 use aigentic_core::{
     Capabilities, CompletionRequest, Message, Provider, ProviderError, ProviderEvent,
 };
 use futures_core::Stream;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 pub use stream::{Translator, parse_stream};
 pub use wire::{WireMessage, from_wire, to_wire};
@@ -19,6 +20,30 @@ pub use wire::{WireMessage, from_wire, to_wire};
 /// Name stamped on `ProviderBlob`s this adapter produces; only blobs with
 /// this name are replayed.
 pub const PROVIDER_NAME: &str = "openai_compat";
+
+/// A reasoning effort as the endpoint takes it: a number (DeepSeek V4.1
+/// takes 1-100) or a label (`low` | `medium` | `high` on OpenAI-style
+/// endpoints; GLM and Kimi have their own knobs). Values pass through
+/// unchecked — the endpoint is the authority, and `reasoning_effort_param`
+/// exists because the accepted shape differs per host (issue #44).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum ReasoningEffort {
+    /// Kept a JSON number on the wire: DeepSeek expects one.
+    Int(u64),
+    Label(String),
+}
+
+impl ReasoningEffort {
+    /// The string a footer or a usage line names: `50` for `Int(50)`,
+    /// the label itself otherwise.
+    pub fn label(&self) -> String {
+        match self {
+            Self::Int(n) => n.to_string(),
+            Self::Label(s) => s.clone(),
+        }
+    }
+}
 
 /// Connection settings. Switching backends is a base URL, a key and a model.
 #[derive(Debug, Clone)]
@@ -34,7 +59,14 @@ pub struct OpenAiCompatConfig {
     /// How long a started reply may produce no model output before it is
     /// treated as dead ([`crate::STALL`] by default; issue #42).
     pub stall: std::time::Duration,
+    /// The param name to send the effort under, and the effort: absent
+    /// means the field is not sent at all (issue #44). The name is a
+    /// dotted path, since some endpoints nest it (`thinking.effort`).
+    pub reasoning_effort: Option<(String, ReasoningEffort)>,
 }
+
+/// The param name an endpoint expects when the config names none.
+pub const REASONING_EFFORT_PARAM: &str = "reasoning_effort";
 
 impl OpenAiCompatConfig {
     pub fn new(base_url: impl Into<String>, model: impl Into<String>) -> Self {
@@ -45,7 +77,25 @@ impl OpenAiCompatConfig {
             max_context_tokens: 32_768,
             supports_images: false,
             stall: crate::STALL,
+            reasoning_effort: None,
         }
+    }
+
+    /// Send `effort` under `param` on every request; `param` is a dotted
+    /// path (`reasoning_effort`, or `thinking.effort` where the endpoint
+    /// nests it).
+    pub fn with_reasoning_effort(
+        mut self,
+        param: impl Into<String>,
+        effort: ReasoningEffort,
+    ) -> Self {
+        self.reasoning_effort = Some((param.into(), effort));
+        self
+    }
+
+    /// The effort the config asks for, or `None`.
+    pub fn reasoning_effort(&self) -> Option<&ReasoningEffort> {
+        self.reasoning_effort.as_ref().map(|(_, e)| e)
     }
 
     pub fn with_api_key(mut self, key: impl Into<String>) -> Self {
@@ -114,7 +164,33 @@ impl OpenAiCompat {
             stream_options: StreamOptions {
                 include_usage: true,
             },
+            extra: self.reasoning_effort_field(),
         }
+    }
+
+    /// The configured effort under its param name, as a top-level entry.
+    /// Empty when no effort is configured, so the flattened body gains
+    /// nothing and absent stays absent (issue #44). A dotted param nests
+    /// the effort, merging into an existing object under that key
+    /// (amendment 2.1).
+    fn reasoning_effort_field(&self) -> BTreeMap<String, serde_json::Value> {
+        let mut extra = BTreeMap::new();
+        let Some((param, effort)) = &self.config.reasoning_effort else {
+            return extra;
+        };
+        let value = serde_json::to_value(effort).expect("an effort serialises");
+        let segments: Vec<&str> = param.split('.').collect();
+        let (head, tail) = segments.split_first().expect("a param has a segment");
+        if tail.is_empty() {
+            extra.insert((*head).to_owned(), value);
+            return extra;
+        }
+        let mut nested = value;
+        for segment in tail.iter().rev() {
+            nested = serde_json::json!({ *segment: nested });
+        }
+        extra.insert((*head).to_owned(), nested);
+        extra
     }
 }
 
@@ -129,6 +205,11 @@ pub struct ChatRequest {
     pub max_tokens: Option<u64>,
     pub stream: bool,
     pub stream_options: StreamOptions,
+    /// Fields whose name the config chooses — today `reasoning_effort`
+    /// under `reasoning_effort_param`. Flattened, so an empty map adds
+    /// no keys at all (issue #44).
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -305,6 +386,94 @@ mod tests {
         let body = serde_json::to_value(provider.build_request(&request)).unwrap();
         assert!(body.get("tools").is_none());
         assert!(body.get("max_tokens").is_none());
+    }
+
+    /// Issue #44: the body carries `reasoning_effort` only when the
+    /// config sets one. `build_request` is a `ChatRequest`'s only
+    /// constructor, so this is the snapshot of an unconfigured profile
+    /// and the per-key checks below say exactly what the field adds.
+    #[test]
+    fn a_request_without_a_reasoning_effort_has_no_field() {
+        let provider = OpenAiCompat::new(OpenAiCompatConfig::new("http://x/v1", "m"));
+        let request = CompletionRequest {
+            messages: &[],
+            tools: &[],
+            max_output_tokens: Some(64),
+        };
+        let body = serde_json::to_value(provider.build_request(&request)).unwrap();
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "absent means absent: {body}"
+        );
+    }
+
+    /// An integer effort stays a JSON number under the default param.
+    #[test]
+    fn an_integer_effort_is_a_json_number_under_the_default_param() {
+        let provider = OpenAiCompat::new(
+            OpenAiCompatConfig::new("http://x/v1", "m")
+                .with_reasoning_effort("reasoning_effort", ReasoningEffort::Int(50)),
+        );
+        let request = CompletionRequest {
+            messages: &[],
+            tools: &[],
+            max_output_tokens: None,
+        };
+        let body = serde_json::to_value(provider.build_request(&request)).unwrap();
+        assert_eq!(body["reasoning_effort"], json!(50));
+        assert!(body["reasoning_effort"].is_u64(), "{body}");
+    }
+
+    /// A label effort rides the same field as its string.
+    #[test]
+    fn a_label_effort_is_a_string() {
+        let provider = OpenAiCompat::new(
+            OpenAiCompatConfig::new("http://x/v1", "m")
+                .with_reasoning_effort("reasoning_effort", ReasoningEffort::Label("high".into())),
+        );
+        let request = CompletionRequest {
+            messages: &[],
+            tools: &[],
+            max_output_tokens: None,
+        };
+        let body = serde_json::to_value(provider.build_request(&request)).unwrap();
+        assert_eq!(body["reasoning_effort"], "high");
+    }
+
+    /// `reasoning_effort_param`: the field goes under the endpoint's own
+    /// name, and the default name stays out of the body.
+    #[test]
+    fn a_configured_param_name_is_the_one_sent() {
+        let provider = OpenAiCompat::new(
+            OpenAiCompatConfig::new("http://x/v1", "m")
+                .with_reasoning_effort("deepseek_effort", ReasoningEffort::Int(50)),
+        );
+        let request = CompletionRequest {
+            messages: &[],
+            tools: &[],
+            max_output_tokens: None,
+        };
+        let body = serde_json::to_value(provider.build_request(&request)).unwrap();
+        assert_eq!(body["deepseek_effort"], json!(50));
+        assert!(body.get("reasoning_effort").is_none(), "{body}");
+    }
+
+    /// Amendment 2.1: a dotted param nests the effort, and the default
+    /// top-level name stays out of the body.
+    #[test]
+    fn a_dotted_param_nests_the_effort() {
+        let provider = OpenAiCompat::new(
+            OpenAiCompatConfig::new("http://x/v1", "m")
+                .with_reasoning_effort("thinking.effort", ReasoningEffort::Int(50)),
+        );
+        let request = CompletionRequest {
+            messages: &[],
+            tools: &[],
+            max_output_tokens: None,
+        };
+        let body = serde_json::to_value(provider.build_request(&request)).unwrap();
+        assert_eq!(body["thinking"]["effort"], json!(50));
+        assert!(body.get("reasoning_effort").is_none(), "{body}");
     }
 
     #[test]
