@@ -52,6 +52,9 @@ pub struct AnthropicConfig {
     pub effort: Option<String>,
     /// Emit `cache_control` breakpoints.
     pub cache: bool,
+    /// How long a started reply may produce no model output before it is
+    /// treated as dead ([`crate::STALL`] by default; issue #42).
+    pub stall: std::time::Duration,
 }
 
 impl AnthropicConfig {
@@ -65,7 +68,13 @@ impl AnthropicConfig {
             thinking: Thinking::Adaptive,
             effort: None,
             cache: true,
+            stall: crate::STALL,
         }
+    }
+
+    pub fn with_stall(mut self, stall: std::time::Duration) -> Self {
+        self.stall = stall;
+        self
     }
 
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
@@ -160,6 +169,7 @@ impl Provider for Anthropic {
         let url = format!("{}/v1/messages", self.config.base_url.trim_end_matches('/'));
         let client = self.client.clone();
         let api_key = self.config.api_key.clone();
+        let stall = self.config.stall;
 
         // Live retries (issue #31), as in the OpenAI adapter: the loop
         // runs in its own task so a `Retried` reaches the caller before
@@ -187,20 +197,30 @@ impl Provider for Anthropic {
                         Ok(resp) => {
                             // Peek the first event: an overload arrives as an
                             // `error` event on a 200 stream.
+                            // The wait for it is bounded by the stall, so a
+                            // byte-alive stream with no events cannot hang
+                            // here (issue #42).
                             let mut events = Box::pin(parse_stream(resp.bytes_stream()).peekable());
-                            match events.as_mut().peek().await {
-                                Some(first) if is_overloaded(first) => Err(first.clone()),
-                                _ => Ok(Box::pin(events) as EventStream<'static>),
+                            match tokio::time::timeout(stall, events.as_mut().peek()).await {
+                                Err(_) => Err(ProviderEvent::Error(ProviderError::Transport(
+                                    format!("no model output for {} s", stall.as_secs()),
+                                ))),
+                                Ok(Some(first)) if is_overloaded(first) => Err(first.clone()),
+                                Ok(_) => Ok(Box::pin(events) as EventStream<'static>),
                             }
                         }
                     };
+                // A stream that stalls or breaks before passing anything on
+                // is retried like a refused request (issue #42).
+                let outcome = match outcome {
+                    Ok(events) => match crate::forward(events, &tx, stall).await {
+                        None => return,
+                        Some(failure) => Err(failure),
+                    },
+                    Err(failure) => Err(failure),
+                };
                 match outcome {
-                    Ok(mut events) => {
-                        while let Some(event) = events.next().await {
-                            let _ = tx.send(event);
-                        }
-                        return;
-                    }
+                    Ok(()) => return,
                     Err(failure) => {
                         // Retries cover an overloaded or rate-limited reply before any
                         // content: HTTP 429/503/529, or a first `overloaded_error` event.
@@ -209,6 +229,8 @@ impl Provider for Anthropic {
                                 ProviderEvent::Error(ProviderError::Http { status, .. }) => {
                                     retryable_status(*status)
                                 }
+                                // Nothing reached the caller (issue #42).
+                                ProviderEvent::Error(ProviderError::Transport(_)) => true,
                                 other => is_overloaded(other),
                             };
                         if !retry {

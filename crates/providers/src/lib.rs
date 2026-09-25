@@ -11,9 +11,12 @@ pub mod sse;
 pub use anthropic::{Anthropic, AnthropicConfig, Thinking};
 pub use openai_compat::{OpenAiCompat, OpenAiCompatConfig};
 
-/// How long a response may go without a byte before it counts as dead.
-/// Reasoning models stream thinking deltas throughout, so two minutes of
-/// silence is a stall, not a slow answer.
+/// How long a response may go without a byte, or without model output,
+/// before it counts as dead. Reasoning models stream thinking deltas
+/// throughout, so two minutes of silence is a stall, not a slow answer.
+/// The byte clock is reqwest's read timeout; the output clock is
+/// [`forward`], because a stream can stay byte-alive on keep-alive
+/// comments while producing nothing (issue #42).
 pub(crate) const STALL: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Retries for a reply that failed before any content streamed. Backoff
@@ -45,6 +48,59 @@ pub(crate) fn retry_reason(failure: &aigentic_core::ProviderEvent) -> String {
         }) => "overloaded".into(),
         ProviderEvent::Error(ProviderError::Http { status, .. }) => format!("http {status}"),
         other => format!("{other:?}"),
+    }
+}
+
+/// Pass a started stream's events to `tx`, watching for a model that has
+/// gone quiet (issue #42). Only model output resets the clock: a text,
+/// tool-call or blob event, usage or a finish. An empty text delta does
+/// not, and keep-alive comments never become events at all, so a stream
+/// that stays byte-alive while producing nothing ends after `stall`.
+///
+/// Returns the failure when the stream stalled or broke before anything
+/// was passed on: nothing reached the caller, so the adapter may retry
+/// it like a refused request. Once an event has gone out, a stall or a
+/// break is passed on as the stream's last event and `None` comes back:
+/// retrying then would repeat output the caller already has.
+pub(crate) async fn forward(
+    mut events: std::pin::Pin<
+        Box<dyn futures_core::Stream<Item = aigentic_core::ProviderEvent> + Send>,
+    >,
+    tx: &tokio::sync::mpsc::UnboundedSender<aigentic_core::ProviderEvent>,
+    stall: std::time::Duration,
+) -> Option<aigentic_core::ProviderEvent> {
+    use aigentic_core::{ProviderError, ProviderEvent};
+    use futures_util::StreamExt;
+    let mut sent = false;
+    let mut deadline = tokio::time::Instant::now() + stall;
+    loop {
+        let event = match tokio::time::timeout_at(deadline, events.next()).await {
+            Ok(Some(event)) => event,
+            Ok(None) => return None,
+            Err(_) => {
+                let stalled = ProviderEvent::Error(ProviderError::Transport(format!(
+                    "no model output for {} s",
+                    stall.as_secs()
+                )));
+                if !sent {
+                    return Some(stalled);
+                }
+                let _ = tx.send(stalled);
+                return None;
+            }
+        };
+        match &event {
+            ProviderEvent::TextDelta(t) if t.is_empty() => continue,
+            ProviderEvent::Error(ProviderError::Transport(_)) if !sent => return Some(event),
+            ProviderEvent::Error(_) => {
+                let _ = tx.send(event);
+                return None;
+            }
+            _ => {}
+        }
+        deadline = tokio::time::Instant::now() + stall;
+        sent = true;
+        let _ = tx.send(event);
     }
 }
 
@@ -88,4 +144,62 @@ pub(crate) fn http_client() -> reqwest::Client {
         .read_timeout(STALL)
         .build()
         .expect("a default TLS backend is compiled in")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aigentic_core::{ProviderError, ProviderEvent};
+
+    fn stalled_after(
+        first: Vec<ProviderEvent>,
+    ) -> std::pin::Pin<Box<dyn futures_core::Stream<Item = ProviderEvent> + Send>> {
+        use futures_util::StreamExt;
+        Box::pin(futures_util::stream::iter(first).chain(futures_util::stream::pending()))
+    }
+
+    /// Issue #42: silence before any output is handed back as a
+    /// retryable failure, and an empty text delta does not count as
+    /// output (it neither resets the clock nor reaches the caller).
+    #[tokio::test]
+    async fn silence_before_output_is_returned_for_a_retry() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let stall = std::time::Duration::from_millis(100);
+        let failure = forward(
+            stalled_after(vec![ProviderEvent::TextDelta(String::new())]),
+            &tx,
+            stall,
+        )
+        .await;
+        assert!(
+            matches!(
+                failure,
+                Some(ProviderEvent::Error(ProviderError::Transport(_)))
+            ),
+            "{failure:?}"
+        );
+        assert!(rx.try_recv().is_err(), "nothing reached the caller");
+    }
+
+    /// Issue #42: silence after output is passed on as the last event.
+    #[tokio::test]
+    async fn silence_after_output_is_passed_on() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let stall = std::time::Duration::from_millis(100);
+        let failure = forward(
+            stalled_after(vec![ProviderEvent::TextDelta("hi".into())]),
+            &tx,
+            stall,
+        )
+        .await;
+        assert!(failure.is_none());
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            ProviderEvent::TextDelta("hi".into())
+        );
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            ProviderEvent::Error(ProviderError::Transport(_))
+        ));
+    }
 }

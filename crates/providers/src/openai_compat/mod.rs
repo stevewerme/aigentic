@@ -11,7 +11,6 @@ use aigentic_core::{
     Capabilities, CompletionRequest, Message, Provider, ProviderError, ProviderEvent,
 };
 use futures_core::Stream;
-use futures_util::StreamExt;
 use serde::Serialize;
 
 pub use stream::{Translator, parse_stream};
@@ -32,6 +31,9 @@ pub struct OpenAiCompatConfig {
     /// way to discover it.
     pub max_context_tokens: u64,
     pub supports_images: bool,
+    /// How long a started reply may produce no model output before it is
+    /// treated as dead ([`crate::STALL`] by default; issue #42).
+    pub stall: std::time::Duration,
 }
 
 impl OpenAiCompatConfig {
@@ -42,6 +44,7 @@ impl OpenAiCompatConfig {
             model: model.into(),
             max_context_tokens: 32_768,
             supports_images: false,
+            stall: crate::STALL,
         }
     }
 
@@ -52,6 +55,11 @@ impl OpenAiCompatConfig {
 
     pub fn with_max_context_tokens(mut self, tokens: u64) -> Self {
         self.max_context_tokens = tokens;
+        self
+    }
+
+    pub fn with_stall(mut self, stall: std::time::Duration) -> Self {
+        self.stall = stall;
         self
     }
 
@@ -166,6 +174,7 @@ impl Provider for OpenAiCompat {
         );
         let client = self.client.clone();
         let api_key = self.config.api_key.clone();
+        let stall = self.config.stall;
 
         // Live retries (issue #31): the attempt loop runs in its own
         // task and sends each event into the channel, so a `Retried` is
@@ -190,26 +199,24 @@ impl Provider for OpenAiCompat {
                             let body = resp.text().await.unwrap_or_default();
                             Err(ProviderEvent::Error(ProviderError::Http { status, body }))
                         }
+                        // `forward` below retries a stream that dies or
+                        // stalls before its first event; no unbounded wait
+                        // on that event here (issue #42).
                         Ok(resp) => {
-                            // A stream that dies before its first event has
-                            // shown nothing, so it is as safe to retry as a
-                            // refused request.
-                            let mut events = Box::pin(parse_stream(resp.bytes_stream()).peekable());
-                            match events.as_mut().peek().await {
-                                Some(first @ ProviderEvent::Error(ProviderError::Transport(_))) => {
-                                    Err(first.clone())
-                                }
-                                _ => Ok(Box::pin(events) as EventStream<'static>),
-                            }
+                            Ok(Box::pin(parse_stream(resp.bytes_stream())) as EventStream<'static>)
                         }
                     };
+                // A stream that stalls or breaks before passing anything on
+                // is retried like a refused request (issue #42).
+                let outcome = match outcome {
+                    Ok(events) => match crate::forward(events, &tx, stall).await {
+                        None => return,
+                        Some(failure) => Err(failure),
+                    },
+                    Err(failure) => Err(failure),
+                };
                 match outcome {
-                    Ok(mut events) => {
-                        while let Some(event) = events.next().await {
-                            let _ = tx.send(event);
-                        }
-                        return;
-                    }
+                    Ok(()) => return,
                     Err(failure) => {
                         if attempt >= crate::RETRIES || !retryable(&failure) {
                             let attempts = attempt as u32 + 1;
@@ -254,6 +261,7 @@ impl Provider for OpenAiCompat {
 mod tests {
     use super::*;
     use aigentic_core::{Author, ContentBlock, Role, ToolSpec, UserId};
+    use futures_util::StreamExt;
     use serde_json::json;
 
     #[test]
@@ -353,6 +361,119 @@ mod tests {
             "{events:?}"
         );
         assert!(!events.iter().any(|e| matches!(e, ProviderEvent::Error(_))));
+    }
+
+    /// A server that answers one request with a 200 and then only SSE
+    /// keep-alive comments (a byte-alive stream with no model output) for
+    /// `hold`, then closes; `then` is written to the next connection, if
+    /// any. Returns the base URL.
+    fn keep_alive_server(
+        first_output: Option<&'static str>,
+        hold: std::time::Duration,
+        then: Option<String>,
+    ) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 65536];
+            let _ = conn.read(&mut buf);
+            conn.write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+            )
+            .unwrap();
+            if let Some(line) = first_output {
+                conn.write_all(line.as_bytes()).unwrap();
+            }
+            let until = std::time::Instant::now() + hold;
+            while std::time::Instant::now() < until {
+                // The client hangs up when it gives up on the stall; the
+                // retry then arrives on a new connection.
+                if conn.write_all(b": keep-alive\n\n").is_err() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            drop(conn);
+            if let Some(reply) = then {
+                let (mut conn, _) = listener.accept().unwrap();
+                let _ = conn.read(&mut buf);
+                conn.write_all(reply.as_bytes()).unwrap();
+            }
+        });
+        format!("http://{addr}/v1")
+    }
+
+    fn hi_reply() -> String {
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// Issue #42: keep-alives are not output. A reply that stays
+    /// byte-alive without producing anything stalls, and since nothing
+    /// reached the caller it is retried, with the retry reported.
+    #[tokio::test]
+    async fn a_byte_alive_stream_without_output_is_retried() {
+        let stall = std::time::Duration::from_millis(300);
+        let base = keep_alive_server(None, stall * 4, Some(hi_reply()));
+        let provider = OpenAiCompat::new(OpenAiCompatConfig::new(base, "m").with_stall(stall));
+        let request = CompletionRequest {
+            messages: &[],
+            tools: &[],
+            max_output_tokens: None,
+        };
+        let events: Vec<ProviderEvent> = provider.complete(&request).collect().await;
+        assert!(
+            matches!(events.first(), Some(ProviderEvent::Retried { attempt: 1, reason, .. }) if reason == "not answering"),
+            "{events:?}"
+        );
+        assert!(
+            matches!(events.get(1), Some(ProviderEvent::TextDelta(t)) if t == "hi"),
+            "{events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, ProviderEvent::Error(_))),
+            "{events:?}"
+        );
+    }
+
+    /// Issue #42: once output has gone out, a stall ends the stream with
+    /// an error naming the silence, and is not retried (a retry would
+    /// repeat what the caller already has).
+    #[tokio::test]
+    async fn a_stall_after_output_ends_without_a_retry() {
+        let stall = std::time::Duration::from_millis(300);
+        let base = keep_alive_server(
+            Some("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"),
+            stall * 4,
+            None,
+        );
+        let provider = OpenAiCompat::new(OpenAiCompatConfig::new(base, "m").with_stall(stall));
+        let request = CompletionRequest {
+            messages: &[],
+            tools: &[],
+            max_output_tokens: None,
+        };
+        let events: Vec<ProviderEvent> = provider.complete(&request).collect().await;
+        assert!(
+            matches!(events.first(), Some(ProviderEvent::TextDelta(t)) if t == "hi"),
+            "{events:?}"
+        );
+        let expected = format!("no model output for {} s", stall.as_secs());
+        assert!(
+            matches!(events.last(), Some(ProviderEvent::Error(ProviderError::Transport(m))) if *m == expected),
+            "{events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ProviderEvent::Retried { .. })),
+            "{events:?}"
+        );
     }
 
     /// The retry is reported *while* the call waits (issue #31): the
