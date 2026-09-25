@@ -38,9 +38,13 @@ against intent, not only wording.
 
 ## 4. Write the prompts
 
-Each prompt starts with the command that opens its thread:
-`aigentic --profile kimi --mode auto` (plan, review) or
-`aigentic --profile flash --mode auto` (implement), from the repo root.
+Give each role two separate fenced blocks: first the shell command that
+opens its thread (`aigentic --profile kimi --mode auto` for plan and
+review, `aigentic --profile flash --mode auto` to implement, from the
+repo root), then the prompt itself. Never put the command inside the
+prompt block. When asked, also save each prompt to
+`.scratch/prompts/<issue>-<n>-<role>.txt` so it can be copied with
+`pbcopy < <file>` (copying from the terminal brings its decorations).
 
 **Planner** (profile `kimi`):
 - "You are the planner for #N. Do not edit any file."
@@ -68,7 +72,8 @@ Each prompt starts with the command that opens its thread:
   with `<model>` filled in by you from the implementer's profile (the
   `model` in its `[profiles.<name>]`, without the provider prefix: `flash`
   is `deepseek-v4.1-flash`). A model may not know its own id.
-  Push; `cargo install --path crates/tui --force`. Do not close the issue.
+  Push, then `cargo install --path crates/tui --force` (every implementer
+  prompt says both). Do not close the issue.
 - The safety line: never `git reset`, `git checkout -- <file>`,
   `git stash`, `git clean` or `git add -A`; commit nothing under
   `.scratch/`; leave `.aigentic/rules.toml` alone.
