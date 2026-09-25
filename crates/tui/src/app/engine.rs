@@ -63,6 +63,17 @@ pub struct TurnStats {
 }
 
 impl TurnStats {
+    /// A turn in a chosen state, for the tests that script a phase
+    /// without a daemon behind them.
+    #[cfg(test)]
+    pub fn for_test(writing: bool, current: Option<&str>) -> Self {
+        Self {
+            writing,
+            current: current.map(str::to_owned),
+            ..Self::new()
+        }
+    }
+
     fn new() -> Self {
         Self {
             started: std::time::Instant::now(),
@@ -790,7 +801,13 @@ impl ClientRepl {
         match notice {
             Notice::TextDelta { text, .. } => {
                 if let Some(t) = self.turn.as_mut() {
-                    t.writing = true;
+                    // A blank block is not writing (issue #43): the
+                    // model sends one before nearly every tool call,
+                    // and a phase change for it would move the pane
+                    // twice per call.
+                    if !text.trim().is_empty() {
+                        t.writing = true;
+                    }
                     // Content is arriving: the call recovered (issue #31).
                     t.retry = None;
                 }

@@ -30,7 +30,7 @@ use tokio::sync::mpsc;
 use crate::app::cells::{Cell, ToolState, is_read_tool};
 use crate::app::completion::{FileIndex, Popup};
 use crate::app::composer::Composer;
-use crate::app::engine::{ClientRepl, MenuKey, Printer};
+use crate::app::engine::{ClientRepl, MenuKey, Printer, TurnStats};
 use crate::app::keymap::{Action, KeyContext, action_for};
 use crate::app::menu::{Menu, Pick};
 use crate::app::pager::Pager;
@@ -173,8 +173,10 @@ impl ShellOut {
         Ok(())
     }
 
-    /// The viewport's changing part, wrapped to the width.
-    fn active_lines(&self) -> Vec<Line<'static>> {
+    /// The viewport's changing part, wrapped to the width. While
+    /// writing, the tail slot is exactly [`TAIL_ROWS`] rows, blank
+    /// padded: the pane holds still between newlines (issue #43).
+    fn active_lines(&self, phase: LivePhase) -> Vec<Line<'static>> {
         let width = self.width;
         let mut lines = Vec::new();
         if !self.explored.is_empty() {
@@ -194,6 +196,11 @@ impl ShellOut {
                 lines.push(Line::raw(""));
             }
             lines.extend(tail_rows(&tail, first, width));
+        }
+        if phase == LivePhase::Writing {
+            while lines.len() < TAIL_ROWS {
+                lines.push(Line::raw(""));
+            }
         }
         lines
     }
@@ -446,11 +453,57 @@ fn transcript_lines(
     lines
 }
 
-/// The live area's rows (issue #21): the call in flight and the
-/// compact task list. The area is its content, so the pane's height
-/// moves by a row or three as rows come and go (issue #39). Each row
-/// is one line: the full command is the pager's to show.
-fn live_rows(
+/// The turn's phase, which sets the live area's height (issue #43).
+/// The pane holds still inside a phase and moves only when the phase
+/// changes: the rows that happen to exist this tick no longer decide
+/// it, so the tail draining to the scrollback on a newline and the
+/// in-flight cell flickering between calls cost nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LivePhase {
+    /// No turn: no live rows at all.
+    Idle,
+    /// The call is out or waiting to retry: nothing is in flight yet,
+    /// and text is not streaming (issue #31 keeps the retry line on the
+    /// activity row).
+    Thinking,
+    /// Text is streaming: the tail slot holds its two rows.
+    Writing,
+    /// A tool is in flight: the row is reserved.
+    Tool,
+}
+
+/// The phase this tick is in, from the state and the turn's figures.
+/// Sticky: a tick that says nothing new keeps the phase it found, so
+/// back-to-back tool calls are one Tool phase and a fresh turn starts
+/// in Thinking. That is what stops the pane moving mid-phase.
+fn next_phase(prev: LivePhase, state: &ThreadState, turn: Option<&TurnStats>) -> LivePhase {
+    if matches!(state, ThreadState::Idle) {
+        return LivePhase::Idle;
+    }
+    match turn {
+        Some(t) if t.current.is_some() => LivePhase::Tool,
+        // Text is arriving: the pane is writing whatever it was doing
+        // a tick ago.
+        Some(t) if t.writing => LivePhase::Writing,
+        // A turn with neither says nothing new: keep the phase, except
+        // that writing has stopped (the flag is cleared when a tool
+        // starts or a message ends), which leaves the reply stretch.
+        // Tool stays stuck through the gap between two calls, so the
+        // in-flight row is never unreserved mid-turn (issue #43).
+        _ => match prev {
+            LivePhase::Idle | LivePhase::Writing => LivePhase::Thinking,
+            other => other,
+        },
+    }
+}
+
+/// The live area's rows (issue #43), by phase: the in-flight tool row
+/// is always reserved while a tool is out, the tail slot is always
+/// [`TAIL_ROWS`] rows while writing, and the compact task list is
+/// added as #21 draws it (at most three rows). Each row is one line:
+/// the full command is the pager's to show.
+fn live_block(
+    phase: LivePhase,
     running: Option<&Cell>,
     tasks: &[aigentic_runtime::harness_tools::Task],
     width: usize,
@@ -459,11 +512,27 @@ fn live_rows(
         wrap_line(&l, width).into_iter().next().unwrap_or(l)
     };
     let mut live: Vec<Line<'static>> = Vec::new();
-    if let Some(Cell::Tool { name, summary, .. }) = running {
-        live.push(one(look::running(name, summary, width)
-            .into_iter()
-            .next()
-            .unwrap_or_default()));
+    match phase {
+        LivePhase::Idle => return live,
+        // The row stays even with nothing to put in it: the call is
+        // between its start and its cell.
+        LivePhase::Tool => {
+            live.push(match running {
+                Some(Cell::Tool { name, summary, .. }) => one(look::running(name, summary, width)
+                    .into_iter()
+                    .next()
+                    .unwrap_or_default()),
+                _ => Line::raw(""),
+            });
+        }
+        LivePhase::Writing | LivePhase::Thinking => {
+            if let Some(Cell::Tool { name, summary, .. }) = running {
+                live.push(one(look::running(name, summary, width)
+                    .into_iter()
+                    .next()
+                    .unwrap_or_default()));
+            }
+        }
     }
     live.extend(cells::task_compact(tasks).into_iter().map(one));
     live
@@ -512,6 +581,9 @@ async fn run_shell(
     root: PathBuf,
 ) -> anyhow::Result<()> {
     let mut out = ShellOut::new(Shell::start()?);
+    // The turn's phase, kept across ticks: the live area's height
+    // changes at phase boundaries only (issue #43).
+    let mut phase = LivePhase::Idle;
     // The file index for `@`, walked once off the loop.
     let mut files_task = Some(tokio::task::spawn_blocking(move || FileIndex::walk(&root)));
     let mut files: Option<FileIndex> = None;
@@ -591,14 +663,14 @@ async fn run_shell(
             let draft = prompt_draft.take().unwrap();
             composer.set_text(&draft);
         }
-        // The live area is its content (issue #39): the in-flight row
-        // and the compact task rows, nothing reserved. The pane's
-        // height moves by a row or three as rows come and go, and the
-        // one blank row the layout puts above them stays one.
-        let mut block: Vec<Line<'static>> = Vec::new();
-        if !matches!(state, ThreadState::Idle) {
-            block.extend(live_rows(out.running.as_ref(), engine.tasks(), out.width));
-        }
+        // The live area is sized by the turn's phase (issue #43), not
+        // by the rows that happen to exist this tick: the in-flight row
+        // stays reserved while a tool is out, the tail slot holds its
+        // two rows while writing. The one blank row the layout puts
+        // above them stays one.
+        phase = next_phase(phase, &state, engine.turn());
+        let mut block: Vec<Line<'static>> =
+            live_block(phase, out.running.as_ref(), engine.tasks(), out.width);
         block.extend(
             engine
                 .menu()
@@ -654,7 +726,7 @@ async fn run_shell(
             )),
             _ => None,
         };
-        let active = out.active_lines();
+        let active = out.active_lines(phase);
         let pane = Pane {
             active: &active,
             composer: &composer,
@@ -840,7 +912,7 @@ async fn run_shell(
 mod tests {
     use super::*;
     use crate::app::menu::Menu;
-    use aigentic_runtime::aigentic_core::{RiskClass, ToolCall};
+    use aigentic_runtime::aigentic_core::{Author, RiskClass, ToolCall};
     use serde_json::json;
 
     fn text(lines: &[Line<'_>]) -> Vec<String> {
@@ -904,11 +976,11 @@ mod tests {
         );
     }
 
-    /// The live area is its rows and nothing more (issue #39): the
-    /// in-flight row and the compact task list, so the pane's height
-    /// moves with them.
+    /// The live block says the call and up to three tasks (issue #21),
+    /// and reserves nothing in the phases that have no rows to show
+    /// (issue #43).
     #[test]
-    fn the_live_area_is_only_its_rows() {
+    fn the_live_block_says_the_call_and_up_to_three_tasks() {
         use aigentic_runtime::harness_tools::{Task, TaskState};
         let task = |text: &str, state: TaskState| Task {
             text: text.into(),
@@ -921,11 +993,13 @@ mod tests {
             state: ToolState::Running,
             output: String::new(),
         };
-        // No reserve: nothing to show is no rows.
-        assert!(live_rows(None, &[], 80).is_empty());
+        // Idle and Thinking reserve nothing: no turn, no rows.
+        assert!(live_block(LivePhase::Idle, None, &[], 80).is_empty());
+        assert!(live_block(LivePhase::Thinking, None, &[], 80).is_empty());
         // Rows are exactly what is in flight plus the list's rows.
         assert_eq!(
-            text(&live_rows(
+            text(&live_block(
+                LivePhase::Tool,
                 Some(&bash),
                 &[task("write the code", TaskState::Active)],
                 80
@@ -942,7 +1016,7 @@ mod tests {
             task("three", TaskState::Pending),
         ];
         assert_eq!(
-            text(&live_rows(Some(&bash), &tasks, 80)),
+            text(&live_block(LivePhase::Tool, Some(&bash), &tasks, 80)),
             vec![
                 "◦ cargo test --workspace",
                 "▸ one",
@@ -950,6 +1024,171 @@ mod tests {
                 "0/3 done · ctrl-t for the list",
             ]
         );
+        // The cap holds with a longer list (#21): three rows of tasks.
+        let long = (0..5)
+            .map(|i| task(&format!("task {i}"), TaskState::Pending))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            text(&live_block(LivePhase::Tool, Some(&bash), &long, 80)).len(),
+            4,
+            "one call row and three task rows"
+        );
+    }
+
+    /// While writing, the tail slot holds its two rows whether or not
+    /// the stream has filled them (issue #43): the pane's height is a
+    /// function of the phase, so a wave of slivers does not make it
+    /// breathe.
+    #[test]
+    fn a_writing_tail_holds_two_rows_blank_padded() {
+        let mut out = out_at(80);
+        let blanks = |rows: &[Line<'static>]| rows.iter().filter(|l| l.spans.is_empty()).count();
+        for text in ["a", "one two three four five six seven eight nine"] {
+            out.tail(text);
+            let rows = out.active_lines(LivePhase::Writing);
+            assert_eq!(
+                rows.len(),
+                TAIL_ROWS,
+                "the slot holds TAIL_ROWS while writing: {text:?}"
+            );
+            assert!(
+                rows.len() - blanks(&rows) >= 1,
+                "the stream's own rows show, padding behind: {text:?}"
+            );
+        }
+        // Idle draws nothing at all.
+        out.tail("");
+        assert!(out.active_lines(LivePhase::Idle).is_empty());
+    }
+
+    /// The pane changes height only at phase boundaries (issue #43):
+    /// the issue's scripted turn — a call out, five streamed lines
+    /// whose tail cycles 0→1→2→0, three tool calls with a tick between
+    /// each, and idle. Writing holds the same height throughout, and so
+    /// does the whole tool stretch including the gap ticks; only a
+    /// phase change moves it. Expected heights come from the same rule
+    /// the pane draws by, never from a literal.
+    #[test]
+    fn the_pane_changes_height_only_at_phase_boundaries() {
+        let running = || ThreadState::Running {
+            by: Author::User(aigentic_runtime::aigentic_core::UserId("steve".into())),
+            queued: 0,
+        };
+        let mut out = out_at(80);
+        let bash = |summary: &str| Cell::Tool {
+            name: "bash".into(),
+            summary: summary.into(),
+            full: None,
+            state: ToolState::Running,
+            output: String::new(),
+        };
+        // What the pane's own height is: the live block's rows plus
+        // the tail slot. The layout's one blank row above them and the
+        // separator the scrollback handoff adds are not part of this
+        // count — the issue's rule is about the live rows.
+        fn height(phase: LivePhase, running: Option<&Cell>, tail: &ShellOut) -> usize {
+            let live = live_block(phase, running, &[], tail.width).len();
+            let slot = if tail.tail.trim().is_empty() {
+                0
+            } else {
+                tail_rows(
+                    &Cell::Assistant {
+                        text: tail.tail.clone(),
+                        fenced: tail.fenced,
+                    },
+                    false,
+                    tail.width,
+                )
+                .len()
+            };
+            live + if phase == LivePhase::Writing {
+                slot.max(TAIL_ROWS)
+            } else {
+                slot
+            }
+        }
+
+        // A message goes out: the call is in flight before it streams.
+        let mut phase = next_phase(LivePhase::Idle, &running(), None);
+        assert_eq!(phase, LivePhase::Thinking);
+        assert_eq!(
+            height(phase, None, &out),
+            0,
+            "nothing to show yet, so no rows"
+        );
+
+        // Five lines of the reply, the tail cycling after each: the
+        // tail slot keeps Writing at the same height throughout.
+        let mut writing = None;
+        for text in ["Sure", " here", " is", " the", " answer."] {
+            let turn = TurnStats::for_test(true, None);
+            let next = next_phase(phase, &running(), Some(&turn));
+            assert_eq!(next, LivePhase::Writing, "text is arriving: {text:?}");
+            out.tail(text);
+            out.cell(
+                Cell::Assistant {
+                    text: text.into(),
+                    fenced: false,
+                },
+                true,
+            );
+            let rows = height(next, None, &out);
+            match writing {
+                None => writing = Some(rows),
+                Some(first) => assert_eq!(rows, first, "height held while writing at {text:?}"),
+            }
+            phase = next;
+            // A tick with no tool and no fresh text stays in Writing.
+            assert_eq!(
+                next_phase(phase, &running(), Some(&turn)),
+                LivePhase::Writing
+            );
+        }
+
+        // Three calls, a tick between each: one Tool stretch, one
+        // height, the in-flight row reserved all the way through.
+        let mut tool_height = None;
+        for call in ["cargo fmt", "cargo clippy", "cargo test"] {
+            let cell = bash(call);
+            let turn = TurnStats::for_test(false, Some(call));
+            let next = next_phase(phase, &running(), Some(&turn));
+            assert_eq!(next, LivePhase::Tool, "a tool is out: {call}");
+            let rows = height(next, Some(&cell), &out);
+            match tool_height {
+                None => tool_height = Some(rows),
+                Some(first) => assert_eq!(rows, first, "height held across calls at {call}"),
+            }
+            phase = next;
+            // A tick that lands between calls: still Tool, same rows.
+            let gap = TurnStats::for_test(false, None);
+            assert_eq!(
+                next_phase(phase, &running(), Some(&gap)),
+                LivePhase::Tool,
+                "the gap tick keeps the phase: {call}"
+            );
+            assert_eq!(
+                height(LivePhase::Tool, None, &out),
+                rows,
+                "the in-flight row stays reserved in the gap: {call}"
+            );
+        }
+
+        // A `"\n\n"` delta between two calls is not writing (amendment
+        // 2): it is not a phase change, so the height does not move.
+        let blank = TurnStats::for_test(false, None);
+        assert_eq!(
+            next_phase(phase, &running(), Some(&blank)),
+            LivePhase::Tool,
+            "a blank block does not start Writing"
+        );
+        assert_eq!(height(LivePhase::Tool, None, &out), tool_height.unwrap());
+
+        // Idle: the tail is committed and cleared, and the live rows
+        // go.
+        out.tail("");
+        phase = next_phase(phase, &ThreadState::Idle, None);
+        assert_eq!(phase, LivePhase::Idle);
+        assert_eq!(height(phase, None, &out), 0);
     }
 
     /// A streaming paragraph shows only its last two rows (issue #39):
@@ -978,7 +1217,7 @@ mod tests {
     /// The pane's own rows: what the viewport draws above the composer,
     /// which a ghost block must not reach.
     fn pane_rows(out: &ShellOut) -> Vec<String> {
-        text(&out.active_lines())
+        text(&out.active_lines(LivePhase::Writing))
     }
 
     /// A whitespace-only text block draws nothing (issue #43): no
@@ -1038,11 +1277,13 @@ mod tests {
             ]
             .concat()
         );
-        // No tail either: the pane's own part draws nothing.
+        // No tail either: a blank reason for the tail draws no ghost
+        // row. What is left is the Writing slot's own blank padding,
+        // which is every row empty — no bullet, nothing to read.
         out.tail("\n\n");
         assert!(out.tail.is_empty());
         assert!(
-            pane_rows(&out).is_empty(),
+            pane_rows(&out).iter().all(String::is_empty),
             "the pane's rows: {:?}",
             pane_rows(&out)
         );
@@ -1123,14 +1364,14 @@ mod tests {
         out.cell(tool(ToolState::Running), false);
         // Writing, with a blank block: the in-flight tool row stays
         // reserved and the blank one moves nothing.
-        let writing = text(&out.active_lines());
+        let writing = text(&out.active_lines(LivePhase::Tool));
         out.cell(blank(), true);
-        assert_eq!(text(&out.active_lines()), writing);
+        assert_eq!(text(&out.active_lines(LivePhase::Tool)), writing);
         // The tool finishes and a blank block follows: still no row,
         // and the pane is the tool's own rows only.
         out.cell(tool(ToolState::Ok), true);
         out.cell(blank(), true);
-        let idle = text(&out.active_lines());
+        let idle = text(&out.active_lines(LivePhase::Idle));
         assert!(idle.is_empty(), "no residual live rows: {idle:?}");
         // The blank blocks left no trace in the transcript either: the
         // three things sent, and nothing between them.
