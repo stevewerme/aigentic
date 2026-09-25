@@ -603,6 +603,16 @@ impl Profile {
         }
     }
 
+    /// The param the effort goes out under, when the profile sets one
+    /// (issue #44). The doctor names it when an endpoint rejects it.
+    pub fn effort_param(&self) -> Option<&str> {
+        self.reasoning_effort.as_ref().map(|_| {
+            self.reasoning_effort_param
+                .as_deref()
+                .unwrap_or(REASONING_EFFORT_PARAM)
+        })
+    }
+
     /// Where requests go, for the banner. Never includes the key.
     pub fn endpoint(&self) -> String {
         match self.provider {

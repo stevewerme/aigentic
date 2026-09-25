@@ -264,7 +264,7 @@ pub enum CompactionStrategy {
     Summary {
         text: String,
         model: String,
-        usage: Usage,
+        usage: Box<Usage>,
     },
 }
 

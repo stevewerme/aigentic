@@ -9,7 +9,8 @@ use std::path::Path;
 use std::time::Instant;
 
 use aigentic_runtime::aigentic_core::{
-    Author, CompletionRequest, ContentBlock, Message, Provider, ProviderEvent, Role, UserId,
+    Author, CompletionRequest, ContentBlock, Message, Provider, ProviderError, ProviderEvent, Role,
+    UserId,
 };
 use aigentic_runtime::aigentic_tools::{ToolRegistry, Workdir};
 use aigentic_runtime::project::{DOT_DIR, FILE_NAME, INSTRUCTIONS_FILE};
@@ -473,6 +474,9 @@ pub async fn check_probe(name: &str, profile: &Profile) -> Check {
         match event {
             ProviderEvent::Done { finish_reason } => finish = Some(finish_reason),
             ProviderEvent::Error(e) => {
+                if let Some(note) = warn_note(profile, &e) {
+                    return Check::new(&check_name, Status::Warn, note);
+                }
                 return Check::fail(&check_name, format!("{} · {e}", profile.model));
             }
             _ => {}
@@ -492,6 +496,24 @@ pub async fn check_probe(name: &str, profile: &Profile) -> Check {
             ),
         ),
     }
+}
+
+/// Issue #44: an endpoint that rejects the configured effort still
+/// runs — at the provider's default. That is a capability note, not an
+/// outage, so the doctor warns rather than failing. The note names the
+/// param and never quotes the response, so it can echo neither the
+/// request nor a secret. `None` for every other error.
+fn warn_note(profile: &Profile, e: &ProviderError) -> Option<String> {
+    let (Some(param), ProviderError::Http { status: 400, body }) = (profile.effort_param(), e)
+    else {
+        return None;
+    };
+    body.contains(param).then(|| {
+        format!(
+            "{} · endpoint rejected `{param}`; it runs at the provider default",
+            profile.model
+        )
+    })
 }
 
 #[cfg(test)]
@@ -877,6 +899,99 @@ mod tests {
         let c = check_probe("a", &config.profiles["a"]).await;
         assert_eq!(c.status, Status::Skip);
         assert!(c.message.contains("AIGENTIC_DOCTOR_TEST_KEY"));
+    }
+
+    /// Issue #44, T12: an endpoint that rejects the configured effort
+    /// warns — the profile still runs at the provider's default — and
+    /// the note names the param, never the response, so no request or
+    /// secret can leak through it.
+    #[tokio::test]
+    async fn a_rejected_effort_param_warns_instead_of_failing() {
+        let config = Config::parse(
+            "[profiles.a]\nbase_url = \"http://127.0.0.1:1/v1\"\nmodel = \"m\"\napi_key_env = \"AIGENTIC_DOCTOR_TEST_KEY\"\nreasoning_effort = 50\nreasoning_effort_param = \"thinking.effort\"\n",
+        )
+        .unwrap();
+        assert!(std::env::var("AIGENTIC_DOCTOR_TEST_KEY").is_err());
+        let c = check_probe("a", &config.profiles["a"]).await;
+        assert_eq!(c.status, Status::Skip, "{}", c.message);
+
+        // The branch, driven directly: a 400 whose body names the param
+        // is a capability note, anything else stays a failure.
+        let profile = config.profiles["a"].clone();
+        for (rejected, warn) in [
+            (
+                Some(ProviderError::Http {
+                    status: 400,
+                    body: "unknown field: thinking.effort".into(),
+                }),
+                true,
+            ),
+            (
+                Some(ProviderError::Http {
+                    status: 401,
+                    body: "thinking.effort".into(),
+                }),
+                false,
+            ),
+            (
+                Some(ProviderError::Http {
+                    status: 400,
+                    body: "bad request".into(),
+                }),
+                false,
+            ),
+            (None, false),
+        ] {
+            let note = match &rejected {
+                Some(e) => warn_note(&profile, e),
+                None => None,
+            };
+            assert_eq!(note.is_some(), warn, "{rejected:?}");
+            if let Some(note) = note {
+                assert!(note.contains("thinking.effort"), "{note}");
+                assert!(note.contains("provider default"), "{note}");
+                assert!(!note.contains("unknown field"), "no echo: {note}");
+            }
+        }
+
+        // A profile with no effort keeps failing as it always has.
+        let plain = Config::parse(GOOD).unwrap();
+        let e = ProviderError::Http {
+            status: 400,
+            body: "unknown field: reasoning_effort".into(),
+        };
+        assert!(warn_note(&plain.profiles["a"], &e).is_none());
+    }
+
+    /// Issue #44, T13: the anthropic profile sends its effort as
+    /// `output_config.effort`, and the configured `effort` string is
+    /// what reaches the wire.
+    #[test]
+    fn an_anthropic_effort_lands_in_output_config() {
+        let config = Config::parse(
+            "[profiles.a]\nprovider = \"anthropic\"\nmodel = \"m\"\napi_key_env = \"K\"\neffort = \"high\"\n",
+        )
+        .unwrap();
+        use aigentic_runtime::aigentic_providers::{Anthropic, AnthropicConfig};
+
+        // The adapter the profile builds, with the effort it configures.
+        let mut c = AnthropicConfig::new("k", "m");
+        c = c.with_effort(config.profiles["a"].effort.clone().unwrap());
+        let provider = Anthropic::new(c);
+        let messages = [Message {
+            role: Role::User,
+            author: Author::User(UserId("t".into())),
+            blocks: vec![ContentBlock::Text("hi".into())],
+        }];
+        let request = CompletionRequest {
+            messages: &messages,
+            tools: &[],
+            max_output_tokens: None,
+        };
+        let body = provider.build_request(&request);
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["output_config"]["effort"], "high");
+        assert_eq!(config.profiles["a"].effort_label().as_deref(), Some("high"));
     }
 
     #[test]

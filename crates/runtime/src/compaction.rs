@@ -226,7 +226,7 @@ impl Runtime {
         let strategy = CompactionStrategy::Summary {
             text: text.trim().to_owned(),
             model: self.model_label.clone(),
-            usage: aigentic_log::Usage::reported(usage),
+            usage: Box::new(aigentic_log::Usage::reported(usage)),
         };
         self.append_compaction(from, to, strategy.clone(), observe)?;
         Ok(Some(strategy))

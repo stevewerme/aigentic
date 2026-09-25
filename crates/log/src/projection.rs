@@ -629,7 +629,7 @@ mod tests {
             strategy: CompactionStrategy::Summary {
                 text: text.into(),
                 model: "m".into(),
-                usage: Usage::reported(aigentic_core::Usage::default()),
+                usage: Box::new(Usage::reported(aigentic_core::Usage::default())),
             },
         };
         ev(
