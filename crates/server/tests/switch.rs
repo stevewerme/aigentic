@@ -132,6 +132,20 @@ async fn until_idle(rx: &mut mpsc::Receiver<Notice>) {
     }
 }
 
+/// The first notice the predicate accepts, within the deadline.
+async fn until_notice(rx: &mut mpsc::Receiver<Notice>, want: impl Fn(&Notice) -> bool) -> Notice {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let n = tokio::time::timeout_at(deadline, rx.recv())
+            .await
+            .expect("the notice in time")
+            .expect("open");
+        if want(&n) {
+            return n;
+        }
+    }
+}
+
 #[tokio::test]
 async fn a_thread_moves_to_another_project_and_stays_there_across_a_reload() {
     let dir = tempfile::tempdir().unwrap();
@@ -225,16 +239,28 @@ async fn a_thread_moves_to_another_project_and_stays_there_across_a_reload() {
         panic!()
     };
     let id = thread.id;
-    assert!(matches!(
-        client
-            .request(Request::Open {
-                thread: id,
-                from_seq: 0
-            })
-            .await
-            .unwrap(),
-        Response::Opened { .. }
-    ));
+    let Response::Opened {
+        profile,
+        model,
+        effort,
+        ..
+    } = client
+        .request(Request::Open {
+            thread: id,
+            from_seq: 0,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("an open reply")
+    };
+    // The footer's head comes from the daemon at attach (issue #43):
+    // the profile the thread's provider was built from, the label its
+    // factory returned, and the effort the profile names — none here,
+    // since a scripted factory's profile sets none.
+    assert_eq!(profile.as_deref(), Some("a"));
+    assert_eq!(model, "scripted");
+    assert_eq!(effort, None);
     let mut notices = client.take_notices().unwrap();
     let post = |t: &str| Request::Post {
         thread: id,
@@ -271,6 +297,21 @@ async fn a_thread_moves_to_another_project_and_stays_there_across_a_reload() {
             .unwrap(),
         Response::Ok
     );
+    // The switch rebinds the provider, so the subscribers are told who
+    // the thread now runs as (issue #43).
+    let announced = until_notice(&mut notices, |n| matches!(n, Notice::Model { .. })).await;
+    let Notice::Model {
+        profile,
+        model,
+        effort,
+        ..
+    } = announced
+    else {
+        panic!("a model notice")
+    };
+    assert_eq!(profile.as_deref(), Some("a"));
+    assert_eq!(model, "scripted");
+    assert_eq!(effort, None);
     assert_eq!(
         client.request(post("where are you?")).await.unwrap(),
         Response::Ok

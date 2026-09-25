@@ -189,6 +189,9 @@ impl Follow {
             writeln!(out, "{}", serde_json::to_string(&notice)?)?;
         }
         match notice {
+            // The model a daemon names at attach (issue #43) is for the
+            // shell's footer; plain exec prints what the model says.
+            Notice::Model { .. } => {}
             Notice::TextDelta { text, .. } => {
                 if !self.json {
                     write!(err, "{text}")?;

@@ -168,6 +168,34 @@ impl Printer for Lines {
 }
 
 /// What the client knows about its thread.
+/// The profile, model and effort a daemon names at attach (issue
+/// #43): `None` profile or effort when the config sets neither.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Identity {
+    pub profile: Option<String>,
+    pub model: String,
+    pub effort: Option<String>,
+}
+
+impl Identity {
+    /// The head of the status line: `flash (deepseek-v4.1-flash)`, with
+    /// `effort <n>` after the model when the profile sets one. Nothing
+    /// when the model is not known.
+    pub fn label(&self) -> Option<String> {
+        if self.model.is_empty() || self.model == "unknown" {
+            return None;
+        }
+        let mut who = match &self.profile {
+            Some(p) => format!("{p} ({})", self.model),
+            None => self.model.clone(),
+        };
+        if let Some(e) = &self.effort {
+            who.push_str(&format!(" · effort {e}"));
+        }
+        Some(who)
+    }
+}
+
 pub struct ClientRepl {
     client: Client,
     thread: Ulid,
@@ -180,6 +208,9 @@ pub struct ClientRepl {
     calls: HashMap<String, (String, String, Option<String>)>,
     state: ThreadState,
     mode: String,
+    /// The profile, model and effort the daemon named at attach
+    /// (issue #43), for the status line's head.
+    identity: Identity,
     /// Streamed assistant text not yet ended by a newline.
     partial: String,
     /// The call id of the request or question this client prompted for
@@ -219,6 +250,7 @@ impl ClientRepl {
         role: Option<String>,
         state: ThreadState,
         mode: String,
+        identity: Identity,
     ) -> Self {
         Self {
             client,
@@ -229,6 +261,7 @@ impl ClientRepl {
             calls: HashMap::new(),
             state,
             mode,
+            identity,
             partial: String::new(),
             prompted: None,
             menu: None,
@@ -785,6 +818,11 @@ impl ClientRepl {
         &self.mode
     }
 
+    /// Who the thread runs as, for the status line's head (issue #43).
+    pub fn identity(&self) -> &Identity {
+        &self.identity
+    }
+
     /// The last window fill the daemon reported: tokens in the window
     /// and the window itself.
     pub fn usage(&self) -> Option<(u64, u64)> {
@@ -799,6 +837,21 @@ impl ClientRepl {
     /// complete; the rest at the message's end.
     pub fn render(&mut self, notice: Notice, out: &mut dyn Printer) {
         match notice {
+            Notice::Model {
+                profile,
+                model,
+                effort,
+                ..
+            } => {
+                // The model this client is attached to (issue #43):
+                // appended at attach, so a shell that missed the frame
+                // still names it.
+                self.identity = Identity {
+                    profile,
+                    model,
+                    effort,
+                };
+            }
             Notice::TextDelta { text, .. } => {
                 if let Some(t) = self.turn.as_mut() {
                     // A blank block is not writing (issue #43): the
@@ -1520,7 +1573,15 @@ mod tests {
         assert_eq!(role.as_deref(), Some("admin"));
         let (thread, state, mode) = open(&client, "proj", None).await;
         let notices = client.take_notices().unwrap();
-        let mut repl = ClientRepl::new(client, thread, "steve", role, state, mode);
+        let mut repl = ClientRepl::new(
+            client,
+            thread,
+            "steve",
+            role,
+            state,
+            mode,
+            Identity::default(),
+        );
         let (tx, rx) = mpsc::unbounded_channel();
         // Lines arrive as a person would type them, with a pause for the
         // turn to finish before the reports.
@@ -1612,7 +1673,15 @@ mod tests {
         let role = welcome.projects[0].role.clone();
         let (thread, state, mode) = open(&client, "proj", None).await;
         let notices = client.take_notices().unwrap();
-        let mut repl = ClientRepl::new(client, thread, "steve", role, state, mode);
+        let mut repl = ClientRepl::new(
+            client,
+            thread,
+            "steve",
+            role,
+            state,
+            mode,
+            Identity::default(),
+        );
         let (tx, rx) = mpsc::unbounded_channel();
         let (pacer, _) = Client::connect(&Addr::Unix(embedded.socket.clone()), &embedded.token)
             .await
@@ -1694,7 +1763,15 @@ mod tests {
         let role = welcome.projects[0].role.clone();
         let (thread, state, mode) = open(&client, "proj", None).await;
         let notices = client.take_notices().unwrap();
-        let mut repl = ClientRepl::new(client, thread, "steve", role, state, mode);
+        let mut repl = ClientRepl::new(
+            client,
+            thread,
+            "steve",
+            role,
+            state,
+            mode,
+            Identity::default(),
+        );
         let (pacer, _) = Client::connect(&addr, &embedded.token).await.unwrap();
         open(&pacer, "proj", Some(thread)).await;
         let mut paced = pacer.take_notices().unwrap();
@@ -1785,7 +1862,15 @@ mod tests {
         let role = welcome.projects[0].role.clone();
         let (thread, state, mode) = open(&client, "proj", None).await;
         let notices = client.take_notices().unwrap();
-        let mut repl = ClientRepl::new(client, thread, "steve", role, state, mode);
+        let mut repl = ClientRepl::new(
+            client,
+            thread,
+            "steve",
+            role,
+            state,
+            mode,
+            Identity::default(),
+        );
         // The pacer: a second session on the same thread.
         let (pacer, _) = Client::connect(&addr, &embedded.token).await.unwrap();
         open(&pacer, "proj", Some(thread)).await;
@@ -1959,7 +2044,15 @@ mod tests {
         let role = welcome.projects[0].role.clone();
         let (thread, state, mode) = open(&steve, "p", None).await;
         let notices = steve.take_notices().unwrap();
-        let mut repl = ClientRepl::new(steve, thread, "steve", role, state, mode);
+        let mut repl = ClientRepl::new(
+            steve,
+            thread,
+            "steve",
+            role,
+            state,
+            mode,
+            Identity::default(),
+        );
         let (magnus, _) = Client::connect(&addr, "tok-magnus").await.unwrap();
         open(&magnus, "p", Some(thread)).await;
         let mut magnus_notices = magnus.take_notices().unwrap();
@@ -2136,15 +2229,30 @@ mod tests {
         let steve_role = welcome.projects[0].role.clone();
         let (thread, state, mode) = open(&steve, "p", None).await;
         let steve_notices = steve.take_notices().unwrap();
-        let mut steve_repl = ClientRepl::new(steve, thread, "steve", steve_role, state, mode);
+        let mut steve_repl = ClientRepl::new(
+            steve,
+            thread,
+            "steve",
+            steve_role,
+            state,
+            mode,
+            Identity::default(),
+        );
 
         let (reviewer, welcome) = connect("reviewer").await;
         let reviewer_role = welcome.projects[0].role.clone();
         assert_eq!(reviewer_role.as_deref(), Some("read"));
         let (_, state, mode) = open(&reviewer, "p", Some(thread)).await;
         let reviewer_notices = reviewer.take_notices().unwrap();
-        let mut reviewer_repl =
-            ClientRepl::new(reviewer, thread, "reviewer", reviewer_role, state, mode);
+        let mut reviewer_repl = ClientRepl::new(
+            reviewer,
+            thread,
+            "reviewer",
+            reviewer_role,
+            state,
+            mode,
+            Identity::default(),
+        );
 
         let (magnus, _) = connect("magnus").await;
         open(&magnus, "p", Some(thread)).await;
@@ -2272,7 +2380,15 @@ mod tests {
         let role = welcome.projects[0].role.clone();
         let (thread, state, mode) = open(&client, "proj", None).await;
         let notices = client.take_notices().unwrap();
-        let mut repl = ClientRepl::new(client, thread, "steve", role, state, mode);
+        let mut repl = ClientRepl::new(
+            client,
+            thread,
+            "steve",
+            role,
+            state,
+            mode,
+            Identity::default(),
+        );
         let (tx, rx) = mpsc::unbounded_channel();
         let feeder = async move {
             let pause = || tokio::time::sleep(std::time::Duration::from_millis(400));
@@ -2399,7 +2515,15 @@ mod tests {
         let role = welcome.projects[0].role.clone();
         let (thread, state, mode) = open(&client, "proj", None).await;
         let notices = client.take_notices().unwrap();
-        let mut repl = ClientRepl::new(client, thread, "steve", role, state, mode);
+        let mut repl = ClientRepl::new(
+            client,
+            thread,
+            "steve",
+            role,
+            state,
+            mode,
+            Identity::default(),
+        );
         let (tx, rx) = mpsc::unbounded_channel();
         let feeder = async move {
             tx.send("go".into()).unwrap();

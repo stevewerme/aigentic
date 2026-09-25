@@ -101,10 +101,17 @@ pub enum Mail {
     Subscribe {
         from_seq: u64,
         notices: mpsc::UnboundedSender<Notice>,
-        /// The state, the events since `from_seq`, the mode's name.
-        reply: oneshot::Sender<(ThreadState, Vec<Event>, String)>,
+        /// The state, the events since `from_seq`, the mode's name,
+        /// and the profile, model label and effort the thread runs
+        /// with (issue #43).
+        reply: oneshot::Sender<(ThreadState, Vec<Event>, String, Identity)>,
     },
 }
+
+/// Who the thread runs as: the profile, its model and its effort
+/// label, carried on `Subscribe` so a client's footer can name them
+/// (issue #43).
+pub type Identity = (Option<String>, String, Option<String>);
 
 /// Renders the text reports a client prints (`/cost`, `/project`,
 /// `/policy`, `/memory`, `/skills`); the daemon's step 9 wires the tui's
@@ -144,6 +151,10 @@ struct Shared {
     last_queued_by: Mutex<Option<Author>>,
     /// The permission mode's name, for `Opened`.
     mode: Mutex<String>,
+    /// The profile, model and effort the thread runs with, for
+    /// `Opened` (issue #43). Replaced when a switch rebinds the
+    /// provider.
+    identity: Mutex<Identity>,
     /// When the running turn started; `None` while idle.
     started: Mutex<Option<Instant>>,
     /// The last window fill the runtime reported, re-sent when the queue
@@ -352,6 +363,7 @@ impl ThreadActor {
             steered: Mutex::new(0),
             last_queued_by: Mutex::new(None),
             mode: Mutex::new(runtime.mode().name().to_owned()),
+            identity: Mutex::new(runtime.identity()),
         });
         let (tx, rx) = mpsc::unbounded_channel();
         let mut actor = Self {
@@ -369,6 +381,25 @@ impl ThreadActor {
     /// Phase 2's resume: repair events are appended (and mirrored) and,
     /// when the log ended mid-turn or on an answered question, the first
     /// thing the actor does is continue that turn.
+    /// Tell the subscribers which profile, model and effort the thread
+    /// now runs with (issue #43), and remember it for the next
+    /// `Opened`.
+    fn announce_identity(&mut self) {
+        let identity = self.runtime.identity();
+        let (profile, model, effort) = identity.clone();
+        *self
+            .shared
+            .identity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = identity;
+        self.shared.broadcast(Notice::Model {
+            thread: self.shared.thread,
+            profile,
+            model,
+            effort,
+        });
+    }
+
     fn resume(&mut self, torn: Option<u64>) -> Result<(), aigentic_runtime::RuntimeError> {
         let shared = self.shared.clone();
         let system = Author::System;
@@ -514,17 +545,21 @@ impl ThreadActor {
             Mail::SwitchProject { ctx, by, reply } => {
                 let shared = self.shared.clone();
                 let sys = Author::System;
-                let _ = reply.send(
-                    match self
-                        .runtime
-                        .set_project(*ctx, by, &mut |s| shared.observe(s, &sys))
-                    {
-                        Ok(()) => Response::Ok,
-                        Err(e) => Response::Error {
-                            message: e.to_string(),
-                        },
+                let sent = match self
+                    .runtime
+                    .set_project(*ctx, by, &mut |s| shared.observe(s, &sys))
+                {
+                    Ok(()) => {
+                        // The new project's profile may run a different
+                        // model: tell the subscribers (issue #43).
+                        self.announce_identity();
+                        Response::Ok
+                    }
+                    Err(e) => Response::Error {
+                        message: e.to_string(),
                     },
-                );
+                };
+                let _ = reply.send(sent);
                 None
             }
             Mail::Interrupt { reply, .. } => {
@@ -579,7 +614,7 @@ impl ThreadActor {
         &self,
         from_seq: u64,
         notices: mpsc::UnboundedSender<Notice>,
-        reply: oneshot::Sender<(ThreadState, Vec<Event>, String)>,
+        reply: oneshot::Sender<(ThreadState, Vec<Event>, String, Identity)>,
     ) {
         // Snapshot and register under one lock, so no event is both
         // missed and unsent.
@@ -605,7 +640,8 @@ impl ThreadActor {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        let _ = reply.send((self.shared.state(), events, mode));
+        let identity = self.runtime.identity();
+        let _ = reply.send((self.shared.state(), events, mode, identity));
     }
 
     /// Run one turn, taking mail throughout, then any turns the mail
@@ -815,7 +851,12 @@ impl ThreadActor {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .clone();
-                let _ = reply.send((shared.state(), events, mode));
+                let identity = shared
+                    .identity
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                let _ = reply.send((shared.state(), events, mode, identity));
             }
             Mail::Status { reply } => {
                 let _ = reply.send(shared.state());

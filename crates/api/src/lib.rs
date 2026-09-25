@@ -175,6 +175,11 @@ pub enum ReportKind {
     Diff,
 }
 
+/// The model label a daemon sends when it knows none.
+fn unknown_model() -> String {
+    "unknown".to_owned()
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Response {
@@ -189,12 +194,23 @@ pub enum Response {
         thread: ThreadInfo,
     },
     /// The reply to `Open`: the state now, the events since `from_seq`,
-    /// and the thread's permission mode.
+    /// and the thread's permission mode, with the identity the footer
+    /// names (issue #43): the profile, its model label and its
+    /// reasoning effort, absent when the daemon does not know them.
     Opened {
         state: ThreadState,
         events: Vec<Event>,
         #[serde(default)]
         mode: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile: Option<String>,
+        /// The model the thread runs on. Always known: a daemon with no
+        /// profile sends `unknown`.
+        #[serde(default = "unknown_model")]
+        model: String,
+        /// The profile's reasoning effort, when it names one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<String>,
     },
     Ok,
     /// A rendered report, for the client to print as is.
@@ -248,6 +264,20 @@ pub enum Notice {
     Mode {
         thread: Ulid,
         mode: String,
+    },
+    /// The thread's identity changed (`/project`; issue #43). Sent
+    /// after the switch, as `Mode` is after `SetMode`; `None` means
+    /// the daemon does not know that part.
+    Model {
+        thread: Ulid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile: Option<String>,
+        /// The model the thread runs on. Always known: a daemon with
+        /// no profile sends `unknown`.
+        #[serde(default = "unknown_model")]
+        model: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<String>,
     },
     /// The window fill after a model call, a queue change or a turn's
     /// end (phase 6): what a status line shows. `turn_elapsed_ms` is
@@ -503,6 +533,9 @@ mod tests {
                 },
                 events: vec![event()],
                 mode: "manual".into(),
+                profile: Some("flash".into()),
+                model: "deepseek-v4.1-flash".into(),
+                effort: Some("50".into()),
             },
             Response::Ok,
             Response::Text {
@@ -560,6 +593,12 @@ mod tests {
                 thread: thread(),
                 mode: "auto".into(),
             },
+            Notice::Model {
+                thread: thread(),
+                profile: Some("flash".into()),
+                model: "deepseek-v4.1-flash".into(),
+                effort: Some("50".into()),
+            },
         ]
     }
 
@@ -615,6 +654,61 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// An `Opened` frame from a daemon that predates the identity
+    /// (issue #43) decodes with the three fields absent, and this
+    /// client then shows the footer it always did.
+    #[test]
+    fn an_opened_frame_without_the_identity_decodes_to_none() {
+        let line = encode(&Frame::response(
+            1,
+            Response::Opened {
+                state: ThreadState::Idle,
+                events: vec![],
+                mode: "auto".into(),
+                profile: Some("flash".into()),
+                model: "deepseek-v4.1-flash".into(),
+                effort: Some("50".into()),
+            },
+        ));
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["response"]["profile"], "flash");
+        assert_eq!(v["response"]["model"], "deepseek-v4.1-flash");
+        assert_eq!(v["response"]["effort"], "50");
+        let old =
+            r#"{"response":{"kind":"opened","state":{"state":"idle"},"events":[],"mode":"auto"}}"#;
+        let f = decode(old).unwrap();
+        match f.body {
+            Body::Response(Response::Opened {
+                profile,
+                model,
+                effort,
+                ..
+            }) => {
+                assert!(profile.is_none());
+                assert_eq!(model, "unknown", "a daemon that sends no model");
+                assert!(effort.is_none());
+            }
+            other => panic!("wrong body: {other:?}"),
+        }
+        // Nothing to name means nothing on the wire.
+        let line = encode(&Frame::response(
+            1,
+            Response::Opened {
+                state: ThreadState::Idle,
+                events: vec![],
+                mode: "auto".into(),
+                profile: None,
+                model: "unknown".into(),
+                effort: None,
+            },
+        ));
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert!(v["response"].get("profile").is_none());
+        assert!(v["response"].get("effort").is_none());
+        // The model is always on the wire, even when it is the stand-in.
+        assert_eq!(v["response"]["model"], "unknown");
     }
 
     /// A waiting human's questions ride the state; a daemon that does

@@ -114,6 +114,8 @@ pub struct Runtime {
     /// every `usage` line so a thread's spend is in the log itself
     /// (issue #31).
     pub(crate) profile: Option<String>,
+    /// The profile's effort label, for the wire only (issue #43).
+    pub(crate) effort: Option<String>,
     pub(crate) prices: Option<Prices>,
     /// The last call's reported prompt size and the context length it was
     /// measured at, so window fill is exact plus the estimated growth.
@@ -155,6 +157,7 @@ impl Runtime {
             compaction: DEFAULT_COMPACTION,
             model_label: "unknown".into(),
             profile: None,
+            effort: None,
             prices: None,
             measured: None,
             harness_instructions: None,
@@ -187,6 +190,7 @@ impl Runtime {
         self.provider = ctx.provider;
         self.model_label = ctx.model_label;
         self.profile = ctx.profile;
+        self.effort = ctx.effort;
         self.prices = ctx.prices;
         self.session_grants.clear();
         self.measured = None;
@@ -368,6 +372,17 @@ impl Runtime {
     /// The model name recorded on summaries: the profile's model.
     pub fn model_label(&self) -> &str {
         &self.model_label
+    }
+
+    /// The profile the thread's provider came from, and its effort
+    /// label, for a client's footer (issue #43). `None` when the config
+    /// sets neither.
+    pub fn identity(&self) -> (Option<String>, String, Option<String>) {
+        (
+            self.profile.clone(),
+            self.model_label.clone(),
+            self.effort.clone(),
+        )
     }
 
     pub fn with_compaction(mut self, settings: CompactionSettings) -> Self {
@@ -596,6 +611,10 @@ pub struct ProjectContext {
     pub provider: Box<dyn Provider>,
     pub model_label: String,
     pub profile: Option<String>,
+    /// The profile's reasoning effort, when it sets one. Carried to the
+    /// wire so a client's footer can name it (issue #43); the runtime
+    /// itself does not act on it.
+    pub effort: Option<String>,
     pub prices: Option<Prices>,
 }
 

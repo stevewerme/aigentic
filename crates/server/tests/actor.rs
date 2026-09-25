@@ -202,7 +202,7 @@ impl Rig {
                 reply,
             })
             .unwrap();
-        let (state, events, _mode) = reply_rx.await.unwrap();
+        let (state, events, _mode, _identity) = reply_rx.await.unwrap();
         (state, events.iter().map(|e| e.kind).collect(), rx)
     }
 
@@ -740,7 +740,7 @@ async fn a_resumed_open_turn_is_continued_before_the_first_mail() {
             reply,
         })
         .unwrap();
-    let (state, events, _mode) = reply_rx.await.unwrap();
+    let (state, events, _mode, _identity) = reply_rx.await.unwrap();
     assert_eq!(state, ThreadState::Idle);
     assert_eq!(
         events.iter().map(|e| e.kind).collect::<Vec<_>>(),

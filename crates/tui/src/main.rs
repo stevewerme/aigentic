@@ -25,7 +25,7 @@ use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use ulid::Ulid;
 
-use crate::app::engine::ClientRepl;
+use crate::app::engine::{ClientRepl, Identity};
 use crate::config::Config;
 use crate::project_cmd::ProjectCommand;
 use crate::skills_cmd::{SkillPaths, SkillsCommand};
@@ -467,7 +467,7 @@ async fn main() -> anyhow::Result<()> {
             other => bail!("unexpected reply creating a thread: {other:?}"),
         },
     };
-    let (state, events, mode) = match client
+    let (state, events, mode, identity) = match client
         .request(Request::Open {
             thread: thread_id,
             from_seq: 0,
@@ -478,7 +478,19 @@ async fn main() -> anyhow::Result<()> {
             state,
             events,
             mode,
-        } => (state, events, mode),
+            profile,
+            model,
+            effort,
+        } => (
+            state,
+            events,
+            mode,
+            Identity {
+                profile,
+                model,
+                effort,
+            },
+        ),
         Response::Refused { reason } => bail!("cannot open thread {thread_id}: {reason}"),
         other => bail!("unexpected reply opening the thread: {other:?}"),
     };
@@ -605,8 +617,16 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let notices = client.take_notices().context("notice stream")?;
-    let repl =
-        ClientRepl::new(client, thread_id, &welcome.user, role, state, mode).with_skills(skills);
+    let repl = ClientRepl::new(
+        client,
+        thread_id,
+        &welcome.user,
+        role,
+        state,
+        mode,
+        identity,
+    )
+    .with_skills(skills);
     app::run(repl, notices, history, project_name, project_root).await?;
     drop(embedded);
     Ok(())

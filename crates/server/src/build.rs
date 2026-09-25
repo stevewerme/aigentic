@@ -175,6 +175,10 @@ pub async fn project_context(
             provider,
             model_label: model,
             profile: Some(profile_name.clone()),
+            effort: config
+                .profiles
+                .get(&profile_name)
+                .and_then(|p| p.effort.clone()),
             prices: config
                 .profiles
                 .get(&profile_name)
@@ -245,4 +249,89 @@ pub async fn build_thread(
         profile: profile_name,
         mcp_skipped,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::pin::Pin;
+
+    use aigentic_runtime::aigentic_core::{
+        Capabilities, CompletionRequest, Message, ProviderEvent,
+    };
+    use futures_core::Stream;
+
+    /// A provider that says nothing: the context is what is under test.
+    struct Silent;
+
+    impl Provider for Silent {
+        fn complete(
+            &self,
+            _: &CompletionRequest<'_>,
+        ) -> Pin<Box<dyn Stream<Item = ProviderEvent> + Send + '_>> {
+            Box::pin(futures_util::stream::empty())
+        }
+
+        fn count_tokens(&self, _: &[Message]) -> u64 {
+            0
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                supports_tools: true,
+                supports_images: false,
+                supports_caching: false,
+                supports_structured_output: false,
+                max_context_tokens: 1,
+            }
+        }
+    }
+
+    struct Stub;
+
+    impl ProviderFactory for Stub {
+        fn build(&self, _: &str) -> Result<(Box<dyn Provider>, String), BuildError> {
+            Ok((Box::new(Silent), "stub-model".into()))
+        }
+    }
+
+    /// The profile, model and effort ride the context, which is what
+    /// the daemon reads at attach (issue #43). A profile with no effort
+    /// names none.
+    #[tokio::test]
+    async fn the_context_carries_the_profile_model_and_effort() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("p");
+        std::fs::create_dir_all(&root).unwrap();
+        let config = Config::parse(
+            "default_profile = \"plain\"\n[profiles.plain]\nprovider = \"anthropic\"\nmodel = \"m\"\napi_key_env = \"K\"\n\
+             [profiles.anthropic-test]\nprovider = \"anthropic\"\nmodel = \"m\"\napi_key_env = \"K\"\neffort = \"high\"\n",
+        )
+        .unwrap();
+
+        let root_of = |root: &Path| Root {
+            name: "p".into(),
+            root: root.to_path_buf(),
+            threads_dir: dir.path().join("threads"),
+        };
+        let with_effort = project_context(
+            &config,
+            dir.path(),
+            &Stub,
+            &root_of(&root),
+            &[],
+            Some("anthropic-test"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(with_effort.ctx.profile.as_deref(), Some("anthropic-test"));
+        assert_eq!(with_effort.ctx.model_label, "stub-model");
+        assert_eq!(with_effort.ctx.effort.as_deref(), Some("high"));
+
+        // The default profile sets no effort, and names none.
+        let plain = project_context(&config, dir.path(), &Stub, &root_of(&root), &[], None)
+            .await
+            .unwrap();
+        assert_eq!(plain.ctx.effort, None);
+    }
 }

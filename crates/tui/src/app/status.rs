@@ -8,10 +8,16 @@ use std::time::Duration;
 
 use aigentic_api::ThreadState;
 
+use crate::app::engine::Identity;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Status {
     /// The thread's project.
     pub project: String,
+    /// The profile, model and effort the daemon named at attach
+    /// (issue #43); `None` on a daemon that does not send them, which
+    /// leaves the line as it was.
+    pub identity: Option<Identity>,
     /// The thread's title, when it has one.
     pub title: Option<String>,
     pub mode: String,
@@ -26,7 +32,8 @@ pub struct Status {
 }
 
 impl Status {
-    /// `vendela · Crate count · manual · 58k / 128k context · queued 1`
+    /// `vendela · Crate count · flash (deepseek-v4.1-flash) · manual ·
+    /// 58k / 128k context · queued 1`
     pub fn line(&self) -> String {
         let mut parts = vec![self.project.clone()];
         if let Some(t) = &self.title {
@@ -36,6 +43,9 @@ impl Status {
             } else {
                 short
             });
+        }
+        if let Some(who) = self.identity.as_ref().and_then(Identity::label) {
+            parts.push(who);
         }
         parts.push(self.mode.clone());
         // The last call's context against the ceiling (issue #21): not
@@ -115,6 +125,7 @@ mod tests {
     fn the_line_reads_left_to_right() {
         let mut s = Status {
             project: "vendela".into(),
+            identity: None,
             title: None,
             mode: "manual".into(),
             usage: Some((31_000, 100_000)),
@@ -136,6 +147,71 @@ mod tests {
         // A fuller window than the ceiling still reads as itself.
         s.usage = Some((250_000, 100_000));
         assert_eq!(s.line(), "vendela · A title · manual · 250k / 100k context");
+    }
+
+    #[test]
+    fn the_line_names_the_profile_and_model_and_says_the_effort_when_one_is_set() {
+        let identity = |profile: Option<&str>, model: &str, effort: Option<&str>| Identity {
+            profile: profile.map(str::to_owned),
+            model: model.to_owned(),
+            effort: effort.map(str::to_owned),
+        };
+        let mut s = Status {
+            project: "vendela".into(),
+            identity: Some(identity(Some("flash"), "deepseek-v4.1-flash", None)),
+            mode: "auto".into(),
+            usage: Some((76_000, 128_000)),
+            ..Status::default()
+        };
+        assert_eq!(
+            s.line(),
+            "vendela · flash (deepseek-v4.1-flash) · auto · 76k / 128k context"
+        );
+        // The effort rides the model when the profile sets one.
+        s.identity = Some(identity(Some("flash"), "deepseek-v4.1-flash", Some("50")));
+        assert_eq!(
+            s.line(),
+            "vendela · flash (deepseek-v4.1-flash) · effort 50 · auto · 76k / 128k context"
+        );
+        // A thread with no profile names the model alone.
+        s.identity = Some(identity(None, "deepseek-v4.1-flash", None));
+        assert_eq!(
+            s.line(),
+            "vendela · deepseek-v4.1-flash · auto · 76k / 128k context"
+        );
+        // A daemon that knows no model leaves the line as it was.
+        s.identity = Some(identity(None, "unknown", None));
+        assert_eq!(s.line(), "vendela · auto · 76k / 128k context");
+        s.identity = None;
+        assert_eq!(s.line(), "vendela · auto · 76k / 128k context");
+    }
+
+    /// The model's own label: profile and model in one name, the effort
+    /// after it, and nothing for a stand-in or an empty model.
+    #[test]
+    fn the_identity_label() {
+        let who = |profile: Option<&str>, model: &str, effort: Option<&str>| {
+            Identity {
+                profile: profile.map(str::to_owned),
+                model: model.to_owned(),
+                effort: effort.map(str::to_owned),
+            }
+            .label()
+        };
+        assert_eq!(
+            who(Some("flash"), "deepseek-v4.1-flash", None).as_deref(),
+            Some("flash (deepseek-v4.1-flash)")
+        );
+        assert_eq!(
+            who(Some("kimi"), "k3", Some("max")).as_deref(),
+            Some("kimi (k3) · effort max")
+        );
+        assert_eq!(
+            who(None, "gpt-5", Some("low")).as_deref(),
+            Some("gpt-5 · effort low")
+        );
+        assert_eq!(who(None, "unknown", Some("low")), None);
+        assert_eq!(who(Some("flash"), "", None), None);
     }
 
     #[test]

@@ -455,7 +455,7 @@ async fn subscribe(
             message: "the thread's actor is gone".into(),
         };
     }
-    let Ok((state, events, mode)) = rx.await else {
+    let Ok((state, events, mode, (profile, model, effort))) = rx.await else {
         return Response::Error {
             message: "the thread's actor is gone".into(),
         };
@@ -475,6 +475,9 @@ async fn subscribe(
         state,
         events,
         mode,
+        profile,
+        model,
+        effort,
     }
 }
 

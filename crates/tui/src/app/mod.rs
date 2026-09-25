@@ -631,6 +631,7 @@ async fn run_shell(
         let state = engine.state().clone();
         status.apply_state(&state);
         status.mode = engine.mode().to_owned();
+        status.identity = Some(engine.identity().clone());
         if let Some(p) = engine.project() {
             status.project = p.to_owned();
         }
