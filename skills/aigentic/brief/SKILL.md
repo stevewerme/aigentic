@@ -18,9 +18,10 @@ Read first: the issue with its comments
 
 - **Trivial** (one function, an obvious fix, about 30 lines, no design
   choice): implementer alone.
-- **Everything else**: planner → implementer → reviewer.
-- **Visual or terminal UI changes**: the reviewer repeats the pty check.
-  Code-only changes get a lean review (diff plus tests).
+- **Everything else**: planner → implementer → verifier → judge.
+- **Visual or terminal UI changes**: the verifier runs the pty check.
+  The judge reads evidence; it re-runs a check only when the evidence is
+  thin or contradicts the diff.
 - **Several commits**: the planner splits them and names each message.
 
 ## 2. Find the code
@@ -40,7 +41,7 @@ against intent, not only wording.
 
 Give each role two separate fenced blocks: first the shell command that
 opens its thread (`aigentic --profile kimi --mode auto` for plan and
-review, `aigentic --profile flash --mode auto` to implement, from the
+judge, `aigentic --profile flash --mode auto` to implement and verify, from the
 repo root), then the prompt itself. Never put the command inside the
 prompt block. When asked, also save each prompt to
 `.scratch/prompts/<issue>-<n>-<role>.txt` so it can be copied with
@@ -52,8 +53,9 @@ prompt block. When asked, also save each prompt to
 - What the plan must contain: the cause as found in the code, exact
   functions and types to change and how, each test with how its expected
   value is derived (from the code or the rule, never by hand), the gate,
-  the commit message(s), and a reference check the reviewer can run when
-  the result is measurable.
+  the commit message(s), and a reference check the verifier can run when
+  the result is measurable. Number the planned tests (T1, T2, …) so the
+  implementer's ledger can refer to them.
 - Post one comment headed `## Plan` with `gh issue comment N --body-file <file>`;
   a length cap (60–90 lines); reply with the comment's URL.
 
@@ -76,23 +78,36 @@ prompt block. When asked, also save each prompt to
   prompt says both). Do not close the issue.
 - Last step: post the final report as one comment headed
   `## Implementation` (`gh issue comment N --body-file <file>`): what
-  changed per commit, tests added, any plan literal corrected and why, and
-  the pty dumps for UI work. The reviewer reads the issue, not the
-  implementer's thread.
+  changed per commit, any plan literal corrected and why, and a **test
+  ledger**: every planned test (T1, T2, …) with its name in the code and
+  `landed`, or `not landed` with the reason. A planned test may be dropped
+  only with a stated reason. Later steps read the issue, not this thread.
 - The safety line: never `git reset`, `git checkout -- <file>`,
   `git stash`, `git clean` or `git add -A`; commit nothing under
   `.scratch/`; leave `.aigentic/rules.toml` alone.
 
-**Reviewer** (profile `kimi`):
-- "Do not edit any file." Read the issue, plan, amendments, the
-  `## Implementation` comment (the implementer's evidence), and each
-  commit (`git show`).
-- Run the tests for the touched crates (`timeout_secs: 600`) and the
-  reference check; for UI work, repeat the pty check.
-- Post one comment headed `## Review`: does it do what the issue and plan
-  ask, what is missing or wrong with file and line, the evidence, and a
-  verdict (`approve`, or `changes needed` with a numbered list). On
-  approve, close the issue.
+**Verifier** (profile `flash`): the mechanical half of the review, on the
+cheap model.
+- "Do not edit any file." Read the plan, amendments and `## Implementation`.
+- Run the gate on the touched crates (`timeout_secs: 600`), each planned
+  test by name, the reference check, and for UI work the pty check.
+- Check the ledger against the code: every planned test exists under the
+  name the ledger gives, or has a stated reason.
+- Post one comment headed `## Verification` with the command outputs,
+  dumps and ledger check, and no verdict.
+
+**Judge** (profile `kimi`): the judgment half, a handful of calls.
+- "Do not edit any file." Read the issue, plan, amendments,
+  `## Implementation`, `## Verification`, and each commit (`git show`).
+- Judge: does the change do what the issue is *for* and what the plan
+  asks; is anything missing or wrong (file and line); do the evidence and
+  the diff agree. Re-run a check only when the evidence is thin or
+  contradicts the diff.
+- A planned test missing without a stated reason is `changes needed`.
+- Post one comment headed `## Review` with a verdict (`approve`, or
+  `changes needed` with a numbered list). On approve, post the closing
+  comment (files changed, tests added, what the issue got wrong or
+  "nothing") and close the issue.
 
 **Implementer alone** (trivial): the implementer prompt with the design
 written into it, plus the closing comment as a done-when item: files
@@ -102,4 +117,6 @@ changed, tests added, what the issue got wrong or "nothing", then close.
 
 Give the prompts in order as fenced blocks, one per thread, and say which
 step the person should pause after (after the plan, so it can be checked
-with `/plan-check`).
+with `/plan-check`). On "changes needed", the fix goes back to the
+implementer (a short prompt listing the numbered items), then verify and
+judge again.

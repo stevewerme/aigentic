@@ -15,6 +15,14 @@ so the rule can be judged, not just obeyed. The `brief`, `plan-check` and
   pays for ~95% of calls, mostly re-reading its cached context. Put the
   cheap model on the many calls, the strong one on the few. On #38/#39 the
   implement step cost $0.20–0.41 on Flash; the same tokens on GLM cost 3×.
+- **Review is split: verify on Flash, judge on Kimi.** The #43 review ran
+  tests and pty checks on Kimi for $6.86, 39% of the cycle. A verifier
+  (flash) posts `## Verification` with outputs and dumps; a judge (kimi)
+  reads evidence and diff and gives the verdict in a handful of calls.
+- **Every planned test is accounted for.** Flash dropped planned tests
+  silently on #37 and #43. The implementer's `## Implementation` carries a
+  ledger (T1, T2, … landed or not, with a reason); a planned test missing
+  without a reason is `changes needed`.
 - **Someone reads the plan before implementing.** Both trial plans had a
   flaw a second reader caught (#38: pipe filters counted as extra work,
   undoing #21; #31: retries collected and emitted after the fact, defeating
