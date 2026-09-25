@@ -220,7 +220,6 @@ pub const TOP_KEYS: &[&str] = &[
     "skills",
     "display",
 ];
-pub const FLAT_KEYS: &[&str] = &["base_url", "model", "api_key_env", "max_context_tokens"];
 pub const PROFILE_KEYS: &[&str] = &[
     "provider",
     "base_url",
@@ -740,7 +739,17 @@ transport = { stdio = { command = "npx" } }
     fn a_full_config_is_clean_and_a_typo_is_named() {
         let (_, unknown) = Config::parse_with(FULL_CONFIG).unwrap();
         assert_eq!(unknown, Vec::<String>::new(), "{FULL_CONFIG}");
-        assert_eq!(unknown, Vec::<String>::new(), "{FULL_CONFIG}");
+
+        // A positive suggestion: `efort` is one edit from `effort`, the
+        // key of the table the path names, and the expected text is the
+        // suggester's own output rather than a literal (issue #39).
+        let expected = Config::suggest_key("profiles.a.efort").expect("a suggestion");
+        assert_eq!(expected, "profiles.a.effort");
+        let (_, unknown) = Config::parse_with(
+            "[profiles.a]\nprovider = \"anthropic\"\nmodel = \"m\"\napi_key_env = \"K\"\nefort = \"high\"\n",
+        )
+        .unwrap();
+        assert_eq!(unknown, vec!["profiles.a.efort"]);
 
         let (_, unknown) = Config::parse_with(
             "[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n[profiles.a.compaction]\ntrigger_fraction = 0.8\ndefault_profile = \"x\"\n",
@@ -752,6 +761,125 @@ transport = { stdio = { command = "npx" } }
             None,
             "no key of that table is close enough"
         );
+    }
+
+    /// A profile without a table is `None`, not a zero price: nothing is
+    /// claimed about a call whose cost is unknown (issue #31).
+    #[test]
+    fn a_profile_without_prices_has_none() {
+        let c = Config::parse(EXAMPLE).unwrap();
+        let (_, p) = c.select(Some("anthropic")).unwrap();
+        assert!(p.prices.is_none());
+    }
+
+    /// The pins `profiles_parse_select_and_build` held before issue #37:
+    /// `select` by name and by default, the derived anthropic endpoint
+    /// and the capabilities each provider reports.
+    #[test]
+    fn profiles_parse_select_and_build() {
+        let c = Config::parse(EXAMPLE).unwrap();
+        assert_eq!(c.default_profile, "tensorx");
+        assert_eq!(c.select(None).unwrap().0, "tensorx");
+        let (_, a) = c.select(Some("anthropic")).unwrap();
+        assert_eq!(a.provider, ProviderKind::Anthropic);
+        assert_eq!(a.base_url, None);
+        assert_eq!(a.endpoint(), "api.anthropic.com");
+        let provider = a.build_provider("k".into());
+        assert!(provider.capabilities().supports_caching);
+        assert_eq!(provider.capabilities().max_context_tokens, 1_000_000);
+        let (_, t) = c.select(Some("tensorx")).unwrap();
+        assert!(!t.build_provider("k".into()).capabilities().supports_caching);
+    }
+
+    /// A single profile needs no `default_profile`, and `[compaction]`
+    /// keeps the defaults for the fields it leaves out. Issue #37 left
+    /// the range checks below with no other home: an unknown key is now
+    /// ignored, but an out-of-range value still fails.
+    #[test]
+    fn single_profile_needs_no_default() {
+        let c = Config::parse(
+            r#"[profiles.only]
+provider = "anthropic"
+model = "claude-opus-5"
+api_key_env = "ANTHROPIC_API_KEY"
+thinking = "off"
+effort = "low"
+cache = false
+
+[profiles.only.compaction]
+trigger_fraction = 0.5
+keep_turns = 3
+keep_last_calls = 20
+context_ceiling_tokens = 96_000
+"#,
+        )
+        .unwrap();
+        assert_eq!(c.default_profile, "only");
+        let (_, p) = c.select(None).unwrap();
+        assert!(!p.build_provider("k".into()).capabilities().supports_caching);
+        let s = p.compaction_settings();
+        assert_eq!((s.trigger_fraction, s.keep_turns), (0.5, 3));
+        assert_eq!((s.keep_last_calls, s.context_ceiling_tokens), (20, 96_000));
+        assert_eq!(s.max_result_bytes, DEFAULT_COMPACTION.max_result_bytes);
+        let bare = Config::parse(FLAT)
+            .unwrap()
+            .select(None)
+            .unwrap()
+            .1
+            .compaction_settings();
+        assert_eq!(
+            (bare.keep_last_calls, bare.context_ceiling_tokens),
+            (
+                DEFAULT_COMPACTION.keep_last_calls,
+                DEFAULT_COMPACTION.context_ceiling_tokens
+            ),
+            "an absent [compaction] keeps the defaults"
+        );
+        // `Profile::validate`'s range checks: out of range still fails,
+        // even though an unknown key beside it would be ignored.
+        assert!(Config::parse("[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n[profiles.a.compaction]\ntrigger_fraction = 2.0\n").is_err());
+        assert!(Config::parse("[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n[profiles.a.compaction]\ncontext_ceiling_tokens = 1024\n").is_err());
+        assert!(Config::parse("[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n[profiles.a.budget]\ncache_read_price_ratio = 1.5\n").is_err());
+        let c = Config::parse("[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n[global]\ninstructions = \"/x/i.md\"\n[tools]\ndenied = [\"mcp.*\"]\n[skills]\ndenied = [\"wizard\"]\n").unwrap();
+        assert_eq!(
+            c.global_instructions.as_deref(),
+            Some(std::path::Path::new("/x/i.md"))
+        );
+        assert_eq!(c.denied_tools, vec!["mcp.*"]);
+        assert_eq!(c.denied_skills, vec!["wizard"]);
+        // An unknown key in a section is ignored, not refused (issue
+        // #37); the `[profiles.a]` prefix keeps the flat form out of it.
+        let c = Config::parse("[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n[profiles.a.budget]\nmax_tokens = 5\ncache_read_price_ratio = 0.19\n").unwrap();
+        let b = c.profiles["a"].budget();
+        assert_eq!(
+            (b.max_iterations, b.max_tokens),
+            (DEFAULT_BUDGET.max_iterations, 5)
+        );
+        assert_eq!(b.max_wall_time, DEFAULT_BUDGET.max_wall_time);
+        assert_eq!(b.cache_read_price_ratio, 0.19);
+        assert_eq!(DEFAULT_BUDGET.cache_read_price_ratio, 0.25);
+    }
+
+    #[test]
+    fn display_caps_default_override_and_reject_the_unknown() {
+        let c = Config::parse(FLAT).unwrap();
+        assert_eq!(
+            (c.display.result_lines, c.display.result_bytes),
+            (3, 600),
+            "an absent [display] keeps the defaults"
+        );
+        let c = Config::parse(
+            "[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n\
+             [display]\nresult_lines = 10\nresult_bytes = 2000\n",
+        )
+        .unwrap();
+        assert_eq!((c.display.result_lines, c.display.result_bytes), (10, 2000));
+        // `FULL_CONFIG` sets `[display]` too, but it is the checklist for
+        // the walk's silence; these asserts are what says the values
+        // themselves parse.
+        let (c, unknown) = Config::parse_with(FULL_CONFIG).unwrap();
+        assert_eq!(unknown, Vec::<String>::new(), "{FULL_CONFIG}");
+        assert_eq!((c.display.result_lines, c.display.result_bytes), (4, 800));
     }
 
     #[test]

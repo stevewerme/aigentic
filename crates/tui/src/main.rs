@@ -647,4 +647,37 @@ mod tests {
         assert_eq!(cli.project.as_deref(), Some("alpha"));
         assert!(matches!(cli.command, Some(Command::Stats { .. })));
     }
+
+    /// Issue #37: `doctor` takes `--strict` (exit non-zero on a warning,
+    /// unknown config keys included) and leaves the rows at `warn`;
+    /// `--probe` and both flags together parse too.
+    #[test]
+    fn doctor_parses_strict_and_defaults_to_lenient() {
+        let cli = Cli::try_parse_from(["aigentic", "doctor"]).unwrap();
+        match cli.command {
+            Some(Command::Doctor { probe, strict }) => {
+                assert!(!probe);
+                assert!(!strict, "warnings pass unless --strict asks for more");
+            }
+            other => panic!("expected doctor: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["aigentic", "doctor", "--strict"]).unwrap();
+        match cli.command {
+            Some(Command::Doctor { probe, strict }) => {
+                assert!(!probe);
+                assert!(strict);
+            }
+            other => panic!("expected doctor: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["aigentic", "doctor", "--probe", "--strict"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Doctor {
+                probe: true,
+                strict: true
+            })
+        ));
+    }
 }
