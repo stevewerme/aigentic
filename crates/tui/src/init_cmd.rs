@@ -297,8 +297,10 @@ fn config_section(
             .with_context(|| format!("writing {}", config_path.display()))?;
         report.written.push(config_path.to_path_buf());
     }
-    let (check, config) = check_config(config_path);
-    ask.show(&check.render());
+    let (found, config) = check_config(config_path);
+    for check in &found {
+        ask.show(&check.render());
+    }
     let Some(mut config) = config else {
         bail!("fix the config and rerun");
     };

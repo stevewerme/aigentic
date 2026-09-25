@@ -48,16 +48,16 @@ pub struct Check {
 }
 
 impl Check {
-    fn ok(name: &str, message: impl Into<String>) -> Self {
+    pub fn ok(name: &str, message: impl Into<String>) -> Self {
         Self::new(name, Status::Ok, message)
     }
-    fn fail(name: &str, message: impl Into<String>) -> Self {
+    pub fn fail(name: &str, message: impl Into<String>) -> Self {
         Self::new(name, Status::Fail, message)
     }
     fn skip(name: &str, message: impl Into<String>) -> Self {
         Self::new(name, Status::Skip, message)
     }
-    fn new(name: &str, status: Status, message: impl Into<String>) -> Self {
+    pub fn new(name: &str, status: Status, message: impl Into<String>) -> Self {
         Self {
             name: name.to_owned(),
             status,
@@ -73,6 +73,33 @@ impl Check {
             self.name,
             self.message
         )
+    }
+}
+
+/// `warn` on stderr for every unknown key in the config and the project
+/// file, as the session starts (issue #37). The keys were ignored; this
+/// is where the user gets to hear about them. Nothing is printed when
+/// both files are clean.
+pub fn warn_unknown_keys(config_path: &Path, project: Option<&Project>) {
+    let mut lines = Vec::new();
+    if let Ok((_, unknown)) = Config::load_with(config_path) {
+        lines.extend(unknown);
+    }
+    if let Some(project) = project {
+        lines.extend(project.unknown.iter().cloned());
+    }
+    if lines.is_empty() {
+        return;
+    }
+    eprintln!(
+        "warn  config keys  ignoring {} unknown key(s):",
+        lines.len()
+    );
+    for path in lines {
+        match Config::suggest_key(&path).or_else(|| Project::suggest_key(&path)) {
+            Some(best) => eprintln!("      {path} (did you mean {best}?)"),
+            None => eprintln!("      {path}"),
+        }
     }
 }
 
@@ -102,29 +129,58 @@ impl Gh for GhCli {
 }
 
 /// The config file parses. On success the config comes back for the
-/// checks that need it.
-pub fn check_config(path: &Path) -> (Check, Option<Config>) {
-    match Config::load(path) {
-        Ok(config) => (
-            Check::ok(
-                "config",
-                format!(
-                    "{} ({} profiles, default {})",
-                    path.display(),
-                    config.profiles.len(),
-                    config.default_profile
+/// checks that need it, and any key it set that is not known is a `warn`
+/// check of its own (issue #37). The key is ignored, not refused.
+pub fn check_config(path: &Path) -> (Vec<Check>, Option<Config>) {
+    match Config::load_with(path) {
+        Ok((config, unknown)) => {
+            let mut checks = vec![unknown_keys("config", &unknown, Config::suggest_key)];
+            checks.insert(
+                0,
+                Check::ok(
+                    "config",
+                    format!(
+                        "{} ({} profiles, default {})",
+                        path.display(),
+                        config.profiles.len(),
+                        config.default_profile
+                    ),
                 ),
-            ),
-            Some(config),
-        ),
+            );
+            (checks, Some(config))
+        }
         Err(e) => {
             // Only the first line: `Config::load` appends the example file
             // when the config is missing, and the parser never echoes a
             // value.
             let first = e.to_string().lines().next().unwrap_or("").to_owned();
-            (Check::fail("config", first), None)
+            (vec![Check::fail("config", first)], None)
         }
     }
+}
+
+/// `warn` for every key `aigentic.toml` or `config.toml` set that the
+/// spec does not know, naming the dotted path and, when one is close, the
+/// key that was probably meant (issue #37). One check of its own, after
+/// the file's own line, so a run of them reads as a list.
+pub fn unknown_keys(
+    name: &str,
+    unknown: &[String],
+    suggest: impl Fn(&str) -> Option<String>,
+) -> Check {
+    if unknown.is_empty() {
+        return Check::ok(name, "all keys known");
+    }
+    let mut message = format!("{} unknown key(s): ", unknown.len());
+    let listed: Vec<String> = unknown
+        .iter()
+        .map(|path| match suggest(path) {
+            Some(best) => format!("{path} (did you mean {best}?)"),
+            None => path.clone(),
+        })
+        .collect();
+    message.push_str(&listed.join(", "));
+    Check::new(name, Status::Warn, message)
 }
 
 /// The profile's key variable is set. The name is reported, never the value.
@@ -492,21 +548,98 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(&path, GOOD).unwrap();
-        let (c, config) = check_config(&path);
-        assert_eq!(c.status, Status::Ok);
+        let (checks, config) = check_config(&path);
         assert!(config.is_some());
+        assert_eq!(checks.len(), 2, "the file's line and its key line");
+        let c = &checks[0];
+        assert_eq!(c.status, Status::Ok);
         assert!(c.message.contains("1 profiles, default a"), "{}", c.message);
         assert_eq!(c.render(), format!("ok    config          {}", c.message));
+        assert_eq!(checks[1].render(), "ok    config          all keys known");
 
-        let (c, config) = check_config(&dir.path().join("missing.toml"));
+        let (checks, config) = check_config(&dir.path().join("missing.toml"));
+        assert_eq!(checks.len(), 1);
+        let c = &checks[0];
         assert_eq!(c.status, Status::Fail);
         assert!(config.is_none());
         assert_eq!(c.message.lines().count(), 1, "{}", c.message);
 
+        // A key pasted into the file is refused by name, and the message
+        // never echoes the value.
         std::fs::write(&path, format!("{GOOD}api_key = \"sk-oops\"\n")).unwrap();
-        let (c, _) = check_config(&path);
+        let (checks, config) = check_config(&path);
+        let c = &checks[0];
         assert_eq!(c.status, Status::Fail);
+        assert!(config.is_none());
         assert!(!c.message.contains("sk-oops"), "{}", c.message);
+    }
+
+    /// Issue #37: an unknown key is ignored, the file still loads, and
+    /// the doctor says which key with a suggestion.
+    #[test]
+    fn an_unknown_config_key_is_a_warning_with_a_suggestion() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        // A top-level key and one inside `[display]`, so both a bare and
+        // a dotted path are covered.
+        std::fs::write(
+            &path,
+            format!("{GOOD}\ndefault_profil = \"a\"\n\n[display]\nresult_linez = 9\n"),
+        )
+        .unwrap();
+        let (checks, config) = check_config(&path);
+        assert!(config.is_some(), "the file still loads");
+        let c = &checks[1];
+        assert_eq!(c.status, Status::Warn);
+        assert_eq!(c.name, "config");
+        // Verified against the parser: TOML puts a key written after
+        // `[profiles.a]` inside that table, so the dotted path says so.
+        assert_eq!(
+            c.message,
+            "2 unknown key(s): display.result_linez (did you mean display.result_lines?), \
+             profiles.a.default_profil"
+        );
+        // The warning is its own line, so the file's own line stays `ok`,
+        // and the ignored key leaves the parsed value at its default.
+        assert_eq!(checks[0].status, Status::Ok);
+        assert_eq!(config.unwrap().display.result_lines, 3);
+        assert!(c.render().starts_with("warn  config"));
+    }
+
+    /// The project side of the same rule: `aigentic.toml`'s unknown key
+    /// is a warning with `bash_timeout_secs`'s near neighbour named.
+    #[test]
+    fn an_unknown_project_key_is_a_warning_with_a_suggestion() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("aigentic.toml"),
+            "[project]\nname = \"p\"\n[tools]\nbash_timout_secs = 5\n",
+        )
+        .unwrap();
+        let project = aigentic_runtime::project::Project::open(dir.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(project.unknown, vec!["tools.bash_timout_secs"]);
+        // The ignored key left the default in place.
+        assert_eq!(project.file.tools.bash_timeout_secs, None);
+        let c = unknown_keys("project keys", &project.unknown, Project::suggest_key);
+        assert_eq!(c.status, Status::Warn);
+        assert_eq!(
+            c.message,
+            "1 unknown key(s): tools.bash_timout_secs (did you mean tools.bash_timeout_secs?)"
+        );
+    }
+
+    /// A clean file warns about nothing.
+    #[test]
+    fn a_clean_config_has_no_key_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, GOOD).unwrap();
+        let (checks, _) = check_config(&path);
+        let names: Vec<&str> = checks.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["config", "config"]);
+        assert!(checks.iter().all(|c| c.status == Status::Ok));
     }
 
     #[test]

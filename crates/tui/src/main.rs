@@ -130,6 +130,9 @@ enum Command {
         /// Also send one tiny completion per profile (the only network use).
         #[arg(long)]
         probe: bool,
+        /// Exit non-zero on a warning too, unknown config keys included.
+        #[arg(long)]
+        strict: bool,
     },
 }
 
@@ -177,8 +180,8 @@ async fn main() -> anyhow::Result<()> {
     let config_path = cli.config.unwrap_or_else(config::default_config_path);
     let cwd = std::env::current_dir().context("current directory")?;
     // The doctor reports what the loading below would refuse on.
-    if let Some(Command::Doctor { probe }) = cli.command {
-        let code = doctor::run(&config_path, &cwd, probe).await?;
+    if let Some(Command::Doctor { probe, strict }) = cli.command {
+        let code = doctor::run(&config_path, &cwd, probe, strict).await?;
         std::process::exit(code);
     }
     if let Some(Command::Init) = cli.command {
@@ -205,6 +208,7 @@ async fn main() -> anyhow::Result<()> {
             );
             return Ok(());
         }
+        checks::warn_unknown_keys(&config_path, None);
         let config = Config::load(&config_path)?;
         let config_dir = config_path
             .parent()
@@ -236,6 +240,9 @@ async fn main() -> anyhow::Result<()> {
     // The nearest aigentic.toml at or above the working directory; the
     // tools still work where the user launched.
     let opened = Project::open(&cwd)?;
+    // An unknown key in either file was ignored while loading; say so
+    // once, here, rather than refuse the session (issue #37).
+    checks::warn_unknown_keys(&config_path, opened.as_ref());
     let project_root = opened
         .as_ref()
         .map_or_else(|| cwd.clone(), |p| p.root.clone());
