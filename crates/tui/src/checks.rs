@@ -516,6 +516,75 @@ fn warn_note(profile: &Profile, e: &ProviderError) -> Option<String> {
     })
 }
 
+/// One row of the effort comparison: what one call at one effort cost.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffortCall {
+    pub effort: String,
+    pub output_tokens: u64,
+    /// `None` when the endpoint does not split reasoning out of output.
+    pub reasoning_tokens: Option<u64>,
+}
+
+/// Issue #44 (amendment 2.2): send the same tiny prompt through the
+/// profile at two efforts and report each call's usage side by side. A
+/// probe that answers `ok` proves only that the endpoint accepts the
+/// field; this shows whether it changes what the call produces. The
+/// configured effort is overridden per call, so no config is edited.
+///
+/// `Err` carries the endpoint's answer when a call failed, never a key.
+pub async fn compare_efforts(
+    profile: &Profile,
+    efforts: [aigentic_runtime::aigentic_providers::ReasoningEffort; 2],
+) -> Result<Vec<EffortCall>, String> {
+    let key = profile
+        .api_key()
+        .map_err(|_| format!("{} is not set", profile.api_key_env))?;
+    let mut rows = Vec::new();
+    for effort in efforts {
+        let label = effort.label();
+        let provider = profile.build_provider_with_effort(key.clone(), Some(effort));
+        let messages = [Message {
+            role: Role::User,
+            author: Author::User(UserId("doctor".into())),
+            blocks: vec![ContentBlock::Text(PROMPT.into())],
+        }];
+        let request = CompletionRequest {
+            messages: &messages,
+            tools: &[],
+            max_output_tokens: None,
+        };
+        let mut stream = provider.complete(&request);
+        let mut usage = None;
+        let mut failure = None;
+        while let Some(event) = stream.next().await {
+            match event {
+                ProviderEvent::Usage(u) => usage = Some(u),
+                ProviderEvent::Error(e) => {
+                    failure = Some(e.to_string());
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let Some(usage) = usage else {
+            return Err(match failure {
+                Some(e) => format!("effort {label}: {e}"),
+                None => format!("effort {label}: stream ended with no usage"),
+            });
+        };
+        rows.push(EffortCall {
+            effort: label,
+            output_tokens: usage.output_tokens,
+            reasoning_tokens: usage.reasoning_tokens,
+        });
+    }
+    Ok(rows)
+}
+
+/// The comparison's prompt: small, deterministic, and the same for both
+/// calls, so the two usages are comparable.
+const PROMPT: &str = "Name the capital of France in one word. Answer with the word only.";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -561,6 +630,50 @@ mod tests {
                 .clone()
                 .map_err(|e| anyhow::anyhow!("gh auth status failed: {e}"))
         }
+    }
+
+    /// A stub endpoint (the pattern in `openai_compat`'s tests): it
+    /// answers every request with `status` and `body`, and hands the
+    /// first request's body back so a caller can assert what was asked
+    /// for. Returns the base URL and the shared request slot.
+    ///
+    /// A `400` is not retried (`retryable` excludes it), so one
+    /// connection is one call; the loop still accepts more than one so a
+    /// test that expects a retry cannot hang the stub thread.
+    fn stub_endpoint(
+        status: u16,
+        body: &'static str,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = std::sync::Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut conn) = conn else { break };
+                let mut buf = [0u8; 65536];
+                let n = conn.read(&mut buf).unwrap_or(0);
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&buf[..n]).into_owned());
+                let reason = match status {
+                    400 => "Bad Request",
+                    401 => "Unauthorized",
+                    _ => "Error",
+                };
+                let _ = conn.write_all(
+                    format!(
+                        "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+        (format!("http://{addr}/v1"), seen)
     }
 
     const GOOD: &str = "[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"AIGENTIC_DOCTOR_TEST_KEY\"\n";
@@ -901,22 +1014,52 @@ mod tests {
         assert!(c.message.contains("AIGENTIC_DOCTOR_TEST_KEY"));
     }
 
-    /// Issue #44, T12: an endpoint that rejects the configured effort
-    /// warns — the profile still runs at the provider's default — and
-    /// the note names the param, never the response, so no request or
-    /// secret can leak through it.
+    /// Issue #44, T12 (amendment 1.3): a stub endpoint answers `400` with
+    /// a body naming the configured param, and `check_probe` reports
+    /// `Status::Warn` — the profile still runs at the provider's
+    /// default. The fixture sets `api_key_env = "PATH"`, which is set in
+    /// any process, so the probe reaches the stub instead of skipping;
+    /// the note names the param and never the response body, so no
+    /// request or secret can leak through it.
     #[tokio::test]
-    async fn a_rejected_effort_param_warns_instead_of_failing() {
+    async fn a_rejected_reasoning_effort_probe_is_a_warning() {
+        let (base, seen) = stub_endpoint(
+            400,
+            r#"{"error":{"message":"unknown field: reasoning_effort"}}"#,
+        );
+        let config = Config::parse(&format!(
+            "[profiles.a]\nbase_url = \"{base}\"\nmodel = \"m\"\napi_key_env = \"PATH\"\n\
+             reasoning_effort = 50\n"
+        ))
+        .unwrap();
+        let profile = config.profiles["a"].clone();
+        assert_eq!(profile.effort_param(), Some("reasoning_effort"));
+
+        let c = check_probe("a", &profile).await;
+        assert_eq!(c.status, Status::Warn, "{}", c.message);
+        assert!(c.message.contains("reasoning_effort"), "{}", c.message);
+        assert!(c.message.contains("provider default"), "{}", c.message);
+        // The response body is never quoted, so nothing the endpoint
+        // said can reach the report.
+        assert!(!c.message.contains("unknown field"), "{}", c.message);
+
+        // The stub saw the effort the profile configured, under the
+        // param the profile named.
+        let asked = seen.lock().unwrap();
+        assert_eq!(asked.len(), 1, "a 400 is not retried: {asked:?}");
+        let body = asked[0].split("\r\n\r\n").nth(1).unwrap_or_default();
+        assert!(body.contains("\"reasoning_effort\":50"), "{body}");
+    }
+
+    /// The direct matrix behind the note: only a `400` whose body names
+    /// the configured param warns; every other error is no note at all.
+    #[test]
+    fn only_a_400_naming_the_param_warns() {
         let config = Config::parse(
-            "[profiles.a]\nbase_url = \"http://127.0.0.1:1/v1\"\nmodel = \"m\"\napi_key_env = \"AIGENTIC_DOCTOR_TEST_KEY\"\nreasoning_effort = 50\nreasoning_effort_param = \"thinking.effort\"\n",
+            "[profiles.a]\nbase_url = \"http://127.0.0.1:1/v1\"\nmodel = \"m\"\napi_key_env = \"PATH\"\n\
+             reasoning_effort = 50\nreasoning_effort_param = \"thinking.effort\"\n",
         )
         .unwrap();
-        assert!(std::env::var("AIGENTIC_DOCTOR_TEST_KEY").is_err());
-        let c = check_probe("a", &config.profiles["a"]).await;
-        assert_eq!(c.status, Status::Skip, "{}", c.message);
-
-        // The branch, driven directly: a 400 whose body names the param
-        // is a capability note, anything else stays a failure.
         let profile = config.profiles["a"].clone();
         for (rejected, warn) in [
             (
@@ -963,9 +1106,33 @@ mod tests {
         assert!(warn_note(&plain.profiles["a"], &e).is_none());
     }
 
-    /// Issue #44, T13: the anthropic profile sends its effort as
-    /// `output_config.effort`, and the configured `effort` string is
-    /// what reaches the wire.
+    /// Issue #44, T13: the same stub, but the profile configures no
+    /// effort — an unexplained 400 stays an outage.
+    #[tokio::test]
+    async fn a_400_without_an_effort_config_is_a_fail() {
+        let (base, seen) = stub_endpoint(
+            400,
+            r#"{"error":{"message":"unknown field: reasoning_effort"}}"#,
+        );
+        let config = Config::parse(&format!(
+            "[profiles.a]\nbase_url = \"{base}\"\nmodel = \"m\"\napi_key_env = \"PATH\"\n"
+        ))
+        .unwrap();
+        let profile = config.profiles["a"].clone();
+        assert_eq!(profile.effort_param(), None);
+
+        let c = check_probe("a", &profile).await;
+        assert_eq!(c.status, Status::Fail, "{}", c.message);
+        assert!(c.message.contains("http 400"), "{}", c.message);
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    /// Issue #44: an openai_compat profile may nest its effort
+    /// (`reasoning_effort_param = "thinking.effort"`); amendment 2.1's
+    /// aside claimed Anthropic does the same. It does not — the
+    /// anthropic adapter sends its effort at `output_config.effort`, and
+    /// the configured `effort` string is what reaches the wire. This
+    /// pins that answer; it is not a planned test.
     #[test]
     fn an_anthropic_effort_lands_in_output_config() {
         let config = Config::parse(

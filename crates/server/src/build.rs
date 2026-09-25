@@ -402,20 +402,20 @@ mod tests {
             let identity = built.runtime.identity();
             assert_eq!(identity.0.as_deref(), Some(profile));
             assert_eq!(identity.2.as_deref(), Some(expected.as_str()));
-
-            // And the same effort is stamped on the call that runs.
-            let plain = build_thread(
-                &config,
-                dir.path(),
-                &Stub,
-                &root,
-                &[],
-                Ulid::from_datetime(std::time::SystemTime::now()),
-                Some("plain"),
-            )
-            .await
-            .unwrap();
-            assert_eq!(plain.runtime.identity().2, None);
         }
+
+        // A profile that sets no effort carries none on its identity.
+        let plain = build_thread(
+            &config,
+            dir.path(),
+            &Stub,
+            &root,
+            &[],
+            Ulid::from_datetime(std::time::SystemTime::now()),
+            Some("plain"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(plain.runtime.identity().2, None);
     }
 }

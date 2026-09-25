@@ -5,13 +5,95 @@
 
 use std::path::Path;
 
+use aigentic_runtime::aigentic_providers::ReasoningEffort;
+
 use crate::checks::{
     Check, GhCli, Status, check_api_key_env, check_config, check_env_ignored, check_github,
     check_participants, check_probe, check_project, check_skills, check_threads_dir, check_window,
-    origin_url, unknown_keys,
+    compare_efforts, origin_url, unknown_keys,
 };
 use crate::config;
 use crate::skills_cmd::SkillPaths;
+
+/// `aigentic doctor --probe-effort LOW,HIGH [--profile NAME]`: one tiny
+/// prompt at each effort, both usages side by side. Prints the table and
+/// returns 0 when both calls answered, 2 when one did not (the doctor's
+/// existing "cannot tell" code is 1; 2 keeps the two apart).
+pub async fn compare(
+    config_path: &Path,
+    profile_name: Option<&str>,
+    pair: &str,
+) -> anyhow::Result<i32> {
+    let Some((low, high)) = pair.split_once(',') else {
+        anyhow::bail!("--probe-effort wants LOW,HIGH, got {pair:?}");
+    };
+    let efforts = [parse_effort(low)?, parse_effort(high)?];
+    let config = config::Config::load(config_path)?;
+    let (name, profile) = match profile_name {
+        Some(name) => (
+            name,
+            config.profiles.get(name).ok_or_else(|| {
+                anyhow::anyhow!("no profile {name:?} in {}", config_path.display())
+            })?,
+        ),
+        None => {
+            let (name, profile) = config.select(None)?;
+            (name, profile)
+        }
+    };
+    println!(
+        "effort comparison · profile {name} · {} · {}",
+        profile.endpoint(),
+        profile.model
+    );
+    match compare_efforts(profile, efforts).await {
+        Ok(calls) => {
+            println!(
+                "{:<10} {:>14} {:>17}",
+                "effort", "output_tokens", "reasoning_tokens"
+            );
+            for c in &calls {
+                let reasoning = c
+                    .reasoning_tokens
+                    .map_or_else(|| "-".to_owned(), |n| n.to_string());
+                println!("{:<10} {:>14} {:>17}", c.effort, c.output_tokens, reasoning);
+            }
+            let [a, b] = &calls[..] else {
+                unreachable!("two calls were asked for");
+            };
+            if a.output_tokens == b.output_tokens && a.reasoning_tokens == b.reasoning_tokens {
+                println!(
+                    "no difference at efforts {} and {}: the endpoint looks like it ignores the field",
+                    a.effort, b.effort
+                );
+            } else {
+                println!(
+                    "efforts {} and {} differ: the endpoint honours the field",
+                    a.effort, b.effort
+                );
+            }
+            Ok(0)
+        }
+        Err(e) => {
+            // The endpoint's own words, never a key: the API key never
+            // enters this message (it comes from the environment).
+            println!("comparison could not run: {e}");
+            Ok(2)
+        }
+    }
+}
+
+/// `1` or `low`: an integer or a label, the two shapes the config takes.
+fn parse_effort(text: &str) -> anyhow::Result<ReasoningEffort> {
+    let text = text.trim();
+    if let Ok(n) = text.parse::<u64>() {
+        return Ok(ReasoningEffort::Int(n));
+    }
+    if text.is_empty() {
+        anyhow::bail!("--probe-effort: an empty effort");
+    }
+    Ok(ReasoningEffort::Label(text.to_owned()))
+}
 
 /// Run every check and print it; `1` when any failed, or when `strict`
 /// and any key was unknown.

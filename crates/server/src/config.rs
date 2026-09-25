@@ -627,6 +627,18 @@ impl Profile {
     /// Build the adapter. `api_key` is passed in so this stays testable
     /// without touching the environment.
     pub fn build_provider(&self, api_key: String) -> Box<dyn Provider> {
+        self.build_provider_with_effort(api_key, None)
+    }
+
+    /// `build_provider` with the openai_compat effort overridden (issue
+    /// #44, amendment 2.2): the doctor's effort comparison runs the same
+    /// prompt at two efforts without editing the config. `None` uses the
+    /// profile's own effort, so every other caller is unchanged.
+    pub fn build_provider_with_effort(
+        &self,
+        api_key: String,
+        effort: Option<ReasoningEffort>,
+    ) -> Box<dyn Provider> {
         match self.provider {
             ProviderKind::OpenaiCompat => {
                 let mut c =
@@ -635,16 +647,24 @@ impl Profile {
                 if let Some(n) = self.max_context_tokens {
                     c = c.with_max_context_tokens(n);
                 }
-                if let Some(effort) = &self.reasoning_effort {
+                let chosen = effort.or_else(|| self.reasoning_effort.clone());
+                if let Some(effort) = chosen {
                     c = c.with_reasoning_effort(
                         self.reasoning_effort_param
                             .as_deref()
                             .unwrap_or(REASONING_EFFORT_PARAM),
-                        effort.clone(),
+                        effort,
                     );
                 }
                 Box::new(OpenAiCompat::new(c))
             }
+            ProviderKind::Anthropic => self.build_anthropic(api_key),
+        }
+    }
+
+    fn build_anthropic(&self, api_key: String) -> Box<dyn Provider> {
+        match self.provider {
+            ProviderKind::OpenaiCompat => unreachable!("callers check the provider"),
             ProviderKind::Anthropic => {
                 let mut c = AnthropicConfig::new(api_key, &self.model);
                 if let Some(u) = &self.base_url {
@@ -995,26 +1015,68 @@ context_ceiling_tokens = 96_000
 
     #[test]
     fn bad_files_are_rejected_without_echoing_values() {
-        let cases = [
-            format!("{EXAMPLE}\napi_key = \"sk-oops\"\n"),
-            format!("{FLAT}\n[profiles.x]\nmodel = \"m\"\napi_key_env = \"K\"\nbase_url = \"u\"\n"),
-            "default_profile = \"nope\"\n[profiles.a]\nmodel = \"m\"\napi_key_env = \"K\"\nbase_url = \"u\"\n".into(),
-            "[profiles.a]\nmodel = \"m\"\napi_key_env = \"K\"\n".into(), // openai without base_url
-            "[profiles.a]\nprovider = \"anthropic\"\nmodel = \"m\"\napi_key_env = \"K\"\nthinking = \"lots\"\n".into(),
-            "[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\neffort = \"high\"\n".into(),
+        // (fixture, the field the message must name). The field comes
+        // from the fixture's own text, not a literal here: only the two
+        // #44 cases carry a second element, and it is the key that
+        // fixture sets.
+        let cases: [(&str, Option<&str>); 12] = [
+            (&format!("{EXAMPLE}\napi_key = \"sk-oops\"\n"), None),
+            (
+                &format!(
+                    "{FLAT}\n[profiles.x]\nmodel = \"m\"\napi_key_env = \"K\"\nbase_url = \"u\"\n"
+                ),
+                None,
+            ),
+            (
+                "default_profile = \"nope\"\n[profiles.a]\nmodel = \"m\"\napi_key_env = \"K\"\nbase_url = \"u\"\n",
+                None,
+            ),
+            (
+                "[profiles.a]\nmodel = \"m\"\napi_key_env = \"K\"\n", // openai without base_url
+                None,
+            ),
+            (
+                "[profiles.a]\nprovider = \"anthropic\"\nmodel = \"m\"\napi_key_env = \"K\"\nthinking = \"lots\"\n",
+                None,
+            ),
+            (
+                "[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\neffort = \"high\"\n",
+                Some("effort"),
+            ),
             // Issue #44, the anthropic mirror: the openai-only keys are
             // refused there, by name.
-            "[profiles.a]\nprovider = \"anthropic\"\nmodel = \"m\"\napi_key_env = \"K\"\nreasoning_effort = 50\n".into(),
-            "[profiles.a]\nprovider = \"anthropic\"\nmodel = \"m\"\napi_key_env = \"K\"\nreasoning_effort_param = \"reasoning_effort\"\n".into(),
+            (
+                "[profiles.a]\nprovider = \"anthropic\"\nmodel = \"m\"\napi_key_env = \"K\"\nreasoning_effort = 50\n",
+                Some("reasoning_effort"),
+            ),
+            (
+                "[profiles.a]\nprovider = \"anthropic\"\nmodel = \"m\"\napi_key_env = \"K\"\nreasoning_effort_param = \"reasoning_effort\"\n",
+                Some("reasoning_effort_param"),
+            ),
             // A param without an effort, and an empty segment in one.
-            "[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\nreasoning_effort_param = \"reasoning_effort\"\n".into(),
-            "[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\nreasoning_effort = 50\nreasoning_effort_param = \"thinking..effort\"\n".into(),
-            "[profiles.a]\nprovider = \"gemini\"\nmodel = \"m\"\napi_key_env = \"K\"\n".into(),
-            "model = \"m\"\n".into(),
+            (
+                "[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\nreasoning_effort_param = \"reasoning_effort\"\n",
+                Some("reasoning_effort_param"),
+            ),
+            (
+                "[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\nreasoning_effort = 50\nreasoning_effort_param = \"thinking..effort\"\n",
+                Some("reasoning_effort_param"),
+            ),
+            (
+                "[profiles.a]\nprovider = \"gemini\"\nmodel = \"m\"\napi_key_env = \"K\"\n",
+                None,
+            ),
+            ("model = \"m\"\n", None),
         ];
-        for text in cases {
-            let err = Config::parse(&text).unwrap_err().to_string();
+        for (text, field) in cases {
+            let err = Config::parse(text).unwrap_err().to_string();
             assert!(!err.contains("sk-oops"), "value echoed: {err}");
+            if let Some(field) = field {
+                // The key this fixture sets is a substring of the field
+                // the message must name.
+                assert!(text.contains(field), "fixture does not set {field}");
+                assert!(err.contains(field), "{field} not named in {err}");
+            }
         }
     }
 

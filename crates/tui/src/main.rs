@@ -130,6 +130,12 @@ enum Command {
         /// Also send one tiny completion per profile (the only network use).
         #[arg(long)]
         probe: bool,
+        /// Compare two efforts on `--profile`: `LOW,HIGH`, each an
+        /// integer or a label. Sends the same prompt twice and prints
+        /// both calls' output and reasoning tokens. The effort comes
+        /// from this flag, so the config is never edited.
+        #[arg(long, value_name = "LOW,HIGH")]
+        probe_effort: Option<String>,
         /// Exit non-zero on a warning too, unknown config keys included.
         #[arg(long)]
         strict: bool,
@@ -180,7 +186,16 @@ async fn main() -> anyhow::Result<()> {
     let config_path = cli.config.unwrap_or_else(config::default_config_path);
     let cwd = std::env::current_dir().context("current directory")?;
     // The doctor reports what the loading below would refuse on.
-    if let Some(Command::Doctor { probe, strict }) = cli.command {
+    if let Some(Command::Doctor {
+        probe,
+        probe_effort,
+        strict,
+    }) = cli.command
+    {
+        if let Some(pair) = probe_effort {
+            let code = doctor::compare(&config_path, cli.profile.as_deref(), &pair).await?;
+            std::process::exit(code);
+        }
         let code = doctor::run(&config_path, &cwd, probe, strict).await?;
         std::process::exit(code);
     }
@@ -675,8 +690,13 @@ mod tests {
     fn doctor_parses_strict_and_defaults_to_lenient() {
         let cli = Cli::try_parse_from(["aigentic", "doctor"]).unwrap();
         match cli.command {
-            Some(Command::Doctor { probe, strict }) => {
+            Some(Command::Doctor {
+                probe,
+                probe_effort,
+                strict,
+            }) => {
                 assert!(!probe);
+                assert!(probe_effort.is_none());
                 assert!(!strict, "warnings pass unless --strict asks for more");
             }
             other => panic!("expected doctor: {other:?}"),
@@ -684,8 +704,13 @@ mod tests {
 
         let cli = Cli::try_parse_from(["aigentic", "doctor", "--strict"]).unwrap();
         match cli.command {
-            Some(Command::Doctor { probe, strict }) => {
+            Some(Command::Doctor {
+                probe,
+                probe_effort,
+                strict,
+            }) => {
                 assert!(!probe);
+                assert!(probe_effort.is_none());
                 assert!(strict);
             }
             other => panic!("expected doctor: {other:?}"),
@@ -696,8 +721,18 @@ mod tests {
             cli.command,
             Some(Command::Doctor {
                 probe: true,
+                probe_effort: _,
                 strict: true
             })
         ));
+
+        // The comparison's pair is parsed off the flag unchanged.
+        let cli = Cli::try_parse_from(["aigentic", "doctor", "--probe-effort", "1,100"]).unwrap();
+        match cli.command {
+            Some(Command::Doctor { probe_effort, .. }) => {
+                assert_eq!(probe_effort.as_deref(), Some("1,100"));
+            }
+            other => panic!("expected doctor: {other:?}"),
+        }
     }
 }
