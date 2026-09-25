@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 
 use aigentic_runtime::aigentic_core::{Budget, Provider};
 use aigentic_runtime::aigentic_providers::{
-    Anthropic, AnthropicConfig, OpenAiCompat, OpenAiCompatConfig, Thinking,
+    Anthropic, AnthropicConfig, OpenAiCompat, OpenAiCompatConfig, REASONING_EFFORT_PARAM,
+    ReasoningEffort, Thinking,
 };
 use aigentic_runtime::config_keys::Table;
 use aigentic_runtime::project::{
@@ -61,6 +62,17 @@ pub struct Profile {
     /// `anthropic` only: `max_tokens` when the runtime sets no cap.
     #[serde(default)]
     pub max_output_tokens: Option<u64>,
+    /// `openai_compat` only: the reasoning effort to send. An integer
+    /// (DeepSeek takes 1-100) or a label (`low` | `medium` | `high`);
+    /// accepted values differ per endpoint, so the doctor's probe is the
+    /// check. Absent means the field is not sent (issue #44).
+    #[serde(default)]
+    pub reasoning_effort: Option<ReasoningEffort>,
+    /// `openai_compat` only: the param name the endpoint expects for the
+    /// effort, a dotted path when it nests it. Defaults to
+    /// `reasoning_effort` (issue #44).
+    #[serde(default)]
+    pub reasoning_effort_param: Option<String>,
     /// `anthropic` only: emit cache breakpoints (default true).
     #[serde(default)]
     pub cache: Option<bool>,
@@ -229,6 +241,8 @@ pub const PROFILE_KEYS: &[&str] = &[
     "thinking",
     "effort",
     "max_output_tokens",
+    "reasoning_effort",
+    "reasoning_effort_param",
     "cache",
     "compaction",
     "budget",
@@ -276,6 +290,9 @@ provider = "openai_compat"
 base_url = "https://api.tensorx.ai/v1"
 model = "z-ai/glm-5.3"
 api_key_env = "TENSORX_API_KEY"
+# An integer 1-100 or "low"/"medium"/"high"; absent sends nothing.
+# reasoning_effort = 50
+# reasoning_effort_param = "reasoning_effort"
 
 [profiles.anthropic]
 provider = "anthropic"
@@ -377,6 +394,8 @@ fn parse_config(text: &str) -> Result<Config, ConfigError> {
                     thinking: None,
                     effort: None,
                     max_output_tokens: None,
+                    reasoning_effort: None,
+                    reasoning_effort_param: None,
                     cache: None,
                     compaction: None,
                     budget: None,
@@ -501,8 +520,41 @@ impl Profile {
                         )));
                     }
                 }
+                // The param names where the effort goes, so it means
+                // nothing without one (issue #44).
+                match (&self.reasoning_effort, &self.reasoning_effort_param) {
+                    (None, Some(_)) => {
+                        return Err(ConfigError::msg(
+                            "reasoning_effort_param needs reasoning_effort: the param names \
+                             where an effort is sent",
+                        ));
+                    }
+                    (Some(_), Some(param)) => {
+                        let segments: Vec<&str> = param.split('.').collect();
+                        if segments.is_empty() || segments.iter().any(|s| s.is_empty()) {
+                            return Err(ConfigError::msg(
+                                "reasoning_effort_param must be a param name or a dotted path \
+                                 with no empty segment",
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
             }
             ProviderKind::Anthropic => {
+                for (field, set) in [
+                    ("reasoning_effort", self.reasoning_effort.is_some()),
+                    (
+                        "reasoning_effort_param",
+                        self.reasoning_effort_param.is_some(),
+                    ),
+                ] {
+                    if set {
+                        return Err(ConfigError::msg(format!(
+                            "{field} only applies to provider = \"openai_compat\""
+                        )));
+                    }
+                }
                 if let Some(t) = &self.thinking
                     && t != "adaptive"
                     && t != "off"
@@ -539,6 +591,18 @@ impl Profile {
             .map_or(DEFAULT_BUDGET, BudgetConfig::budget)
     }
 
+    /// The effort label the profile runs at: `effort` for anthropic,
+    /// the openai_compat `reasoning_effort` as its string otherwise
+    /// (issue #44). `None` when the profile sets neither.
+    pub fn effort_label(&self) -> Option<String> {
+        match self.provider {
+            ProviderKind::OpenaiCompat => {
+                self.reasoning_effort.as_ref().map(ReasoningEffort::label)
+            }
+            ProviderKind::Anthropic => self.effort.clone(),
+        }
+    }
+
     /// Where requests go, for the banner. Never includes the key.
     pub fn endpoint(&self) -> String {
         match self.provider {
@@ -560,6 +624,14 @@ impl Profile {
                         .with_api_key(api_key);
                 if let Some(n) = self.max_context_tokens {
                     c = c.with_max_context_tokens(n);
+                }
+                if let Some(effort) = &self.reasoning_effort {
+                    c = c.with_reasoning_effort(
+                        self.reasoning_effort_param
+                            .as_deref()
+                            .unwrap_or(REASONING_EFFORT_PARAM),
+                        effort.clone(),
+                    );
                 }
                 Box::new(OpenAiCompat::new(c))
             }
@@ -682,6 +754,8 @@ base_url = "https://api.tensorx.ai/v1"
 model = "z-ai/glm-5.3"
 api_key_env = "TENSORX_API_KEY"
 max_context_tokens = 200000
+reasoning_effort = 50
+reasoning_effort_param = "deepseek_effort"
 
 [profiles.tensorx.budget]
 max_iterations = 5
@@ -772,7 +846,34 @@ transport = { stdio = { command = "npx" } }
         assert!(p.prices.is_none());
     }
 
-    /// The pins `profiles_parse_select_and_build` held before issue #37:
+    /// Issue #44: `reasoning_effort` takes an integer or a label, and the
+    /// param defaults to none (the adapter's own default applies). Both
+    /// are asserted equal to what the fixture sets.
+    #[test]
+    fn an_openai_profile_parses_reasoning_effort_and_its_param() {
+        let c = Config::parse(
+            "default_profile = \"a\"\n[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\nreasoning_effort = 50\n",
+        )
+        .unwrap();
+        let (_, a) = c.select(Some("a")).unwrap();
+        assert_eq!(a.reasoning_effort, Some(ReasoningEffort::Int(50)));
+        assert_eq!(a.reasoning_effort_param, None);
+        assert_eq!(a.effort_label(), Some(ReasoningEffort::Int(50).label()));
+
+        let c = Config::parse(
+            "default_profile = \"b\"\n[profiles.b]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\nreasoning_effort = \"high\"\nreasoning_effort_param = \"deepseek_effort\"\n",
+        )
+        .unwrap();
+        let (_, b) = c.select(Some("b")).unwrap();
+        assert_eq!(
+            b.reasoning_effort,
+            Some(ReasoningEffort::Label("high".into()))
+        );
+        assert_eq!(b.reasoning_effort_param.as_deref(), Some("deepseek_effort"));
+        assert_eq!(b.effort_label(), Some("high".to_owned()));
+    }
+
+    /// The pin `profiles_parse_select_and_build` held before issue #37:
     /// `select` by name and by default, the derived anthropic endpoint
     /// and the capabilities each provider reports.
     #[test]
@@ -891,6 +992,13 @@ context_ceiling_tokens = 96_000
             "[profiles.a]\nmodel = \"m\"\napi_key_env = \"K\"\n".into(), // openai without base_url
             "[profiles.a]\nprovider = \"anthropic\"\nmodel = \"m\"\napi_key_env = \"K\"\nthinking = \"lots\"\n".into(),
             "[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\neffort = \"high\"\n".into(),
+            // Issue #44, the anthropic mirror: the openai-only keys are
+            // refused there, by name.
+            "[profiles.a]\nprovider = \"anthropic\"\nmodel = \"m\"\napi_key_env = \"K\"\nreasoning_effort = 50\n".into(),
+            "[profiles.a]\nprovider = \"anthropic\"\nmodel = \"m\"\napi_key_env = \"K\"\nreasoning_effort_param = \"reasoning_effort\"\n".into(),
+            // A param without an effort, and an empty segment in one.
+            "[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\nreasoning_effort_param = \"reasoning_effort\"\n".into(),
+            "[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\nreasoning_effort = 50\nreasoning_effort_param = \"thinking..effort\"\n".into(),
             "[profiles.a]\nprovider = \"gemini\"\nmodel = \"m\"\napi_key_env = \"K\"\n".into(),
             "model = \"m\"\n".into(),
         ];

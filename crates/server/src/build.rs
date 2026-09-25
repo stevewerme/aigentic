@@ -178,7 +178,7 @@ pub async fn project_context(
             effort: config
                 .profiles
                 .get(&profile_name)
-                .and_then(|p| p.effort.clone()),
+                .and_then(|p| p.effort_label()),
             prices: config
                 .profiles
                 .get(&profile_name)
@@ -305,7 +305,8 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let config = Config::parse(
             "default_profile = \"plain\"\n[profiles.plain]\nprovider = \"anthropic\"\nmodel = \"m\"\napi_key_env = \"K\"\n\
-             [profiles.anthropic-test]\nprovider = \"anthropic\"\nmodel = \"m\"\napi_key_env = \"K\"\neffort = \"high\"\n",
+             [profiles.anthropic-test]\nprovider = \"anthropic\"\nmodel = \"m\"\napi_key_env = \"K\"\neffort = \"high\"\n\
+             [profiles.openai-test]\nprovider = \"openai_compat\"\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\nreasoning_effort = 50\n",
         )
         .unwrap();
 
@@ -327,6 +328,29 @@ mod tests {
         assert_eq!(with_effort.ctx.profile.as_deref(), Some("anthropic-test"));
         assert_eq!(with_effort.ctx.model_label, "stub-model");
         assert_eq!(with_effort.ctx.effort.as_deref(), Some("high"));
+
+        // Issue #44: an openai_compat profile's effort reaches the
+        // context the same way; the label comes from the adapter, not a
+        // literal here.
+        let openai = project_context(
+            &config,
+            dir.path(),
+            &Stub,
+            &root_of(&root),
+            &[],
+            Some("openai-test"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(openai.ctx.profile.as_deref(), Some("openai-test"));
+        assert_eq!(
+            openai.ctx.effort.as_deref(),
+            Some(
+                aigentic_runtime::aigentic_providers::openai_compat::ReasoningEffort::Int(50)
+                    .label()
+                    .as_str()
+            )
+        );
 
         // The default profile sets no effort, and names none.
         let plain = project_context(&config, dir.path(), &Stub, &root_of(&root), &[], None)

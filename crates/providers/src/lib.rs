@@ -9,7 +9,9 @@ pub mod openai_compat;
 pub mod sse;
 
 pub use anthropic::{Anthropic, AnthropicConfig, Thinking};
-pub use openai_compat::{OpenAiCompat, OpenAiCompatConfig};
+pub use openai_compat::{
+    OpenAiCompat, OpenAiCompatConfig, REASONING_EFFORT_PARAM, ReasoningEffort,
+};
 
 /// How long a response may go without a byte, or without model output,
 /// before it counts as dead. Reasoning models stream thinking deltas
