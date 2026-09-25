@@ -23,6 +23,12 @@ so the rule can be judged, not just obeyed. The `brief`, `plan-check` and
   silently on #37 and #43. The implementer's `## Implementation` carries a
   ledger (T1, T2, … landed or not, with a reason); a planned test missing
   without a reason is `changes needed`.
+- **Check a ledger by matched count, and check quotes against the thread.**
+  On #44 seven of fourteen ledger names matched no test, and `cargo test
+  <wrong name>` still exits 0; the verifier caught it by counting matches.
+  The same report justified replacing a planned test with a sentence the
+  plan never contained; the judge caught it by searching the thread. An
+  implementer's account of the plan is a claim, not evidence.
 - **Someone reads the plan before implementing.** Both trial plans had a
   flaw a second reader caught (#38: pipe filters counted as extra work,
   undoing #21; #31: retries collected and emitted after the fact, defeating
@@ -85,6 +91,14 @@ so the rule can be judged, not just obeyed. The `brief`, `plan-check` and
   #37 lands: add the key in the same commit that teaches the binary.
 - A message typed while a turn runs reaches the model at its next step
   (#33); use it to steer instead of interrupting.
+
+## Models and endpoints
+
+- **TensorX takes DeepSeek Flash's effort as a label, not 1–100.** Integers
+  other than 0 get `400 2 validation errors`; `none`, `minimal`, `low`,
+  `medium`, `high`, `xhigh` work (`aigentic doctor --probe-effort none,high
+  --profile flash`: 2/0 vs 18/16 output/reasoning tokens). On Flash most
+  output at `high` is reasoning, so effort is a real cost lever.
 
 ## Memory and context
 
