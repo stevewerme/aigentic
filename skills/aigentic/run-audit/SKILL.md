@@ -11,9 +11,11 @@ not edit code.
 
 ## 1. Find the thread
 
-The newest log is the last run:
-`ls -t ~/.local/share/aigentic/threads/*/*.jsonl | head -1`. The file name
-is the thread id. When `aigentic stats` exists (#31), prefer it for the
+The newest log is your own thread, so the run to audit is the one before
+it: `ls -t ~/.local/share/aigentic/threads/*/*.jsonl | sed -n 2p`, unless
+the person names a thread id. The file name is the thread id. For a whole
+issue cycle (brief, plan, check, implement, review), audit each thread
+that mentions the issue and add up their cost. When `aigentic stats` exists (#31), prefer it for the
 numbers.
 
 ## 2. Read the numbers

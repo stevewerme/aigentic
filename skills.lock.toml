@@ -636,6 +636,6 @@ name = "run-audit"
 path = "skills/aigentic/run-audit"
 source = "local"
 commit = ""
-sha256 = "9688967e333d79c085fa11b14f561b6ab103b6bc916b400ae4c054d40d70767c"
+sha256 = "4f1a222dfccb524e38f92360546ba99fc6f0191ef0f61e1cb5e42f4bea2d9e7f"
 invocation = "user"
 review = { by = "steve", on = "2026-09-24" }
