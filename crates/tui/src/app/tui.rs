@@ -64,6 +64,182 @@ pub struct Pane<'a> {
     pub activity: Option<Line<'static>>,
 }
 
+/// What a shell draws on: the terminal, or a `TestBackend` when a test
+/// drives one. An enum rather than a type parameter so `Shell` stays a
+/// single concrete type.
+enum Screen {
+    Terminal(CrosstermBackend<Stdout>),
+    #[cfg(test)]
+    Test(ratatui::backend::TestBackend),
+}
+
+impl std::io::Write for Screen {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Terminal(inner) => std::io::Write::write(inner, buf),
+            // A `TestBackend` keeps its own buffer; nothing goes out.
+            #[cfg(test)]
+            Self::Test(_) => Ok(buf.len()),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Terminal(inner) => std::io::Write::flush(inner),
+            #[cfg(test)]
+            Self::Test(_) => Ok(()),
+        }
+    }
+}
+
+impl ratatui::backend::Backend for Screen {
+    type Error = std::io::Error;
+
+    fn draw<'a, I>(&mut self, content: I) -> std::io::Result<()>
+    where
+        I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+    {
+        match self {
+            Self::Terminal(inner) => ratatui::backend::Backend::draw(inner, content),
+            #[cfg(test)]
+            Self::Test(inner) => {
+                let _ = ratatui::backend::Backend::draw(inner, content);
+                Ok(())
+            }
+        }
+    }
+
+    fn append_lines(&mut self, n: u16) -> std::io::Result<()> {
+        match self {
+            Self::Terminal(inner) => inner.append_lines(n),
+            #[cfg(test)]
+            Self::Test(inner) => {
+                let _ = inner.append_lines(n);
+                Ok(())
+            }
+        }
+    }
+
+    fn hide_cursor(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Terminal(inner) => inner.hide_cursor(),
+            #[cfg(test)]
+            Self::Test(inner) => {
+                let _ = inner.hide_cursor();
+                Ok(())
+            }
+        }
+    }
+
+    fn show_cursor(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Terminal(inner) => inner.show_cursor(),
+            #[cfg(test)]
+            Self::Test(inner) => {
+                let _ = inner.show_cursor();
+                Ok(())
+            }
+        }
+    }
+
+    fn get_cursor_position(&mut self) -> std::io::Result<Position> {
+        match self {
+            Self::Terminal(inner) => inner.get_cursor_position(),
+            // A `TestBackend` always answers.
+            #[cfg(test)]
+            Self::Test(inner) => Ok(inner.get_cursor_position().expect("a test position")),
+        }
+    }
+
+    fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> std::io::Result<()> {
+        match self {
+            Self::Terminal(inner) => inner.set_cursor_position(position),
+            #[cfg(test)]
+            Self::Test(inner) => {
+                let _ = inner.set_cursor_position(position);
+                Ok(())
+            }
+        }
+    }
+
+    fn clear(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Terminal(inner) => inner.clear(),
+            #[cfg(test)]
+            Self::Test(inner) => {
+                let _ = inner.clear();
+                Ok(())
+            }
+        }
+    }
+
+    fn clear_region(&mut self, clear_type: ratatui::backend::ClearType) -> std::io::Result<()> {
+        match self {
+            Self::Terminal(inner) => inner.clear_region(clear_type),
+            #[cfg(test)]
+            Self::Test(inner) => {
+                let _ = inner.clear_region(clear_type);
+                Ok(())
+            }
+        }
+    }
+
+    fn size(&self) -> std::io::Result<ratatui::layout::Size> {
+        match self {
+            Self::Terminal(inner) => inner.size(),
+            // A `TestBackend` always knows its size.
+            #[cfg(test)]
+            Self::Test(inner) => Ok(inner.size().expect("a test size")),
+        }
+    }
+
+    fn window_size(&mut self) -> std::io::Result<ratatui::backend::WindowSize> {
+        match self {
+            Self::Terminal(inner) => inner.window_size(),
+            #[cfg(test)]
+            Self::Test(inner) => {
+                let size = inner.size().expect("a test size");
+                Ok(ratatui::backend::WindowSize {
+                    columns_rows: size,
+                    pixels: size,
+                })
+            }
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Terminal(inner) => ratatui::backend::Backend::flush(inner),
+            #[cfg(test)]
+            Self::Test(inner) => {
+                let _ = ratatui::backend::Backend::flush(inner);
+                Ok(())
+            }
+        }
+    }
+
+    fn scroll_region_up(&mut self, region: std::ops::Range<u16>, n: u16) -> std::io::Result<()> {
+        match self {
+            Self::Terminal(inner) => inner.scroll_region_up(region, n),
+            #[cfg(test)]
+            Self::Test(inner) => {
+                let _ = inner.scroll_region_up(region, n);
+                Ok(())
+            }
+        }
+    }
+
+    fn scroll_region_down(&mut self, region: std::ops::Range<u16>, n: u16) -> std::io::Result<()> {
+        match self {
+            Self::Terminal(inner) => inner.scroll_region_down(region, n),
+            #[cfg(test)]
+            Self::Test(inner) => {
+                let _ = inner.scroll_region_down(region, n);
+                Ok(())
+            }
+        }
+    }
+}
+
 /// The crossterm backend, remembering where it last put the cursor.
 /// ratatui asks the terminal for the cursor position when it places an
 /// inline viewport; the answer arrives on the input, where the key-event
@@ -71,25 +247,26 @@ pub struct Pane<'a> {
 /// After the first real query the shell always knows the position, since
 /// every draw ends by setting it, so the question is answered here.
 pub struct Tracked {
-    inner: CrosstermBackend<Stdout>,
+    inner: Screen,
     known: Option<Position>,
 }
 
 impl Tracked {
     fn new() -> Self {
         Self {
-            inner: CrosstermBackend::new(std::io::stdout()),
+            inner: Screen::Terminal(CrosstermBackend::new(std::io::stdout())),
             known: None,
         }
     }
-}
 
-impl std::io::Write for Tracked {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        std::io::Write::write(&mut self.inner, buf)
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        std::io::Write::flush(&mut self.inner)
+    /// A tracked backend over a `TestBackend`: a test drives the shell
+    /// with no terminal attached.
+    #[cfg(test)]
+    fn test(width: u16, height: u16) -> Self {
+        Self {
+            inner: Screen::Test(ratatui::backend::TestBackend::new(width, height)),
+            known: Some(Position::new(0, 0)),
+        }
     }
 }
 
@@ -104,7 +281,11 @@ impl ratatui::backend::Backend for Tracked {
     }
     fn append_lines(&mut self, n: u16) -> std::io::Result<()> {
         if let Some(p) = self.known.as_mut() {
-            let bottom = crossterm::terminal::size()?.1.saturating_sub(1);
+            // The terminal's height, when there is one: a test backend
+            // has no screen to run off the bottom of.
+            let bottom = crossterm::terminal::size()
+                .map(|(_, h)| h.saturating_sub(1))
+                .unwrap_or(u16::MAX);
             p.y = (p.y + n).min(bottom);
             p.x = 0;
         }
@@ -243,6 +424,19 @@ impl Shell {
         self.rows = rows;
         self.last_size = size;
         Ok(())
+    }
+
+    /// A shell over a `TestBackend`: a test drives the scrollback with
+    /// no terminal attached.
+    #[cfg(test)]
+    pub fn test(width: u16, height: u16) -> Self {
+        Self {
+            terminal: Terminal::new(Tracked::test(width, height)).expect("a test terminal"),
+            enhanced_keys: false,
+            stopped: false,
+            rows: height,
+            last_size: (width, height),
+        }
     }
 
     /// Put the terminal back. Called on quit and by `Drop`.

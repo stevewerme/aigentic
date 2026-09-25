@@ -92,6 +92,9 @@ const TRANSCRIPT_KEEP: usize = 2000;
 /// `Explored` cell, committed when something else arrives.
 struct ShellOut {
     shell: Shell,
+    /// The width lines are wrapped to, read from the shell while the
+    /// loop draws: a resize takes effect on the next pass.
+    width: usize,
     /// Every committed cell, for the pager.
     transcript: Vec<Cell>,
     /// Committed lines the next draw flushes.
@@ -113,8 +116,10 @@ struct ShellOut {
 
 impl ShellOut {
     fn new(shell: Shell) -> Self {
+        let width = shell.width();
         Self {
             shell,
+            width,
             transcript: Vec::new(),
             pending: Vec::new(),
             explored: Vec::new(),
@@ -130,7 +135,7 @@ impl ShellOut {
         // What was looked at so far comes first: the scrollback keeps
         // the order the work happened in.
         self.flush_explored();
-        let width = self.shell.width();
+        let width = self.width;
         let group = look::group(&cell);
         // A blank line between blocks of different kinds.
         if self.last.is_some_and(|last| last != group) {
@@ -143,6 +148,15 @@ impl ShellOut {
         if self.transcript.len() > TRANSCRIPT_KEEP {
             self.transcript.remove(0);
         }
+    }
+
+    /// Whether `text` draws nothing (issue #43): a text block that is
+    /// empty once trimmed. Such a block has no cell, no separator and
+    /// no tail. A blank *inside* a block (`a\n\nb`) is the model's own
+    /// spacing and keeps its row: that block is not whitespace-only,
+    /// and its rows are the renderer's to make.
+    fn ghost(text: &str) -> bool {
+        text.trim().is_empty()
     }
 
     fn flush_explored(&mut self) {
@@ -161,7 +175,7 @@ impl ShellOut {
 
     /// The viewport's changing part, wrapped to the width.
     fn active_lines(&self) -> Vec<Line<'static>> {
-        let width = self.shell.width();
+        let width = self.width;
         let mut lines = Vec::new();
         if !self.explored.is_empty() {
             lines.extend(look::render(
@@ -219,12 +233,23 @@ impl Printer for ShellOut {
     }
 
     fn tail(&mut self, text: &str) {
-        self.tail = text.to_owned();
+        // A tail blank after trimming draws no rows (issue #43), as a
+        // blank cell draws no cell.
+        self.tail = if Self::ghost(text) {
+            String::new()
+        } else {
+            text.to_owned()
+        };
     }
 
     fn cell(&mut self, cell: Cell, done: bool) {
         match (&cell, done) {
             (Cell::Assistant { text, .. }, _) => {
+                // A block that is blank after trimming draws nothing:
+                // no cell, no separator, no tail (issue #43).
+                if Self::ghost(text) {
+                    return;
+                }
                 self.flush_explored();
                 let fence = markdown::is_fence(text);
                 let cell = Cell::Assistant {
@@ -527,7 +552,9 @@ async fn run_shell(
     engine.show_state(&state, &mut out);
 
     loop {
-        // Everything the last step produced, then the pane.
+        // Everything the last step produced, then the pane. The window
+        // may have been resized since the last pass.
+        out.width = out.shell.width();
         out.flush()?;
         let state = engine.state().clone();
         status.apply_state(&state);
@@ -540,7 +567,7 @@ async fn run_shell(
         // The turn line carries the clock while a turn runs.
         status.elapsed = None;
         let activity = engine.turn().map(|t| {
-            let width = out.shell.width();
+            let width = out.width;
             let text = format!("{} · {} · esc interrupts", t.activity(), t.figures());
             let line = Line::from(vec![
                 Span::styled("✻ ", Style::default().fg(look::CLAY)),
@@ -570,16 +597,12 @@ async fn run_shell(
         // one blank row the layout puts above them stays one.
         let mut block: Vec<Line<'static>> = Vec::new();
         if !matches!(state, ThreadState::Idle) {
-            block.extend(live_rows(
-                out.running.as_ref(),
-                engine.tasks(),
-                out.shell.width(),
-            ));
+            block.extend(live_rows(out.running.as_ref(), engine.tasks(), out.width));
         }
         block.extend(
             engine
                 .menu()
-                .map(|m| block_lines(m, out.shell.width()))
+                .map(|m| block_lines(m, out.width))
                 .unwrap_or_default(),
         );
         if files.is_none()
@@ -827,6 +850,11 @@ mod tests {
             .collect()
     }
 
+    /// A `ShellOut` over a test terminal, wrapped to `width` columns.
+    fn out_at(width: usize) -> ShellOut {
+        ShellOut::new(Shell::test(width as u16, 24))
+    }
+
     fn bash(command: &str) -> ToolCall {
         ToolCall {
             id: "c1".into(),
@@ -945,6 +973,169 @@ mod tests {
         // The reply's first row marker is elision's business, not the
         // cap's: the cap still keeps two rows.
         assert_eq!(tail_rows(&cell, true, 12).len(), 2);
+    }
+
+    /// The pane's own rows: what the viewport draws above the composer,
+    /// which a ghost block must not reach.
+    fn pane_rows(out: &ShellOut) -> Vec<String> {
+        text(&out.active_lines())
+    }
+
+    /// A whitespace-only text block draws nothing (issue #43): no
+    /// cell, no streaming tail, no group separator. The log keeps it
+    /// as sent — the block reaches us either way.
+    #[test]
+    fn a_whitespace_only_text_block_draws_nothing() {
+        let mut out = out_at(80);
+        let width = out.width;
+        let assistant = |block: &str, first: bool| {
+            text(&look::render(
+                &Cell::Assistant {
+                    text: block.into(),
+                    fenced: false,
+                },
+                first,
+                width,
+            ))
+        };
+        // Three blocks, then the blank ones a transcript carries
+        // between tool calls.
+        let lines = [
+            "Checking the log now.",
+            "Running the gate.",
+            "Two tests added.",
+        ];
+        for line in lines {
+            out.cell(
+                Cell::Assistant {
+                    text: line.into(),
+                    fenced: false,
+                },
+                true,
+            );
+        }
+        let wanted = out.pending.clone();
+        for blank in ["\n\n", "   ", ""] {
+            out.cell(
+                Cell::Assistant {
+                    text: blank.into(),
+                    fenced: false,
+                },
+                true,
+            );
+        }
+        // The scrollback is the three blocks and nothing for a blank
+        // one: the same rows the three alone would push, the first
+        // still carrying the reply marker.
+        assert_eq!(out.transcript.len(), 3);
+        assert_eq!(out.pending, wanted);
+        assert_eq!(
+            text(&out.pending),
+            [
+                assistant(lines[0], true),
+                assistant(lines[1], false),
+                assistant(lines[2], false),
+            ]
+            .concat()
+        );
+        // No tail either: the pane's own part draws nothing.
+        out.tail("\n\n");
+        assert!(out.tail.is_empty());
+        assert!(
+            pane_rows(&out).is_empty(),
+            "the pane's rows: {:?}",
+            pane_rows(&out)
+        );
+        // The next real block commits with no separator row: the
+        // dropped blocks left the last group where it was, so a note
+        // after the assistant's line is a new group with one blank row
+        // before it and nothing more.
+        let before = out.pending.len();
+        out.cell(Cell::Note("[title set]".into()), true);
+        let note = text(&look::render(
+            &Cell::Note("[title set]".into()),
+            false,
+            width,
+        ));
+        assert_eq!(
+            text(&out.pending[before..]),
+            [vec![String::new()], note].concat(),
+            "one separator row, no ghost rows"
+        );
+    }
+
+    /// The rule is a blank *block*, not every blank row: an interior
+    /// blank of a real block is the model's own spacing, and the row
+    /// the renderer makes for it stays.
+    #[test]
+    fn a_blank_inside_a_real_block_still_draws() {
+        let mut out = out_at(80);
+        let block = "a\n\nb";
+        out.cell(
+            Cell::Assistant {
+                text: block.into(),
+                fenced: false,
+            },
+            true,
+        );
+        let rendered = look::render(
+            &Cell::Assistant {
+                text: block.into(),
+                fenced: false,
+            },
+            true,
+            out.width,
+        );
+        assert_eq!(out.pending, rendered, "the block draws as it renders");
+        assert_eq!(out.transcript.len(), 1, "the block is kept as one cell");
+        assert_eq!(
+            out.pending.last().map(|l| l.spans.len()).unwrap_or(0),
+            2,
+            "the block's own rows are the renderer's: {rendered:?}"
+        );
+    }
+
+    /// The issue's `"\n\n"` fixture: a blank block between tool calls
+    /// adds no bullet row, and repeated blank blocks leave the live
+    /// pane exactly where they found it.
+    #[test]
+    fn a_blank_block_between_tool_calls_adds_no_row() {
+        let mut out = out_at(80);
+        let tool = |state| Cell::Tool {
+            name: "bash".into(),
+            summary: "cargo fmt".into(),
+            full: None,
+            state,
+            output: "ok".into(),
+        };
+        let blank = || Cell::Assistant {
+            text: "\n\n".into(),
+            fenced: false,
+        };
+        out.cell(
+            Cell::Assistant {
+                text: "Running the gate.".into(),
+                fenced: false,
+            },
+            true,
+        );
+        out.cell(blank(), true);
+        out.cell(tool(ToolState::Running), false);
+        // Writing, with a blank block: the in-flight tool row stays
+        // reserved and the blank one moves nothing.
+        let writing = text(&out.active_lines());
+        out.cell(blank(), true);
+        assert_eq!(text(&out.active_lines()), writing);
+        // The tool finishes and a blank block follows: still no row,
+        // and the pane is the tool's own rows only.
+        out.cell(tool(ToolState::Ok), true);
+        out.cell(blank(), true);
+        let idle = text(&out.active_lines());
+        assert!(idle.is_empty(), "no residual live rows: {idle:?}");
+        // The blank blocks left no trace in the transcript either: the
+        // three things sent, and nothing between them.
+        out.cell(blank(), true);
+        assert_eq!(out.transcript.len(), 2, "the reply and the tool");
     }
 
     /// The rows the issue draws (issue #21), at 100 columns: a `bash`
