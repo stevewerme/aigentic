@@ -114,7 +114,8 @@ pub struct Runtime {
     /// every `usage` line so a thread's spend is in the log itself
     /// (issue #31).
     pub(crate) profile: Option<String>,
-    /// The profile's effort label, for the wire only (issue #43).
+    /// The profile's effort label, for the wire and for each `usage`
+    /// line (issues #43, #44).
     pub(crate) effort: Option<String>,
     pub(crate) prices: Option<Prices>,
     /// The last call's reported prompt size and the context length it was
@@ -409,6 +410,19 @@ impl Runtime {
     pub fn set_pricing(&mut self, profile: impl Into<String>, prices: Option<Prices>) {
         self.profile = Some(profile.into());
         self.prices = prices;
+    }
+
+    /// The profile's effort label, stamped on every `usage` line and
+    /// named to a client's footer (issues #43, #44).
+    pub fn with_effort(mut self, effort: Option<String>) -> Self {
+        self.set_effort(effort);
+        self
+    }
+
+    /// `with_effort` in place, for a caller that already owns a
+    /// `&mut Runtime` (a test fixture, a live session).
+    pub fn set_effort(&mut self, effort: Option<String>) {
+        self.effort = effort;
     }
 
     pub fn compaction(&self) -> &CompactionSettings {

@@ -441,6 +441,7 @@ async fn a_priced_call_is_stamped_and_recomputable() {
         None,
     );
     h.runtime.set_pricing("tensorx", Some(prices));
+    h.runtime.set_effort(Some("50".into()));
     h.runtime
         .run_turn(steve(), vec![ContentBlock::Text("hi".into())], &mut |_| {})
         .await
@@ -457,6 +458,7 @@ async fn a_priced_call_is_stamped_and_recomputable() {
         .expect("a usage line");
 
     assert_eq!(u.profile.as_deref(), Some("tensorx"));
+    assert_eq!(u.effort.as_deref(), Some("50"), "the effort it was set to");
     assert!(!u.model.as_deref().unwrap_or_default().is_empty());
     assert!(u.latency_ms.is_some(), "latency is measured");
     assert!(u.ttft_ms.is_some(), "a scripted stream has a first event");
@@ -494,4 +496,5 @@ async fn an_unpriced_call_has_no_cost() {
         .unwrap();
     assert_eq!(u.profile.as_deref(), Some("free"));
     assert_eq!(u.cost_usd, None);
+    assert_eq!(u.effort, None, "no effort set, none claimed");
 }

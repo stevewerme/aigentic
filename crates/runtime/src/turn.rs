@@ -305,6 +305,7 @@ impl Runtime {
             let mut usage = usage.unwrap_or_else(|| self.estimate_usage(&context, &agent, &blocks));
             usage.profile = self.profile.clone();
             usage.model = Some(self.model_label.clone());
+            usage.effort = self.effort.clone();
             usage.latency_ms = Some(requested.elapsed().as_millis() as u64);
             usage.ttft_ms = ttft_ms;
             usage.cost_usd = self.prices.map(|p| p.cost_usd(&usage));

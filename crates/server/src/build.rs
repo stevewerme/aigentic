@@ -226,6 +226,7 @@ pub async fn build_thread(
             &profile_name,
             profile.and_then(|p| p.prices.as_ref()).map(|p| p.prices()),
         )
+        .with_effort(ctx.effort)
         .with_policy(ctx.policy)
         .with_skills(ctx.skills)
         .with_harness_instructions();
@@ -357,5 +358,64 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(plain.ctx.effort, None);
+    }
+
+    /// Amendment 1.1: the effort a fresh thread is built with reaches
+    /// the runtime itself, which is what the daemon answers `Open` with
+    /// and what every `usage` line carries — not only a project switch.
+    /// The anthropic profile is the regression pin.
+    #[tokio::test]
+    async fn a_built_thread_carries_the_profile_effort() {
+        let dir = tempfile::tempdir().unwrap();
+        let root_dir = dir.path().join("p");
+        std::fs::create_dir_all(&root_dir).unwrap();
+        let config = Config::parse(
+            "default_profile = \"plain\"\n[profiles.plain]\nprovider = \"anthropic\"\nmodel = \"m\"\napi_key_env = \"K\"\n\
+             [profiles.anthropic-test]\nprovider = \"anthropic\"\nmodel = \"m\"\napi_key_env = \"K\"\neffort = \"high\"\n\
+             [profiles.openai-test]\nprovider = \"openai_compat\"\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\nreasoning_effort = 50\n",
+        )
+        .unwrap();
+        let root = Root {
+            name: "p".into(),
+            root: root_dir.clone(),
+            threads_dir: dir.path().join("threads"),
+        };
+
+        for (profile, expected) in [
+            (
+                "openai-test",
+                aigentic_runtime::aigentic_providers::ReasoningEffort::Int(50).label(),
+            ),
+            ("anthropic-test", "high".to_owned()),
+        ] {
+            let built = build_thread(
+                &config,
+                dir.path(),
+                &Stub,
+                &root,
+                &[],
+                Ulid::from_datetime(std::time::SystemTime::now()),
+                Some(profile),
+            )
+            .await
+            .unwrap();
+            let identity = built.runtime.identity();
+            assert_eq!(identity.0.as_deref(), Some(profile));
+            assert_eq!(identity.2.as_deref(), Some(expected.as_str()));
+
+            // And the same effort is stamped on the call that runs.
+            let plain = build_thread(
+                &config,
+                dir.path(),
+                &Stub,
+                &root,
+                &[],
+                Ulid::from_datetime(std::time::SystemTime::now()),
+                Some("plain"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(plain.runtime.identity().2, None);
+        }
     }
 }
