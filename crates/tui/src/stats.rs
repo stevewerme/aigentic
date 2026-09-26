@@ -37,7 +37,7 @@ pub struct Stats {
     pub days: Vec<DayStats>,
     /// Every project in the window, by name.
     pub projects: Vec<ProjectStats>,
-    /// Up to five threads by effective spend, dearest first.
+    /// Up to five threads by effective spend, costliest first.
     pub threads: Vec<ThreadSpend>,
     /// Threads whose files could not be read; counted so the totals are
     /// never silently short.
@@ -511,7 +511,7 @@ pub fn run_thread(
 }
 
 /// `aigentic stats --issue <n>` (issue #40): every thread whose first
-/// own-user message names that issue, dearest first, with a total.
+/// own-user message names that issue, costliest first, with a total.
 pub fn run_issue(
     base: &Path,
     project: Option<&str>,
@@ -943,7 +943,8 @@ fn absorb(
 
 /// A thread matches `#<n>` when its *first own-user message* (a) carries
 /// the first `#` followed by digits as that number, with a boundary on
-/// each side — so `#40` and `see #40.` match, `#400` and `#40x` do not —
+/// each side — so `#40`, `see #40.` and `#40's` match and `#400` does
+/// not —
 /// or (b) follows a user-invoked `skill_loaded` and its first
 /// whitespace-separated token is the number, which is how a slash
 /// command's arguments arrive.
@@ -960,8 +961,9 @@ fn names_issue(meta: &ThreadMeta, issue: u64) -> bool {
 
 /// The number of the *first* `#` in the text that is followed by digits,
 /// `None` when there is none. The `#` must start the text or follow a
-/// non-alphanumeric character, and the digits must run to the text's end
-/// or a non-digit — so `#400`, `#40x` and `a#40` name nothing.
+/// non-alphanumeric character. The digit run is taken whole, so `#400`
+/// names 400, never 40; whatever follows it is not checked, so `#40x`
+/// and `#40's` name 40. `a#40` names nothing.
 fn hashed_issue_number(text: &str) -> Option<u64> {
     let chars: Vec<char> = text.chars().collect();
     for (i, c) in chars.iter().enumerate() {
@@ -1065,7 +1067,7 @@ pub fn render_thread(t: &ThreadReport) -> String {
     out
 }
 
-/// `stats --issue <n>`: the matched threads, dearest first, and the
+/// `stats --issue <n>`: the matched threads, costliest first, and the
 /// total over them.
 pub fn render_issue(report: &IssueReport) -> String {
     let mut out = String::new();
@@ -2099,7 +2101,8 @@ api_key_env = "TENSORX_API_KEY"
         assert!(text.contains("threads    3"), "{text}");
         assert!(text.contains("3 calls"), "{text}");
 
-        // `#400` and `#40x` are not `#40`, and `4` is not `#40`.
+        // `#400` is not `#40` (the first reference wins, so the later
+        // `#40x` is never read), and `4` is not `#40`.
         let dir2 = tempfile::tempdir().unwrap();
         let over = Ulid::generate();
         write_thread(
@@ -2140,6 +2143,18 @@ api_key_env = "TENSORX_API_KEY"
                 .is_empty(),
             "#40 must not match 4"
         );
+    }
+
+    #[test]
+    fn an_issue_reference_takes_the_whole_digit_run_and_checks_only_before() {
+        assert_eq!(hashed_issue_number("#40"), Some(40));
+        assert_eq!(hashed_issue_number("see #40."), Some(40));
+        assert_eq!(hashed_issue_number("#40's review"), Some(40));
+        assert_eq!(hashed_issue_number("#40x"), Some(40));
+        assert_eq!(hashed_issue_number("#400"), Some(400));
+        assert_eq!(hashed_issue_number("a#40"), None);
+        assert_eq!(hashed_issue_number("# 40, then #41"), Some(41));
+        assert_eq!(hashed_issue_number("no reference"), None);
     }
 
     #[test]

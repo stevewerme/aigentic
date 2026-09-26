@@ -82,7 +82,9 @@ enum Command {
     /// List this project's threads, newest first.
     Threads,
     /// What the thread logs spent: cost, calls, context, cache and
-    /// retries, by day and project. Reads local logs only.
+    /// retries, by day and project. Reads local logs only. With the
+    /// global `--thread <id>`, one thread read on its own (`--project`
+    /// narrows the search).
     Stats {
         /// A window: `7d` is the last seven days, `2026-09-23` that day
         /// onwards. Without it, every thread on this machine.
@@ -97,10 +99,6 @@ enum Command {
         /// profile guesses their cost.
         #[arg(long, value_name = "NAME")]
         assume_profile: Option<String>,
-        /// One thread read on its own: pass the global `--thread <id>`,
-        /// and `stats` reads that thread instead of the whole machine.
-        /// `--project` narrows the search.
-        ///
         /// Every thread whose first user message names `#<n>`, with a
         /// total: the cost of one issue's build cycle.
         #[arg(long, value_name = "N", conflicts_with = "thread")]
