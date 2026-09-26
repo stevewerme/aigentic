@@ -91,6 +91,12 @@ enum Command {
         /// The same report as one JSON object.
         #[arg(long)]
         json: bool,
+        /// Price calls that carry neither a model nor a profile from this
+        /// profile's `[prices]`, and mark them estimated (`~$`). Off by
+        /// default: those calls predate model stamping, so guessing their
+        /// profile guesses their cost.
+        #[arg(long, value_name = "NAME")]
+        assume_profile: Option<String>,
     },
     /// Guided setup: config, project file and AGENTS.md, GitHub issues
     /// and labels through `gh`, knowledge links. Shows every file first.
@@ -316,12 +322,20 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Stats { .. }) if cli.server.is_some() => {
             bail!("stats reads this machine's logs; drop --server and run it locally");
         }
-        Some(Command::Stats { since, json }) => {
+        Some(Command::Stats {
+            since,
+            json,
+            assume_profile,
+        }) => {
+            // #40: the config's price tables travel with the request, so
+            // an unpriced call can be retro-priced and marked estimated.
+            let book = stats::PriceBook::from_config(&config, assume_profile.as_deref())?;
             stats::run(
                 &threads_base,
                 cli.project.as_deref(),
                 since.as_deref(),
                 json,
+                &book,
             )?;
             std::process::exit(0);
         }
@@ -658,9 +672,14 @@ mod tests {
     fn stats_parses_since_and_json() {
         let cli = Cli::try_parse_from(["aigentic", "stats", "--since", "7d", "--json"]).unwrap();
         match cli.command {
-            Some(Command::Stats { since, json }) => {
+            Some(Command::Stats {
+                since,
+                json,
+                assume_profile,
+            }) => {
                 assert_eq!(since.as_deref(), Some("7d"));
                 assert!(json);
+                assert_eq!(assume_profile, None);
             }
             other => panic!("expected stats: {other:?}"),
         }
@@ -668,9 +687,14 @@ mod tests {
         // Bare `stats` is every thread, text.
         let cli = Cli::try_parse_from(["aigentic", "stats"]).unwrap();
         match cli.command {
-            Some(Command::Stats { since, json }) => {
+            Some(Command::Stats {
+                since,
+                json,
+                assume_profile,
+            }) => {
                 assert_eq!(since, None);
                 assert!(!json);
+                assert_eq!(assume_profile, None);
             }
             other => panic!("expected stats: {other:?}"),
         }
