@@ -97,6 +97,14 @@ enum Command {
         /// profile guesses their cost.
         #[arg(long, value_name = "NAME")]
         assume_profile: Option<String>,
+        /// One thread read on its own: pass the global `--thread <id>`,
+        /// and `stats` reads that thread instead of the whole machine.
+        /// `--project` narrows the search.
+        ///
+        /// Every thread whose first user message names `#<n>`, with a
+        /// total: the cost of one issue's build cycle.
+        #[arg(long, value_name = "N", conflicts_with = "thread")]
+        issue: Option<u64>,
     },
     /// Guided setup: config, project file and AGENTS.md, GitHub issues
     /// and labels through `gh`, knowledge links. Shows every file first.
@@ -326,17 +334,39 @@ async fn main() -> anyhow::Result<()> {
             since,
             json,
             assume_profile,
+            issue,
         }) => {
             // #40: the config's price tables travel with the request, so
             // an unpriced call can be retro-priced and marked estimated.
             let book = stats::PriceBook::from_config(&config, assume_profile.as_deref())?;
-            stats::run(
-                &threads_base,
-                cli.project.as_deref(),
-                since.as_deref(),
-                json,
-                &book,
-            )?;
+            // A drill-down, not the whole report: the global `--thread`
+            // names one thread, `--issue` names every thread that walked
+            // off one issue.
+            match (cli.thread, issue) {
+                (Some(id), _) => stats::run_thread(
+                    &threads_base,
+                    cli.project.as_deref(),
+                    id,
+                    since.as_deref(),
+                    json,
+                    &book,
+                )?,
+                (None, Some(n)) => stats::run_issue(
+                    &threads_base,
+                    cli.project.as_deref(),
+                    n,
+                    since.as_deref(),
+                    json,
+                    &book,
+                )?,
+                (None, None) => stats::run(
+                    &threads_base,
+                    cli.project.as_deref(),
+                    since.as_deref(),
+                    json,
+                    &book,
+                )?,
+            }
             std::process::exit(0);
         }
         Some(Command::Project {
@@ -665,6 +695,7 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use clap::Parser;
+    use ulid::Ulid;
 
     /// Issue #31: `stats` takes its own `--since` and `--json`, and the
     /// global `--project` still reaches it.
@@ -676,10 +707,12 @@ mod tests {
                 since,
                 json,
                 assume_profile,
+                issue,
             }) => {
                 assert_eq!(since.as_deref(), Some("7d"));
                 assert!(json);
                 assert_eq!(assume_profile, None);
+                assert_eq!(issue, None);
             }
             other => panic!("expected stats: {other:?}"),
         }
@@ -691,10 +724,12 @@ mod tests {
                 since,
                 json,
                 assume_profile,
+                issue,
             }) => {
                 assert_eq!(since, None);
                 assert!(!json);
                 assert_eq!(assume_profile, None);
+                assert_eq!(issue, None);
             }
             other => panic!("expected stats: {other:?}"),
         }
@@ -705,6 +740,45 @@ mod tests {
             .unwrap();
         assert_eq!(cli.project.as_deref(), Some("alpha"));
         assert!(matches!(cli.command, Some(Command::Stats { .. })));
+    }
+
+    /// Issue #40: the drill-downs. A thread id is the *global* `--thread`
+    /// (the same flag `exec` uses), `--issue` is the subcommand's, and
+    /// asking for both is an error rather than a silent winner.
+    #[test]
+    fn stats_parses_the_drill_down_flags() {
+        let id = Ulid::generate();
+        let cli = Cli::try_parse_from(["aigentic", "stats", "--thread", &id.to_string()]).unwrap();
+        assert_eq!(cli.thread, Some(id), "the global --thread must bind");
+        assert!(matches!(cli.command, Some(Command::Stats { .. })));
+
+        let cli = Cli::try_parse_from(["aigentic", "stats", "--issue", "40"]).unwrap();
+        match cli.command {
+            Some(Command::Stats { issue, .. }) => assert_eq!(issue, Some(40)),
+            other => panic!("expected stats: {other:?}"),
+        }
+        assert_eq!(cli.thread, None);
+
+        let clash = Cli::try_parse_from([
+            "aigentic",
+            "stats",
+            "--thread",
+            &id.to_string(),
+            "--issue",
+            "40",
+        ])
+        .unwrap_err();
+        assert_eq!(clash.kind(), clap::error::ErrorKind::ArgumentConflict);
+
+        // #40's estimate lever, parsed here and priced in `stats`.
+        let cli =
+            Cli::try_parse_from(["aigentic", "stats", "--assume-profile", "tensorx"]).unwrap();
+        match cli.command {
+            Some(Command::Stats { assume_profile, .. }) => {
+                assert_eq!(assume_profile.as_deref(), Some("tensorx"));
+            }
+            other => panic!("expected stats: {other:?}"),
+        }
     }
 
     /// Issue #37: `doctor` takes `--strict` (exit non-zero on a warning,

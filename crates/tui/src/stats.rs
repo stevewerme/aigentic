@@ -16,8 +16,8 @@ use std::path::{Path, PathBuf};
 use aigentic_runtime::Prices;
 use aigentic_runtime::aigentic_core::{Author, ContentBlock, EventKind};
 use aigentic_runtime::aigentic_log::{
-    AssistantMessagePayload, ThreadLog, ThreadRenamedPayload, TurnEndedPayload, Usage,
-    UserMessagePayload,
+    AssistantMessagePayload, Invoker, SkillLoadedPayload, ThreadLog, ThreadRenamedPayload,
+    ToolResultPayload, TurnEndedPayload, Usage, UserMessagePayload,
 };
 use aigentic_server::config::Config;
 use anyhow::{Context, bail};
@@ -109,6 +109,14 @@ fn effective(t: &ThreadSpend) -> Option<f64> {
     }
 }
 
+/// The same sum for the drill-downs, which carry a `ThreadReport`.
+fn effective_report(t: &ThreadReport) -> Option<f64> {
+    match (t.spent, t.price_estimated_spent) {
+        (None, None) => None,
+        (stamped, estimated) => Some(stamped.unwrap_or(0.0) + estimated.unwrap_or(0.0)),
+    }
+}
+
 #[derive(Debug, Default, Serialize)]
 pub struct ThreadSpend {
     pub id: String,
@@ -119,6 +127,107 @@ pub struct ThreadSpend {
     pub spent: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub price_estimated_spent: Option<f64>,
+}
+
+/// One thread read on its own (`stats --thread <id>`, issue #40): the
+/// same totals as a day or a project, plus what only a single thread
+/// knows.
+#[derive(Debug, Serialize)]
+pub struct ThreadReport {
+    pub id: String,
+    pub project: String,
+    pub title: String,
+    /// The last profile any of the thread's usage lines carried; empty
+    /// when none did.
+    pub profile: String,
+    pub calls: u32,
+    pub priced_calls: u32,
+    pub price_estimated_calls: u32,
+    pub unpriced_calls: u32,
+    pub unstamped_calls: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spent: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub price_estimated_spent: Option<f64>,
+    pub peak_context: u64,
+    pub context_total: u64,
+    pub mean_context: u64,
+    pub cache_read: u64,
+    pub hit_rate: f64,
+    /// `context_evicted` lines in the window: how often old context was
+    /// swept out.
+    pub sweeps: u32,
+    /// `tool_result` lines whose payload says `is_error`.
+    pub tool_errors: u32,
+    pub turns: BTreeMap<String, u32>,
+    pub retries: u32,
+}
+
+/// `stats --issue <n>` (issue #40): every thread whose first own-user
+/// message names that issue, with a total over them.
+#[derive(Debug, Serialize)]
+pub struct IssueReport {
+    pub issue: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub since: Option<String>,
+    /// Dearest first, the same ordering as the top-thread table.
+    pub threads: Vec<ThreadReport>,
+    /// The aggregate over the matched threads.
+    pub total: IssueTotals,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct IssueTotals {
+    pub threads: u32,
+    pub calls: u32,
+    pub priced_calls: u32,
+    pub price_estimated_calls: u32,
+    pub unpriced_calls: u32,
+    pub unstamped_calls: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spent: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub price_estimated_spent: Option<f64>,
+    pub context_total: u64,
+    pub cache_read: u64,
+    pub hit_rate: f64,
+    pub sweeps: u32,
+    pub tool_errors: u32,
+    pub turns: BTreeMap<String, u32>,
+    pub retries: u32,
+}
+
+impl IssueTotals {
+    fn of(threads: &[ThreadReport]) -> Self {
+        let mut total = Self {
+            threads: threads.len() as u32,
+            ..Self::default()
+        };
+        let sum = |slot: &mut Option<f64>, value: Option<f64>| {
+            if let Some(v) = value {
+                *slot = Some(slot.unwrap_or(0.0) + v);
+            }
+        };
+        for t in threads {
+            total.calls += t.calls;
+            total.priced_calls += t.priced_calls;
+            total.price_estimated_calls += t.price_estimated_calls;
+            total.unpriced_calls += t.unpriced_calls;
+            total.unstamped_calls += t.unstamped_calls;
+            sum(&mut total.spent, t.spent);
+            sum(&mut total.price_estimated_spent, t.price_estimated_spent);
+            total.context_total += t.context_total;
+            total.cache_read += t.cache_read;
+            total.sweeps += t.sweeps;
+            total.tool_errors += t.tool_errors;
+            total.retries += t.retries;
+            for (head, n) in &t.turns {
+                *total.turns.entry(head.clone()).or_default() += n;
+            }
+        }
+        total.hit_rate = hit_rate(total.cache_read, total.context_total);
+        total
+    }
 }
 
 /// What one call's dollars are (issue #40).
@@ -276,20 +385,11 @@ pub fn parse_since(arg: &str, now: OffsetDateTime) -> anyhow::Result<OffsetDateT
     Ok(date.midnight().assume_utc())
 }
 
-/// Walk every project directory under `base` and fold each thread's
-/// events into the day, project and top-thread totals.
-pub fn collect(
-    base: &Path,
-    project: Option<&str>,
-    cutoff: Option<OffsetDateTime>,
-    book: &PriceBook,
-) -> anyhow::Result<Stats> {
-    let mut stats = Stats {
-        since: cutoff.map(|c| c.format(&Rfc3339).unwrap_or_default()),
-        ..Stats::default()
-    };
-    // `_none` is the directory for work outside a project: it is a real
-    // group, not something to hide.
+/// Every project directory under `base`, `--project` narrowing to one.
+/// `_none` is the directory for work outside a project: it is a real
+/// group, not something to hide. A named project with no threads is an
+/// empty group, not an error.
+fn groups(base: &Path, project: Option<&str>) -> anyhow::Result<Vec<(String, PathBuf)>> {
     let mut groups: Vec<(String, PathBuf)> = Vec::new();
     match std::fs::read_dir(base) {
         Ok(entries) => {
@@ -313,39 +413,40 @@ pub fn collect(
     if let Some(want) = project
         && !groups.iter().any(|(name, _)| name == want)
     {
-        // A named project with no threads is an empty report, not an
-        // error.
         groups.push((want.to_owned(), base.join(want)));
     }
     groups.sort();
+    Ok(groups)
+}
+
+/// Walk every project directory under `base` and fold each thread's
+/// events into the day, project and top-thread totals.
+pub fn collect(
+    base: &Path,
+    project: Option<&str>,
+    cutoff: Option<OffsetDateTime>,
+    book: &PriceBook,
+) -> anyhow::Result<Stats> {
+    let mut stats = Stats {
+        since: cutoff.map(|c| c.format(&Rfc3339).unwrap_or_default()),
+        ..Stats::default()
+    };
 
     let mut days: BTreeMap<String, Accum> = BTreeMap::new();
     let mut projects: Vec<ProjectStats> = Vec::new();
     let mut threads: Vec<ThreadSpend> = Vec::new();
 
-    for (name, dir) in groups {
+    for (name, dir) in groups(base, project)? {
         let mut acc = Accum::default();
         for id in thread_ids(&dir) {
             match ThreadLog::open(&dir, id).and_then(|log| log.read_all()) {
                 Ok(events) => {
-                    let mut spend = ThreadSpend {
-                        id: id.to_string(),
-                        project: name.clone(),
-                        ..ThreadSpend::default()
-                    };
-                    absorb(
-                        &mut acc,
-                        &events,
-                        cutoff,
-                        &mut days,
-                        name.as_str(),
-                        &mut spend,
-                        book,
-                    );
+                    let mut thread = Accum::default();
+                    let meta = absorb(&mut acc, &mut thread, &events, cutoff, &mut days, book);
                     // #40: a thread with no call inside the window is not
                     // a row. Its title is a label, but a row is a total.
-                    if spend.calls > 0 {
-                        threads.push(spend);
+                    if thread.calls > 0 {
+                        threads.push(thread.into_spend(id.to_string(), &name, meta.title));
                     }
                 }
                 Err(_) => stats.unreadable += 1,
@@ -383,6 +484,141 @@ pub fn collect(
     stats.projects = projects;
     stats.days = days.into_iter().map(|(day, a)| a.into_day(day)).collect();
     Ok(stats)
+}
+
+/// `aigentic stats --thread <id>` (issue #40): one thread read on its
+/// own, under the same `--since` window as the report. `--project`
+/// narrows the search; the global `--thread` supplies the id.
+pub fn run_thread(
+    base: &Path,
+    project: Option<&str>,
+    id: Ulid,
+    since: Option<&str>,
+    json: bool,
+    book: &PriceBook,
+) -> anyhow::Result<()> {
+    let cutoff = match since {
+        Some(arg) => Some(parse_since(arg, OffsetDateTime::now_utc())?),
+        None => None,
+    };
+    let report = collect_thread(base, project, id, cutoff, book)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{}", render_thread(&report));
+    }
+    Ok(())
+}
+
+/// `aigentic stats --issue <n>` (issue #40): every thread whose first
+/// own-user message names that issue, dearest first, with a total.
+pub fn run_issue(
+    base: &Path,
+    project: Option<&str>,
+    issue: u64,
+    since: Option<&str>,
+    json: bool,
+    book: &PriceBook,
+) -> anyhow::Result<()> {
+    let cutoff = match since {
+        Some(arg) => Some(parse_since(arg, OffsetDateTime::now_utc())?),
+        None => None,
+    };
+    let report = collect_issue(base, project, issue, cutoff, book)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{}", render_issue(&report));
+    }
+    Ok(())
+}
+
+/// Read one thread's log and fold it. An id that no project holds is an
+/// error naming it, so a typo never reads as an empty report.
+fn collect_thread(
+    base: &Path,
+    project: Option<&str>,
+    id: Ulid,
+    cutoff: Option<OffsetDateTime>,
+    book: &PriceBook,
+) -> anyhow::Result<ThreadReport> {
+    for (name, dir) in groups(base, project)? {
+        if !dir.join(format!("{id}.jsonl")).is_file() {
+            continue;
+        }
+        let events = ThreadLog::open(&dir, id)
+            .and_then(|log| log.read_all())
+            .with_context(|| format!("reading {}/{id}.jsonl", dir.display()))?;
+        let mut thread = Accum::default();
+        let mut dropped = Accum::default();
+        let mut dropped_days = BTreeMap::new();
+        let meta = absorb(
+            &mut dropped,
+            &mut thread,
+            &events,
+            cutoff,
+            &mut dropped_days,
+            book,
+        );
+        return Ok(thread.into_report(id.to_string(), &name, meta));
+    }
+    bail!("no thread {id} found under {}", base.display())
+}
+
+/// Every thread whose first own-user message names `issue`, folded.
+/// `--thread`'s walk, one project at a time.
+fn collect_issue(
+    base: &Path,
+    project: Option<&str>,
+    issue: u64,
+    cutoff: Option<OffsetDateTime>,
+    book: &PriceBook,
+) -> anyhow::Result<IssueReport> {
+    let mut threads: Vec<ThreadReport> = Vec::new();
+    for (name, dir) in groups(base, project)? {
+        for id in thread_ids(&dir) {
+            let Ok(events) = ThreadLog::open(&dir, id).and_then(|log| log.read_all()) else {
+                continue;
+            };
+            let mut thread = Accum::default();
+            let mut dropped = Accum::default();
+            let mut dropped_days = BTreeMap::new();
+            let meta = absorb(
+                &mut dropped,
+                &mut thread,
+                &events,
+                cutoff,
+                &mut dropped_days,
+                book,
+            );
+            if !names_issue(&meta, issue) {
+                continue;
+            }
+            // The window applies here too: a matched thread with no call
+            // inside it has no row, exactly as in the main report.
+            if thread.calls == 0 {
+                continue;
+            }
+            threads.push(thread.into_report(id.to_string(), &name, meta));
+        }
+    }
+    threads.sort_by(|a, b| match (effective_report(a), effective_report(b)) {
+        (Some(x), Some(y)) => y
+            .partial_cmp(&x)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.calls.cmp(&a.calls))
+            .then_with(|| a.id.cmp(&b.id)),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => b.calls.cmp(&a.calls).then_with(|| a.id.cmp(&b.id)),
+    });
+    let total = IssueTotals::of(&threads);
+    Ok(IssueReport {
+        issue,
+        since: cutoff.map(|c| c.format(&Rfc3339).unwrap_or_default()),
+        threads,
+        total,
+    })
 }
 
 fn thread_ids(dir: &Path) -> Vec<Ulid> {
@@ -474,6 +710,46 @@ impl Accum {
             day,
         }
     }
+
+    /// The row the report's thread table shows.
+    fn into_spend(self, id: String, project: &str, title: String) -> ThreadSpend {
+        ThreadSpend {
+            id,
+            project: project.to_owned(),
+            title,
+            calls: self.calls,
+            spent: self.spent,
+            price_estimated_spent: self.price_estimated_spent,
+        }
+    }
+
+    /// The `--thread` and `--issue` shape: the same totals as a day or a
+    /// project, plus what only a single thread knows (`sweeps`,
+    /// `tool_errors`, its own labels).
+    fn into_report(self, id: String, project: &str, meta: ThreadMeta) -> ThreadReport {
+        ThreadReport {
+            id,
+            project: project.to_owned(),
+            title: meta.title,
+            profile: meta.profile,
+            calls: self.calls,
+            priced_calls: self.priced_calls,
+            price_estimated_calls: self.price_estimated_calls,
+            unpriced_calls: self.unpriced_calls,
+            unstamped_calls: self.unstamped_calls,
+            spent: self.spent,
+            price_estimated_spent: self.price_estimated_spent,
+            peak_context: self.peak_context,
+            mean_context: mean(self.context_total, self.calls),
+            hit_rate: hit_rate(self.cache_read, self.context_total),
+            context_total: self.context_total,
+            cache_read: self.cache_read,
+            sweeps: meta.sweeps,
+            tool_errors: meta.tool_errors,
+            turns: self.turns,
+            retries: self.retries,
+        }
+    }
 }
 
 fn mean(total: u64, calls: u32) -> u64 {
@@ -492,21 +768,46 @@ fn hit_rate(cache_read: u64, context_total: u64) -> f64 {
     }
 }
 
-/// Fold one thread's events into its project's totals and, for events in
-/// the window, its day's totals too. Since #40 the window gates the
-/// project and the thread as well; only a thread's title and profile are
-/// read from outside it, because those are labels, not totals.
+/// What only one thread can tell the report: its labels, and the two
+/// counters that are not calls.
+#[derive(Debug, Default)]
+struct ThreadMeta {
+    title: String,
+    /// The full text of the thread's first own-user message, text blocks
+    /// joined — not the truncated display title. `--issue` matches it.
+    first_message: String,
+    /// A `skill_loaded` with `invoked_by: user` seen *before* the first
+    /// own-user message: the thread began with a slash command, whose
+    /// arguments are then the first message.
+    skill_invoked_by_user: bool,
+    /// The last `profile` any usage line in the thread carried.
+    profile: String,
+    sweeps: u32,
+    tool_errors: u32,
+}
+
+/// Fold one thread's events into its own totals, its project's, and —
+/// for events in the window — its day's. Since #40 the window gates the
+/// project and the thread as well; only a thread's labels are read from
+/// outside it, because those are labels, not totals.
 fn absorb(
     project: &mut Accum,
+    thread: &mut Accum,
     events: &[aigentic_runtime::aigentic_core::Event],
     cutoff: Option<OffsetDateTime>,
     days: &mut BTreeMap<String, Accum>,
-    project_name: &str,
-    spend: &mut ThreadSpend,
     book: &PriceBook,
-) {
+) -> ThreadMeta {
+    let mut meta = ThreadMeta::default();
     let mut renamed: Option<String> = None;
-    let mut first_line = String::new();
+    let mut own_user_seen = false;
+    // The project and the days are the same window partitioned two ways,
+    // so each accepted call is replayed into both once the thread is
+    // fully folded.
+    let mut calls: Vec<(String, u64, u64, Cost, bool)> = Vec::new();
+    let mut retry_days: Vec<String> = Vec::new();
+    let mut turn_days: Vec<(String, String)> = Vec::new();
+
     for event in events {
         let day = event
             .created_at
@@ -533,31 +834,19 @@ fn absorb(
                 let context = u.input_tokens + u.cache_read_tokens + u.cache_write_tokens;
                 let cost = classify_cost(&u, book);
                 let unstamped = matches!(cost, Cost::Unpriced) && is_unstamped(&u);
-                project.add_call(context, u.cache_read_tokens, cost);
+                if let Some(profile) = &u.profile {
+                    meta.profile = profile.clone();
+                }
+                thread.add_call(context, u.cache_read_tokens, cost);
                 if unstamped {
-                    project.unstamped_calls += 1;
+                    thread.unstamped_calls += 1;
                 }
-                spend.calls += 1;
-                match cost {
-                    Cost::Stamped(usd) => {
-                        spend.spent = Some(spend.spent.unwrap_or(0.0) + usd);
-                    }
-                    Cost::Retro(usd) => {
-                        spend.price_estimated_spent =
-                            Some(spend.price_estimated_spent.unwrap_or(0.0) + usd);
-                    }
-                    Cost::Unpriced => {}
-                }
-                let day = days.entry(day).or_default();
-                day.add_call(context, u.cache_read_tokens, cost);
-                if unstamped {
-                    day.unstamped_calls += 1;
-                }
+                calls.push((day, context, u.cache_read_tokens, cost, unstamped));
             }
             EventKind::ProviderRetried => {
                 if in_window {
-                    project.retries += 1;
-                    days.entry(day).or_default().retries += 1;
+                    thread.retries += 1;
+                    retry_days.push(day);
                 }
             }
             EventKind::TurnEnded => {
@@ -571,8 +860,21 @@ fn absorb(
                 // Turns group by the reason's head: `provider_error:
                 // http 503` is a `provider_error` turn.
                 let head = p.reason.split(':').next().unwrap_or("").to_owned();
-                *project.turns.entry(head.clone()).or_default() += 1;
-                *days.entry(day).or_default().turns.entry(head).or_default() += 1;
+                *thread.turns.entry(head.clone()).or_default() += 1;
+                turn_days.push((day, head));
+            }
+            EventKind::ContextEvicted => {
+                if in_window {
+                    meta.sweeps += 1;
+                }
+            }
+            EventKind::ToolResult => {
+                if in_window
+                    && serde_json::from_value::<ToolResultPayload>(event.payload.clone())
+                        .is_ok_and(|p| p.result.is_error)
+                {
+                    meta.tool_errors += 1;
+                }
             }
             EventKind::ThreadRenamed => {
                 if let Ok(p) = serde_json::from_value::<ThreadRenamedPayload>(event.payload.clone())
@@ -580,28 +882,108 @@ fn absorb(
                     renamed = Some(p.title);
                 }
             }
-            EventKind::UserMessage if first_line.is_empty() => {
+            EventKind::SkillLoaded => {
+                // Only a slash command in the client counts, and only
+                // before the thread's opening prompt: a skill the model
+                // loaded itself says nothing about the issue.
+                if !own_user_seen
+                    && let Ok(p) =
+                        serde_json::from_value::<SkillLoadedPayload>(event.payload.clone())
+                    && p.invoked_by == Invoker::User
+                {
+                    meta.skill_invoked_by_user = true;
+                }
+            }
+            EventKind::UserMessage if !own_user_seen => {
                 // Our own posts only; another user's line is not this
                 // thread's opening prompt. `author` carries the user.
                 if matches!(event.author, Author::User(_))
                     && let Ok(p) =
                         serde_json::from_value::<UserMessagePayload>(event.payload.clone())
                 {
-                    first_line = p
+                    own_user_seen = true;
+                    meta.first_message = p
                         .blocks
-                        .into_iter()
-                        .find_map(|b| match b {
-                            ContentBlock::Text(t) => Some(first_line_of(&t)),
+                        .iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::Text(t) => Some(t.as_str()),
                             _ => None,
                         })
-                        .unwrap_or_default();
+                        .collect::<Vec<_>>()
+                        .join("\n");
                 }
             }
             _ => {}
         }
     }
-    spend.title = renamed.unwrap_or(first_line);
-    spend.project = project_name.to_owned();
+
+    for (day, context, cache_read, cost, unstamped) in calls {
+        project.add_call(context, cache_read, cost);
+        if unstamped {
+            project.unstamped_calls += 1;
+        }
+        let d = days.entry(day).or_default();
+        d.add_call(context, cache_read, cost);
+        if unstamped {
+            d.unstamped_calls += 1;
+        }
+    }
+    for day in retry_days {
+        project.retries += 1;
+        days.entry(day).or_default().retries += 1;
+    }
+    for (day, head) in turn_days {
+        *project.turns.entry(head.clone()).or_default() += 1;
+        *days.entry(day).or_default().turns.entry(head).or_default() += 1;
+    }
+
+    meta.title = renamed.unwrap_or_else(|| first_line_of(&meta.first_message));
+    meta
+}
+
+/// A thread matches `#<n>` when its *first own-user message* (a) carries
+/// the first `#` followed by digits as that number, with a boundary on
+/// each side — so `#40` and `see #40.` match, `#400` and `#40x` do not —
+/// or (b) follows a user-invoked `skill_loaded` and its first
+/// whitespace-separated token is the number, which is how a slash
+/// command's arguments arrive.
+fn names_issue(meta: &ThreadMeta, issue: u64) -> bool {
+    hashed_issue_number(&meta.first_message) == Some(issue)
+        || (meta.skill_invoked_by_user
+            && meta
+                .first_message
+                .split_whitespace()
+                .next()
+                .and_then(|t| t.parse::<u64>().ok())
+                == Some(issue))
+}
+
+/// The number of the *first* `#` in the text that is followed by digits,
+/// `None` when there is none. The `#` must start the text or follow a
+/// non-alphanumeric character, and the digits must run to the text's end
+/// or a non-digit — so `#400`, `#40x` and `a#40` name nothing.
+fn hashed_issue_number(text: &str) -> Option<u64> {
+    let chars: Vec<char> = text.chars().collect();
+    for (i, c) in chars.iter().enumerate() {
+        if *c != '#' {
+            continue;
+        }
+        let mut j = i + 1;
+        while j < chars.len() && chars[j].is_ascii_digit() {
+            j += 1;
+        }
+        if j == i + 1 {
+            // A `#` with no digits after it is not a reference; keep
+            // looking for the first that is.
+            continue;
+        }
+        let starts = i == 0 || !chars[i - 1].is_alphanumeric();
+        if !starts {
+            return None;
+        }
+        return chars[i + 1..j].iter().collect::<String>().parse().ok();
+    }
+    None
 }
 
 /// A cost cell: stamped, estimated, both, or `-`. A guessed dollar is
@@ -613,6 +995,141 @@ fn money(stamped: Option<f64>, estimated: Option<f64>) -> String {
         (None, Some(b)) => format!("~${b:.4}"),
         (None, None) => "-".into(),
     }
+}
+
+/// The cost line every report shares: what was measured and what was
+/// guessed, never added together (issue #40).
+fn cost_line(
+    stamped: f64,
+    estimated: f64,
+    priced: u32,
+    price_estimated: u32,
+    unpriced: u32,
+    calls: u32,
+) -> String {
+    let counts = format!(
+        "{priced} priced, {price_estimated} estimated, {unpriced} unpriced of {calls} calls"
+    );
+    if priced > 0 && price_estimated > 0 {
+        format!("cost       ${stamped:.4} + ~${estimated:.4} ({counts})")
+    } else if priced > 0 {
+        format!("cost       ${stamped:.4} ({counts})")
+    } else if price_estimated > 0 {
+        format!("cost       ~${estimated:.4} ({counts})")
+    } else {
+        format!("cost       unpriced ({unpriced} calls)")
+    }
+}
+
+/// `stats --thread`: one thread's money, context and turn reasons.
+pub fn render_thread(t: &ThreadReport) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("thread     {}\n", t.id));
+    out.push_str(&format!("project    {}\n", t.project));
+    out.push_str(&format!("title      {}\n", t.title));
+    let profile = if t.profile.is_empty() {
+        "-"
+    } else {
+        t.profile.as_str()
+    };
+    out.push_str(&format!("profile    {profile}\n"));
+    out.push_str(&format!(
+        "{}\n",
+        cost_line(
+            t.spent.unwrap_or(0.0),
+            t.price_estimated_spent.unwrap_or(0.0),
+            t.priced_calls,
+            t.price_estimated_calls,
+            t.unpriced_calls,
+            t.calls
+        )
+    ));
+    out.push_str(&format!(
+        "calls      {}   retries {}   sweeps {}   tool errors {}\n",
+        t.calls, t.retries, t.sweeps, t.tool_errors
+    ));
+    out.push_str(&format!(
+        "context    peak {:>10}   mean {:>10}   cache hit {:.0}%\n",
+        t.peak_context,
+        t.mean_context,
+        t.hit_rate * 100.0
+    ));
+    out.push_str(&format!("turns      {}\n", turns_line(&t.turns)));
+    if t.unstamped_calls > 0 {
+        out.push_str(&format!(
+            "stamping   {} calls predate model stamping \
+             (pass --assume-profile NAME to estimate them)\n",
+            t.unstamped_calls
+        ));
+    }
+    out
+}
+
+/// `stats --issue <n>`: the matched threads, dearest first, and the
+/// total over them.
+pub fn render_issue(report: &IssueReport) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("issue {}\n", report.issue));
+    // `all threads` is the report's label for "no window"; under an issue
+    // it would only repeat the header.
+    if let Some(since) = &report.since {
+        out.push_str(&format!("since {since}\n"));
+    }
+    let total = &report.total;
+    out.push_str(&format!(
+        "{}\n",
+        cost_line(
+            total.spent.unwrap_or(0.0),
+            total.price_estimated_spent.unwrap_or(0.0),
+            total.priced_calls,
+            total.price_estimated_calls,
+            total.unpriced_calls,
+            total.calls
+        )
+    ));
+    out.push_str(&format!(
+        "threads    {}   calls {}   retries {}   sweeps {}   tool errors {}\n",
+        total.threads, total.calls, total.retries, total.sweeps, total.tool_errors
+    ));
+    out.push_str(&format!(
+        "context    total {:>12}   cache hit {:.0}%\n",
+        total.context_total,
+        total.hit_rate * 100.0
+    ));
+    out.push_str(&format!("turns      {}\n", turns_line(&total.turns)));
+    if report.threads.is_empty() {
+        out.push_str("\nno thread names this issue\n");
+        return out;
+    }
+    out.push_str("\nthread                              calls               cost  title\n");
+    for t in &report.threads {
+        out.push_str(&format!(
+            "  {:<26} {:<14} {:>5} calls {:>18}  {}\n",
+            t.id,
+            t.project,
+            t.calls,
+            money(t.spent, t.price_estimated_spent),
+            t.title
+        ));
+    }
+    out.push_str(&format!(
+        "  total                      {:>5} calls {:>18}\n",
+        total.calls,
+        money(total.spent, total.price_estimated_spent)
+    ));
+    out
+}
+
+/// `done 3   provider_error 1`, or `-` when no turn ended in the window.
+fn turns_line(turns: &BTreeMap<String, u32>) -> String {
+    if turns.is_empty() {
+        return "-".to_owned();
+    }
+    turns
+        .iter()
+        .map(|(head, n)| format!("{head} {n}"))
+        .collect::<Vec<_>>()
+        .join("   ")
 }
 
 /// The text report: a `Cost`-style table of days, then projects, then
@@ -639,20 +1156,10 @@ pub fn render(stats: &Stats) -> String {
     let retries: u32 = stats.days.iter().map(|d| d.retries).sum();
     // #40: the two dollars are never added together. `$31.78 + ~$1.59`
     // says what was measured and what was guessed.
-    let counts = format!(
-        "{priced} priced, {price_estimated} estimated, {unpriced} unpriced of {calls} calls"
-    );
-    if priced > 0 && price_estimated > 0 {
-        out.push_str(&format!(
-            "cost       ${stamped:.4} + ~${estimated:.4} ({counts})\n"
-        ));
-    } else if priced > 0 {
-        out.push_str(&format!("cost       ${stamped:.4} ({counts})\n"));
-    } else if price_estimated > 0 {
-        out.push_str(&format!("cost       ~${estimated:.4} ({counts})\n"));
-    } else {
-        out.push_str(&format!("cost       unpriced ({unpriced} calls)\n"));
-    }
+    out.push_str(&format!(
+        "{}\n",
+        cost_line(stamped, estimated, priced, price_estimated, unpriced, calls)
+    ));
     out.push_str(&format!("calls      {calls}   retries {retries}\n"));
     if unstamped > 0 {
         out.push_str(&format!(
@@ -877,6 +1384,35 @@ api_key_env = "TENSORX_API_KEY"
             "kind": "assistant_message",
             "author": {"kind": "agent", "id": "assistant"},
             "payload": {"blocks": [{"type": "text", "text": text}]},
+            "created_at": at,
+        })
+    }
+
+    fn evicted(at: &str) -> serde_json::Value {
+        json!({
+            "kind": "context_evicted",
+            "author": {"kind": "system"},
+            "payload": {"through_seq": 41},
+            "created_at": at,
+        })
+    }
+
+    fn tool_result(at: &str, is_error: bool) -> serde_json::Value {
+        json!({
+            "kind": "tool_result",
+            "author": {"kind": "system"},
+            "payload": {"id": "c1", "content": "boom", "is_error": is_error},
+            "created_at": at,
+        })
+    }
+
+    /// A slash command: the client loaded the skill the user typed, and
+    /// its arguments are the thread's first message (#40).
+    fn skill_loaded(at: &str, name: &str, invoked_by: &str) -> serde_json::Value {
+        json!({
+            "kind": "skill_loaded",
+            "author": {"kind": "system"},
+            "payload": {"name": name, "hash": "h", "source": "s", "body": "b", "invoked_by": invoked_by},
             "created_at": at,
         })
     }
@@ -1291,6 +1827,382 @@ api_key_env = "TENSORX_API_KEY"
         assert_eq!(title(twice), "the later title");
         assert_eq!(title(plain), "no rename here");
         assert_eq!(title(agent_first), "what the user actually asked");
+    }
+
+    /// A log with everything a single-thread report reads: two calls
+    /// (one stamped, one retro-priced), a sweep, an errored tool result,
+    /// two retries, and two turn reasons under a shared head.
+    fn single_thread_fixture() -> (tempfile::TempDir, Ulid, Vec<serde_json::Value>) {
+        let dir = tempfile::tempdir().unwrap();
+        let id = Ulid::generate();
+        let lines = vec![
+            user("2026-09-27T12:00:00Z", "one thread, everything in it"),
+            retried("2026-09-27T12:00:01Z"),
+            call(
+                "2026-09-27T12:00:02Z",
+                100,
+                40,
+                20,
+                Some(0.5),
+                Some("z-ai/glm-5.3"),
+                Some("tensorx"),
+            ),
+            evicted("2026-09-27T12:00:03Z"),
+            tool_result("2026-09-27T12:00:04Z", true),
+            tool_result("2026-09-27T12:00:05Z", false),
+            call(
+                "2026-09-27T12:00:06Z",
+                300,
+                60,
+                400_000,
+                None,
+                Some("unknown/model"),
+                Some("flash"),
+            ),
+            retried("2026-09-27T12:00:07Z"),
+            turn_ended("2026-09-27T12:00:08Z", "done"),
+            turn_ended("2026-09-27T12:00:09Z", "provider_error: transport timeout"),
+            turn_ended("2026-09-27T12:00:10Z", "provider_error: http 503"),
+        ];
+        write_thread(&dir.path().join("alpha"), id, &lines);
+        (dir, id, lines)
+    }
+
+    #[test]
+    fn one_thread_reads_back_every_field_from_its_lines() {
+        let (dir, id, lines) = single_thread_fixture();
+        let book = book_of(PRICED_CONFIG);
+        let report = collect_thread(dir.path(), None, id, None, &book).unwrap();
+
+        assert_eq!(report.id, id.to_string());
+        assert_eq!(report.project, "alpha");
+        assert_eq!(report.title, "one thread, everything in it");
+        // The last usage line to carry a profile is the retro-priced one.
+        assert_eq!(report.profile, "flash");
+
+        assert_eq!(report.calls, 2);
+        assert_eq!(report.priced_calls, 1);
+        assert_eq!(report.price_estimated_calls, 1);
+        assert_eq!(report.unpriced_calls, 0);
+        assert_eq!(report.unstamped_calls, 0);
+        assert_eq!(report.spent, Some(0.5));
+        assert_eq!(
+            report.price_estimated_spent,
+            Some(expected_cost(PRICED_CONFIG, "flash", &lines[6]))
+        );
+        // Context, peak, mean, cache and hit rate, the `reports.rs`
+        // formula, recomputed here from the lines.
+        // The fixture's two calls are lines 2 and 6; the formula is the
+        // `reports.rs` one, applied to their own usage fields.
+        let usage = |i: usize| &lines[i]["payload"]["usage"];
+        let contexts: Vec<u64> = [2, 6]
+            .iter()
+            .map(|i| {
+                ["input_tokens", "cache_read_tokens", "cache_write_tokens"]
+                    .iter()
+                    .map(|k| usage(*i)[*k].as_u64().unwrap())
+                    .sum()
+            })
+            .collect();
+        let cache_read: u64 = [2, 6]
+            .iter()
+            .map(|i| usage(*i)["cache_read_tokens"].as_u64().unwrap())
+            .sum();
+        assert_eq!(report.context_total, contexts.iter().sum::<u64>());
+        assert_eq!(report.peak_context, contexts.iter().copied().max().unwrap());
+        assert_eq!(report.mean_context, contexts.iter().sum::<u64>() / 2);
+        assert_eq!(report.cache_read, cache_read);
+        assert!(
+            (report.hit_rate - cache_read as f64 / contexts.iter().sum::<u64>() as f64).abs()
+                < 1e-12
+        );
+
+        assert_eq!(report.sweeps, 1);
+        assert_eq!(report.tool_errors, 1, "only the is_error result counts");
+        assert_eq!(report.retries, 2);
+        assert_eq!(
+            report.turns,
+            BTreeMap::from([("done".to_owned(), 1), ("provider_error".to_owned(), 2)])
+        );
+
+        let text = render_thread(&report);
+        assert!(text.contains(&id.to_string()), "{text}");
+        assert!(text.contains("provider_error 2"), "{text}");
+        assert!(text.contains("sweeps 1"), "{text}");
+
+        // The window gates the report too: a cutoff past the thread
+        // leaves its labels but no calls.
+        let cutoff = Some(datetime!(2026-09-28 00:00:00 UTC));
+        let after = collect_thread(dir.path(), None, id, cutoff, &book).unwrap();
+        assert_eq!(after.calls, 0);
+        assert_eq!(after.sweeps, 0);
+        assert_eq!(after.tool_errors, 0);
+        assert_eq!(after.title, "one thread, everything in it");
+
+        // An id no project holds is an error naming it, never an empty
+        // report.
+        let missing = Ulid::generate();
+        let err = collect_thread(dir.path(), None, missing, None, &book)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(&missing.to_string()), "{err}");
+
+        // `--project` narrows the search: the same id is not in `beta`.
+        assert!(collect_thread(dir.path(), Some("beta"), id, None, &book).is_err());
+        assert!(collect_thread(dir.path(), Some("alpha"), id, None, &book).is_ok());
+    }
+
+    /// One thread per match shape, each named so the assertion can point
+    /// at the case that broke. Built here, matched by `collect_issue`.
+    fn issue_fixture() -> (tempfile::TempDir, Ulid, Ulid, Ulid, Ulid, Ulid) {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("alpha");
+        let plain = Ulid::generate();
+        let skill = Ulid::generate();
+        let model_skill = Ulid::generate();
+        let next_line = Ulid::generate();
+        write_thread(
+            &base,
+            plain,
+            &[
+                user(
+                    "2026-09-27T09:00:00Z",
+                    "fix the stats windowing -- see #40 for the rule",
+                ),
+                call(
+                    "2026-09-27T09:00:01Z",
+                    10,
+                    0,
+                    10,
+                    Some(0.25),
+                    Some("z-ai/glm-5.3"),
+                    None,
+                ),
+            ],
+        );
+        write_thread(
+            &base,
+            skill,
+            &[
+                skill_loaded("2026-09-27T09:10:00Z", "brief", "user"),
+                user("2026-09-27T09:10:01Z", "40 -- the stats drill-downs"),
+                call(
+                    "2026-09-27T09:10:02Z",
+                    10,
+                    0,
+                    10,
+                    Some(0.5),
+                    Some("z-ai/glm-5.3"),
+                    None,
+                ),
+            ],
+        );
+        write_thread(
+            &base,
+            model_skill,
+            &[
+                skill_loaded("2026-09-27T09:20:00Z", "simplify", "model"),
+                user("2026-09-27T09:20:01Z", "40 -- the model chose this skill"),
+                call(
+                    "2026-09-27T09:20:02Z",
+                    10,
+                    0,
+                    10,
+                    Some(1.0),
+                    Some("z-ai/glm-5.3"),
+                    None,
+                ),
+            ],
+        );
+        write_thread(
+            &base,
+            next_line,
+            &[
+                user(
+                    "2026-09-27T09:30:00Z",
+                    "a long first line that runs past the display title and only mentions #40 here",
+                ),
+                call(
+                    "2026-09-27T09:30:01Z",
+                    10,
+                    0,
+                    10,
+                    Some(2.0),
+                    Some("z-ai/glm-5.3"),
+                    None,
+                ),
+            ],
+        );
+        // A bare `40` with no slash command before it: no `#`, no skill,
+        // so nothing names the issue.
+        let bare = Ulid::generate();
+        write_thread(
+            &base,
+            bare,
+            &[
+                user("2026-09-27T09:40:00Z", "40 is just a number here"),
+                call(
+                    "2026-09-27T09:40:01Z",
+                    10,
+                    0,
+                    10,
+                    Some(4.0),
+                    Some("z-ai/glm-5.3"),
+                    None,
+                ),
+            ],
+        );
+        (dir, plain, skill, model_skill, next_line, bare)
+    }
+
+    #[test]
+    fn an_issue_search_matches_the_first_message_and_never_a_substring() {
+        let (dir, plain, skill, model_skill, past_title, bare) = issue_fixture();
+        let book = no_prices();
+        let ids = |report: &IssueReport| {
+            report
+                .threads
+                .iter()
+                .map(|t| t.id.clone())
+                .collect::<Vec<_>>()
+        };
+
+        // (a) `#40` anywhere in the first message matches.
+        let report = collect_issue(dir.path(), None, 40, None, &book).unwrap();
+        assert!(
+            ids(&report).contains(&plain.to_string()),
+            "{:?}",
+            ids(&report)
+        );
+        // (b) a slash command's arguments are the first message.
+        assert!(ids(&report).contains(&skill.to_string()));
+        // A skill the *model* loaded says nothing, and a bare `40` with
+        // no slash command before it is not a reference either.
+        assert!(!ids(&report).contains(&model_skill.to_string()));
+        assert!(
+            !ids(&report).contains(&bare.to_string()),
+            "{:?}",
+            ids(&report)
+        );
+        // #40's first rule keeps the whole message, so a `#40` past the
+        // display title's 72 characters still matches.
+        assert!(ids(&report).contains(&past_title.to_string()));
+        assert_eq!(report.issue, 40);
+        assert_eq!(report.total.threads, 3);
+        assert_eq!(report.total.calls, 3);
+        // Dearest first: 2.0000, 0.5000, 0.2500.
+        assert_eq!(report.total.spent, Some(2.75));
+        let money_order: Vec<f64> = report.threads.iter().filter_map(|t| t.spent).collect();
+        assert_eq!(money_order, vec![2.0, 0.5, 0.25], "{:?}", ids(&report));
+        let text = render_issue(&report);
+        assert!(text.contains("issue 40"), "{text}");
+        assert!(text.contains("threads    3"), "{text}");
+        assert!(text.contains("3 calls"), "{text}");
+
+        // `#400` and `#40x` are not `#40`, and `4` is not `#40`.
+        let dir2 = tempfile::tempdir().unwrap();
+        let over = Ulid::generate();
+        write_thread(
+            &dir2.path().join("alpha"),
+            over,
+            &[
+                user("2026-09-27T10:00:00Z", "see #400 and #40x"),
+                call(
+                    "2026-09-27T10:00:01Z",
+                    10,
+                    0,
+                    10,
+                    Some(0.1),
+                    Some("z-ai/glm-5.3"),
+                    None,
+                ),
+            ],
+        );
+        assert!(
+            collect_issue(dir2.path(), None, 40, None, &book)
+                .unwrap()
+                .threads
+                .is_empty()
+        );
+        // `#400` names 400, not 40 — the digits are one reference, so
+        // the boundary rule can never split them into 4 and 00.
+        assert_eq!(
+            collect_issue(dir2.path(), None, 400, None, &book)
+                .unwrap()
+                .threads
+                .len(),
+            1
+        );
+        assert!(
+            collect_issue(dir.path(), None, 4, None, &book)
+                .unwrap()
+                .threads
+                .is_empty(),
+            "#40 must not match 4"
+        );
+    }
+
+    #[test]
+    fn an_issue_search_takes_the_first_reference_not_a_later_one() {
+        // The amendment's case: the prompt itself is about #40 and
+        // mentions #44 later.
+        let dir = tempfile::tempdir().unwrap();
+        let first = Ulid::generate();
+        let lines = vec![
+            user("2026-09-27T11:00:00Z", "for #40, not like #44 did"),
+            call(
+                "2026-09-27T11:00:01Z",
+                10,
+                0,
+                10,
+                Some(0.1),
+                Some("z-ai/glm-5.3"),
+                None,
+            ),
+        ];
+        write_thread(&dir.path().join("alpha"), first, &lines);
+        let book = no_prices();
+        assert_eq!(
+            collect_issue(dir.path(), None, 40, None, &book)
+                .unwrap()
+                .threads
+                .len(),
+            1
+        );
+        assert!(
+            collect_issue(dir.path(), None, 44, None, &book)
+                .unwrap()
+                .threads
+                .is_empty(),
+            "the first reference is #40, so #44 must not match"
+        );
+
+        // A `#40` on the message's second line is still the first message.
+        let dir2 = tempfile::tempdir().unwrap();
+        let second = Ulid::generate();
+        write_thread(
+            &dir2.path().join("alpha"),
+            second,
+            &[
+                user("2026-09-27T11:10:00Z", "the headline\nand #40 below it"),
+                call(
+                    "2026-09-27T11:10:01Z",
+                    10,
+                    0,
+                    10,
+                    Some(0.1),
+                    Some("z-ai/glm-5.3"),
+                    None,
+                ),
+            ],
+        );
+        assert_eq!(
+            collect_issue(dir2.path(), None, 40, None, &book)
+                .unwrap()
+                .threads
+                .len(),
+            1
+        );
     }
 
     #[test]
