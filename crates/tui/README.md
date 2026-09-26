@@ -18,6 +18,13 @@ base_url = "https://api.tensorx.ai/v1"
 model = "z-ai/glm-5.3"
 api_key_env = "TENSORX_API_KEY"          # NAME of the variable holding the key
 # max_context_tokens = 131072
+# reasoning_effort = "medium"             # a label or 1-100, as the endpoint takes it;
+                                          # `aigentic doctor --probe-effort LOW,HIGH` checks it
+# [profiles.tensorx.prices]               # USD per 1M tokens, for /cost and `aigentic stats`
+# input = 3.00
+# cache_read = 0.75
+# cache_write = 3.00
+# output = 15.00
 
 [profiles.anthropic]
 provider = "anthropic"
@@ -38,6 +45,7 @@ api_key_env = "ANTHROPIC_API_KEY"
 # max_result_bytes = 4096                 # truncation target for old tool results
 # summary_max_output_tokens = 2048
 
+# utility_profile = "flash"               # side jobs: thread titles, memory extraction
 # user = "steve"                          # author id on your messages ($USER by default)
 # threads_dir = "/path/to/threads"        # default ~/.local/share/aigentic/threads
 # bundled_dir = "/path/to/aigentic"       # holds skills/ and skills.lock.toml; default: the build repo
@@ -51,8 +59,9 @@ The phase 0 flat form (top-level `base_url`, `model`, `api_key_env`) still
 works and is read as a single profile named `default`.
 
 The key is read only from the named environment variable, never from the
-config file, and is never logged or printed. Unknown fields are rejected, so
-a pasted `api_key` line fails to load. A `.env` file in the current
+config file, and is never logged or printed. An unknown key is ignored with
+a warning (`aigentic doctor --strict` fails on it); an `api_key` line is
+refused by name, so a pasted key never loads. A `.env` file in the current
 directory is loaded at startup if present; see `.env.example` at the repo
 root. For a local llama.cpp server that needs no key, set the variable to
 any non-empty value.
@@ -201,9 +210,13 @@ the decision prints with it. Streamed text prints as its lines complete.
 Slash commands: `/cost` (input and output tokens for the thread, reported and
 estimated shown separately, plus cache reads and writes, the reasoning share,
 compactions and memory extractions), `/pin <text>` (a fact for the stable
-prefix, never summarised), `/compact` (run compaction now and report what it
-did), `/verbose` (toggle the session between the configured cap and 40 lines
-/ 8000 bytes; it prints which is on), `/mode [name]` (show or set the
+prefix, never summarised), `/remember [decision|constraint|fact] <text>`
+(file a memory line directly), `/compact` (run compaction now and report
+what it did), `/copy [n|all]` (the n-th fenced code block of the latest
+reply, default the last, or the whole reply, to the clipboard as its source
+text: no gutters or wrapping; over SSH through OSC 52), `/diff` (the
+project's working-tree diff in the pager), `/rename <title>` (the thread's
+title), `/keys` (the key table), `/mode [name]` (show or set the
 permission mode, below), `/who` (the participants and their roles, and who
 you are), `/queue` (what the thread is doing and what is queued),
 `/interrupt <text>` or a line starting with `!` (end the running turn and
@@ -213,7 +226,8 @@ mode, and the session grants with who gave them), `/memory` (the memory
 files with line counts, the `through_seq` of the last extraction, and
 the block as the prefix carries it), `/skills` (the enabled set), `/project`
 (the same report as `project show`, over the live registry so MCP tools are
-included), `/threads`, `/<skill> [args]` for every enabled user-invoked
+included), `/project use <name>` (move the thread to another project),
+`/threads`, `/<skill> [args]` for every enabled user-invoked
 skill, `/help`, `/quit`. Anything else starting with `/` prints `unknown
 command`. Ctrl-D quits; Ctrl-C clears the line.
 
@@ -240,7 +254,7 @@ model and prints `[memory: N lines written]` when anything new landed in
 Assistant text streams as it arrives. Tool calls print as `→ name {args}`
 and their output follows, truncated to `[display]`'s `result_lines` or
 `result_bytes` (3 lines / 600 bytes by default) with a note of what was
-omitted; `/verbose` widens the session to 40 lines / 8000 bytes.
+omitted; Ctrl-T opens the whole transcript in the pager.
 
 ## Project file, policy, skills and MCP
 

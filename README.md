@@ -17,9 +17,10 @@ and memory across threads.
 - A streaming terminal client: an inline shell, not a full screen —
   markdown replies, tool calls with truncated output, a file picker,
   command completion, a transcript pager and a turn line while it works
-- Two provider adapters (OpenAI-compatible, Anthropic with thinking and
-  effort control), config profiles, and a utility profile for side jobs
-  such as thread titles and memory extraction
+- Two provider adapters (OpenAI-compatible with a reasoning-effort
+  setting, Anthropic with thinking and effort control), config profiles,
+  and a utility profile for side jobs such as thread titles and memory
+  extraction
 - The event log: resume any thread by id, compaction near the window,
   `/cost` over long threads, attributed permission decisions
 - Built-in tools — read, write and edit files (edits report diffs), list,
@@ -35,7 +36,8 @@ and memory across threads.
 - The multiplayer daemon: `aigentic serve`, sessions over a Unix socket or
   TCP, per-user roles checked on every request
 - `aigentic exec` for scripting (exit 0 done, 1 failed, 3 a human was
-  needed) and `aigentic doctor` for setup checks
+  needed), `aigentic doctor` for setup checks, and `aigentic stats` for
+  what the logs spent, by day, project, thread or issue
 
 ## Getting started
 
