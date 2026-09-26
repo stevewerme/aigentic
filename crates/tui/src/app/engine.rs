@@ -578,13 +578,13 @@ impl ClientRepl {
                 self.show(r, "", out);
             }
             Command::Copy(arg) => {
-                use crate::app::copy::{CopyChoice, pick};
+                use crate::app::copy::{CopyChoice, count, pick};
                 let outcome = match pick(&self.reply, arg) {
                     CopyChoice::Block { n, text, lines } => {
-                        Ok((text, format!("copied block {n} ({lines} lines)")))
+                        Ok((text, format!("copied block {n} ({})", count(lines, "line"))))
                     }
                     CopyChoice::All { text, lines } => {
-                        Ok((text, format!("copied the whole reply ({lines} lines)")))
+                        Ok((text, format!("copied the whole reply ({})", count(lines, "line"))))
                     }
                     CopyChoice::NoReply => Err(
                         "[no assistant reply in this session yet: /copy covers turns since this session started]"
@@ -594,7 +594,8 @@ impl ClientRepl {
                         Err("[the last reply has no fenced code blocks]".to_owned())
                     }
                     CopyChoice::OutOfRange { n, total } => Err(format!(
-                        "[block {n} is out of range: the last reply has {total} block(s)]"
+                        "[block {n} is out of range: the last reply has {}]",
+                        count(total, "block")
                     )),
                     CopyChoice::NotANumber => {
                         Err("[copy takes a block number or \"all\": /copy [n|all]]".to_owned())
@@ -2078,8 +2079,8 @@ mod tests {
             "block 1 before the question, block 2 after it: {lines:#?}"
         );
         assert!(
-            lines.contains(&"copied block 1 (1 lines)".to_owned())
-                && lines.contains(&"copied block 2 (1 lines)".to_owned()),
+            lines.contains(&"copied block 1 (1 line)".to_owned())
+                && lines.contains(&"copied block 2 (1 line)".to_owned()),
             "{lines:#?}"
         );
         drop(embedded);

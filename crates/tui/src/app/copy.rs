@@ -128,9 +128,21 @@ fn run_clipboard_tool(argv: &[&str], text: &str) -> bool {
     if let Some(mut stdin) = child.stdin.take()
         && stdin.write_all(text.as_bytes()).is_err()
     {
+        // Reap it either way, so a failed write leaves no zombie.
+        let _ = child.kill();
+        let _ = child.wait();
         return false;
     }
     child.wait().map(|s| s.success()).unwrap_or(false)
+}
+
+/// `1 line`, `2 lines`: a count with its noun, for the `/copy` lines.
+pub fn count(n: usize, noun: &str) -> String {
+    if n == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{n} {noun}s")
+    }
 }
 
 /// Put `text` on the clipboard. Over SSH that is OSC 52 alone; locally
@@ -305,6 +317,13 @@ mod tests {
         assert_eq!(transports(true, false), ssh);
         assert_eq!(transports(false, true), macos);
         assert_eq!(transports(false, false), linux);
+    }
+
+    #[test]
+    fn a_count_of_one_is_singular() {
+        assert_eq!(count(1, "line"), "1 line");
+        assert_eq!(count(2, "line"), "2 lines");
+        assert_eq!(count(0, "block"), "0 blocks");
     }
 
     #[test]
