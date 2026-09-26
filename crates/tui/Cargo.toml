@@ -15,6 +15,7 @@ aigentic-api = { workspace = true, features = ["client"] }
 aigentic-runtime.workspace = true
 aigentic-server.workspace = true
 anyhow.workspace = true
+base64 = "0.22"
 clap.workspace = true
 dotenvy.workspace = true
 futures-util.workspace = true

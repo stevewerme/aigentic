@@ -9,6 +9,7 @@ pub mod cells;
 pub mod commands;
 pub mod completion;
 pub mod composer;
+pub mod copy;
 pub mod diff;
 pub mod engine;
 pub mod keymap;
@@ -237,6 +238,12 @@ impl Printer for ShellOut {
         // Drawn by the loop after this step.
         self.flush_explored();
         self.page = Some((title.to_owned(), text.to_owned()));
+    }
+
+    fn copy(&mut self, text: &str) -> Result<crate::app::copy::Used, String> {
+        // The shell owns the terminal, so it is the one place the
+        // transport can be chosen (issue #41).
+        crate::app::copy::set_clipboard(text)
     }
 
     fn tail(&mut self, text: &str) {

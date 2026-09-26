@@ -22,6 +22,8 @@ pub enum Command<'a> {
     Queue,
     /// Print the permission mode, or set it when a name is given.
     Mode(Option<&'a str>),
+    /// Copy a code block of the latest reply: /copy [n|all].
+    Copy(Option<&'a str>),
     /// Swap the provider to a profile from the config, between turns.
     Profile(&'a str),
     /// The rule table, the bash allow patterns, the mode and the grants.
@@ -73,6 +75,8 @@ pub fn parse_line<'a>(line: &'a str, skills: &[String]) -> Command<'a> {
         ("queue", _) => Command::Queue,
         ("mode", "") => Command::Mode(None),
         ("mode", name) => Command::Mode(Some(name)),
+        ("copy", "") => Command::Copy(None),
+        ("copy", arg) => Command::Copy(Some(arg)),
         ("profile", name) if !name.is_empty() => Command::Profile(name),
         ("policy", _) => Command::Policy,
         ("memory", _) => Command::Memory,
@@ -120,6 +124,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ),
     ("threads", "this project's threads, newest first"),
     ("diff", "the project's working-tree diff, in the pager"),
+    ("copy", "copy a code block of the last reply: /copy [n|all]"),
     ("rename", "set the thread's title: /rename <title>"),
     ("keys", "the key table: interrupt, recall, quit"),
     ("help", "the command list"),
@@ -144,6 +149,7 @@ pub const HELP: &str = "\
 /<skill> [args]  run a user-invoked skill
 /diff            the project's working-tree diff, untracked files included
 /rename <title>  set the thread's title (one is proposed after the first turn)
+/copy [n|all]    copy the n-th code block of the last reply (default: the last); \"all\" for the whole reply, without the decorations
 /keys            the key table: interrupt, recall, quit
 /help            this list
 /quit            exit (Ctrl-D too)
@@ -201,6 +207,10 @@ mod tests {
             parse_line("/mode accept-edits", &none),
             Command::Mode(Some("accept-edits"))
         );
+        assert_eq!(parse_line("/copy", &none), Command::Copy(None));
+        assert_eq!(parse_line("/copy 2", &none), Command::Copy(Some("2")));
+        assert_eq!(parse_line("/copy all", &none), Command::Copy(Some("all")));
+        assert_eq!(parse_line("/copy x", &none), Command::Copy(Some("x")));
         assert_eq!(
             parse_line("/profile anthropic", &none),
             Command::Profile("anthropic")
@@ -292,5 +302,20 @@ mod tests {
         let out = truncate_for_display(&wide, 12, 100);
         assert!(out.starts_with(&"x".repeat(100)), "{out}");
         assert!(out.contains("… (400 more bytes)"), "{out}");
+    }
+
+    /// `/copy` is discoverable wherever the others are (issue #41).
+    #[test]
+    fn copy_is_listed_in_commands_help_and_keys() {
+        assert!(
+            COMMANDS.iter().any(|(name, _)| *name == "copy"),
+            "{COMMANDS:#?}"
+        );
+        assert!(HELP.contains("/copy"), "{HELP}");
+        assert!(
+            crate::app::keymap::KEYS.contains("/copy"),
+            "{}",
+            crate::app::keymap::KEYS
+        );
     }
 }

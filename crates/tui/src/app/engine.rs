@@ -28,6 +28,7 @@ use ulid::Ulid;
 
 use crate::app::cells::{Cell, ToolState, summarise_args};
 use crate::app::commands::{Command, HELP, parse_line, truncate_for_display};
+use crate::app::copy::Used;
 use crate::app::menu::{Keyed, Kind, Menu, Pick};
 
 /// What a key on the prompt menu came to, from `ClientRepl::menu_key`.
@@ -143,6 +144,13 @@ pub trait Printer {
             self.line(l);
         }
     }
+    /// Put `text` on the system clipboard (`/copy`, issue #41). The
+    /// default refuses: plain stdout would have to put an OSC 52 escape
+    /// on the same stream as the transcript, so a pipe that does not
+    /// support it gets a message instead.
+    fn copy(&mut self, _text: &str) -> Result<Used, String> {
+        Err("/copy needs the shell UI".into())
+    }
     fn cell(&mut self, cell: Cell, done: bool) {
         let lines = cell.plain();
         if done {
@@ -164,6 +172,24 @@ pub struct Lines(pub Vec<String>);
 impl Printer for Lines {
     fn line(&mut self, text: &str) {
         self.0.push(text.to_owned());
+    }
+}
+
+/// Plain lines plus the texts handed to the clipboard, for `/copy`
+/// (issue #41). The lines are `Copies::0`, the clipboard `Copies::1`.
+#[cfg(test)]
+#[derive(Default)]
+pub struct Copies(pub Lines, pub Vec<String>);
+
+#[cfg(test)]
+impl Printer for Copies {
+    fn line(&mut self, text: &str) {
+        self.0.line(text);
+    }
+
+    fn copy(&mut self, text: &str) -> Result<Used, String> {
+        self.1.push(text.to_owned());
+        Ok(Used::Child)
     }
 }
 
@@ -213,6 +239,10 @@ pub struct ClientRepl {
     identity: Identity,
     /// Streamed assistant text not yet ended by a newline.
     partial: String,
+    /// The assistant's text since the last prompt this client posted
+    /// (issue #41), the source of `/copy`: unlike `partial` it survives a
+    /// newline, so a whole reply's fences are intact.
+    reply: String,
     /// The call id of the request or question this client prompted for
     /// and has not answered: a decision from elsewhere withdraws it.
     prompted: Option<String>,
@@ -263,6 +293,7 @@ impl ClientRepl {
             mode,
             identity,
             partial: String::new(),
+            reply: String::new(),
             prompted: None,
             menu: None,
             turn: None,
@@ -546,6 +577,34 @@ impl ClientRepl {
                     .await;
                 self.show(r, "", out);
             }
+            Command::Copy(arg) => {
+                use crate::app::copy::{CopyChoice, pick};
+                let outcome = match pick(&self.reply, arg) {
+                    CopyChoice::Block { n, text, lines } => {
+                        Ok((text, format!("copied block {n} ({lines} lines)")))
+                    }
+                    CopyChoice::All { text, lines } => {
+                        Ok((text, format!("copied the whole reply ({lines} lines)")))
+                    }
+                    CopyChoice::NoReply => Err(
+                        "[no assistant reply in this session yet: /copy covers turns since this session started]"
+                            .to_owned(),
+                    ),
+                    CopyChoice::NoBlocks => {
+                        Err("[the last reply has no fenced code blocks]".to_owned())
+                    }
+                    CopyChoice::OutOfRange { n, total } => Err(format!(
+                        "[block {n} is out of range: the last reply has {total} block(s)]"
+                    )),
+                    CopyChoice::NotANumber => {
+                        Err("[copy takes a block number or \"all\": /copy [n|all]]".to_owned())
+                    }
+                };
+                match outcome {
+                    Ok((text, ok)) => self.finish_copy(&text, &ok, out),
+                    Err(line) => out.line(&line),
+                }
+            }
             Command::Profile(_) => {
                 out.line(
                     "[/profile is not available over the daemon: the profile is the project's]",
@@ -570,6 +629,9 @@ impl ClientRepl {
         };
         if matches!(r, Response::Ok) && matches!(self.state, ThreadState::Idle) {
             self.awaiting_turn = true;
+            // A new prompt starts a new reply (issue #41): what `/copy`
+            // copies is the answer to the last thing asked here.
+            self.reply.clear();
         }
         self.show(r, ok, out);
     }
@@ -805,6 +867,28 @@ impl ClientRepl {
         }
     }
 
+    /// A tool call ends the model's message; its text may have no
+    /// trailing newline, and the next message's text would run into it
+    /// (issue #41). The display already breaks a line here, so `reply`
+    /// keeps the same boundary and `/copy` sees the same blocks the
+    /// person did.
+    fn reply_boundary(&mut self) {
+        if !self.reply.is_empty() && !self.reply.ends_with('\n') {
+            self.reply.push('\n');
+        }
+    }
+
+    /// Put `text` on the clipboard through the printer's transport and
+    /// say what happened. `OSC 52` is named because the terminal may
+    /// ignore it (issue #41).
+    fn finish_copy(&mut self, text: &str, ok: &str, out: &mut dyn Printer) {
+        match out.copy(text) {
+            Ok(Used::Osc52) => out.line(&format!("{ok} via OSC 52")),
+            Ok(Used::Child) => out.line(ok),
+            Err(e) => out.line(&format!("[copy failed: {e}]")),
+        }
+    }
+
     pub fn state(&self) -> &ThreadState {
         &self.state
     }
@@ -865,6 +949,9 @@ impl ClientRepl {
                     t.retry = None;
                 }
                 self.partial.push_str(&text);
+                // `/copy` keeps the whole reply, not just the current
+                // line (issue #41); nothing renders from this.
+                self.reply.push_str(&text);
                 while let Some(pos) = self.partial.find('\n') {
                     let line: String = self.partial.drain(..=pos).collect();
                     out.cell(
@@ -881,6 +968,7 @@ impl ClientRepl {
                 if call.name == aigentic_runtime::harness_tools::UPDATE_TASKS =>
             {
                 self.flush_partial(out);
+                self.reply_boundary();
                 self.task_calls.insert(call.id.clone());
                 if let Ok(args) = serde_json::from_value::<
                     aigentic_runtime::harness_tools::UpdateTasksArgs,
@@ -909,6 +997,7 @@ impl ClientRepl {
             }
             Notice::ToolCallStarted { call, .. } => {
                 self.flush_partial(out);
+                self.reply_boundary();
                 let summary = summarise_args(&call);
                 let full = full_command(&call);
                 if let Some(t) = self.turn.as_mut() {
@@ -1814,6 +1903,185 @@ mod tests {
         assert!(lines.contains(&"  └ colour: Red".to_owned()), "{lines:#?}");
         assert!(lines.contains(&"  └ yes, friday".to_owned()), "{lines:#?}");
         assert!(lines.contains(&"done".to_owned()), "{lines:#?}");
+        drop(embedded);
+    }
+
+    /// `/copy n` across a turn's tool calls (issue #41, the real brief's
+    /// shape): the first message ends in a closing fence with no
+    /// newline and then calls a tool, so the next message's text would
+    /// run into the fence without `reply_boundary`; the turn's last
+    /// message is a plain sentence. `/copy 2` still finds both blocks.
+    #[tokio::test]
+    async fn copy_gets_the_nth_block_of_the_latest_turns_reply_across_tool_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = project(dir.path(), "proj", "");
+        let cfg_dir = dir.path().join("cfg");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        let one = "fn one() {}\nfn one_more() {}";
+        let two = "let two = 2;\nlet two_more = 3;";
+        // No trailing newline after the closing fence: the tool call is
+        // the boundary.
+        let block1 = format!("First block:\n\n```rust\n{one}\n```");
+        // This fence closes before the turn's last sentence.
+        let block2 = format!("Second block:\n\n```rust\n{two}\n```\n");
+        let script = vec![
+            vec![
+                text(&block1),
+                call(
+                    "t1",
+                    "update_tasks",
+                    serde_json::json!({"tasks": [{"text": "write the tests", "state": "done"}]}),
+                ),
+                tool_use(),
+            ],
+            vec![text(&block2), text("Delivered above."), done()],
+        ];
+        let embedded = Server::embed_with(
+            config(dir.path()),
+            cfg_dir.clone(),
+            root,
+            "steve",
+            None,
+            Factory::scripted(script),
+            Arc::new(DefaultReports {
+                global_instructions: cfg_dir.join("instructions.md"),
+            }),
+        )
+        .await
+        .unwrap();
+        let addr = Addr::Unix(embedded.socket.clone());
+        let (client, welcome) = Client::connect(&addr, &embedded.token).await.unwrap();
+        let role = welcome.projects[0].role.clone();
+        let (thread, state, mode) = open(&client, "proj", None).await;
+        let notices = client.take_notices().unwrap();
+        let mut repl = ClientRepl::new(
+            client,
+            thread,
+            "steve",
+            role,
+            state,
+            mode,
+            Identity::default(),
+        );
+        let (pacer, _) = Client::connect(&addr, &embedded.token).await.unwrap();
+        open(&pacer, "proj", Some(thread)).await;
+        let mut paced = pacer.take_notices().unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let feeder = async move {
+            // Before any turn there is nothing to copy.
+            tx.send("/copy".into()).unwrap();
+            tx.send("hello".into()).unwrap();
+            until_state(&mut paced, |s| *s == ThreadState::Idle).await;
+            tx.send("/copy 2".into()).unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            tx.send("/quit".into()).unwrap();
+        };
+        let mut caps = Copies::default();
+        let ((), ()) = tokio::join!(repl.run(rx, notices, &mut caps), feeder);
+        let lines = caps.0.0;
+        assert!(
+            lines.contains(
+                &"[no assistant reply in this session yet: /copy covers turns since this session started]"
+                    .to_owned()
+            ),
+            "the first /copy has no reply yet: {lines:#?}"
+        );
+        assert_eq!(
+            caps.1,
+            vec![two.to_owned()],
+            "the second block, verbatim: {lines:#?}"
+        );
+        assert!(
+            lines.contains(&"copied block 2 (2 lines)".to_owned()),
+            "{lines:#?}"
+        );
+        drop(embedded);
+    }
+
+    /// `/copy` keeps the turn's reply across an `ask_human` answer
+    /// (issue #41): block 1 is written before the question, block 2 in
+    /// the continuation turn after it, and both survive — clearing on a
+    /// state notice, or on the continuation turn, would lose block 1.
+    #[tokio::test]
+    async fn copy_keeps_the_reply_across_an_ask_human_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = project(dir.path(), "proj", "");
+        let cfg_dir = dir.path().join("cfg");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        let one = "fn before() {}";
+        let two = "fn after() {}";
+        let block1 = format!("Before the question:\n\n```rust\n{one}\n```");
+        let block2 = format!("After the answer:\n\n```rust\n{two}\n```\n");
+        let script = vec![
+            vec![
+                text(&block1),
+                call(
+                    "q1",
+                    "ask_human",
+                    serde_json::json!({"questions": [{"question": "Ship it?"}]}),
+                ),
+                tool_use(),
+            ],
+            vec![text(&block2), text("Done."), done()],
+        ];
+        let embedded = Server::embed_with(
+            config(dir.path()),
+            cfg_dir.clone(),
+            root,
+            "steve",
+            None,
+            Factory::scripted(script),
+            Arc::new(DefaultReports {
+                global_instructions: cfg_dir.join("instructions.md"),
+            }),
+        )
+        .await
+        .unwrap();
+        let addr = Addr::Unix(embedded.socket.clone());
+        let (client, welcome) = Client::connect(&addr, &embedded.token).await.unwrap();
+        let role = welcome.projects[0].role.clone();
+        let (thread, state, mode) = open(&client, "proj", None).await;
+        let notices = client.take_notices().unwrap();
+        let mut repl = ClientRepl::new(
+            client,
+            thread,
+            "steve",
+            role,
+            state,
+            mode,
+            Identity::default(),
+        );
+        let (pacer, _) = Client::connect(&addr, &embedded.token).await.unwrap();
+        open(&pacer, "proj", Some(thread)).await;
+        let mut paced = pacer.take_notices().unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let feeder = async move {
+            tx.send("go".into()).unwrap();
+            until_state(
+                &mut paced,
+                |s| matches!(s, ThreadState::AwaitingHuman { call_id, .. } if call_id == "q1"),
+            )
+            .await;
+            tx.send("yes, friday".into()).unwrap();
+            until_state(&mut paced, |s| *s == ThreadState::Idle).await;
+            tx.send("/copy 1".into()).unwrap();
+            tx.send("/copy".into()).unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            tx.send("/quit".into()).unwrap();
+        };
+        let mut caps = Copies::default();
+        let ((), ()) = tokio::join!(repl.run(rx, notices, &mut caps), feeder);
+        let lines = caps.0.0;
+        assert_eq!(
+            caps.1,
+            vec![one.to_owned(), two.to_owned()],
+            "block 1 before the question, block 2 after it: {lines:#?}"
+        );
+        assert!(
+            lines.contains(&"copied block 1 (1 lines)".to_owned())
+                && lines.contains(&"copied block 2 (1 lines)".to_owned()),
+            "{lines:#?}"
+        );
         drop(embedded);
     }
 
