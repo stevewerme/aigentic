@@ -37,7 +37,7 @@ pub struct Stats {
     pub days: Vec<DayStats>,
     /// Every project in the window, by name.
     pub projects: Vec<ProjectStats>,
-    /// Up to five threads by spend, dearest first.
+    /// Up to five threads by effective spend, dearest first.
     pub threads: Vec<ThreadSpend>,
     /// Threads whose files could not be read; counted so the totals are
     /// never silently short.
@@ -98,6 +98,15 @@ pub struct ProjectStats {
     pub hit_rate: f64,
     pub turns: BTreeMap<String, u32>,
     pub retries: u32,
+}
+
+/// What a thread's dollars really are (#40): stamped plus retro-priced,
+/// `Some` when either exists, `None` when neither does.
+fn effective(t: &ThreadSpend) -> Option<f64> {
+    match (t.spent, t.price_estimated_spent) {
+        (None, None) => None,
+        (stamped, estimated) => Some(stamped.unwrap_or(0.0) + estimated.unwrap_or(0.0)),
+    }
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -348,13 +357,14 @@ pub fn collect(
         });
     }
 
-    // Dearest first, and a priced thread outranks an unpriced one. A
-    // thread with no price (an endpoint with no price table) is ranked
-    // by its call count instead: on an unpriced setup "the dearest
-    // threads" would otherwise be five arbitrary ones. The id settles
-    // the last tie, so the order is the same on every run.
+    // Dearest first on the *effective* spend (stamped + retro-priced),
+    // and a priced thread outranks an unpriced one. A thread with no
+    // price at all (an endpoint with no price table) is ranked by its
+    // call count instead: on an unpriced setup "the costliest threads"
+    // would otherwise be five arbitrary ones. The id settles the last
+    // tie, so the order is the same on every run.
     threads.sort_by(|a, b| {
-        match (a.spent, b.spent) {
+        match (effective(a), effective(b)) {
             (Some(x), Some(y)) => y
                 .partial_cmp(&x)
                 .unwrap_or(std::cmp::Ordering::Equal)
@@ -606,7 +616,7 @@ fn money(stamped: Option<f64>, estimated: Option<f64>) -> String {
 }
 
 /// The text report: a `Cost`-style table of days, then projects, then
-/// the dearest threads.
+/// the costliest threads.
 pub fn render(stats: &Stats) -> String {
     let mut out = String::new();
     match &stats.since {
@@ -687,7 +697,7 @@ pub fn render(stats: &Stats) -> String {
         }
     }
     if !stats.threads.is_empty() {
-        out.push_str("\ndearest threads\n");
+        out.push_str("\ncostliest threads\n");
         for t in &stats.threads {
             out.push_str(&format!(
                 "  {:<26} {:<14} {:>5} calls {:>18}  {}\n",
@@ -1073,7 +1083,7 @@ api_key_env = "TENSORX_API_KEY"
     }
 
     #[test]
-    fn dearest_threads_rank_by_spend_then_calls_with_titles() {
+    fn costliest_threads_rank_by_effective_spend_then_calls_with_titles() {
         let f = fixture();
         let stats = collect(f.dir.path(), None, None, &no_prices()).unwrap();
         // The fixture sorted in-test by spend, unpriced last.
@@ -1098,6 +1108,104 @@ api_key_env = "TENSORX_API_KEY"
         assert_eq!(alpha.title, "first thread please");
         let beta = stats.threads.iter().find(|t| t.project == "beta").unwrap();
         assert_eq!(beta.title, "a named thread");
+    }
+
+    #[test]
+    fn threads_rank_by_effective_spend_and_the_cell_shows_both() {
+        let dir = tempfile::tempdir().unwrap();
+        // A mixed thread (stamped + retro), a retro-only one, and a
+        // stamped-only one whose stamp is the biggest single number.
+        let mixed = Ulid::generate();
+        let guessy = Ulid::generate();
+        let stamped = Ulid::generate();
+        let mixed_lines = vec![
+            user("2026-09-26T09:00:00Z", "mixed"),
+            call(
+                "2026-09-26T09:00:01Z",
+                10,
+                0,
+                10,
+                Some(0.9),
+                Some("z-ai/glm-5.3"),
+                None,
+            ),
+            // 2M output tokens on the tensorx table: exactly 9 dollars.
+            call(
+                "2026-09-26T09:00:02Z",
+                0,
+                0,
+                2_000_000,
+                None,
+                Some("z-ai/glm-5.3"),
+                None,
+            ),
+        ];
+        let guessy_lines = vec![
+            user("2026-09-26T09:10:00Z", "guessy"),
+            call(
+                "2026-09-26T09:10:01Z",
+                0,
+                0,
+                2_000_000,
+                None,
+                Some("unknown/model"),
+                Some("flash"),
+            ),
+        ];
+        let stamped_lines = vec![
+            user("2026-09-26T09:20:00Z", "stamped"),
+            call(
+                "2026-09-26T09:20:01Z",
+                10,
+                0,
+                10,
+                Some(1.0),
+                Some("z-ai/glm-5.3"),
+                None,
+            ),
+        ];
+        let base = dir.path().join("alpha");
+        write_thread(&base, mixed, &mixed_lines);
+        write_thread(&base, guessy, &guessy_lines);
+        write_thread(&base, stamped, &stamped_lines);
+
+        let stats = collect(dir.path(), None, None, &book_of(PRICED_CONFIG)).unwrap();
+        let mixed_retro = expected_cost(PRICED_CONFIG, "tensorx", &mixed_lines[2]);
+        let guessy_retro = expected_cost(PRICED_CONFIG, "flash", &guessy_lines[1]);
+        assert!(
+            (mixed_retro - 9.0).abs() < 1e-12 && (guessy_retro - 3.0).abs() < 1e-12,
+            "the fixture's tables: {mixed_retro} {guessy_retro}"
+        );
+
+        let ids: Vec<&str> = stats.threads.iter().map(|t| t.id.as_str()).collect();
+        let (m, g, s) = (mixed.to_string(), guessy.to_string(), stamped.to_string());
+        assert_eq!(
+            ids,
+            vec![m.as_str(), g.as_str(), s.as_str()],
+            "{:?}",
+            stats.threads
+        );
+        // The effective spend is what the sort used: 9.9 beats the plain
+        // $1.0000 stamp, and the retro-only thread still ranks.
+        let cells: Vec<String> = stats
+            .threads
+            .iter()
+            .map(|t| money(t.spent, t.price_estimated_spent))
+            .collect();
+        assert_eq!(
+            cells,
+            vec![
+                format!("${:.4}+~${:.4}", 0.9, mixed_retro),
+                format!("~${:.4}", guessy_retro),
+                format!("${:.4}", 1.0),
+            ],
+            "{cells:?}"
+        );
+        let text = render(&stats);
+        assert!(text.contains("costliest threads"), "{text}");
+        for cell in &cells {
+            assert!(text.contains(cell.as_str()), "{cell} missing from {text}");
+        }
     }
 
     #[test]
