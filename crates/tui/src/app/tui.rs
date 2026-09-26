@@ -5,7 +5,11 @@
 //! any other terminal output and survives quitting. The viewport holds
 //! the streaming tail, the composer and the status line.
 
+#[cfg(test)]
+use std::cell::RefCell;
 use std::io::Stdout;
+#[cfg(test)]
+use std::rc::Rc;
 
 use crossterm::event::{
     DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
@@ -69,8 +73,10 @@ pub struct Pane<'a> {
 /// single concrete type.
 enum Screen {
     Terminal(CrosstermBackend<Stdout>),
+    /// A test's screen, shared with the backends `fit` rebuilds so the
+    /// buffer the test reads is the one every draw writes.
     #[cfg(test)]
-    Test(ratatui::backend::TestBackend),
+    Test(Rc<RefCell<ratatui::backend::TestBackend>>),
 }
 
 impl std::io::Write for Screen {
@@ -102,7 +108,7 @@ impl ratatui::backend::Backend for Screen {
             Self::Terminal(inner) => ratatui::backend::Backend::draw(inner, content),
             #[cfg(test)]
             Self::Test(inner) => {
-                let _ = ratatui::backend::Backend::draw(inner, content);
+                let _ = ratatui::backend::Backend::draw(&mut *inner.borrow_mut(), content);
                 Ok(())
             }
         }
@@ -113,7 +119,7 @@ impl ratatui::backend::Backend for Screen {
             Self::Terminal(inner) => inner.append_lines(n),
             #[cfg(test)]
             Self::Test(inner) => {
-                let _ = inner.append_lines(n);
+                let _ = inner.borrow_mut().append_lines(n);
                 Ok(())
             }
         }
@@ -124,7 +130,7 @@ impl ratatui::backend::Backend for Screen {
             Self::Terminal(inner) => inner.hide_cursor(),
             #[cfg(test)]
             Self::Test(inner) => {
-                let _ = inner.hide_cursor();
+                let _ = inner.borrow_mut().hide_cursor();
                 Ok(())
             }
         }
@@ -135,7 +141,7 @@ impl ratatui::backend::Backend for Screen {
             Self::Terminal(inner) => inner.show_cursor(),
             #[cfg(test)]
             Self::Test(inner) => {
-                let _ = inner.show_cursor();
+                let _ = inner.borrow_mut().show_cursor();
                 Ok(())
             }
         }
@@ -146,7 +152,10 @@ impl ratatui::backend::Backend for Screen {
             Self::Terminal(inner) => inner.get_cursor_position(),
             // A `TestBackend` always answers.
             #[cfg(test)]
-            Self::Test(inner) => Ok(inner.get_cursor_position().expect("a test position")),
+            Self::Test(inner) => Ok(inner
+                .borrow_mut()
+                .get_cursor_position()
+                .expect("a test position")),
         }
     }
 
@@ -155,7 +164,7 @@ impl ratatui::backend::Backend for Screen {
             Self::Terminal(inner) => inner.set_cursor_position(position),
             #[cfg(test)]
             Self::Test(inner) => {
-                let _ = inner.set_cursor_position(position);
+                let _ = inner.borrow_mut().set_cursor_position(position);
                 Ok(())
             }
         }
@@ -166,7 +175,7 @@ impl ratatui::backend::Backend for Screen {
             Self::Terminal(inner) => inner.clear(),
             #[cfg(test)]
             Self::Test(inner) => {
-                let _ = inner.clear();
+                let _ = inner.borrow_mut().clear();
                 Ok(())
             }
         }
@@ -177,7 +186,7 @@ impl ratatui::backend::Backend for Screen {
             Self::Terminal(inner) => inner.clear_region(clear_type),
             #[cfg(test)]
             Self::Test(inner) => {
-                let _ = inner.clear_region(clear_type);
+                let _ = inner.borrow_mut().clear_region(clear_type);
                 Ok(())
             }
         }
@@ -188,7 +197,7 @@ impl ratatui::backend::Backend for Screen {
             Self::Terminal(inner) => inner.size(),
             // A `TestBackend` always knows its size.
             #[cfg(test)]
-            Self::Test(inner) => Ok(inner.size().expect("a test size")),
+            Self::Test(inner) => Ok(inner.borrow().size().expect("a test size")),
         }
     }
 
@@ -197,7 +206,7 @@ impl ratatui::backend::Backend for Screen {
             Self::Terminal(inner) => inner.window_size(),
             #[cfg(test)]
             Self::Test(inner) => {
-                let size = inner.size().expect("a test size");
+                let size = inner.borrow().size().expect("a test size");
                 Ok(ratatui::backend::WindowSize {
                     columns_rows: size,
                     pixels: size,
@@ -211,7 +220,7 @@ impl ratatui::backend::Backend for Screen {
             Self::Terminal(inner) => ratatui::backend::Backend::flush(inner),
             #[cfg(test)]
             Self::Test(inner) => {
-                let _ = ratatui::backend::Backend::flush(inner);
+                let _ = ratatui::backend::Backend::flush(&mut *inner.borrow_mut());
                 Ok(())
             }
         }
@@ -222,7 +231,7 @@ impl ratatui::backend::Backend for Screen {
             Self::Terminal(inner) => inner.scroll_region_up(region, n),
             #[cfg(test)]
             Self::Test(inner) => {
-                let _ = inner.scroll_region_up(region, n);
+                let _ = inner.borrow_mut().scroll_region_up(region, n);
                 Ok(())
             }
         }
@@ -233,7 +242,7 @@ impl ratatui::backend::Backend for Screen {
             Self::Terminal(inner) => inner.scroll_region_down(region, n),
             #[cfg(test)]
             Self::Test(inner) => {
-                let _ = inner.scroll_region_down(region, n);
+                let _ = inner.borrow_mut().scroll_region_down(region, n);
                 Ok(())
             }
         }
@@ -264,8 +273,34 @@ impl Tracked {
     #[cfg(test)]
     fn test(width: u16, height: u16) -> Self {
         Self {
-            inner: Screen::Test(ratatui::backend::TestBackend::new(width, height)),
+            inner: Screen::Test(Rc::new(RefCell::new(ratatui::backend::TestBackend::new(
+                width, height,
+            )))),
             known: Some(Position::new(0, 0)),
+        }
+    }
+
+    /// A backend of the same kind, for the `Terminal` `fit` builds: the
+    /// terminal, or the same test screen, so a test stays attached to
+    /// the buffer every draw writes.
+    fn rebuild(&self) -> Self {
+        let inner = match &self.inner {
+            Screen::Terminal(_) => Screen::Terminal(CrosstermBackend::new(std::io::stdout())),
+            #[cfg(test)]
+            Screen::Test(screen) => Screen::Test(Rc::clone(screen)),
+        };
+        Self {
+            inner,
+            known: self.known,
+        }
+    }
+
+    /// A test's screen, for a test to read.
+    #[cfg(test)]
+    fn test_screen(&self) -> Option<Rc<RefCell<ratatui::backend::TestBackend>>> {
+        match &self.inner {
+            Screen::Terminal(_) => None,
+            Screen::Test(screen) => Some(Rc::clone(screen)),
         }
     }
 }
@@ -281,10 +316,12 @@ impl ratatui::backend::Backend for Tracked {
     }
     fn append_lines(&mut self, n: u16) -> std::io::Result<()> {
         if let Some(p) = self.known.as_mut() {
-            // The terminal's height, when there is one: a test backend
-            // has no screen to run off the bottom of.
-            let bottom = crossterm::terminal::size()
-                .map(|(_, h)| h.saturating_sub(1))
+            // The screen's height, so a test backend clamps to its own
+            // screen rather than to a terminal it has not got.
+            let bottom = self
+                .inner
+                .size()
+                .map(|s| s.height.saturating_sub(1))
                 .unwrap_or(u16::MAX);
             p.y = (p.y + n).min(bottom);
             p.x = 0;
@@ -373,45 +410,61 @@ impl Shell {
         })
     }
 
-    /// Size the viewport to `wanted` rows (clamped to the screen): it
-    /// grows and shrinks with the pane's content (issue #39), so the
-    /// viewport tracks what the live area draws. ratatui's inline
-    /// viewport has a fixed height, so a new one is made at the old
-    /// one's top: the old area is cleared first, and the new one
-    /// scrolls the screen only when it needs more room below.
+    /// The terminal's size in columns and rows, from the backend the
+    /// shell draws on: the same query a terminal answers, and a test
+    /// backend's fixed screen.
+    fn size(&self) -> anyhow::Result<(u16, u16)> {
+        let size = ratatui::backend::Backend::size(self.terminal.backend())?;
+        Ok((size.width, size.height))
+    }
+
     /// The height `fit` would move to, or `None` when it would not.
     fn target(&self, wanted: u16) -> anyhow::Result<Option<u16>> {
-        let screen = crossterm::terminal::size()?.1;
+        let screen = self.size()?.1;
         let wanted = wanted.clamp(MIN_ROWS, screen.saturating_sub(1).max(MIN_ROWS));
         Ok((wanted != self.rows).then_some(wanted))
     }
 
     /// Size the viewport to `wanted` rows (clamped to the screen).
-    /// The viewport tracks the pane's content (issue #39): it grows
-    /// and shrinks as rows come and go, so the layout's one blank row
-    /// above the live area stays one. A resized window is refitted at
-    /// the same height. ratatui's inline viewport has a fixed height,
-    /// so a new one is made at the old one's top: the old area is
-    /// cleared first, and the new one scrolls the screen only when it
-    /// needs more room below.
+    ///
+    /// The viewport tracks the pane's content (issue #39): it grows and
+    /// shrinks as rows come and go, so the layout's one blank row above
+    /// the live area stays one. A resized window is refitted at the same
+    /// height. ratatui's inline viewport has a fixed height, so a new one
+    /// is made at the old one's top, over rows the old one did not cover.
+    ///
+    /// Growing upwards over the transcript would erase it, so growth
+    /// scrolls first: `shortfall` line feeds at the last row move the
+    /// whole screen up, which puts the `shortfall` topmost screen rows
+    /// into the terminal's own history, and the transcript rows that sat
+    /// directly above the viewport move up with them and stay visible.
+    /// The old viewport's rows move up too; clearing from the old top,
+    /// now `shortfall` rows higher, wipes exactly those and the blank
+    /// rows below, so no transcript row is ever inside the cleared band.
+    /// Shrinking (and growth with room below the old top) leaves
+    /// `shortfall` at zero: nothing scrolls, the clear starts at the old
+    /// top, and the new viewport anchors there.
     pub fn fit(&mut self, wanted: u16) -> anyhow::Result<()> {
-        let size = crossterm::terminal::size()?;
+        let size = self.size()?;
         let resized = size != self.last_size;
         let rows = match self.target(wanted)? {
             Some(rows) => rows,
             None if resized => self.rows.min(size.1.saturating_sub(1).max(MIN_ROWS)),
             None => return Ok(()),
         };
-        let top = self
-            .terminal
-            .get_frame()
-            .area()
-            .y
-            .min(size.1.saturating_sub(rows));
-        let mut backend = Tracked::new();
+        let height = size.1;
+        let old_top = self.terminal.get_frame().area().y;
+        // How far the new viewport would run past the bottom of the
+        // screen: 0 when it shrinks, or when the old top leaves room.
+        let shortfall = old_top.saturating_add(rows).saturating_sub(height);
+        let mut backend = self.terminal.backend().rebuild();
         {
             use ratatui::backend::{Backend, ClearType};
-            backend.set_cursor_position(Position::new(0, top))?;
+            if shortfall > 0 {
+                backend.set_cursor_position(Position::new(0, height.saturating_sub(1)))?;
+                backend.append_lines(shortfall)?;
+            }
+            backend.set_cursor_position(Position::new(0, old_top.saturating_sub(shortfall)))?;
             backend.clear_region(ClearType::AfterCursor)?;
             Backend::flush(&mut backend)?;
         }
@@ -437,6 +490,55 @@ impl Shell {
             rows: height,
             last_size: (width, height),
         }
+    }
+
+    /// A shell over a `TestBackend` with an inline viewport `rows` tall:
+    /// a test drives the live area itself, and `fit` can move it.
+    #[cfg(test)]
+    pub fn test_inline(width: u16, height: u16, rows: u16) -> Self {
+        Self {
+            terminal: Terminal::with_options(
+                Tracked::test(width, height),
+                TerminalOptions {
+                    viewport: Viewport::Inline(rows),
+                },
+            )
+            .expect("a test terminal"),
+            enhanced_keys: false,
+            stopped: false,
+            rows,
+            last_size: (width, height),
+        }
+    }
+
+    /// The live area's top row.
+    #[cfg(test)]
+    fn frame_top(&mut self) -> u16 {
+        self.terminal.get_frame().area().y
+    }
+
+    /// The screen's rows, top to bottom, trailing blanks trimmed.
+    #[cfg(test)]
+    fn screen_lines(&self) -> Vec<String> {
+        self.with_screen(|screen| rows_of(screen.buffer()))
+    }
+
+    /// The rows that have scrolled off the top, oldest first.
+    #[cfg(test)]
+    fn history_lines(&self) -> Vec<String> {
+        self.with_screen(|screen| rows_of(screen.scrollback()))
+    }
+
+    /// Read the test's screen: the one `fit` rebuilds stay attached to.
+    #[cfg(test)]
+    fn with_screen<R>(&self, f: impl FnOnce(&ratatui::backend::TestBackend) -> R) -> R {
+        let screen = self
+            .terminal
+            .backend()
+            .test_screen()
+            .expect("a test screen");
+        let screen = screen.borrow();
+        f(&screen)
     }
 
     /// Put the terminal back. Called on quit and by `Drop`.
@@ -536,6 +638,21 @@ struct Blank;
 
 impl Widget for Blank {
     fn render(self, _: Rect, _: &mut ratatui::buffer::Buffer) {}
+}
+
+/// A buffer's rows, top to bottom, with trailing blanks trimmed: a
+/// test's view of the screen or of the history above it.
+#[cfg(test)]
+fn rows_of(buf: &ratatui::buffer::Buffer) -> Vec<String> {
+    (0..buf.area.height)
+        .map(|y| {
+            (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol().to_owned())
+                .collect::<String>()
+                .trim_end()
+                .to_owned()
+        })
+        .collect()
 }
 
 /// The pane's rows, bottom-aligned in `area`, and the cursor position
@@ -952,5 +1069,131 @@ mod tests {
         assert_eq!(wrap("a\n\nb", 4), vec!["a", "", "b"]);
         assert_eq!(wrap("", 4), vec![""]);
         assert_eq!(wrap("日本語", 4), vec!["日本", "語"]);
+    }
+
+    /// An inline shell on a `height`-row screen (issue #48) with a
+    /// transcript committed below a `MIN_ROWS` viewport: the pane's
+    /// rows, one per line, as long as it takes to bottom-anchor the
+    /// live area, plus the one directly above it. Returns the shell,
+    /// the committed lines in order, and the live area's top row.
+    fn anchored_shell(width: u16, height: u16) -> (Shell, Vec<String>, u16) {
+        let mut shell = Shell::test_inline(width, height, MIN_ROWS);
+        // One commit per row the live area has to move down to reach
+        // the bottom, and one more for the line above it.
+        let n = usize::from(height - MIN_ROWS) + 1;
+        let lines: Vec<String> = (1..=n).map(|i| format!("line {i}")).collect();
+        for line in &lines {
+            shell.commit(Line::raw(line.clone())).expect("a commit");
+        }
+        let top = shell.frame_top();
+        (shell, lines, top)
+    }
+
+    #[test]
+    fn growth_scrolls_the_transcript_into_history() {
+        let (mut shell, lines, old_top) = anchored_shell(40, 15);
+        let d = 2; // a small growth: two rows more than the minimum
+        let screen_before = shell.screen_lines();
+        let history_before = shell.history_lines();
+        assert_eq!(
+            screen_before[usize::from(old_top) - 1],
+            lines[lines.len() - 1],
+            "the pane's last row sits directly above the live area"
+        );
+
+        shell.fit(MIN_ROWS + d).expect("a fit");
+
+        assert_eq!(shell.rows, MIN_ROWS + d);
+        assert_eq!(shell.frame_top(), old_top - d, "the live area grows up");
+        let screen_after = shell.screen_lines();
+        let history_after = shell.history_lines();
+
+        // Nothing the test committed is gone, and the order holds: read
+        // the screen and the history as one transcript, the committed
+        // lines are all there, in order (issue #48: the rows that
+        // vanished from the screen).
+        let seen: Vec<&String> = history_after
+            .iter()
+            .chain(screen_after.iter())
+            .filter(|row| lines.contains(row))
+            .collect();
+        let expected: Vec<&String> = lines.iter().collect();
+        assert_eq!(seen, expected, "every committed line, in order");
+
+        // The rows that left the screen are its topmost `d`, now at the
+        // end of the history: the whole screen moved up by `d`.
+        assert_eq!(
+            &history_after[history_before.len()..],
+            &screen_before[..usize::from(d)]
+        );
+
+        // The pane's last line is still on screen, one row above the
+        // live area's new top.
+        assert_eq!(
+            screen_after[usize::from(old_top - d) - 1],
+            lines[lines.len() - 1]
+        );
+    }
+
+    #[test]
+    fn growth_with_room_below_scrolls_nothing() {
+        let height = 15;
+        let mut shell = Shell::test_inline(40, height, MIN_ROWS);
+        let lines: Vec<String> = (1..=2).map(|i| format!("line {i}")).collect();
+        for line in &lines {
+            shell.commit(Line::raw(line.clone())).expect("a commit");
+        }
+        let old_top = shell.frame_top();
+        assert!(
+            old_top + MIN_ROWS < height,
+            "the live area is not at the bottom of the screen"
+        );
+        let history_before = shell.history_lines();
+
+        shell.fit(MIN_ROWS + 3).expect("a fit");
+
+        assert_eq!(
+            shell.frame_top(),
+            old_top,
+            "the live area stays where it is"
+        );
+        assert_eq!(shell.rows, MIN_ROWS + 3);
+        assert_eq!(
+            shell.history_lines(),
+            history_before,
+            "nothing scrolled: the room below the pane paid for it"
+        );
+        let screen = shell.screen_lines();
+        for (i, line) in lines.iter().enumerate() {
+            assert_eq!(&screen[i], line, "the transcript is still on screen");
+        }
+    }
+
+    #[test]
+    fn a_shrinking_viewport_leaves_the_history_alone() {
+        let (mut shell, lines, old_top) = anchored_shell(40, 15);
+        let d = 2;
+        shell.fit(MIN_ROWS + d).expect("a fit");
+        let top_before = shell.frame_top();
+        let history_before = shell.history_lines();
+
+        shell.fit(MIN_ROWS).expect("a fit");
+
+        assert_eq!(shell.rows, MIN_ROWS);
+        assert_eq!(
+            shell.frame_top(),
+            top_before,
+            "a shrink keeps the live area's top and pulls its bottom up"
+        );
+        assert_eq!(
+            shell.history_lines(),
+            history_before,
+            "a shrink scrolls nothing"
+        );
+        assert_eq!(top_before, old_top - d, "the tall fit grew the live area");
+        assert_eq!(
+            shell.screen_lines()[usize::from(top_before) - 1],
+            lines[lines.len() - 1]
+        );
     }
 }
