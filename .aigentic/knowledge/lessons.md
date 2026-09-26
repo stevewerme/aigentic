@@ -54,6 +54,14 @@ so the rule can be judged, not just obeyed. The `brief`, `plan-check` and
 - **Visual changes need a pty check** (`~/.local/share/aigentic/devtools/drive.py`,
   a venv with `pyte`); the implementer pastes dumps, and the reviewer
   repeats the check for UI work. Code-only work gets a lean review.
+- **A pty check never copies `.env`.** The session it starts reads the key
+  from the environment: export it from the repo's `.env` in the same
+  command (`set -a; . ./.env; set +a; python3 drive.py …`) and run from a
+  scratch directory with no `.env` of its own. On #41 the implementer
+  copied `.env` into `/tmp/41-pty`, leaving the API key in a file any user
+  on the machine could read. Judge the dumps from `raw.bin` when rows
+  appear or vanish: pyte mis-renders scroll-region inserts (#48 was found
+  that way).
 
 ## Git and GitHub
 

@@ -68,7 +68,8 @@ prompt block. When asked, also save each prompt to
 - Gate: `cargo fmt`, `cargo clippy --all-targets -- -D warnings`,
   `cargo test` with `timeout_secs: 900`, run once with its output saved
   to a log file under the temp directory, then searched; never re-run the
-  suite to see other lines of it. For UI work, the pty check, with dumps
+  suite to see other lines of it. For UI work, the pty check (the key
+  from the environment, never a copied `.env`), with dumps
   pasted in the final message.
 - Commit per the plan with `git commit -F <file>`, files staged by name, a
   blank line, then exactly
@@ -93,7 +94,9 @@ prompt block. When asked, also save each prompt to
 cheap model.
 - "Do not edit any file." Read the plan, amendments and `## Implementation`.
 - Run the gate on the touched crates (`timeout_secs: 600`), each planned
-  test by name, the reference check, and for UI work the pty check.
+  test by name, the reference check, and for UI work the pty check (the
+  key from the environment, never a copied `.env`; rows that appear or
+  vanish judged from `raw.bin`, not the pyte dump).
 - Check the ledger against the code: every planned test exists under the
   name the ledger gives, or has a stated reason.
 - Post one comment headed `## Verification` with the command outputs,
