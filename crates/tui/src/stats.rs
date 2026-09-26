@@ -193,7 +193,11 @@ pub fn collect(
                         name.as_str(),
                         &mut spend,
                     );
-                    threads.push(spend);
+                    // #40: a thread with no call inside the window is not
+                    // a row. Its title is a label, but a row is a total.
+                    if spend.calls > 0 {
+                        threads.push(spend);
+                    }
                 }
                 Err(_) => stats.unreadable += 1,
             }
@@ -326,7 +330,9 @@ fn hit_rate(cache_read: u64, context_total: u64) -> f64 {
 }
 
 /// Fold one thread's events into its project's totals and, for events in
-/// the window, its day's totals too.
+/// the window, its day's totals too. Since #40 the window gates the
+/// project and the thread as well; only a thread's title and profile are
+/// read from outside it, because those are labels, not totals.
 fn absorb(
     project: &mut Accum,
     events: &[aigentic_runtime::aigentic_core::Event],
@@ -347,6 +353,12 @@ fn absorb(
         let in_window = cutoff.is_none_or(|c| event.created_at >= c);
         match event.kind {
             EventKind::AssistantMessage => {
+                // #40: the window gates every table, not just the days.
+                // A call outside it is invisible to the projects and the
+                // top threads too, so all three sums agree.
+                if !in_window {
+                    continue;
+                }
                 let Ok(AssistantMessagePayload { usage: Some(u), .. }) =
                     serde_json::from_value(event.payload.clone())
                 else {
@@ -361,19 +373,20 @@ fn absorb(
                 if let Some(usd) = cost {
                     spend.spent = Some(spend.spent.unwrap_or(0.0) + usd);
                 }
-                if in_window {
-                    days.entry(day)
-                        .or_default()
-                        .add_call(context, u.cache_read_tokens, cost);
-                }
+                days.entry(day)
+                    .or_default()
+                    .add_call(context, u.cache_read_tokens, cost);
             }
             EventKind::ProviderRetried => {
-                project.retries += 1;
                 if in_window {
+                    project.retries += 1;
                     days.entry(day).or_default().retries += 1;
                 }
             }
             EventKind::TurnEnded => {
+                if !in_window {
+                    continue;
+                }
                 let Ok(p) = serde_json::from_value::<TurnEndedPayload>(event.payload.clone())
                 else {
                     continue;
@@ -382,9 +395,7 @@ fn absorb(
                 // http 503` is a `provider_error` turn.
                 let head = p.reason.split(':').next().unwrap_or("").to_owned();
                 *project.turns.entry(head.clone()).or_default() += 1;
-                if in_window {
-                    *days.entry(day).or_default().turns.entry(head).or_default() += 1;
-                }
+                *days.entry(day).or_default().turns.entry(head).or_default() += 1;
             }
             EventKind::ThreadRenamed => {
                 if let Ok(p) = serde_json::from_value::<ThreadRenamedPayload>(event.payload.clone())
@@ -595,6 +606,26 @@ mod tests {
     /// expectation below is recomputed from these lines, not written out.
     struct Fixture {
         dir: tempfile::TempDir,
+        /// Every line written, in order, so an expectation can filter the
+        /// fixture the way the code does (#40).
+        events: Vec<serde_json::Value>,
+    }
+
+    impl Fixture {
+        /// The fixture's `assistant_message` lines at or after `cutoff` —
+        /// what `--since` says is in the window.
+        fn calls_since(&self, cutoff: OffsetDateTime) -> u32 {
+            self.events
+                .iter()
+                .filter(|e| {
+                    e["kind"] == "assistant_message"
+                        && e["created_at"]
+                            .as_str()
+                            .and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok())
+                            .is_some_and(|t| t >= cutoff)
+                })
+                .count() as u32
+        }
     }
 
     fn fixture() -> Fixture {
@@ -622,6 +653,7 @@ mod tests {
             retried("2026-09-22T09:00:03Z"),
             turn_ended("2026-09-22T09:00:04Z", "done"),
         ];
+        let mut events = lines.clone();
         write_thread(&dir.path().join("alpha"), one, &lines);
         lines = vec![
             user("2026-09-23T10:00:00Z", "second thread"),
@@ -630,8 +662,9 @@ mod tests {
             retried("2026-09-23T10:00:03Z"),
             turn_ended("2026-09-23T10:00:04Z", "provider_error: http 503"),
         ];
+        events.extend(lines.clone());
         write_thread(&dir.path().join("beta"), two, &lines);
-        Fixture { dir }
+        Fixture { dir, events }
     }
 
     #[test]
@@ -711,24 +744,50 @@ mod tests {
     }
 
     #[test]
-    fn since_filters_the_day_keys_by_the_fixture_dates() {
+    fn since_filters_every_table_by_the_fixture_dates() {
         let f = fixture();
         // The fixture's second day is 2026-09-23: a cutoff inside it
-        // drops 2026-09-22's day only.
+        // drops 2026-09-22's day.
         let cutoff = parse_since("2026-09-23", datetime!(2026-09-24 00:00:00 UTC)).unwrap();
         let stats = collect(f.dir.path(), None, Some(cutoff)).unwrap();
         let days: Vec<&str> = stats.days.iter().map(|d| d.day.as_str()).collect();
         assert_eq!(days, vec!["2026-09-23"], "{stats:?}");
         assert_eq!(stats.days[0].calls, 1);
-        // Projects and threads are not windowed: the whole thread is
-        // still worth knowing about.
-        assert_eq!(stats.projects.iter().map(|p| p.calls).sum::<u32>(), 3);
+        // #40 flips this: the window gates the projects and the threads
+        // too, so all three sums are the same window. The old comment
+        // ("the whole thread is still worth knowing about") is overruled
+        // by the issue: a project row that counted 3254 all-time calls
+        // beside a 2457-call window is exactly the bug.
+        let in_window = f.calls_since(cutoff);
+        assert_eq!(in_window, 1, "the fixture filtered as the code should");
+        assert_eq!(
+            stats.projects.iter().map(|p| p.calls).sum::<u32>(),
+            in_window
+        );
+        assert_eq!(
+            stats.threads.iter().map(|t| t.calls).sum::<u32>(),
+            in_window
+        );
+        // beta is the only thread with a call in the window; alpha, whose
+        // two calls predate it, leaves no row at all.
+        assert_eq!(
+            stats
+                .threads
+                .iter()
+                .map(|t| t.project.as_str())
+                .collect::<Vec<_>>(),
+            vec!["beta"]
+        );
 
         // `Nd` is now minus N whole days; a week back keeps both days.
         let week = parse_since("7d", datetime!(2026-09-24 12:00:00 UTC)).unwrap();
         assert_eq!(week, datetime!(2026-09-17 12:00:00 UTC));
         let stats = collect(f.dir.path(), None, Some(week)).unwrap();
         assert_eq!(stats.days.len(), 2);
+        assert_eq!(
+            stats.projects.iter().map(|p| p.calls).sum::<u32>(),
+            f.calls_since(week)
+        );
     }
 
     #[test]
