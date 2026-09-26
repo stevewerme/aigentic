@@ -62,6 +62,14 @@ so the rule can be judged, not just obeyed. The `brief`, `plan-check` and
 - Stage files by name. Never `git add -A`, `git reset`, `git checkout --
   <file>`, `git stash` or `git clean` in a build thread; the tree may hold
   someone else's unfinished work.
+- Never amend, rebase or force-push a commit once it is pushed; a late fix
+  is a new commit. On #40 the implementer amended a pushed commit on `main`
+  and force-pushed it (disclosed, nothing lost), which rewrites history
+  under anyone who pulled.
+- Every closed issue states its `Release impact:` (none, patch, minor,
+  breaking). A release takes the highest since the last tag (ADR 0001);
+  pre-1.0, `breaking` and `minor` bump the minor version (0.1 → 0.2),
+  `patch` the patch, and `none` alone cuts no release.
 - The trailer names the model that wrote the code:
   `Co-Authored-By: aigentic (<model>) <332865255+aigentic-bot@users.noreply.github.com>`.
   Never copy another trailer from history (a build once credited Claude
@@ -75,7 +83,10 @@ so the rule can be judged, not just obeyed. The `brief`, `plan-check` and
 
 ## Running builds
 
-- The full test suite needs `timeout_secs: 600`; the repo default is 600.
+- The full test suite needs `timeout_secs: 900` (600 was cut short on
+  #40). Run it once with its output in a log file, then search the file:
+  #40's implementer ran the whole suite five times, three of them only to
+  read other lines of the same result.
 - **One task per thread.** A new commit-sized task starts a fresh thread;
   resume the same thread only to finish what it was doing.
 - A turn that stops on `max_tokens`, `max_iterations` or `max_wall_time`
@@ -84,7 +95,9 @@ so the rule can be judged, not just obeyed. The `brief`, `plan-check` and
 - `provider_error: transport …` is the provider: probe it
   (`aigentic doctor --probe`), then `continue`. TensorX once hung 9.5
   minutes; retries were invisible until #31.
-- A laptop that sleeps pauses tool timers: a `cargo test` "took" 37 minutes.
+- A laptop that sleeps pauses tool timers: a `cargo test` "took" 37
+  minutes, and on #40 16 (12.5 of them asleep, `pmset -g log`). Until #47,
+  start build threads with `caffeinate -i aigentic …`.
 - A running session keeps the binary it started with: a fix installed
   mid-run only applies to sessions started afterwards.
 - A new key in `aigentic.toml` makes older binaries refuse the repo until

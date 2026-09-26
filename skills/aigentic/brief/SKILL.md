@@ -66,8 +66,10 @@ prompt block. When asked, also save each prompt to
   that is wrong, and say so. Never change an assertion just to make it
   pass. If a step is impossible as written, say so instead of improvising."
 - Gate: `cargo fmt`, `cargo clippy --all-targets -- -D warnings`,
-  `cargo test` with `timeout_secs: 600`. For UI work, the pty check, with
-  dumps pasted in the final message.
+  `cargo test` with `timeout_secs: 900`, run once with its output saved
+  to a log file under the temp directory, then searched; never re-run the
+  suite to see other lines of it. For UI work, the pty check, with dumps
+  pasted in the final message.
 - Commit per the plan with `git commit -F <file>`, files staged by name, a
   blank line, then exactly
   `Co-Authored-By: aigentic (<model>) <332865255+aigentic-bot@users.noreply.github.com>`,
@@ -83,8 +85,9 @@ prompt block. When asked, also save each prompt to
   `landed`, or `not landed` with the reason. A planned test may be dropped
   only with a stated reason. Later steps read the issue, not this thread.
 - The safety line: never `git reset`, `git checkout -- <file>`,
-  `git stash`, `git clean` or `git add -A`; commit nothing under
-  `.scratch/`; leave `.aigentic/rules.toml` alone.
+  `git stash`, `git clean` or `git add -A`; never amend, rebase or
+  force-push a commit once it is pushed (a late fix is a new commit);
+  commit nothing under `.scratch/`; leave `.aigentic/rules.toml` alone.
 
 **Verifier** (profile `flash`): the mechanical half of the review, on the
 cheap model.
@@ -105,13 +108,19 @@ cheap model.
   contradicts the diff.
 - A planned test missing without a stated reason is `changes needed`.
 - Post one comment headed `## Review` with a verdict (`approve`, or
-  `changes needed` with a numbered list). On approve, post the closing
-  comment (files changed, tests added, what the issue got wrong or
-  "nothing") and close the issue.
+  `changes needed` with a numbered list) and, on its own line,
+  `Release impact: none | patch | minor | breaking`, with one clause of
+  reason: `breaking` when a config key, CLI flag, wire type or on-disk
+  format that worked before now fails; `minor` for a new command, flag,
+  tool, event kind or behaviour; `patch` for a fix with no new surface;
+  `none` for docs, tests and internal refactors. On approve, post the
+  closing comment (files changed, tests added, what the issue got wrong
+  or "nothing", and the release impact) and close the issue.
 
 **Implementer alone** (trivial): the implementer prompt with the design
 written into it, plus the closing comment as a done-when item: files
-changed, tests added, what the issue got wrong or "nothing", then close.
+changed, tests added, what the issue got wrong or "nothing", and the
+`Release impact:` line by the judge's rule, then close.
 
 ## 5. Hand over
 
