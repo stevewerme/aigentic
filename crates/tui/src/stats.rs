@@ -871,6 +871,16 @@ api_key_env = "TENSORX_API_KEY"
         })
     }
 
+    /// What the agent said before the user did: never a thread's title.
+    fn agent_says(at: &str, text: &str) -> serde_json::Value {
+        json!({
+            "kind": "assistant_message",
+            "author": {"kind": "agent", "id": "assistant"},
+            "payload": {"blocks": [{"type": "text", "text": text}]},
+            "created_at": at,
+        })
+    }
+
     fn renamed(at: &str, title: &str) -> serde_json::Value {
         json!({
             "kind": "thread_renamed",
@@ -1206,6 +1216,81 @@ api_key_env = "TENSORX_API_KEY"
         for cell in &cells {
             assert!(text.contains(cell.as_str()), "{cell} missing from {text}");
         }
+    }
+
+    #[test]
+    fn a_thread_takes_its_latest_rename_else_its_first_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("alpha");
+        let twice = Ulid::generate();
+        let plain = Ulid::generate();
+        write_thread(
+            &base,
+            twice,
+            &[
+                user("2026-09-27T09:00:00Z", "the first line of a thread"),
+                renamed("2026-09-27T09:00:01Z", "an earlier title"),
+                call(
+                    "2026-09-27T09:00:02Z",
+                    10,
+                    0,
+                    10,
+                    Some(0.1),
+                    Some("z-ai/glm-5.3"),
+                    None,
+                ),
+                renamed("2026-09-27T09:00:03Z", "the later title"),
+            ],
+        );
+        write_thread(
+            &base,
+            plain,
+            &[
+                user("2026-09-27T09:10:00Z", "no rename here\nsecond line"),
+                call(
+                    "2026-09-27T09:10:02Z",
+                    10,
+                    0,
+                    10,
+                    Some(0.2),
+                    Some("z-ai/glm-5.3"),
+                    None,
+                ),
+            ],
+        );
+
+        // The agent spoke first: that is not the thread's opening line.
+        let agent_first = Ulid::generate();
+        write_thread(
+            &base,
+            agent_first,
+            &[
+                agent_says("2026-09-27T09:20:00Z", "a greeting from the agent"),
+                user("2026-09-27T09:20:01Z", "what the user actually asked"),
+                call(
+                    "2026-09-27T09:20:02Z",
+                    10,
+                    0,
+                    10,
+                    Some(0.3),
+                    Some("z-ai/glm-5.3"),
+                    None,
+                ),
+            ],
+        );
+
+        let stats = collect(dir.path(), None, None, &no_prices()).unwrap();
+        let title = |id: Ulid| {
+            stats
+                .threads
+                .iter()
+                .find(|t| t.id == id.to_string())
+                .map(|t| t.title.clone())
+                .unwrap_or_else(|| panic!("{id} missing from {:?}", stats.threads))
+        };
+        assert_eq!(title(twice), "the later title");
+        assert_eq!(title(plain), "no rename here");
+        assert_eq!(title(agent_first), "what the user actually asked");
     }
 
     #[test]
