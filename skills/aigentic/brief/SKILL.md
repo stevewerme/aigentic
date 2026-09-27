@@ -77,8 +77,10 @@ prompt block. When asked, also save each prompt to
   with `<model>` filled in by you from the implementer's profile (the
   `model` in its `[profiles.<name>]`, without the provider prefix: `flash`
   is `deepseek-v4.1-flash`). A model may not know its own id.
-  Push, then `cargo install --path crates/tui --force` (every implementer
-  prompt says both). Do not close the issue.
+  Before pushing, compare each commit's subject with the plan's named
+  message and fix any difference while it is still unpushed. Push, then
+  `cargo install --path crates/tui --force` (every implementer prompt says
+  both). Do not close the issue.
 - Last step: post the final report as one comment headed
   `## Implementation` (`gh issue comment N --body-file <file>`): what
   changed per commit, any plan literal corrected and why, and a **test

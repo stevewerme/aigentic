@@ -618,9 +618,9 @@ name = "brief"
 path = "skills/aigentic/brief"
 source = "local"
 commit = ""
-sha256 = "49689cd6cf2cba158318de9fec6376fe677b58d1a0ca801e196f2d4c5055dca2"
+sha256 = "7dd08402ba391ebe040979879764562249549e6a8ed9ba56dbe4dcc87b31071d"
 invocation = "user"
-review = { by = "steve", on = "2026-09-26" }
+review = { by = "steve", on = "2026-09-27" }
 
 [[skill]]
 name = "plan-check"

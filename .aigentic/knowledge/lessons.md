@@ -69,6 +69,9 @@ so the rule can be judged, not just obeyed. The `brief`, `plan-check` and
 
 - Commit with `git commit -F <file>`, never a heredoc (a heredoc once left
   `EOF )` in a pushed message), a blank line before the trailer.
+- Compare commit subjects with the plan's named messages before pushing:
+  #47's implementer noticed two differed only after its one push, when the
+  no-rewrite rule already applied.
 - Stage files by name. Never `git add -A`, `git reset`, `git checkout --
   <file>`, `git stash` or `git clean` in a build thread; the tree may hold
   someone else's unfinished work.
