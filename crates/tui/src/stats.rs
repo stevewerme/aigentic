@@ -9,6 +9,9 @@
 //! Since #40 the prices come from the config file too: an unpriced
 //! call's model or profile is looked up in the current `[prices]` and
 //! the result marked estimated, so a retro can put dollars on old work.
+//! Since #46 the memory extractions are a line of their own, priced from
+//! their `memory_extracted` usage, so the agent's turns keep their own
+//! calls and context.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -16,8 +19,8 @@ use std::path::{Path, PathBuf};
 use aigentic_runtime::Prices;
 use aigentic_runtime::aigentic_core::{Author, ContentBlock, EventKind};
 use aigentic_runtime::aigentic_log::{
-    AssistantMessagePayload, Invoker, SkillLoadedPayload, ThreadLog, ThreadRenamedPayload,
-    ToolResultPayload, TurnEndedPayload, Usage, UserMessagePayload,
+    AssistantMessagePayload, Invoker, MemoryExtractedPayload, SkillLoadedPayload, ThreadLog,
+    ThreadRenamedPayload, ToolResultPayload, TurnEndedPayload, Usage, UserMessagePayload,
 };
 use aigentic_server::config::Config;
 use anyhow::{Context, bail};
@@ -77,6 +80,21 @@ pub struct DayStats {
     /// Turns by their first reason segment (`done`, `provider_error`, …).
     pub turns: BTreeMap<String, u32>,
     pub retries: u32,
+    /// The `memory_extracted` side jobs, counted and priced apart from
+    /// the calls (issue #46). Folding them into the calls would make the
+    /// hit rate fiction and hide the loop's own cost.
+    pub memory_calls: u32,
+    pub memory_priced_calls: u32,
+    pub memory_price_estimated_calls: u32,
+    pub memory_unpriced_calls: u32,
+    /// Tokens the extractions sent and produced, also apart: folding
+    /// them into the calls' context would make the hit rate fiction.
+    pub memory_context: u64,
+    pub memory_output: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_spent: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_price_estimated_spent: Option<f64>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -98,23 +116,37 @@ pub struct ProjectStats {
     pub hit_rate: f64,
     pub turns: BTreeMap<String, u32>,
     pub retries: u32,
+    pub memory_calls: u32,
+    pub memory_priced_calls: u32,
+    pub memory_price_estimated_calls: u32,
+    pub memory_unpriced_calls: u32,
+    pub memory_context: u64,
+    pub memory_output: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_spent: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_price_estimated_spent: Option<f64>,
+}
+
+/// The sum of two optional dollar figures: `Some` when either is,
+/// `None` when neither is. The two sides are the calls' dollars and the
+/// extractions' (issue #46), added only where a single figure is wanted.
+fn add(a: Option<f64>, b: Option<f64>) -> Option<f64> {
+    match (a, b) {
+        (None, None) => None,
+        (x, y) => Some(x.unwrap_or(0.0) + y.unwrap_or(0.0)),
+    }
 }
 
 /// What a thread's dollars really are (#40): stamped plus retro-priced,
 /// `Some` when either exists, `None` when neither does.
 fn effective(t: &ThreadSpend) -> Option<f64> {
-    match (t.spent, t.price_estimated_spent) {
-        (None, None) => None,
-        (stamped, estimated) => Some(stamped.unwrap_or(0.0) + estimated.unwrap_or(0.0)),
-    }
+    add(t.spent, t.price_estimated_spent)
 }
 
 /// The same sum for the drill-downs, which carry a `ThreadReport`.
 fn effective_report(t: &ThreadReport) -> Option<f64> {
-    match (t.spent, t.price_estimated_spent) {
-        (None, None) => None,
-        (stamped, estimated) => Some(stamped.unwrap_or(0.0) + estimated.unwrap_or(0.0)),
-    }
+    add(t.spent, t.price_estimated_spent)
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -161,6 +193,18 @@ pub struct ThreadReport {
     pub tool_errors: u32,
     pub turns: BTreeMap<String, u32>,
     pub retries: u32,
+    /// The thread's `memory_extracted` side jobs (issue #46), the same
+    /// fields a day and a project carry.
+    pub memory_calls: u32,
+    pub memory_priced_calls: u32,
+    pub memory_price_estimated_calls: u32,
+    pub memory_unpriced_calls: u32,
+    pub memory_context: u64,
+    pub memory_output: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_spent: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_price_estimated_spent: Option<f64>,
     /// Summed `wall_secs` over the thread's measured `turn_ended` lines,
     /// and how much of that the machine spent asleep (issue #47). Both
     /// come from the lines' own numbers, never from `created_at`, which
@@ -205,6 +249,16 @@ pub struct IssueTotals {
     pub tool_errors: u32,
     pub turns: BTreeMap<String, u32>,
     pub retries: u32,
+    pub memory_calls: u32,
+    pub memory_priced_calls: u32,
+    pub memory_price_estimated_calls: u32,
+    pub memory_unpriced_calls: u32,
+    pub memory_context: u64,
+    pub memory_output: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_spent: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_price_estimated_spent: Option<f64>,
 }
 
 impl IssueTotals {
@@ -231,6 +285,17 @@ impl IssueTotals {
             total.sweeps += t.sweeps;
             total.tool_errors += t.tool_errors;
             total.retries += t.retries;
+            total.memory_calls += t.memory_calls;
+            total.memory_priced_calls += t.memory_priced_calls;
+            total.memory_price_estimated_calls += t.memory_price_estimated_calls;
+            total.memory_unpriced_calls += t.memory_unpriced_calls;
+            total.memory_context += t.memory_context;
+            total.memory_output += t.memory_output;
+            sum(&mut total.memory_spent, t.memory_spent);
+            sum(
+                &mut total.memory_price_estimated_spent,
+                t.memory_price_estimated_spent,
+            );
             for (head, n) in &t.turns {
                 *total.turns.entry(head.clone()).or_default() += n;
             }
@@ -455,7 +520,10 @@ pub fn collect(
                     let meta = absorb(&mut acc, &mut thread, &events, cutoff, &mut days, book);
                     // #40: a thread with no call inside the window is not
                     // a row. Its title is a label, but a row is a total.
-                    if thread.calls > 0 {
+                    // #46: an extraction inside the window is a total
+                    // too, so a thread that only extracted is still a
+                    // row — with 0 calls and its side-job money.
+                    if thread.calls > 0 || thread.memory_calls > 0 {
                         threads.push(thread.into_spend(id.to_string(), &name, meta.title));
                     }
                 }
@@ -605,8 +673,9 @@ fn collect_issue(
                 continue;
             }
             // The window applies here too: a matched thread with no call
-            // inside it has no row, exactly as in the main report.
-            if thread.calls == 0 {
+            // inside it has no row, exactly as in the main report (and,
+            // since #46, no extraction inside it either).
+            if thread.calls == 0 && thread.memory_calls == 0 {
                 continue;
             }
             threads.push(thread.into_report(id.to_string(), &name, meta));
@@ -664,6 +733,18 @@ struct Accum {
     cache_read: u64,
     turns: BTreeMap<String, u32>,
     retries: u32,
+    /// `memory_extracted` side jobs (issue #46). Their tokens stay out of
+    /// `context_total`/`cache_read` — that arithmetic describes the
+    /// agent's calls, and an extraction sends a transcript with none of
+    /// the call's cache behaviour.
+    memory_calls: u32,
+    memory_priced_calls: u32,
+    memory_price_estimated_calls: u32,
+    memory_unpriced_calls: u32,
+    memory_context: u64,
+    memory_output: u64,
+    memory_spent: Option<f64>,
+    memory_price_estimated_spent: Option<f64>,
 }
 
 impl Accum {
@@ -685,6 +766,44 @@ impl Accum {
         }
     }
 
+    /// A thread *row*'s dollars: the calls' plus the extractions'
+    /// (issue #46). The thread table prints one figure per thread, so
+    /// that figure is the thread's whole spend and "costliest threads"
+    /// ranks by it. The day and project tables print the two separately,
+    /// so their `spent` stays the calls' and a reader can still see what
+    /// the main loop cost on its own.
+    fn row_spent(&self) -> Option<f64> {
+        add(self.spent, self.memory_spent)
+    }
+
+    /// The same sum for the retro-priced dollars.
+    fn row_estimated(&self) -> Option<f64> {
+        add(
+            self.price_estimated_spent,
+            self.memory_price_estimated_spent,
+        )
+    }
+
+    /// One `memory_extracted` line, the same three price outcomes as a
+    /// call, into the memory counters.
+    fn add_memory(&mut self, context: u64, output: u64, cost: Cost) {
+        self.memory_calls += 1;
+        self.memory_context += context;
+        self.memory_output += output;
+        match cost {
+            Cost::Stamped(usd) => {
+                self.memory_priced_calls += 1;
+                self.memory_spent = Some(self.memory_spent.unwrap_or(0.0) + usd);
+            }
+            Cost::Retro(usd) => {
+                self.memory_price_estimated_calls += 1;
+                self.memory_price_estimated_spent =
+                    Some(self.memory_price_estimated_spent.unwrap_or(0.0) + usd);
+            }
+            Cost::Unpriced => self.memory_unpriced_calls += 1,
+        }
+    }
+
     fn into_project(self) -> ProjectStats {
         ProjectStats {
             calls: self.calls,
@@ -701,6 +820,14 @@ impl Accum {
             cache_read: self.cache_read,
             turns: self.turns,
             retries: self.retries,
+            memory_calls: self.memory_calls,
+            memory_priced_calls: self.memory_priced_calls,
+            memory_price_estimated_calls: self.memory_price_estimated_calls,
+            memory_unpriced_calls: self.memory_unpriced_calls,
+            memory_context: self.memory_context,
+            memory_output: self.memory_output,
+            memory_spent: self.memory_spent,
+            memory_price_estimated_spent: self.memory_price_estimated_spent,
             project: String::new(),
         }
     }
@@ -721,19 +848,31 @@ impl Accum {
             cache_read: self.cache_read,
             turns: self.turns,
             retries: self.retries,
+            memory_calls: self.memory_calls,
+            memory_priced_calls: self.memory_priced_calls,
+            memory_price_estimated_calls: self.memory_price_estimated_calls,
+            memory_unpriced_calls: self.memory_unpriced_calls,
+            memory_context: self.memory_context,
+            memory_output: self.memory_output,
+            memory_spent: self.memory_spent,
+            memory_price_estimated_spent: self.memory_price_estimated_spent,
             day,
         }
     }
 
-    /// The row the report's thread table shows.
+    /// The row the report's thread table shows. The row's dollars are the
+    /// thread's whole spend — the calls' and the extractions' — and its
+    /// `calls` are the calls alone, because a memory extraction is not a
+    /// turn's step (issue #46). The memory table beside it is where a
+    /// reader sees how much of the money is side-job money.
     fn into_spend(self, id: String, project: &str, title: String) -> ThreadSpend {
         ThreadSpend {
             id,
             project: project.to_owned(),
             title,
             calls: self.calls,
-            spent: self.spent,
-            price_estimated_spent: self.price_estimated_spent,
+            spent: self.row_spent(),
+            price_estimated_spent: self.row_estimated(),
         }
     }
 
@@ -762,6 +901,14 @@ impl Accum {
             tool_errors: meta.tool_errors,
             turns: self.turns,
             retries: self.retries,
+            memory_calls: self.memory_calls,
+            memory_priced_calls: self.memory_priced_calls,
+            memory_price_estimated_calls: self.memory_price_estimated_calls,
+            memory_unpriced_calls: self.memory_unpriced_calls,
+            memory_context: self.memory_context,
+            memory_output: self.memory_output,
+            memory_spent: self.memory_spent,
+            memory_price_estimated_spent: self.memory_price_estimated_spent,
             wall_secs: self.wall_secs,
             slept_secs: self.slept_secs,
         }
@@ -819,8 +966,10 @@ fn absorb(
     let mut own_user_seen = false;
     // The project and the days are the same window partitioned two ways,
     // so each accepted call is replayed into both once the thread is
-    // fully folded.
+    // fully folded. The memory extractions are replayed the same way,
+    // with their own counters (issue #46).
     let mut calls: Vec<(String, u64, u64, Cost, bool)> = Vec::new();
+    let mut memory_days: Vec<(String, u64, u64, Cost)> = Vec::new();
     let mut retry_days: Vec<String> = Vec::new();
     let mut turn_days: Vec<(String, String)> = Vec::new();
 
@@ -858,6 +1007,30 @@ fn absorb(
                     thread.unstamped_calls += 1;
                 }
                 calls.push((day, context, u.cache_read_tokens, cost, unstamped));
+            }
+            EventKind::MemoryExtracted => {
+                // #46: the extraction is a priced call the log made on
+                // its own, counted on its own line so the turns keep
+                // their calls and their context arithmetic.
+                if !in_window {
+                    continue;
+                }
+                let Ok(p) = serde_json::from_value::<MemoryExtractedPayload>(event.payload.clone())
+                else {
+                    continue;
+                };
+                let mut usage = p.usage;
+                // The payload's own `model` is the provider that ran the
+                // extraction (issue #18), so a line written before the
+                // runtime stamped a cost can still be priced by name.
+                if usage.model.is_none() {
+                    usage.model = Some(p.model);
+                }
+                let context =
+                    usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens;
+                let cost = classify_cost(&usage, book);
+                thread.add_memory(context, usage.output_tokens, cost);
+                memory_days.push((day, context, usage.output_tokens, cost));
             }
             EventKind::ProviderRetried => {
                 if in_window {
@@ -950,6 +1123,12 @@ fn absorb(
             d.unstamped_calls += 1;
         }
     }
+    for (day, context, output, cost) in memory_days {
+        project.add_memory(context, output, cost);
+        days.entry(day)
+            .or_default()
+            .add_memory(context, output, cost);
+    }
     for day in retry_days {
         project.retries += 1;
         days.entry(day).or_default().retries += 1;
@@ -1021,6 +1200,17 @@ fn money(stamped: Option<f64>, estimated: Option<f64>) -> String {
     }
 }
 
+/// The memory dollars cell of the day and project tables (issue #46):
+/// empty when the window held no extractions at all, so the old header
+/// and the old rows stand.
+fn mem_cell(show: bool, stamped: Option<f64>, estimated: Option<f64>) -> String {
+    if show {
+        format!(" {:>8}", money(stamped, estimated))
+    } else {
+        String::new()
+    }
+}
+
 /// The cost line every report shares: what was measured and what was
 /// guessed, never added together (issue #40).
 fn cost_line(
@@ -1042,6 +1232,53 @@ fn cost_line(
         format!("cost       ~${estimated:.4} ({counts})")
     } else {
         format!("cost       unpriced ({unpriced} calls)")
+    }
+}
+
+/// The `memory` line `stats` prints when the window held extractions
+/// (issue #46): how many side jobs, the tokens they sent and produced,
+/// and the same priced/estimated/unpriced split the calls' cost line
+/// uses — the two dollar classes are never added together (#40's rule),
+/// and the extractions are never folded into the calls' figures.
+#[allow(clippy::too_many_arguments)]
+fn memory_line(
+    stamped: f64,
+    estimated: f64,
+    priced: u32,
+    price_estimated: u32,
+    unpriced: u32,
+    calls: u32,
+    context: u64,
+    output: u64,
+) -> String {
+    let detail = format!(
+        "{priced} priced, {price_estimated} estimated, {unpriced} unpriced of {calls} \
+         extractions, in {context} out {output}",
+    );
+    if stamped > 0.0 && estimated > 0.0 {
+        format!("memory     ${stamped:.4} + ~${estimated:.4} ({detail})")
+    } else if stamped > 0.0 {
+        format!("memory     ${stamped:.4} ({detail})")
+    } else if estimated > 0.0 {
+        format!("memory     ~${estimated:.4} ({detail})")
+    } else {
+        format!("memory     unpriced ({detail})")
+    }
+}
+
+/// The whole-cost line under the calls' and the extractions' lines: the
+/// `cost_line` split applied to both, so a reader sees the two halves
+/// while their sum is one figure (issue #46).
+fn total_line(stamped: f64, estimated: f64, calls: u32, extractions: u32) -> String {
+    let counts = format!("{calls} calls + {extractions} extractions");
+    if stamped > 0.0 && estimated > 0.0 {
+        format!("total      ${stamped:.4} + ~${estimated:.4} ({counts})")
+    } else if stamped > 0.0 {
+        format!("total      ${stamped:.4} ({counts})")
+    } else if estimated > 0.0 {
+        format!("total      ~${estimated:.4} ({counts})")
+    } else {
+        format!("total      unpriced ({counts})")
     }
 }
 
@@ -1072,6 +1309,23 @@ pub fn render_thread(t: &ThreadReport) -> String {
         "calls      {}   retries {}   sweeps {}   tool errors {}\n",
         t.calls, t.retries, t.sweeps, t.tool_errors
     ));
+    // Only when the thread extracted something: a thread without side
+    // jobs prints exactly what it printed before (issue #46).
+    if t.memory_calls > 0 {
+        out.push_str(&format!(
+            "{}\n",
+            memory_line(
+                t.memory_spent.unwrap_or(0.0),
+                t.memory_price_estimated_spent.unwrap_or(0.0),
+                t.memory_priced_calls,
+                t.memory_price_estimated_calls,
+                t.memory_unpriced_calls,
+                t.memory_calls,
+                t.memory_context,
+                t.memory_output
+            )
+        ));
+    }
     out.push_str(&format!(
         "context    peak {:>10}   mean {:>10}   cache hit {:.0}%\n",
         t.peak_context,
@@ -1138,6 +1392,34 @@ pub fn render_issue(report: &IssueReport) -> String {
         "threads    {}   calls {}   retries {}   sweeps {}   tool errors {}\n",
         total.threads, total.calls, total.retries, total.sweeps, total.tool_errors
     ));
+    // A build cycle's extractions are part of what it cost, so the
+    // totals block carries the same two lines `stats` prints (issue #46),
+    // and only when the window held any.
+    if total.memory_calls > 0 {
+        out.push_str(&format!(
+            "{}\n",
+            memory_line(
+                total.memory_spent.unwrap_or(0.0),
+                total.memory_price_estimated_spent.unwrap_or(0.0),
+                total.memory_priced_calls,
+                total.memory_price_estimated_calls,
+                total.memory_unpriced_calls,
+                total.memory_calls,
+                total.memory_context,
+                total.memory_output
+            )
+        ));
+        out.push_str(&format!(
+            "{}\n",
+            total_line(
+                total.spent.unwrap_or(0.0) + total.memory_spent.unwrap_or(0.0),
+                total.price_estimated_spent.unwrap_or(0.0)
+                    + total.memory_price_estimated_spent.unwrap_or(0.0),
+                total.calls,
+                total.memory_calls
+            )
+        ));
+    }
     out.push_str(&format!(
         "context    total {:>12}   cache hit {:.0}%\n",
         total.context_total,
@@ -1201,6 +1483,23 @@ pub fn render(stats: &Stats) -> String {
     let context: u64 = stats.days.iter().map(|d| d.context_total).sum();
     let cache_read: u64 = stats.days.iter().map(|d| d.cache_read).sum();
     let retries: u32 = stats.days.iter().map(|d| d.retries).sum();
+    // The extraction totals, summed the same way (issue #46).
+    let extractions: u32 = stats.days.iter().map(|d| d.memory_calls).sum();
+    let memory_priced: u32 = stats.days.iter().map(|d| d.memory_priced_calls).sum();
+    let memory_price_estimated: u32 = stats
+        .days
+        .iter()
+        .map(|d| d.memory_price_estimated_calls)
+        .sum();
+    let memory_unpriced: u32 = stats.days.iter().map(|d| d.memory_unpriced_calls).sum();
+    let memory_context: u64 = stats.days.iter().map(|d| d.memory_context).sum();
+    let memory_output: u64 = stats.days.iter().map(|d| d.memory_output).sum();
+    let memory_stamped: f64 = stats.days.iter().filter_map(|d| d.memory_spent).sum();
+    let memory_estimated: f64 = stats
+        .days
+        .iter()
+        .filter_map(|d| d.memory_price_estimated_spent)
+        .sum();
     // #40: the two dollars are never added together. `$31.78 + ~$1.59`
     // says what was measured and what was guessed.
     out.push_str(&format!(
@@ -1208,6 +1507,33 @@ pub fn render(stats: &Stats) -> String {
         cost_line(stamped, estimated, priced, price_estimated, unpriced, calls)
     ));
     out.push_str(&format!("calls      {calls}   retries {retries}\n"));
+    // The side jobs get their own line and a whole-cost line under it,
+    // only when the window held any (issue #46): a window without
+    // extractions renders byte-identically to before.
+    if extractions > 0 {
+        out.push_str(&format!(
+            "{}\n",
+            memory_line(
+                memory_stamped,
+                memory_estimated,
+                memory_priced,
+                memory_price_estimated,
+                memory_unpriced,
+                extractions,
+                memory_context,
+                memory_output
+            )
+        ));
+        out.push_str(&format!(
+            "{}\n",
+            total_line(
+                stamped + memory_stamped,
+                estimated + memory_estimated,
+                calls,
+                extractions
+            )
+        ));
+    }
     if unstamped > 0 {
         out.push_str(&format!(
             "stamping   {unstamped} calls predate model stamping \
@@ -1220,11 +1546,23 @@ pub fn render(stats: &Stats) -> String {
         mean(context, calls),
         hit_rate(cache_read, context) * 100.0
     ));
+    // The extraction dollars get a column of their own in both tables
+    // (issue #46), and only when the window held extractions: the cost
+    // column keeps meaning "the calls", and a window without side jobs
+    // renders byte-identically to before.
+    let mem_header = if extractions > 0 { "      mem" } else { "" };
     if !stats.days.is_empty() {
-        out.push_str("\nday          calls     priced               cost      peak     hit\n");
+        out.push_str(&format!(
+            "\nday          calls{mem_header}     priced               cost      peak     hit\n"
+        ));
         for d in &stats.days {
+            let cell = mem_cell(
+                extractions > 0,
+                d.memory_spent,
+                d.memory_price_estimated_spent,
+            );
             out.push_str(&format!(
-                "{:<12} {:>5} {:>10} {:>18} {:>9} {:>6.0}%\n",
+                "{:<12} {:>5}{cell} {:>10} {:>18} {:>9} {:>6.0}%\n",
                 d.day,
                 d.calls,
                 d.priced_calls,
@@ -1235,12 +1573,17 @@ pub fn render(stats: &Stats) -> String {
         }
     }
     if !stats.projects.is_empty() {
-        out.push_str(
-            "\nproject                          calls     priced               cost      peak     hit\n",
-        );
+        out.push_str(&format!(
+            "\nproject                          calls{mem_header}     priced               cost      peak     hit\n"
+        ));
         for p in &stats.projects {
+            let cell = mem_cell(
+                extractions > 0,
+                p.memory_spent,
+                p.memory_price_estimated_spent,
+            );
             out.push_str(&format!(
-                "{:<32} {:>5} {:>10} {:>18} {:>9} {:>6.0}%\n",
+                "{:<32} {:>5}{cell} {:>10} {:>18} {:>9} {:>6.0}%\n",
                 p.project,
                 p.calls,
                 p.priced_calls,
@@ -1432,9 +1775,12 @@ api_key_env = "TENSORX_API_KEY"
         })
     }
 
-    /// A side job's line after a turn: written after `turn_ended`, so a
-    /// wall time derived from timestamps would count the time between
-    /// them as turn time (issue #47, amendment 2 item 3).
+    /// A side job's line after a turn, in the minimal shape #47 needs:
+    /// written after `turn_ended`, so a wall time derived from
+    /// timestamps would count the time between them as turn time (#47,
+    /// amendment 2 item 3). #46's two shapes are `stamped_extraction`
+    /// and `payload_only_extraction` below; this one carries a model no
+    /// table knows and no cost, so it stays unpriced.
     fn memory_extracted(at: &str) -> serde_json::Value {
         json!({
             "kind": "memory_extracted",
@@ -1447,6 +1793,82 @@ api_key_env = "TENSORX_API_KEY"
             },
             "created_at": at,
         })
+    }
+
+    /// A `memory_extracted` line as the runtime stamps one since #46:
+    /// the usage names the model that ran the extraction, and `cost` is
+    /// what its profile's table said — `None` on a line the stamp never
+    /// reached.
+    fn stamped_extraction(
+        at: &str,
+        model: &str,
+        input: u64,
+        cache_read: u64,
+        output: u64,
+        cost: Option<f64>,
+    ) -> serde_json::Value {
+        json!({
+            "kind": "memory_extracted",
+            "author": {"kind": "system"},
+            "payload": {
+                "through_seq": 1,
+                "written": [],
+                "model": model,
+                "usage": {
+                    "input_tokens": input,
+                    "output_tokens": output,
+                    "cache_read_tokens": cache_read,
+                    "cache_write_tokens": 0,
+                    "estimated": false,
+                    "cost_usd": cost,
+                    "model": model,
+                },
+            },
+            "created_at": at,
+        })
+    }
+
+    /// The older shape of the same line: the model on the payload only,
+    /// as #18 wrote it, and no cost — what #40's retro pricing has to
+    /// cover (issue #46).
+    fn payload_only_extraction(
+        at: &str,
+        model: &str,
+        input: u64,
+        output: u64,
+    ) -> serde_json::Value {
+        json!({
+            "kind": "memory_extracted",
+            "author": {"kind": "system"},
+            "payload": {
+                "through_seq": 1,
+                "written": [],
+                "model": model,
+                "usage": {"input_tokens": input, "output_tokens": output},
+            },
+            "created_at": at,
+        })
+    }
+
+    /// The usage a fixture extraction line carries, so a test's expected
+    /// tokens are the fixture's own numbers.
+    fn extraction_usage(line: &serde_json::Value) -> Usage {
+        serde_json::from_value(line["payload"]["usage"].clone()).unwrap()
+    }
+
+    /// What the report's own table lookup says a fixture line costs: the
+    /// `table(&usage)` step `classify_cost` takes, with the same
+    /// payload-model fallback an extraction line written before the
+    /// usage carried a model needs. Never a hand-computed number.
+    fn expected_memory_cost(text: &str, line: &serde_json::Value) -> f64 {
+        let book = book_of(text);
+        let mut usage: Usage = serde_json::from_value(line["payload"]["usage"].clone()).unwrap();
+        if usage.model.is_none() {
+            usage.model = line["payload"]["model"].as_str().map(str::to_owned);
+        }
+        book.table(&usage)
+            .unwrap_or_else(|| panic!("no table for {usage:?}"))
+            .cost_usd(&usage)
     }
 
     fn retried(at: &str) -> serde_json::Value {
@@ -2600,5 +3022,400 @@ api_key_env = "TENSORX_API_KEY"
             .unwrap_err()
             .to_string();
         assert!(err.contains("priceless") && err.contains("prices"), "{err}");
+    }
+
+    /// T5 (issue #46, the issue's own ask): one turn call and one stamped
+    /// extraction. The call keeps its arithmetic — its dollars, its
+    /// context, its hit rate — and the extraction lands in the memory
+    /// counters beside it, never inside them.
+    #[test]
+    fn a_stamped_extraction_is_counted_beside_the_turn_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = Ulid::generate();
+        let lines = vec![
+            user("2026-09-28T09:00:00Z", "one turn and its side job"),
+            call(
+                "2026-09-28T09:00:01Z",
+                1000,
+                200,
+                100,
+                Some(0.42),
+                Some("z-ai/glm-5.3"),
+                Some("tensorx"),
+            ),
+            stamped_extraction(
+                "2026-09-28T09:00:02Z",
+                "deepseek/deepseek-v4.1-flash",
+                500,
+                100,
+                50,
+                Some(0.03),
+            ),
+        ];
+        write_thread(&dir.path().join("alpha"), id, &lines);
+        let stats = collect(dir.path(), None, None, &book_of(PRICED_CONFIG)).unwrap();
+        let day = &stats.days[0];
+
+        assert_eq!(day.calls, 1);
+        assert_eq!(day.spent, Some(0.42), "{day:?}");
+        // 1000 input + 200 cache read, the call's own usage: the side
+        // job's 600 tokens are not in the context total.
+        assert_eq!(day.context_total, 1200);
+        assert_eq!(day.cache_read, 200);
+        assert_eq!(
+            day.cache_read as f64 / day.context_total as f64,
+            day.hit_rate
+        );
+
+        assert_eq!(day.memory_calls, 1);
+        assert_eq!(day.memory_priced_calls, 1);
+        assert_eq!(day.memory_price_estimated_calls, 0);
+        assert_eq!(day.memory_unpriced_calls, 0);
+        assert_eq!(day.memory_spent, Some(0.03));
+        assert_eq!(day.memory_context, 600);
+        assert_eq!(day.memory_output, 50);
+        // The thread row is the one that shows a single figure, so it is
+        // the one that carries both (the plan's amendment, item 5).
+        assert_eq!(
+            stats.threads[0].spent,
+            Some(0.42 + 0.03),
+            "{:?}",
+            stats.threads
+        );
+        assert_eq!(stats.threads[0].calls, 1);
+    }
+
+    /// T6 (issue #46): a line written before the stamp existed is priced
+    /// by the model the payload names (#40's retro path), and a model no
+    /// table knows stays unpriced with no dollars invented for it.
+    #[test]
+    fn an_old_extraction_is_retro_priced_by_its_payload_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = Ulid::generate();
+        let lines = vec![
+            user("2026-09-28T10:00:00Z", "old extraction lines"),
+            // The payload names a model `PRICED_CONFIG` knows.
+            payload_only_extraction("2026-09-28T10:00:01Z", "z-ai/glm-5.3", 2000, 300),
+            // A model no table knows: nothing to price it with.
+            payload_only_extraction("2026-09-28T10:00:02Z", "some/other-model", 900, 90),
+        ];
+        write_thread(&dir.path().join("alpha"), id, &lines);
+        let stats = collect(dir.path(), None, None, &book_of(PRICED_CONFIG)).unwrap();
+        let day = &stats.days[0];
+
+        let retro = expected_memory_cost(PRICED_CONFIG, &lines[1]);
+        assert!(retro > 0.0, "{retro}");
+        assert_eq!(day.memory_calls, 2);
+        assert_eq!(day.memory_price_estimated_calls, 1);
+        assert_eq!(day.memory_priced_calls, 0);
+        assert_eq!(day.memory_unpriced_calls, 1);
+        assert_eq!(day.memory_spent, None, "nothing was stamped");
+        assert_eq!(day.memory_price_estimated_spent, Some(retro), "{day:?}");
+        let context: u64 = lines[1..3]
+            .iter()
+            .map(|l| {
+                let u = extraction_usage(l);
+                u.input_tokens + u.cache_read_tokens
+            })
+            .sum();
+        let output: u64 = lines[1..3]
+            .iter()
+            .map(|l| extraction_usage(l).output_tokens)
+            .sum();
+        assert_eq!(day.memory_context, context);
+        assert_eq!(day.memory_output, output);
+        // The guessed dollar is dressed as guessed, never as measured.
+        let text = render(&stats);
+        assert!(
+            text.contains(&format!("memory     ~${retro:.4} ")),
+            "{text}"
+        );
+        assert_eq!(stats.threads[0].spent, None);
+        assert_eq!(stats.threads[0].price_estimated_spent, Some(retro));
+    }
+
+    /// T7 (issue #46): the two lines a window with extractions adds. The
+    /// measured and the guessed dollars keep #40's `$a + ~$b` split, and
+    /// the total is the two halves added by class.
+    #[test]
+    fn render_shows_the_memory_line_and_the_total_under_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = Ulid::generate();
+        let lines = vec![
+            user("2026-09-28T11:00:00Z", "stamped and guessed side jobs"),
+            call(
+                "2026-09-28T11:00:01Z",
+                1000,
+                0,
+                100,
+                Some(0.42),
+                Some("z-ai/glm-5.3"),
+                Some("tensorx"),
+            ),
+            stamped_extraction(
+                "2026-09-28T11:00:02Z",
+                "deepseek/deepseek-v4.1-flash",
+                500,
+                100,
+                50,
+                Some(0.03),
+            ),
+            payload_only_extraction("2026-09-28T11:00:03Z", "z-ai/glm-5.3", 800, 100),
+        ];
+        write_thread(&dir.path().join("alpha"), id, &lines);
+        let stats = collect(dir.path(), None, None, &book_of(PRICED_CONFIG)).unwrap();
+        let retro = expected_memory_cost(PRICED_CONFIG, &lines[3]);
+        let day = &stats.days[0];
+        let side_jobs = [&lines[2], &lines[3]];
+        let context: u64 = side_jobs
+            .iter()
+            .map(|l| {
+                let u = extraction_usage(l);
+                u.input_tokens + u.cache_read_tokens
+            })
+            .sum();
+        let output: u64 = side_jobs
+            .iter()
+            .map(|l| extraction_usage(l).output_tokens)
+            .sum();
+        assert_eq!((day.memory_context, day.memory_output), (context, output));
+
+        let text = render(&stats);
+        assert!(
+            text.contains(&format!(
+                "memory     $0.0300 + ~${retro:.4} \
+                 (1 priced, 1 estimated, 0 unpriced of 2 extractions, in {context} out {output})"
+            )),
+            "{text}"
+        );
+        // The calls' line is untouched: one call, its own stamp.
+        assert!(
+            text.contains("1 priced, 0 estimated, 0 unpriced of 1 calls"),
+            "{text}"
+        );
+        // The total adds within each class, once.
+        assert!(
+            text.contains(&format!(
+                "total      ${:.4} + ~${retro:.4} (1 calls + 2 extractions)",
+                0.42 + 0.03
+            )),
+            "{text}"
+        );
+
+        // A window with no extractions at all: byte-identical to before
+        // #46 — no `memory` line, no `total` line, no `mem` column.
+        let plain = tempfile::tempdir().unwrap();
+        let plain_id = Ulid::generate();
+        write_thread(
+            &plain.path().join("alpha"),
+            plain_id,
+            &[
+                user("2026-09-28T11:10:00Z", "no side jobs"),
+                lines[1].clone(),
+            ],
+        );
+        let none = collect(plain.path(), None, None, &book_of(PRICED_CONFIG)).unwrap();
+        let text = render(&none);
+        assert!(!text.contains("memory "), "{text}");
+        assert!(!text.contains("total "), "{text}");
+        assert!(!text.contains("mem"), "{text}");
+    }
+
+    /// T8 (issue #46): the day and project rows show the extraction
+    /// dollars in a column of their own, and the costliest-threads table
+    /// ranks a thread with only side jobs above a cheaper turn-only one,
+    /// because a row's figure is the row's whole spend.
+    #[test]
+    fn the_tables_show_memory_dollars_and_rank_by_whole_spend() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("alpha");
+        let turn_only = Ulid::generate();
+        let memory_only = Ulid::generate();
+        write_thread(
+            &base,
+            turn_only,
+            &[
+                user("2026-09-28T12:00:00Z", "a cheap turn"),
+                call(
+                    "2026-09-28T12:00:01Z",
+                    100,
+                    0,
+                    10,
+                    Some(0.05),
+                    Some("z-ai/glm-5.3"),
+                    Some("tensorx"),
+                ),
+            ],
+        );
+        write_thread(
+            &base,
+            memory_only,
+            &[
+                user("2026-09-28T12:01:00Z", "only a side job"),
+                stamped_extraction(
+                    "2026-09-28T12:01:01Z",
+                    "deepseek/deepseek-v4.1-flash",
+                    100,
+                    0,
+                    10,
+                    Some(0.30),
+                ),
+            ],
+        );
+        let stats = collect(dir.path(), None, None, &book_of(PRICED_CONFIG)).unwrap();
+
+        // Dearest first: the memory-only thread's 0.30 beats the turn's
+        // 0.05, and its `calls` still says 0.
+        assert_eq!(stats.threads[0].id, memory_only.to_string());
+        assert_eq!(stats.threads[0].calls, 0);
+        assert_eq!(stats.threads[0].spent, Some(0.30));
+        assert_eq!(stats.threads[1].id, turn_only.to_string());
+        assert_eq!(stats.threads[1].spent, Some(0.05));
+
+        // Both rows carry the call's dollars and the side job's, apart.
+        let day = &stats.days[0];
+        assert_eq!(day.spent, Some(0.05), "{day:?}");
+        assert_eq!(day.memory_spent, Some(0.30));
+        let project = &stats.projects[0];
+        assert_eq!(
+            (project.spent, project.memory_spent),
+            (Some(0.05), Some(0.30))
+        );
+
+        let text = render(&stats);
+        assert!(text.contains("mem"), "{text}");
+        let row = text
+            .lines()
+            .find(|l| l.starts_with(&day.day))
+            .unwrap_or_else(|| panic!("no day row in {text}"));
+        assert!(
+            row.contains(&money(day.spent, day.price_estimated_spent)),
+            "{row}"
+        );
+        assert!(
+            row.contains(&money(day.memory_spent, day.memory_price_estimated_spent)),
+            "{row}"
+        );
+    }
+
+    /// T9 (issue #46): the drill-down and the issue report show the
+    /// extraction too — the issue's totals include the side jobs of the
+    /// build it describes, which is the whole point of the issue.
+    #[test]
+    fn the_drill_down_and_the_issue_report_include_the_extractions() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = Ulid::generate();
+        let lines = vec![
+            user("2026-09-28T13:00:00Z", "fix for #46, the stats gap"),
+            call(
+                "2026-09-28T13:00:01Z",
+                1000,
+                0,
+                100,
+                Some(0.42),
+                Some("z-ai/glm-5.3"),
+                Some("tensorx"),
+            ),
+            stamped_extraction(
+                "2026-09-28T13:00:02Z",
+                "deepseek/deepseek-v4.1-flash",
+                500,
+                100,
+                50,
+                Some(0.03),
+            ),
+        ];
+        write_thread(&dir.path().join("alpha"), id, &lines);
+        let book = book_of(PRICED_CONFIG);
+
+        let report = collect_thread(dir.path(), None, id, None, &book).unwrap();
+        assert_eq!((report.calls, report.memory_calls), (1, 1));
+        assert_eq!(report.memory_spent, Some(0.03));
+        let u = extraction_usage(&lines[2]);
+        let (context, output) = (u.input_tokens + u.cache_read_tokens, u.output_tokens);
+        let text = render_thread(&report);
+        assert!(
+            text.contains(&format!(
+                "memory     $0.0300 (1 priced, 0 estimated, 0 unpriced of 1 extractions, \
+                 in {context} out {output})"
+            )),
+            "{text}"
+        );
+
+        let issue = collect_issue(dir.path(), None, 46, None, &book).unwrap();
+        assert_eq!(issue.total.calls, 1);
+        assert_eq!(issue.total.memory_calls, 1);
+        assert_eq!(issue.total.memory_spent, Some(0.03));
+        assert_eq!(issue.total.memory_context, context);
+        let text = render_issue(&issue);
+        assert!(
+            text.contains(&format!(
+                "memory     $0.0300 (1 priced, 0 estimated, 0 unpriced of 1 extractions, \
+                 in {context} out {output})"
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "total      ${:.4} (1 calls + 1 extractions)",
+                0.42 + 0.03
+            )),
+            "{text}"
+        );
+    }
+
+    /// T10 (issue #46): `--since` gates the extractions exactly as it
+    /// gates the calls — one outside the window is not in any memory
+    /// counter.
+    #[test]
+    fn an_extraction_outside_the_window_is_invisible() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = Ulid::generate();
+        let lines = vec![
+            user("2026-09-27T08:00:00Z", "before the window"),
+            stamped_extraction(
+                "2026-09-27T08:00:01Z",
+                "deepseek/deepseek-v4.1-flash",
+                900,
+                0,
+                90,
+                Some(0.09),
+            ),
+            user("2026-09-28T08:00:00Z", "inside the window"),
+            stamped_extraction(
+                "2026-09-28T08:00:01Z",
+                "deepseek/deepseek-v4.1-flash",
+                100,
+                0,
+                10,
+                Some(0.01),
+            ),
+        ];
+        write_thread(&dir.path().join("alpha"), id, &lines);
+        let book = book_of(PRICED_CONFIG);
+        let cutoff = parse_since("2026-09-28", datetime!(2026-09-28 12:00:00 UTC)).unwrap();
+        let stats = collect(dir.path(), None, Some(cutoff), &book).unwrap();
+
+        assert_eq!(stats.days.iter().map(|d| d.memory_calls).sum::<u32>(), 1);
+        let inside = extraction_usage(&lines[3]);
+        assert_eq!(
+            stats
+                .days
+                .iter()
+                .filter_map(|d| d.memory_spent)
+                .sum::<f64>(),
+            0.01
+        );
+        assert_eq!(
+            stats.days.iter().map(|d| d.memory_context).sum::<u64>(),
+            inside.input_tokens + inside.cache_read_tokens
+        );
+        // The whole window, extractions included, is one day.
+        assert_eq!(stats.days.len(), 1, "{:?}", stats.days);
+        assert!(
+            !render(&stats).contains("0.0900"),
+            "the old side job is nowhere: {}",
+            render(&stats)
+        );
     }
 }
