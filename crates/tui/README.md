@@ -46,6 +46,8 @@ api_key_env = "ANTHROPIC_API_KEY"
 # summary_max_output_tokens = 2048
 
 # utility_profile = "flash"               # side jobs: thread titles, memory extraction
+# keep_awake = true                      # hold off idle sleep while a turn works (default);
+                                          # released while a turn waits for you
 # user = "steve"                          # author id on your messages ($USER by default)
 # threads_dir = "/path/to/threads"        # default ~/.local/share/aigentic/threads
 # bundled_dir = "/path/to/aigentic"       # holds skills/ and skills.lock.toml; default: the build repo
@@ -250,6 +252,14 @@ recorded; continuing]`.
 After a turn that ends `done`, memory extraction runs with the project's
 model and prints `[memory: N lines written]` when anything new landed in
 `.aigentic/memory/`; `[memory] enabled = false` turns it off.
+
+While a turn works, the daemon keeps the machine from idle-sleeping
+(`caffeinate -i -w <pid>` on macOS, `systemd-inhibit` on Linux), and lets
+go while the turn waits for an answer or approval from you. If the machine
+slept anyway, the turn line says `the machine slept N min during this
+turn`, and adds how to prevent it when the guard was off or could not
+start. `keep_awake = false` in `config.toml` turns the guard off;
+`aigentic doctor` shows its state.
 
 Assistant text streams as it arrives. Tool calls print as `→ name {args}`
 and their output follows, truncated to `[display]`'s `result_lines` or
