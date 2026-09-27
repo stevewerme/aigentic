@@ -601,14 +601,36 @@ pub fn missing_labels(
 }
 
 /// Symlinks to offer: `(link, target)` for `docs/` and `CONTEXT.md` when
-/// they exist at `root` and nothing sits at the link's path yet.
+/// they exist at `root`, nothing sits at the link's path yet, and no link
+/// already in the knowledge dir points at or inside the target.
 pub fn knowledge_links(root: &Path) -> Vec<(PathBuf, PathBuf)> {
     let knowledge = root.join(DOT_DIR).join(KNOWLEDGE_DIR);
+    let covered = linked_targets(&knowledge);
     ["docs", "CONTEXT.md"]
         .into_iter()
         .filter(|name| root.join(name).exists())
         .filter(|name| std::fs::symlink_metadata(knowledge.join(name)).is_err())
+        .filter(|name| {
+            let Ok(target) = std::fs::canonicalize(root.join(name)) else {
+                return true;
+            };
+            !covered.iter().any(|c| c.starts_with(&target))
+        })
         .map(|name| (knowledge.join(name), Path::new("..").join("..").join(name)))
+        .collect()
+}
+
+/// The canonical paths of the symlinks already in `knowledge`. An entry
+/// that is not a symlink, or whose link target does not resolve, is
+/// ignored, as is a knowledge dir that is missing or unreadable.
+fn linked_targets(knowledge: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(knowledge) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_symlink()))
+        .filter_map(|e| std::fs::canonicalize(e.path()).ok())
         .collect()
 }
 
@@ -765,6 +787,57 @@ mod tests {
         std::fs::write(root.join("CONTEXT.md"), "# ctx\n").unwrap();
         let config = dir.path().join("cfg/config.toml");
         (dir, root, config)
+    }
+
+    /// T1: a link already pointing inside `docs/` suppresses the offer.
+    #[test]
+    fn knowledge_link_inside_docs_suppresses_the_docs_offer() {
+        let (_dir, root, _config) = fixture();
+        let knowledge = root.join(".aigentic/knowledge");
+        std::fs::create_dir_all(&knowledge).unwrap();
+        std::fs::write(root.join("docs/guide.md"), "# guide\n").unwrap();
+        std::os::unix::fs::symlink("../../docs/guide.md", knowledge.join("guide.md")).unwrap();
+        assert_eq!(
+            knowledge_links(&root),
+            vec![(
+                knowledge.join("CONTEXT.md"),
+                PathBuf::from("../../CONTEXT.md")
+            )]
+        );
+    }
+
+    /// T2: a link onto `CONTEXT.md` under another name suppresses it too.
+    #[test]
+    fn knowledge_link_onto_context_suppresses_the_context_offer() {
+        let (_dir, root, _config) = fixture();
+        let knowledge = root.join(".aigentic/knowledge");
+        std::fs::create_dir_all(&knowledge).unwrap();
+        std::os::unix::fs::symlink("../../CONTEXT.md", knowledge.join("ctx.md")).unwrap();
+        assert_eq!(
+            knowledge_links(&root),
+            vec![(knowledge.join("docs"), PathBuf::from("../../docs"))]
+        );
+    }
+
+    /// T3: an unrelated link and a dangling link cover nothing.
+    #[test]
+    fn unrelated_and_dangling_links_leave_both_offers() {
+        let (_dir, root, _config) = fixture();
+        let knowledge = root.join(".aigentic/knowledge");
+        std::fs::create_dir_all(&knowledge).unwrap();
+        std::fs::write(root.join("notes.md"), "# notes\n").unwrap();
+        std::os::unix::fs::symlink("../../notes.md", knowledge.join("notes.md")).unwrap();
+        std::os::unix::fs::symlink("../../gone.md", knowledge.join("gone.md")).unwrap();
+        assert_eq!(
+            knowledge_links(&root),
+            vec![
+                (knowledge.join("docs"), PathBuf::from("../../docs")),
+                (
+                    knowledge.join("CONTEXT.md"),
+                    PathBuf::from("../../CONTEXT.md")
+                ),
+            ]
+        );
     }
 
     #[test]
