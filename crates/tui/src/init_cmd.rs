@@ -19,6 +19,7 @@ use anyhow::{Context, bail};
 
 use crate::checks::{
     Gh, GhCli, Status, check_api_key_env, check_config, is_github_remote, origin_url,
+    reachable_profiles,
 };
 use crate::config::{Config, EXAMPLE};
 use crate::pocock::{self, Outcome, TRIAGE_ROLES};
@@ -177,6 +178,23 @@ pub fn run_with(
                 .join(", ")
         ));
     }
+    // The key checks, after the `[model] profile` answer: only the
+    // profiles this project routes to — the default, the utility, the
+    // chosen `[model] profile` — are checked; an unset key on any other
+    // profile is a `skip`, never the `fail` a machine configured for one
+    // backend would otherwise hit (issue #19). The `.env` hint stays
+    // gated on `Fail`.
+    let reachable = reachable_profiles(&config, Some(&profile), None);
+    for (name, profile) in &config.profiles {
+        let check = check_api_key_env(name, profile, reachable.contains(name));
+        ask.show(&check.render());
+        if check.status == Status::Fail {
+            ask.show(&format!(
+                "  set {} in .env or the environment before starting a thread",
+                profile.api_key_env
+            ));
+        }
+    }
     let mut text = render_project_file(existing_text.as_deref(), &name, &description, &profile);
     propose(&root, &project_file, &text, ask, &mut report)?;
     for dir in [KNOWLEDGE_DIR, MEMORY_DIR] {
@@ -322,16 +340,6 @@ fn config_section(
                 report.written.push(config_path.to_path_buf());
                 config.default_profile = chosen;
             }
-        }
-    }
-    for (name, profile) in &config.profiles {
-        let check = check_api_key_env(name, profile);
-        ask.show(&check.render());
-        if check.status == Status::Fail {
-            ask.show(&format!(
-                "  set {} in .env or the environment before starting a thread",
-                profile.api_key_env
-            ));
         }
     }
     Ok(config)
@@ -1028,5 +1036,50 @@ mod tests {
         let mut ask = Scripted::new(&[("write it?", "n")]);
         assert!(run_with(&missing, &root, &mut ask, &gh, None).is_err());
         assert!(!missing.exists());
+    }
+
+    /// T6 (issue #19): init's key lines follow the same reachability rule
+    /// as the doctor's. The two-profile config's default `a` has its key
+    /// set; the `[model] profile` is answered `a`; `b`, which nothing
+    /// here routes to, renders `skip` with the code's message and never
+    /// `fail key b`.
+    #[test]
+    fn init_checks_only_the_reachable_profiles_keys() {
+        use crate::checks::Check;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("myapp");
+        std::fs::create_dir_all(&root).unwrap();
+        let config = dir.path().join("cfg/config.toml");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(
+            &config,
+            "default_profile = \"a\"\n\
+             [profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"PATH\"\n\
+             [profiles.b]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"AIGENTIC_INIT_TEST_UNSET_KEY\"\n",
+        )
+        .unwrap();
+        let gh = FakeGh {
+            labels: RefCell::new(Vec::new()),
+            created: RefCell::new(Vec::new()),
+            auth_ok: false,
+        };
+        let mut ask = Scripted::new(&[("[model] profile", "a")]);
+        run_with(&config, &root, &mut ask, &gh, None).unwrap();
+
+        let ok = Check::ok("key a", "PATH is set").render();
+        let skip = Check::new(
+            "key b",
+            Status::Skip,
+            "AIGENTIC_INIT_TEST_UNSET_KEY is not set (not used here; needed only with --profile b)",
+        )
+        .render();
+        assert!(ask.shown.iter().any(|s| s == &ok), "{:#?}", ask.shown);
+        assert!(ask.shown.iter().any(|s| s == &skip), "{:#?}", ask.shown);
+        assert!(
+            !ask.shown.iter().any(|s| s.contains("fail key b")),
+            "{:#?}",
+            ask.shown
+        );
     }
 }

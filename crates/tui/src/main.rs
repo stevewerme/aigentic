@@ -209,7 +209,7 @@ async fn main() -> anyhow::Result<()> {
             let code = doctor::compare(&config_path, cli.profile.as_deref(), &pair).await?;
             std::process::exit(code);
         }
-        let code = doctor::run(&config_path, &cwd, probe, strict).await?;
+        let code = doctor::run(&config_path, &cwd, probe, strict, cli.profile.as_deref()).await?;
         std::process::exit(code);
     }
     if let Some(Command::Init) = cli.command {

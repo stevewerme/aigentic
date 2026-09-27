@@ -186,15 +186,51 @@ pub fn unknown_keys(
     Check::new(name, Status::Warn, message)
 }
 
-/// The profile's key variable is set. The name is reported, never the value.
-pub fn check_api_key_env(name: &str, profile: &Profile) -> Check {
+/// The profiles a command here can actually route to (issue #19): the
+/// config's `default_profile`, its `utility_profile` when one is set, the
+/// project's `[model] profile` (`model_profile`), and the `--profile`
+/// name a caller passed (`cli_profile`). A profile no route here reaches
+/// is never a `fail` for a missing key; an unset key there is a `skip`,
+/// so a machine configured for one backend does not fail the doctor over
+/// an unreached, unkeyed one. `--profile` is included because it makes
+/// the profile reachable on purpose — a missing key there is exactly
+/// what a setup check should catch.
+pub fn reachable_profiles(
+    config: &Config,
+    model_profile: Option<&str>,
+    cli_profile: Option<&str>,
+) -> std::collections::BTreeSet<String> {
+    let mut reachable = std::collections::BTreeSet::new();
+    reachable.insert(config.default_profile.clone());
+    if let Some(utility) = &config.utility_profile {
+        reachable.insert(utility.clone());
+    }
+    if let Some(model) = model_profile {
+        reachable.insert(model.to_owned());
+    }
+    if let Some(cli) = cli_profile {
+        reachable.insert(cli.to_owned());
+    }
+    reachable
+}
+
+/// The profile's key variable is set. The name is reported, never the
+/// value. `reachable` is whether anything here routes to the profile
+/// (`reachable_profiles`, issue #19): a set key is `ok` either way, an
+/// unset key is `fail` for a reachable profile and `skip` for one
+/// nothing reaches.
+pub fn check_api_key_env(name: &str, profile: &Profile, reachable: bool) -> Check {
     let var = &profile.api_key_env;
     let check_name = format!("key {name}");
     match std::env::var(var) {
         Ok(v) if !v.trim().is_empty() => Check::ok(&check_name, format!("{var} is set")),
-        _ => Check::fail(
+        _ if reachable => Check::fail(
             &check_name,
             format!("{var} is not set (put it in .env or export it)"),
+        ),
+        _ => Check::skip(
+            &check_name,
+            format!("{var} is not set (not used here; needed only with --profile {name})"),
         ),
     }
 }
@@ -878,17 +914,106 @@ mod tests {
         let config = Config::parse(GOOD).unwrap();
         let profile = config.profiles["a"].clone();
         // Unset by construction in a fresh process.
-        let c = check_api_key_env("a", &profile);
+        let c = check_api_key_env("a", &profile, true);
         assert_eq!(c.status, Status::Fail);
         assert_eq!(c.name, "key a");
         assert!(c.message.starts_with("AIGENTIC_DOCTOR_TEST_KEY is not set"));
 
         let mut set = profile.clone();
         set.api_key_env = "PATH".into();
-        let c = check_api_key_env("a", &set);
+        let c = check_api_key_env("a", &set, true);
         assert_eq!(c.status, Status::Ok);
         assert_eq!(c.message, "PATH is set");
         assert!(!c.message.contains(&std::env::var("PATH").unwrap()));
+    }
+
+    /// T1 (issue #19): an unset key on a profile nothing here reaches is
+    /// a `skip`, never the `fail` that made vendela's tensorx-only
+    /// machine exit 1; a set key stays `ok` whatever the reachability.
+    /// The message is the code's format for an unreachable profile.
+    #[test]
+    fn an_unreachable_profile_without_a_key_skips_instead_of_failing() {
+        let config = Config::parse(GOOD).unwrap();
+        let profile = config.profiles["a"].clone();
+        // Unset by construction in a fresh process.
+        let c = check_api_key_env("a", &profile, false);
+        assert_eq!(c.status, Status::Skip, "{}", c.message);
+        assert_ne!(c.status, Status::Fail);
+        assert_eq!(c.name, "key a");
+        assert_eq!(
+            c.message,
+            "AIGENTIC_DOCTOR_TEST_KEY is not set (not used here; needed only with --profile a)"
+        );
+
+        let mut set = profile.clone();
+        set.api_key_env = "PATH".into();
+        let c = check_api_key_env("a", &set, false);
+        assert_eq!(c.status, Status::Ok);
+        assert_eq!(c.message, "PATH is set");
+    }
+
+    /// T2 (issue #19): the reachable set is the default, the utility, the
+    /// project's `[model] profile` and the `--profile` name — each when
+    /// it is set; a `--profile` naming a profile the config does not
+    /// define is still included, because the CLI asked for it.
+    #[test]
+    fn reachable_profiles_lists_the_default_utility_model_and_cli_names() {
+        let config = Config::parse(
+            "default_profile = \"a\"\nutility_profile = \"b\"\n\
+             [profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n\
+             [profiles.b]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n\
+             [profiles.c]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n\
+             [profiles.m]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n\
+             [profiles.x]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n",
+        )
+        .unwrap();
+
+        let names =
+            |set: &std::collections::BTreeSet<String>| set.iter().cloned().collect::<Vec<_>>();
+        assert_eq!(
+            names(&reachable_profiles(&config, Some("m"), Some("x"))),
+            vec!["a", "b", "m", "x"]
+        );
+        assert_eq!(
+            names(&reachable_profiles(&config, None, None)),
+            vec!["a", "b"]
+        );
+        // A `--profile` the config never defines is still reachable: the
+        // CLI asked for it, so a missing key there is the doctor's to
+        // report.
+        assert_eq!(
+            names(&reachable_profiles(&config, None, Some("nowhere"))),
+            vec!["a", "b", "nowhere"]
+        );
+    }
+
+    /// T3 (issue #19): with a reachable set, an unset key still `fail`s
+    /// with today's message — the gate only softens profiles nothing here
+    /// routes to. The vars are distinct and unset by construction.
+    #[test]
+    fn a_reachable_profile_without_a_key_still_fails() {
+        let config = Config::parse(
+            "default_profile = \"a\"\nutility_profile = \"b\"\n\
+             [profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"AIGENTIC_DOCTOR_TEST_KEY_A\"\n\
+             [profiles.b]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"AIGENTIC_DOCTOR_TEST_KEY_B\"\n\
+             [profiles.m]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"AIGENTIC_DOCTOR_TEST_KEY_M\"\n\
+             [profiles.x]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"AIGENTIC_DOCTOR_TEST_KEY_X\"\n",
+        )
+        .unwrap();
+        let reachable = reachable_profiles(&config, Some("m"), Some("x"));
+        for name in ["a", "b", "m", "x"] {
+            let profile = &config.profiles[name];
+            assert!(reachable.contains(name), "{name} should be reachable");
+            let c = check_api_key_env(name, profile, true);
+            assert_eq!(c.status, Status::Fail, "{name}: {}", c.message);
+            assert_eq!(
+                c.message,
+                format!(
+                    "{} is not set (put it in .env or export it)",
+                    profile.api_key_env
+                )
+            );
+        }
     }
 
     #[test]

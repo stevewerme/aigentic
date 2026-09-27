@@ -11,7 +11,7 @@ use crate::checks::{
     Check, EffortVerdict, GhCli, JudgedMetric, SAMPLES, Status, check_api_key_env, check_config,
     check_env_ignored, check_github, check_keep_awake, check_participants, check_probe,
     check_project, check_skills, check_threads_dir, check_window, compare_efforts, compare_medians,
-    judged_metric, origin_url, unknown_keys,
+    judged_metric, origin_url, reachable_profiles, unknown_keys,
 };
 use crate::config;
 use crate::skills_cmd::SkillPaths;
@@ -149,16 +149,41 @@ fn parse_effort(text: &str) -> anyhow::Result<ReasoningEffort> {
 }
 
 /// Run every check and print it; `1` when any failed, or when `strict`
-/// and any key was unknown.
-pub async fn run(config_path: &Path, cwd: &Path, probe: bool, strict: bool) -> anyhow::Result<i32> {
+/// and any key was unknown. `cli_profile` is the `--profile` name when
+/// the CLI carries one: it makes that profile reachable, so its missing
+/// key still fails (issue #19).
+pub async fn run(
+    config_path: &Path,
+    cwd: &Path,
+    probe: bool,
+    strict: bool,
+    cli_profile: Option<&str>,
+) -> anyhow::Result<i32> {
     let mut checks = Vec::new();
     let (found, config) = check_config(config_path);
     checks.extend(found);
     let Some(config) = config else {
         return Ok(finish(&checks, strict));
     };
+
+    // The default profile's window decides the knowledge mode, as
+    // `project show` does; the provider is built without a key and never
+    // called here. Run before the key loop so the project's `[model]
+    // profile` is known when reachability is decided; the check is
+    // pushed at its old position below, so the report order is unchanged.
+    let (_, profile) = config.select(None)?;
+    let provider = profile.build_provider(String::new());
+    let (project_check, project) = check_project(cwd, &*provider);
+    let reachable = reachable_profiles(
+        &config,
+        project
+            .as_ref()
+            .and_then(|p| p.file.model.as_ref())
+            .map(|m| m.profile.as_str()),
+        cli_profile,
+    );
     for (name, profile) in &config.profiles {
-        checks.push(check_api_key_env(name, profile));
+        checks.push(check_api_key_env(name, profile, reachable.contains(name)));
         checks.push(check_window(name, profile));
     }
     let threads_base = config
@@ -166,14 +191,7 @@ pub async fn run(config_path: &Path, cwd: &Path, probe: bool, strict: bool) -> a
         .clone()
         .unwrap_or_else(config::default_threads_dir);
     checks.push(check_threads_dir(&threads_base));
-
-    // The default profile's window decides the knowledge mode, as
-    // `project show` does; the provider is built without a key and never
-    // called here.
-    let (_, profile) = config.select(None)?;
-    let provider = profile.build_provider(String::new());
-    let (c, project) = check_project(cwd, &*provider);
-    checks.push(c);
+    checks.push(project_check);
     // `aigentic.toml`'s unknown keys, beside the config's: the project
     // check above already opened the file, so this is the same walk's
     // result, not a second read.
@@ -281,5 +299,45 @@ mod tests {
         let failing = [Check::fail("config", "broken"), warn()];
         assert_eq!(finish(&failing, false), 1);
         assert_eq!(finish(&failing, true), 1, "a fail outranks a warn");
+    }
+
+    /// A two-profile config: `a` is the default, its key variable is one
+    /// a fresh process always has (`PATH`); `b` needs a variable no fresh
+    /// process has. `threads_dir` lives under `root`, so a run touches
+    /// nothing outside the tempdir.
+    fn two_profile_config(root: &Path) -> String {
+        format!(
+            "default_profile = \"a\"\nthreads_dir = {:?}\n\
+             [profiles.a]\nbase_url = \"http://127.0.0.1:9/v1\"\nmodel = \"m\"\napi_key_env = \"PATH\"\n\
+             [profiles.b]\nbase_url = \"http://127.0.0.1:9/v1\"\nmodel = \"m\"\napi_key_env = \"AIGENTIC_DOCTOR_TEST_UNSET_KEY\"\n",
+            root.join("threads").to_string_lossy()
+        )
+    }
+
+    /// T4 (issue #19): a config with an unkeyed profile nothing routes to
+    /// exits 0 — the default's key is set, the other profile's is not,
+    /// and the report skips it instead of failing. Before the fix this
+    /// fixture exited 1, which is vendela's `fail key anthropic`.
+    #[tokio::test]
+    async fn an_unreached_unkeyed_profile_does_not_fail_the_doctor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, two_profile_config(dir.path())).unwrap();
+        assert_eq!(run(&path, dir.path(), false, false, None).await.unwrap(), 0);
+    }
+
+    /// T5 (issue #19): `--profile b` makes `b` reachable on purpose, so
+    /// its missing key is one `Fail` and the exit code is 1.
+    #[tokio::test]
+    async fn the_cli_profile_without_a_key_still_fails_the_doctor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, two_profile_config(dir.path())).unwrap();
+        assert_eq!(
+            run(&path, dir.path(), false, false, Some("b"))
+                .await
+                .unwrap(),
+            1
+        );
     }
 }
