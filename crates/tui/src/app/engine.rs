@@ -267,6 +267,10 @@ pub struct ClientRepl {
     /// The turn that ran last (issue #21): tokens written and calls,
     /// shown by `/cost` — the live line carries state and time only.
     last_turn: Option<(u64, u32)>,
+    /// The last turn's raw stop reason when it ended on a provider
+    /// failure (issue #22): the machine text kept off the screen, shown
+    /// by `/why`. Cleared by a turn that ended in the ordinary way.
+    last_stop: Option<String>,
     /// A post went out while idle and its turn has not been seen
     /// running yet; input at its end waits for that turn.
     awaiting_turn: bool,
@@ -303,6 +307,7 @@ impl ClientRepl {
             task_calls: std::collections::HashSet::new(),
             usage: None,
             last_turn: None,
+            last_stop: None,
             awaiting_turn: false,
             quit: false,
         }
@@ -488,6 +493,9 @@ impl ClientRepl {
                 self.show(r, "", out);
             }
             Command::Cost => self.report(ReportKind::Cost, out).await,
+            // The raw stop reason stays off the transcript (issue #22):
+            // `/why` fetches it, engine-local, no daemon round-trip.
+            Command::Why => out.line(&why_line(self.last_stop.as_deref())),
             Command::Project => self.report(ReportKind::Project, out).await,
             Command::Policy => self.report(ReportKind::Policy, out).await,
             Command::Memory => self.report(ReportKind::Memory, out).await,
@@ -1242,23 +1250,15 @@ impl ClientRepl {
                     }
                 }
                 if let Ok(p) = serde_json::from_value::<TurnEndedPayload>(event.payload.clone()) {
+                    // The raw reason, for `/why`, is kept off the screen
+                    // (issue #22): a provider failure shows its plain
+                    // line, and the machine text stays one command away.
+                    self.last_stop = stop_reason(&p);
                     // After the summary, before the stop line, so a turn
                     // that ended for any reason still says it slept
                     // (issue #47).
-                    if let Some(line) = slept_line(&p) {
+                    for line in turn_end_lines(&p) {
                         out.line(&line);
-                    }
-                    if p.reason == "done" || p.reason == ASKED_HUMAN || p.reason == INTERRUPTED {
-                        return;
-                    }
-                    if p.touched.is_empty() {
-                        out.line(&format!("[turn ended: {}]", p.reason));
-                    } else {
-                        out.line(&format!(
-                            "[turn ended: {}; wrote {}]",
-                            p.reason,
-                            p.touched.join(", ")
-                        ));
                     }
                 }
             }
@@ -1383,6 +1383,53 @@ pub(crate) fn slept_line(p: &TurnEndedPayload) -> Option<String> {
         }
     }
     Some(line)
+}
+
+/// The head of a `turn_ended` reason: `provider_error: http 503` is a
+/// `provider_error` turn, the same grouping `stats.rs` uses.
+fn reason_head(reason: &str) -> &str {
+    reason.split(':').next().unwrap_or("")
+}
+
+/// The raw stop reason a payload leaves for `/why`: only a provider
+/// failure has machine text worth showing (issue #22). Every other end
+/// (done, asked_human, interrupted) clears it.
+pub(crate) fn stop_reason(p: &TurnEndedPayload) -> Option<String> {
+    (reason_head(&p.reason) == "provider_error").then(|| p.reason.clone())
+}
+
+/// What `/why` prints (issue #22): the last turn's raw stop reason, or
+/// that there is nothing raw to show.
+pub(crate) fn why_line(last_stop: Option<&str>) -> String {
+    match last_stop {
+        Some(reason) => format!("[last stop: {reason}]"),
+        None => "[the last turn ended done]".to_owned(),
+    }
+}
+
+/// The lines a `turn_ended` payload prints after the turn's summary: the
+/// slept line (issue #47), then the stop line for a turn that ended on
+/// anything but `done`/`asked_human`/`interrupted`. A provider failure
+/// with a structured `error` reads as its plain line (issue #22); a line
+/// without one (an old log, an older daemon) keeps the raw reason.
+pub(crate) fn turn_end_lines(p: &TurnEndedPayload) -> Vec<String> {
+    let mut lines: Vec<String> = slept_line(p).into_iter().collect();
+    if p.reason == "done" || p.reason == ASKED_HUMAN || p.reason == INTERRUPTED {
+        return lines;
+    }
+    let message = match (reason_head(&p.reason), &p.error) {
+        ("provider_error", Some(e)) => format!("{} (/why shows the raw error)", e.plain_line()),
+        _ => p.reason.clone(),
+    };
+    if p.touched.is_empty() {
+        lines.push(format!("[turn ended: {message}]"));
+    } else {
+        lines.push(format!(
+            "[turn ended: {message}; wrote {}]",
+            p.touched.join(", ")
+        ));
+    }
+    lines
 }
 
 pub(crate) fn author_name(author: &Author) -> String {
@@ -1513,7 +1560,7 @@ mod tests {
     use crate::config::Config;
     use aigentic_api::client::Addr;
     use aigentic_runtime::aigentic_core::{
-        Capabilities, CompletionRequest, Message, Provider, ProviderEvent, Usage,
+        Capabilities, CompletionRequest, Message, Provider, ProviderError, ProviderEvent, Usage,
     };
     use aigentic_server::build::{BuildError, ProviderFactory};
     use aigentic_server::{DefaultReports, Server};
@@ -2903,6 +2950,22 @@ mod tests {
             slept_secs: Some(slept),
             slept_awaiting_secs: Some(awaiting),
             keep_awake: keep.map(str::to_owned),
+            error: None,
+        }
+    }
+
+    /// A provider-error `turn_ended` payload as the runtime writes one
+    /// (issue #22): the machine `reason` string plus the structured
+    /// error.
+    fn provider_error_payload(status: u16, body: &str) -> TurnEndedPayload {
+        let error = ProviderError::Http {
+            status,
+            body: body.to_owned(),
+        };
+        TurnEndedPayload {
+            reason: format!("provider_error: {error}"),
+            error: Some(error),
+            ..TurnEndedPayload::new("")
         }
     }
 
@@ -2973,5 +3036,69 @@ mod tests {
             None,
             "a turn without slept_secs renders exactly as it always did"
         );
+    }
+
+    /// T7 (issue #22): a provider-error turn end prints the plain line
+    /// plus the `/why` pointer, never the raw JSON reason.
+    #[test]
+    fn provider_error_turn_end_renders_plain_line() {
+        let mut p = provider_error_payload(503, "{\"error\": {\"message\": \"unavailable\"}}");
+        p.touched = vec!["src/main.rs".into()];
+        let expected = format!(
+            "[turn ended: {} (/why shows the raw error); wrote src/main.rs]",
+            p.error
+                .as_ref()
+                .expect("the payload carries its error")
+                .plain_line()
+        );
+        let lines = turn_end_lines(&p);
+        assert_eq!(lines, vec![expected], "{lines:#?}");
+        assert!(!lines[0].contains('{'), "{lines:#?}");
+        assert!(!lines[0].contains("provider_error"), "{lines:#?}");
+    }
+
+    /// T8 (issue #22): a payload without a structured error (an old log,
+    /// an older daemon) keeps the raw reason — no regression.
+    #[test]
+    fn legacy_turn_end_without_error_falls_back() {
+        let p = TurnEndedPayload::new("provider_error: transport error: connection closed");
+        assert_eq!(
+            turn_end_lines(&p),
+            vec!["[turn ended: provider_error: transport error: connection closed]".to_owned()],
+            "an unreadable error shape degrades to the raw reason"
+        );
+    }
+
+    /// T9 (issue #22): `/why` shows the raw reason after a provider
+    /// failure, and a later done turn clears it.
+    #[test]
+    fn why_shows_raw_reason_then_done_clears_interest() {
+        let failed = provider_error_payload(400, "{\"error\": {\"message\": \"bad request\"}}");
+        let last = stop_reason(&failed);
+        assert_eq!(last.as_deref(), Some(failed.reason.as_str()));
+        assert_eq!(
+            why_line(last.as_deref()),
+            format!("[last stop: {}]", failed.reason)
+        );
+
+        let done = TurnEndedPayload::new("done");
+        assert_eq!(stop_reason(&done), None);
+        assert_eq!(
+            why_line(stop_reason(&done).as_deref()),
+            "[the last turn ended done]"
+        );
+    }
+
+    /// T10 (issue #22): a provider failure after a nap still prints the
+    /// slept line first, then the stop line.
+    #[test]
+    fn slept_line_stays_before_stop_line() {
+        let mut p = provider_error_payload(503, "{}");
+        p.slept_secs = Some(750);
+        p.slept_awaiting_secs = Some(750);
+        let lines = turn_end_lines(&p);
+        assert_eq!(lines.len(), 2, "{lines:#?}");
+        assert!(lines[0].starts_with("the machine slept"), "{lines:#?}");
+        assert!(lines[1].starts_with("[turn ended: "), "{lines:#?}");
     }
 }

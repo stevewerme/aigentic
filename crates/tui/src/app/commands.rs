@@ -4,6 +4,8 @@
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command<'a> {
     Cost,
+    /// The last turn's raw stop reason (issue #22).
+    Why,
     Quit,
     Help,
     Skills,
@@ -58,6 +60,7 @@ pub fn parse_line<'a>(line: &'a str, skills: &[String]) -> Command<'a> {
     let (head, tail) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
     match (head, tail.trim()) {
         ("cost", _) => Command::Cost,
+        ("why", _) => Command::Why,
         ("quit" | "exit", _) => Command::Quit,
         ("help", _) => Command::Help,
         ("keys", _) => Command::Keys,
@@ -93,6 +96,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "cost",
         "tokens for the thread, reported and estimated separately",
     ),
+    ("why", "the last turn's raw stop reason"),
     ("pin", "pin a fact to the stable prefix: /pin <text>"),
     (
         "remember",
@@ -133,6 +137,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
 
 pub const HELP: &str = "\
 /cost            tokens for the thread, reported and estimated separately
+/why             the last turn's raw stop reason (a provider failure shows a plain line)
 /pin <text>      pin a fact to the stable prefix
 /remember <text> file a memory line; an optional first word picks the file: decision, constraint, fact
 /compact         run compaction now
@@ -190,6 +195,7 @@ mod tests {
     fn slash_commands_dispatch() {
         let none: Vec<String> = vec![];
         assert_eq!(parse_line("/cost", &none), Command::Cost);
+        assert_eq!(parse_line("/why", &none), Command::Why);
         assert_eq!(parse_line("  /quit  ", &none), Command::Quit);
         assert_eq!(parse_line("/exit", &none), Command::Quit);
         assert_eq!(parse_line("/help", &none), Command::Help);
@@ -302,6 +308,17 @@ mod tests {
         let out = truncate_for_display(&wide, 12, 100);
         assert!(out.starts_with(&"x".repeat(100)), "{out}");
         assert!(out.contains("… (400 more bytes)"), "{out}");
+    }
+
+    /// `/why` is discoverable wherever the others are (issue #22,
+    /// amendment 3): the completion table and the help text list it.
+    #[test]
+    fn why_is_listed_in_commands_and_help() {
+        assert!(
+            COMMANDS.iter().any(|(name, _)| *name == "why"),
+            "{COMMANDS:#?}"
+        );
+        assert!(HELP.contains("/why"), "{HELP}");
     }
 
     /// `/copy` is discoverable wherever the others are (issue #41).

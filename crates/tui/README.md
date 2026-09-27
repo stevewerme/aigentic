@@ -211,7 +211,9 @@ the decision prints with it. Streamed text prints as its lines complete.
 
 Slash commands: `/cost` (input and output tokens for the thread, reported and
 estimated shown separately, plus cache reads and writes, the reasoning share,
-compactions and memory extractions), `/pin <text>` (a fact for the stable
+compactions and memory extractions), `/why` (the last turn's raw stop
+reason, when the turn ended on a provider failure: the plain line is on
+screen and this is the machine text), `/pin <text>` (a fact for the stable
 prefix, never summarised), `/remember [decision|constraint|fact] <text>`
 (file a memory line directly), `/compact` (run compaction now and report
 what it did), `/copy [n|all]` (the n-th fenced code block of the latest
