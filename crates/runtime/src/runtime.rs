@@ -132,6 +132,14 @@ pub struct Runtime {
     /// `memory_extracted`. `None` means no utility is configured and the
     /// thread's own `model_label` ran the extraction (issue #18).
     pub(crate) utility_label: Option<String>,
+    /// What the utility profile's calls cost, stamped on a
+    /// `memory_extracted` usage line (issue #46). The utility provider
+    /// is a different endpoint from the thread's, so only its own table
+    /// prices its calls: when it has none the line stays unpriced, on a
+    /// model name the report can price later. The thread's prices apply
+    /// only when the thread's provider ran the extraction, i.e. when no
+    /// utility is configured at all.
+    pub(crate) utility_prices: Option<Prices>,
     /// The turn clock (issue #47): one monotonic and one wall reading,
     /// taken together. Both go through this seam so a test can script a
     /// sleep the way the machine makes one — wall time moving on while
@@ -178,6 +186,7 @@ impl Runtime {
             harness_instructions: None,
             utility: None,
             utility_label: None,
+            utility_prices: None,
             clock: Arc::new(|| (Instant::now(), SystemTime::now())),
             keep_awake: None,
         }
@@ -228,10 +237,18 @@ impl Runtime {
 
     /// A smaller model for side jobs (phase 6 step 9). `label` is its
     /// model name, recorded on `memory_extracted` so the log names the
-    /// provider that ran the extraction (issue #18).
-    pub fn with_utility(mut self, provider: Box<dyn Provider>, label: impl Into<String>) -> Self {
+    /// provider that ran the extraction (issue #18); `prices` is that
+    /// profile's `[prices]`, stamped on the extraction's usage line
+    /// (issue #46).
+    pub fn with_utility(
+        mut self,
+        provider: Box<dyn Provider>,
+        label: impl Into<String>,
+        prices: Option<Prices>,
+    ) -> Self {
         self.utility = Some(provider);
         self.utility_label = Some(label.into());
+        self.utility_prices = prices;
         self
     }
 

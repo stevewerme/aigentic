@@ -296,11 +296,23 @@ impl Runtime {
             .utility_label
             .clone()
             .unwrap_or_else(|| self.model_label.clone());
+        // And what that provider's table says the call cost (issue #46):
+        // the utility profile's prices when a utility is configured, the
+        // thread's when the thread's own provider ran it. No table at all
+        // leaves `cost_usd` unset, which is the honest answer — the
+        // report's retro pricing covers such a line by `model`.
+        let prices = if self.utility.is_some() {
+            self.utility_prices
+        } else {
+            self.prices
+        };
+        let mut usage = aigentic_log::Usage::reported(usage);
+        usage.cost_usd = prices.map(|p| p.cost_usd(&usage));
         let payload = MemoryExtractedPayload {
             through_seq,
             written,
             model,
-            usage: aigentic_log::Usage::reported(usage),
+            usage,
         };
         let value = serde_json::to_value(&payload).expect("serialisable");
         self.append(

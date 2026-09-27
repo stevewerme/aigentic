@@ -8,7 +8,7 @@ mod common;
 
 use aigentic_core::{ContentBlock, EventKind, Message, ProviderEvent, Role, ToolCall};
 use aigentic_log::{MemoryExtractedPayload, MemoryRememberedPayload, ThreadLog};
-use aigentic_runtime::{Layers, MEMORY_PROMPT, Project, Runtime, RuntimeError};
+use aigentic_runtime::{Layers, MEMORY_PROMPT, Prices, Project, Runtime, RuntimeError};
 use aigentic_tools::ToolRegistry;
 use common::{EchoTool, Seen, done, scripted, steve, usage};
 use serde_json::json;
@@ -520,7 +520,8 @@ async fn the_extraction_label_names_the_utility_model_not_the_threads() {
     let dir = project_dir("");
     let (thread, thread_seen) = scripted(one_turn());
     let (utility, utility_seen) = scripted(vec![vec![text(REPLY), usage(300, 20)]]);
-    let mut rt = runtime_with(&dir, thread, "thread-model").with_utility(utility, "utility-model");
+    let mut rt =
+        runtime_with(&dir, thread, "thread-model").with_utility(utility, "utility-model", None);
 
     say(&mut rt, "For the record, use Swedish in the UI.").await;
     let p = rt.extract_memory(&mut |_| {}).await.unwrap().unwrap();
@@ -540,4 +541,88 @@ async fn the_extraction_label_names_the_utility_model_not_the_threads() {
             .all(|r| texts(&r[0]) != MEMORY_PROMPT),
         "the thread's provider saw the extraction prompt"
     );
+}
+
+/// Issue #46: the extraction is a priced call of its own. With a utility
+/// profile that has a `[prices]` table, its usage line carries what that
+/// table says the call cost — recomputed here from the same table and the
+/// scripted usage, never a literal.
+#[tokio::test]
+async fn a_priced_utility_stamps_the_extraction_with_its_own_table() {
+    let prices = Prices {
+        input: 0.07,
+        cache_read: 0.01,
+        cache_write: 0.08,
+        output: 0.28,
+    };
+    let dir = project_dir("");
+    let (thread, _thread_seen) = scripted(one_turn());
+    let (utility, _utility_seen) = scripted(vec![vec![text(REPLY), usage(300, 20)]]);
+    let mut rt = runtime_with(&dir, thread, "thread-model").with_utility(
+        utility,
+        "utility-model",
+        Some(prices),
+    );
+
+    say(&mut rt, "For the record, use Swedish in the UI.").await;
+    let p = rt.extract_memory(&mut |_| {}).await.unwrap().unwrap();
+
+    // `usage(300, 20)`: 300 input at 0.07 and 20 output at 0.28 per
+    // million, from the table the test passed in.
+    let expected = prices.cost_usd(&p.usage);
+    assert!(expected > 0.0, "{expected}");
+    assert_eq!(p.usage.cost_usd, Some(expected));
+    assert_eq!((p.usage.input_tokens, p.usage.output_tokens), (300, 20));
+    assert!(!p.usage.estimated, "the provider reported this usage");
+}
+
+/// Issue #46, the fallback half: with no utility profile the thread's own
+/// provider ran the extraction, so the thread's table prices it.
+#[tokio::test]
+async fn a_threads_table_prices_an_extraction_the_thread_ran() {
+    let prices = Prices {
+        input: 0.11,
+        cache_read: 0.0,
+        cache_write: 0.0,
+        output: 0.44,
+    };
+    let dir = project_dir("");
+    // The thread's own provider is the extractor here, so its script
+    // holds the extraction exchange too.
+    let mut script = one_turn();
+    script.push(vec![text(REPLY), usage(300, 20)]);
+    let (thread, _seen) = scripted(script);
+    let mut rt =
+        runtime_with(&dir, thread, "thread-model").with_pricing("thread-profile", Some(prices));
+
+    say(&mut rt, "For the record, use Swedish in the UI.").await;
+    let p = rt.extract_memory(&mut |_| {}).await.unwrap().unwrap();
+
+    assert_eq!(p.usage.cost_usd, Some(prices.cost_usd(&p.usage)));
+    assert!(p.usage.cost_usd.unwrap() > 0.0);
+}
+
+/// Issue #46, the honest hole: a utility profile with no table of its own
+/// does not borrow the thread's prices for its calls — the line stays
+/// unpriced, on a model name the report can price later.
+#[tokio::test]
+async fn a_utility_without_prices_leaves_the_extraction_unpriced() {
+    let thread_prices = Prices {
+        input: 9.0,
+        cache_read: 0.0,
+        cache_write: 0.0,
+        output: 9.0,
+    };
+    let dir = project_dir("");
+    let (thread, _thread_seen) = scripted(one_turn());
+    let (utility, _utility_seen) = scripted(vec![vec![text(REPLY), usage(300, 20)]]);
+    let mut rt = runtime_with(&dir, thread, "thread-model")
+        .with_utility(utility, "utility-model", None)
+        .with_pricing("thread-profile", Some(thread_prices));
+
+    say(&mut rt, "For the record, use Swedish in the UI.").await;
+    let p = rt.extract_memory(&mut |_| {}).await.unwrap().unwrap();
+
+    assert_eq!(p.usage.cost_usd, None);
+    assert_eq!(p.model, "utility-model");
 }

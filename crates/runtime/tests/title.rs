@@ -41,7 +41,7 @@ async fn the_utility_model_titles_the_first_finished_turn_once() {
         dir.path(),
         vec![vec![text("They share serde."), done("stop")]],
     )
-    .with_utility(utility, "utility-model");
+    .with_utility(utility, "utility-model", None);
     // Nothing to title before a turn has finished.
     assert_eq!(rt.title_if_untitled(&mut |_| {}).await.unwrap(), None);
     rt.run_turn(

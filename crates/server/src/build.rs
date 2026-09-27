@@ -236,7 +236,14 @@ pub async fn build_thread(
         // A missing key for the utility profile is not fatal: the
         // thread's own model does the side jobs instead.
         if let Ok((provider, label)) = providers.build(utility) {
-            runtime = runtime.with_utility(provider, label);
+            // The utility profile's own table prices its calls (issue
+            // #46): a different endpoint usually costs different money.
+            let prices = config
+                .profiles
+                .get(utility)
+                .and_then(|p| p.prices.as_ref())
+                .map(|p| p.prices());
+            runtime = runtime.with_utility(provider, label, prices);
         }
     }
     if let Some(p) = profile {
