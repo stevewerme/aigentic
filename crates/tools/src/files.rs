@@ -6,6 +6,7 @@ use crate::truncate::{DEFAULT_OUTPUT_CAP, truncate_output};
 use crate::workdir::Workdir;
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ReadFileArgs {
     /// Path to read, absolute or relative to the working directory.
     path: String,
@@ -69,6 +70,7 @@ impl Tool for ReadFileTool {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct WriteFileArgs {
     /// Path to write, absolute or relative to the working directory.
     /// Parent directories are created.
@@ -149,6 +151,29 @@ pub(crate) fn parse_args<T: serde::de::DeserializeOwned>(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn read_file_rejects_unknown_argument_keys() {
+        let err = parse_args::<ReadFileArgs>(json!({
+            "path": "n.txt",
+            "bogus": "leaked tool-call template",
+        }))
+        .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgs(_)), "{err:?}");
+        assert!(err.to_string().contains("bogus"), "{err}");
+    }
+
+    #[test]
+    fn write_file_rejects_unknown_argument_keys() {
+        let err = parse_args::<WriteFileArgs>(json!({
+            "path": "n.txt",
+            "content": "one\n",
+            "bogus": "leaked tool-call template",
+        }))
+        .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgs(_)), "{err:?}");
+        assert!(err.to_string().contains("bogus"), "{err}");
+    }
 
     #[tokio::test]
     async fn write_file_result_starts_with_a_diff() {

@@ -25,6 +25,7 @@ pub const MAX_TIMEOUT_SECS: u64 = 900;
 const TERM_GRACE: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct BashArgs {
     /// Command to run with `bash -c`. The working directory persists between
     /// calls, so `cd` takes effect for later commands.
@@ -357,6 +358,17 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::time::Instant;
+
+    #[test]
+    fn rejects_unknown_argument_keys() {
+        let err = parse_args::<BashArgs>(json!({
+            "command": "echo hi",
+            "bogus": "leaked tool-call template",
+        }))
+        .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgs(_)), "{err:?}");
+        assert!(err.to_string().contains("bogus"), "{err}");
+    }
 
     fn tool(dir: &std::path::Path) -> BashTool {
         BashTool::new(Workdir::new(dir))

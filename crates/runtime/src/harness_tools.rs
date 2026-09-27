@@ -35,6 +35,7 @@ pub struct HumanOption {
 
 /// One question an `ask_human` call asks.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct HumanQuestion {
     pub question: String,
     /// A short name for the answer line, e.g. `colour`, so a
@@ -73,6 +74,7 @@ pub struct AskHumanArgs {
 impl<'de> Deserialize<'de> for AskHumanArgs {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct Raw {
             #[serde(default)]
             question: Option<String>,
@@ -107,6 +109,7 @@ impl<'de> Deserialize<'de> for AskHumanArgs {
 
 /// One checklist item as the model sends it.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Task {
     pub text: String,
     #[serde(default)]
@@ -123,16 +126,19 @@ pub enum TaskState {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateTasksArgs {
     pub tasks: Vec<Task>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PinArgs {
     text: String,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct LoadSkillArgs {
     name: String,
 }
@@ -405,5 +411,75 @@ impl Runtime {
         .expect("serialisable");
         self.append(EventKind::SkillLoaded, author, payload, None, observe)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // The runtime parses each harness call with
+    // `serde_json::from_value::<T>(call.args.clone())`, so these go
+    // through the same path.
+
+    #[test]
+    fn ask_human_rejects_unknown_argument_keys() {
+        let err = serde_json::from_value::<AskHumanArgs>(json!({
+            "questions": [{"question": "which?"}],
+            "bogus": "leaked tool-call template",
+        }))
+        .unwrap_err();
+        assert!(err.to_string().contains("bogus"), "{err}");
+    }
+
+    #[test]
+    fn task_rejects_unknown_argument_keys() {
+        let err = serde_json::from_value::<Task>(json!({
+            "text": "step",
+            "bogus": "leaked tool-call template",
+        }))
+        .unwrap_err();
+        assert!(err.to_string().contains("bogus"), "{err}");
+    }
+
+    #[test]
+    fn update_tasks_rejects_unknown_argument_keys() {
+        let err = serde_json::from_value::<UpdateTasksArgs>(json!({
+            "tasks": [{"text": "step"}],
+            "bogus": "leaked tool-call template",
+        }))
+        .unwrap_err();
+        assert!(err.to_string().contains("bogus"), "{err}");
+    }
+
+    #[test]
+    fn pin_rejects_unknown_argument_keys() {
+        let err = serde_json::from_value::<PinArgs>(json!({
+            "text": "a fact",
+            "bogus": "leaked tool-call template",
+        }))
+        .unwrap_err();
+        assert!(err.to_string().contains("bogus"), "{err}");
+    }
+
+    #[test]
+    fn load_skill_rejects_unknown_argument_keys() {
+        let err = serde_json::from_value::<LoadSkillArgs>(json!({
+            "name": "brief",
+            "bogus": "leaked tool-call template",
+        }))
+        .unwrap_err();
+        assert!(err.to_string().contains("bogus"), "{err}");
+    }
+
+    #[test]
+    fn human_question_rejects_unknown_argument_keys() {
+        let err = serde_json::from_value::<HumanQuestion>(json!({
+            "question": "which?",
+            "bogus": "leaked tool-call template",
+        }))
+        .unwrap_err();
+        assert!(err.to_string().contains("bogus"), "{err}");
     }
 }

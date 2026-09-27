@@ -17,6 +17,7 @@ pub const DEFAULT_GREP_MATCHES: usize = 200;
 // list_dir
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ListDirArgs {
     /// Directory to list, absolute or relative to the working directory.
     /// Defaults to the working directory.
@@ -96,6 +97,7 @@ impl Tool for ListDirTool {
 // grep
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct GrepArgs {
     /// Regular expression (Rust `regex` syntax) to search for.
     pattern: String,
@@ -250,6 +252,7 @@ fn grep_sync(
 // edit_file
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct EditFileArgs {
     /// File to edit, absolute or relative to the working directory.
     path: String,
@@ -346,6 +349,41 @@ impl Tool for EditFileTool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn list_dir_rejects_unknown_argument_keys() {
+        let err = parse_args::<ListDirArgs>(json!({
+            "bogus": "leaked tool-call template",
+        }))
+        .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgs(_)), "{err:?}");
+        assert!(err.to_string().contains("bogus"), "{err}");
+    }
+
+    #[test]
+    fn grep_rejects_unknown_argument_keys() {
+        // The 2026-09-23 spin: GLM leaked this key into a grep call.
+        let err = parse_args::<GrepArgs>(json!({
+            "pattern": "needle",
+            "output_to=null\npath": "src",
+        }))
+        .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgs(_)), "{err:?}");
+        assert!(err.to_string().contains("output_to=null\npath"), "{err}");
+    }
+
+    #[test]
+    fn edit_file_rejects_unknown_argument_keys() {
+        let err = parse_args::<EditFileArgs>(json!({
+            "path": "n.txt",
+            "old_string": "one",
+            "new_string": "two",
+            "bogus": "leaked tool-call template",
+        }))
+        .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgs(_)), "{err:?}");
+        assert!(err.to_string().contains("bogus"), "{err}");
+    }
 
     fn fixture() -> (tempfile::TempDir, Workdir) {
         let dir = tempfile::tempdir().unwrap();

@@ -189,6 +189,7 @@ pub fn search<'a>(sections: &'a [Section], query: &str, max_hits: usize) -> Vec<
 pub type KnowledgeSnapshot = Arc<Mutex<Vec<Section>>>;
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct SearchArgs {
     /// Words to look for; sections mentioning more of them rank higher.
     query: String,
@@ -267,6 +268,17 @@ impl Tool for SearchKnowledgeTool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn rejects_unknown_argument_keys() {
+        let err = parse_args::<SearchArgs>(json!({
+            "query": "deploys",
+            "bogus": "leaked tool-call template",
+        }))
+        .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgs(_)), "{err:?}");
+        assert!(err.to_string().contains("bogus"), "{err}");
+    }
 
     const DOC: &str = "Intro line before any heading.\n\n# Deploys\n\nWe deploy on Fridays.\n```\n# not a heading\n```\n\n## Rollback\n\nRollback with vercel rollback.\n\n# Billing\n\nStripe handles billing and invoices.\n";
 
