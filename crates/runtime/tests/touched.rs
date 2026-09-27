@@ -112,10 +112,15 @@ async fn a_turn_without_writes_carries_no_list_and_old_lines_read_back() {
     assert!(outcome.touched.is_empty());
     let events = rt.log().read_all().unwrap();
     let end = events.last().unwrap();
-    assert_eq!(
-        end.payload,
-        json!({"reason": "done"}),
-        "no field when empty"
+    assert_eq!(end.payload["reason"], "done");
+    // The `touched` list is the field under test, and it is absent when
+    // nothing was written. The line is no longer *only* `reason`:
+    // issue #47 amendment 2 has every measured turn carry `wall_secs`,
+    // so a whole-object literal here would fail for the wrong reason.
+    assert!(
+        end.payload.get("touched").is_none(),
+        "no touched field when empty: {}",
+        end.payload
     );
     let old: TurnEndedPayload = serde_json::from_value(json!({"reason": "done"})).unwrap();
     assert!(old.touched.is_empty());

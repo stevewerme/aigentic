@@ -245,6 +245,12 @@ async fn assistant_without_calls_gets_its_lost_turn_ended() {
     let p: TurnEndedPayload =
         serde_json::from_value(events.last().unwrap().payload.clone()).unwrap();
     assert_eq!(p.reason, "resumed");
+    // T11 (issue #47): a resumed turn never slept under the guard — it
+    // ran after the crash — so the three fields are absent, and so is
+    // every older line.
+    assert_eq!(p.slept_secs, None);
+    assert_eq!(p.slept_awaiting_secs, None);
+    assert_eq!(p.keep_awake, None);
 }
 
 #[tokio::test]

@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use aigentic_core::{AgentId, Budget, Event, Provider, ToolCall};
 use aigentic_log::ThreadLog;
@@ -128,6 +128,16 @@ pub struct Runtime {
     /// The provider for side jobs (titles, memory extraction): the
     /// config's `utility_profile` when set, else the thread's own.
     pub(crate) utility: Option<Box<dyn Provider>>,
+    /// The turn clock (issue #47): one monotonic and one wall reading,
+    /// taken together. Both go through this seam so a test can script a
+    /// sleep the way the machine makes one — wall time moving on while
+    /// running time stands still.
+    pub(crate) clock: Arc<dyn Fn() -> (Instant, SystemTime) + Send + Sync>,
+    /// The keep-awake guard's status reader, installed by the daemon
+    /// (issue #47). Read when a turn ends, never earlier, so a guard
+    /// that failed to spawn mid-run is reported by the turn it affected
+    /// rather than freezing its status into every thread at startup.
+    pub(crate) keep_awake: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
 }
 
 impl Runtime {
@@ -163,6 +173,8 @@ impl Runtime {
             measured: None,
             harness_instructions: None,
             utility: None,
+            clock: Arc::new(|| (Instant::now(), SystemTime::now())),
+            keep_awake: None,
         }
     }
 
@@ -436,6 +448,36 @@ impl Runtime {
 
     pub fn set_budget(&mut self, budget: Budget) {
         self.budget = budget;
+    }
+
+    /// Replace the turn clock (issue #47): both readings are taken
+    /// through this seam, so a test can script a sleep the way the
+    /// machine makes one — wall time moving on while running time stands
+    /// still.
+    pub fn with_clock(
+        mut self,
+        clock: Arc<dyn Fn() -> (Instant, SystemTime) + Send + Sync>,
+    ) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// Install the keep-awake guard's status reader (issue #47). The
+    /// daemon passes a closure over its guard; it is called once when a
+    /// turn ends, so a guard that failed to spawn later in the run is
+    /// still reported by the turn it affected.
+    pub fn with_keep_awake(
+        mut self,
+        reader: Arc<dyn Fn() -> Option<String> + Send + Sync>,
+    ) -> Self {
+        self.set_keep_awake(reader);
+        self
+    }
+
+    /// The same, on a runtime already built: what the daemon's actor
+    /// uses, since its runtime lives behind `&mut self` by then.
+    pub fn set_keep_awake(&mut self, reader: Arc<dyn Fn() -> Option<String> + Send + Sync>) {
+        self.keep_awake = Some(reader);
     }
 
     /// The global and project layers; their instructions and memory join

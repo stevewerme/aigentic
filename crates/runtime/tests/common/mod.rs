@@ -250,6 +250,41 @@ pub fn harness_with_log(
     }
 }
 
+/// A harness whose turn clock is scripted (issue #47): the first
+/// reading — the turn's start — is the bases, and every later reading is
+/// the bases plus the deltas. So a test can make wall time move while
+/// running time stands still, exactly as an idle sleep does.
+pub fn harness_with_clock(
+    script: Vec<Vec<ProviderEvent>>,
+    instructions: Option<&str>,
+    running: std::time::Duration,
+    wall: std::time::Duration,
+) -> Harness {
+    let dir = tempfile::tempdir().unwrap();
+    let log = ThreadLog::open(dir.path(), ulid::Ulid::generate()).unwrap();
+    let (provider, seen) = scripted(script);
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let registry: ToolRegistry = vec![Box::new(EchoTool(calls.clone())) as Box<dyn Tool>].into();
+    let base_running = std::time::Instant::now();
+    let base_wall = std::time::SystemTime::now();
+    let reads = std::sync::atomic::AtomicUsize::new(0);
+    let runtime = Runtime::new(provider, registry, log, AgentId("worker".into()))
+        .with_layers(instructions.map_or_else(Layers::default, Layers::global_instructions))
+        .with_clock(Arc::new(move || {
+            if reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                (base_running, base_wall)
+            } else {
+                (base_running + running, base_wall + wall)
+            }
+        }));
+    Harness {
+        runtime,
+        seen,
+        calls,
+        dir,
+    }
+}
+
 pub fn steve() -> Author {
     Author::User(UserId("steve".into()))
 }

@@ -144,9 +144,15 @@ impl Runtime {
         inbox: &mut Inbox,
         observe: &mut (dyn FnMut(Signal<'_>) + Send),
     ) -> Result<TurnOutcome, RuntimeError> {
+        // The turn's two starts, read through the clock seam so a test
+        // can script a sleep (issue #47). Wall time keeps moving while
+        // the machine is asleep; the monotonic clock counts only uptime.
+        let (started, wall_started) = (self.clock)();
         let mut spent = Spent {
-            started: Instant::now(),
+            started,
+            wall_started,
             waited: std::time::Duration::ZERO,
+            wall_waited: std::time::Duration::ZERO,
             iterations: 0,
             tokens: 0,
         };
@@ -339,7 +345,14 @@ impl Runtime {
                 self.drain_inbox(inbox, observe)?;
                 observe(Signal::ToolCallStarted(&call));
                 let (result, record, by) = self
-                    .execute(&call, cancel, inbox, observe, &mut spent.waited)
+                    .execute(
+                        &call,
+                        cancel,
+                        inbox,
+                        observe,
+                        &mut spent.waited,
+                        &mut spent.wall_waited,
+                    )
                     .await?;
                 answered |= call.name == ASK_HUMAN && !result.is_error;
                 let payload = serde_json::to_value(ToolResultPayload::new(result, record))
@@ -498,6 +511,7 @@ impl Runtime {
         inbox: &mut Inbox,
         observe: &mut (dyn FnMut(Signal<'_>) + Send),
         waited: &mut std::time::Duration,
+        wall_waited: &mut std::time::Duration,
     ) -> Result<(ToolResult, PolicyRecord, Author), RuntimeError> {
         // A tool the layers hide is unknown to this thread: the same
         // refusal as a name that was never registered.
@@ -519,16 +533,22 @@ impl Runtime {
                 Author::System,
             ));
         };
-        let asked = Instant::now();
+        // The policy check and the `ask_human` wait are timed on both
+        // clocks: running time is what the wall-time budget discounts,
+        // the wall reading is what tells a sleep inside the wait from
+        // time actually parked on a human (issue #47).
+        let (asked, asked_wall) = (self.clock)();
         let verdict = self.policy_check(call, class, cancel, observe).await?;
         *waited += asked.elapsed();
+        *wall_waited += asked_wall.elapsed().unwrap_or_default();
         match verdict {
             Verdict::Run(record) => {
                 let (result, by) = if is_harness_tool(&call.name) {
-                    let started = Instant::now();
+                    let (started, started_wall) = (self.clock)();
                     let ran = self.run_harness_tool(call, cancel, observe).await?;
                     if call.name == ASK_HUMAN {
                         *waited += started.elapsed();
+                        *wall_waited += started_wall.elapsed().unwrap_or_default();
                     }
                     ran
                 } else {
