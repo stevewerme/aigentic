@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use aigentic_core::{Author, ContentBlock, RiskClass, ToolCall, ToolResult};
+use aigentic_core::{Author, ContentBlock, ProviderError, RiskClass, ToolCall, ToolResult};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -266,6 +266,29 @@ pub struct TurnEndedPayload {
     /// lines and when no daemon set one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keep_awake: Option<String>,
+    /// The structured provider error when the turn ended on one (issue
+    /// #22): the machine shape the plain line is derived from. `None`
+    /// on old lines, on turns that did not fail on a provider, and when
+    /// a shape this binary cannot read is stored — the field is read
+    /// leniently (`de_lenient`), so a `turn_ended` event from another
+    /// version always still parses and falls back to its raw `reason`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_lenient"
+    )]
+    pub error: Option<ProviderError>,
+}
+
+/// Read `Option<ProviderError>` without ever failing the whole payload
+/// (issue #22): a `turn_ended` line whose `error` holds a variant,
+/// rename or shape this binary does not know degrades to `None`, so the
+/// line still replays through its raw `reason`.
+fn de_lenient<'de, D>(d: D) -> Result<Option<ProviderError>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<ProviderError>::deserialize(d).unwrap_or(None))
 }
 
 impl TurnEndedPayload {
@@ -277,6 +300,7 @@ impl TurnEndedPayload {
             slept_secs: None,
             slept_awaiting_secs: None,
             keep_awake: None,
+            error: None,
         }
     }
 }
@@ -787,6 +811,7 @@ mod tests {
             "slept_secs",
             "slept_awaiting_secs",
             "keep_awake",
+            "error",
         ] {
             assert!(
                 back.get(absent).is_none(),
@@ -802,6 +827,7 @@ mod tests {
             slept_secs: Some(750),
             slept_awaiting_secs: Some(120),
             keep_awake: Some("on".into()),
+            error: None,
         };
         let value = serde_json::to_value(&measured).unwrap();
         assert_eq!(value["wall_secs"], 980);
@@ -811,6 +837,48 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<TurnEndedPayload>(value).unwrap(),
             measured
+        );
+    }
+
+    /// T6 (issue #22): a `turn_ended` line written before the `error`
+    /// field existed parses with `error: None` and writes nothing back.
+    #[test]
+    fn turn_ended_payload_without_error_field_deserializes() {
+        let line = json!({"reason": "provider_error: http 503: boom"});
+        let p: TurnEndedPayload = serde_json::from_value(line.clone()).unwrap();
+        assert_eq!(p.error, None);
+        assert_eq!(serde_json::to_value(&p).unwrap(), line);
+    }
+
+    /// The amendment to issue #22: an `error` this binary cannot read
+    /// (an unknown variant) degrades to `None` instead of failing the
+    /// whole `turn_ended` line, so the stored raw `reason` still replays.
+    #[test]
+    fn an_unreadable_error_degrades_to_none() {
+        let line = json!({
+            "reason": "provider_error: http 503: boom",
+            "error": {"a_variant_from_a_later_version": {"detail": "?"}}
+        });
+        let p: TurnEndedPayload = serde_json::from_value(line).unwrap();
+        assert_eq!(p.error, None);
+        assert_eq!(p.reason, "provider_error: http 503: boom");
+    }
+
+    /// And a readable error round-trips as its machine shape.
+    #[test]
+    fn a_readable_error_round_trips() {
+        let p = TurnEndedPayload {
+            error: Some(ProviderError::Http {
+                status: 503,
+                body: "boom".into(),
+            }),
+            ..TurnEndedPayload::new("provider_error: http 503: boom")
+        };
+        let value = serde_json::to_value(&p).unwrap();
+        assert_eq!(value["error"]["Http"]["status"], 503);
+        assert_eq!(
+            serde_json::from_value::<TurnEndedPayload>(value).unwrap(),
+            p
         );
     }
 }

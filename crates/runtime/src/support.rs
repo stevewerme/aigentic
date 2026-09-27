@@ -2,7 +2,7 @@
 
 use std::time::{Duration, Instant, SystemTime};
 
-use aigentic_core::{Author, ContentBlock, Event, EventKind, Message, Role};
+use aigentic_core::{Author, ContentBlock, Event, EventKind, Message, ProviderError, Role};
 use aigentic_log::{NewEvent, TurnEndedPayload, Usage, UserMessagePayload};
 
 use crate::decisions::Queued;
@@ -98,6 +98,7 @@ impl Runtime {
     pub(crate) fn end_turn(
         &mut self,
         reason: &str,
+        error: Option<ProviderError>,
         spent: &Spent,
         held: &mut Vec<Queued>,
         observe: &mut (dyn FnMut(Signal<'_>) + Send),
@@ -120,6 +121,7 @@ impl Runtime {
             slept_secs,
             slept_awaiting_secs,
             keep_awake: self.keep_awake.as_ref().and_then(|f| f()),
+            error,
         })
         .expect("serialisable");
         self.append(

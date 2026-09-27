@@ -177,7 +177,7 @@ impl Runtime {
             // conversation whose tool calls have no matching tool message,
             // so a log left in that state could not be resumed.
             if let Some(reason) = self.budget_reason(&spent) {
-                return self.end_turn(reason, &spent, &mut held, observe);
+                return self.end_turn(reason, None, &spent, &mut held, observe);
             }
             // What a stream held, appended at the point of first sight:
             // the reply that was streaming when it arrived had tool
@@ -197,7 +197,13 @@ impl Runtime {
             self.evict_stale(observe)?;
             if let Err(e) = self.compact(observe).await {
                 if let RuntimeError::Provider(p) = &e {
-                    self.end_turn(&format!("provider_error: {p}"), &spent, &mut held, observe)?;
+                    self.end_turn(
+                        &format!("provider_error: {p}"),
+                        Some(p.clone()),
+                        &spent,
+                        &mut held,
+                        observe,
+                    )?;
                 }
                 return Err(e);
             }
@@ -317,7 +323,13 @@ impl Runtime {
             usage.cost_usd = self.prices.map(|p| p.cost_usd(&usage));
             spent.tokens += self.budget.spent_of(&usage.to_core());
             if let Some(e) = error {
-                self.end_turn(&format!("provider_error: {e}"), &spent, &mut held, observe)?;
+                self.end_turn(
+                    &format!("provider_error: {e}"),
+                    Some(e.clone()),
+                    &spent,
+                    &mut held,
+                    observe,
+                )?;
                 return Err(RuntimeError::Provider(e));
             }
 
@@ -336,7 +348,7 @@ impl Runtime {
             let assistant =
                 self.append(EventKind::AssistantMessage, agent, payload, None, observe)?;
             if calls.is_empty() {
-                return self.end_turn("done", &spent, &mut held, observe);
+                return self.end_turn("done", None, &spent, &mut held, observe);
             }
 
             let mut answered = false;
@@ -404,7 +416,7 @@ impl Runtime {
             // A human's answer starts a turn: everything after it is new
             // work with its own budget. The client continues at once.
             if answered {
-                return self.end_turn(ASKED_HUMAN, &spent, &mut held, observe);
+                return self.end_turn(ASKED_HUMAN, None, &spent, &mut held, observe);
             }
         }
     }
@@ -495,7 +507,7 @@ impl Runtime {
             None,
             observe,
         )?;
-        self.end_turn(INTERRUPTED, spent, held, observe)
+        self.end_turn(INTERRUPTED, None, spent, held, observe)
     }
 
     /// The one call site for tool execution, behind `policy_check`. An
