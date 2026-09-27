@@ -290,10 +290,16 @@ impl Runtime {
         let thread = self.log.thread_id().to_string();
         let written = write_lines(&memory_dir, &kept, &date, &thread)?;
 
+        // Which provider ran the extraction: the utility profile's when
+        // one is configured, else the thread's own (issue #18).
+        let model = self
+            .utility_label
+            .clone()
+            .unwrap_or_else(|| self.model_label.clone());
         let payload = MemoryExtractedPayload {
             through_seq,
             written,
-            model: self.model_label.clone(),
+            model,
             usage: aigentic_log::Usage::reported(usage),
         };
         let value = serde_json::to_value(&payload).expect("serialisable");

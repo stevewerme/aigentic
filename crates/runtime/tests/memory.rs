@@ -28,22 +28,31 @@ fn project_dir(memory_section: &str) -> tempfile::TempDir {
     dir
 }
 
-fn rig(dir: &tempfile::TempDir, script: Vec<Vec<ProviderEvent>>) -> (Runtime, Seen) {
-    let (provider, seen) = scripted(script);
+/// The shared runtime shape: one thread provider, one model label, the
+/// project's layers and an echo tool.
+fn runtime_with(
+    dir: &tempfile::TempDir,
+    provider: Box<dyn aigentic_core::Provider>,
+    label: &str,
+) -> Runtime {
     let log = ThreadLog::open(dir.path(), ulid::Ulid::generate()).unwrap();
     let project = Project::open(dir.path()).unwrap().unwrap();
     let registry: ToolRegistry =
         vec![Box::new(EchoTool(Arc::new(Mutex::new(Vec::new())))) as Box<dyn aigentic_core::Tool>]
             .into();
-    let runtime = Runtime::new(
+    Runtime::new(
         provider,
         registry,
         log,
         aigentic_core::AgentId("worker".into()),
     )
     .with_layers(Layers::default().with_project(project))
-    .with_model_label("scripted");
-    (runtime, seen)
+    .with_model_label(label)
+}
+
+fn rig(dir: &tempfile::TempDir, script: Vec<Vec<ProviderEvent>>) -> (Runtime, Seen) {
+    let (provider, seen) = scripted(script);
+    (runtime_with(dir, provider, "scripted"), seen)
 }
 
 async fn say(rt: &mut Runtime, what: &str) {
@@ -502,4 +511,33 @@ async fn an_instruction_without_a_cue_never_reaches_the_model_or_the_file() {
         texts(&request[1])
     );
     assert!(!dir.path().join(".aigentic/memory").exists());
+}
+
+/// Issue #18: `memory_extracted.model` names the provider that ran the
+/// extraction — the utility profile's model, not the thread's.
+#[tokio::test]
+async fn the_extraction_label_names_the_utility_model_not_the_threads() {
+    let dir = project_dir("");
+    let (thread, thread_seen) = scripted(one_turn());
+    let (utility, utility_seen) = scripted(vec![vec![text(REPLY), usage(300, 20)]]);
+    let mut rt = runtime_with(&dir, thread, "thread-model").with_utility(utility, "utility-model");
+
+    say(&mut rt, "For the record, use Swedish in the UI.").await;
+    let p = rt.extract_memory(&mut |_| {}).await.unwrap().unwrap();
+    assert_eq!(p.model, "utility-model");
+    assert!(!p.written.is_empty(), "{:?}", p.written);
+
+    // The extraction reached the utility, so the label is not right by
+    // accident, and never the thread's provider.
+    let utility_seen = utility_seen.lock().unwrap();
+    assert_eq!(utility_seen.len(), 1);
+    assert_eq!(texts(&utility_seen[0][0]), MEMORY_PROMPT);
+    assert!(
+        thread_seen
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|r| texts(&r[0]) != MEMORY_PROMPT),
+        "the thread's provider saw the extraction prompt"
+    );
 }

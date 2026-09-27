@@ -128,6 +128,10 @@ pub struct Runtime {
     /// The provider for side jobs (titles, memory extraction): the
     /// config's `utility_profile` when set, else the thread's own.
     pub(crate) utility: Option<Box<dyn Provider>>,
+    /// The utility profile's model, set with its provider; recorded on
+    /// `memory_extracted`. `None` means no utility is configured and the
+    /// thread's own `model_label` ran the extraction (issue #18).
+    pub(crate) utility_label: Option<String>,
     /// The turn clock (issue #47): one monotonic and one wall reading,
     /// taken together. Both go through this seam so a test can script a
     /// sleep the way the machine makes one — wall time moving on while
@@ -173,6 +177,7 @@ impl Runtime {
             measured: None,
             harness_instructions: None,
             utility: None,
+            utility_label: None,
             clock: Arc::new(|| (Instant::now(), SystemTime::now())),
             keep_awake: None,
         }
@@ -221,15 +226,24 @@ impl Runtime {
         Ok(())
     }
 
-    /// A smaller model for side jobs (phase 6 step 9).
-    pub fn with_utility(mut self, provider: Box<dyn Provider>) -> Self {
+    /// A smaller model for side jobs (phase 6 step 9). `label` is its
+    /// model name, recorded on `memory_extracted` so the log names the
+    /// provider that ran the extraction (issue #18).
+    pub fn with_utility(mut self, provider: Box<dyn Provider>, label: impl Into<String>) -> Self {
         self.utility = Some(provider);
+        self.utility_label = Some(label.into());
         self
     }
 
     /// The provider side jobs use.
     pub fn utility(&self) -> &dyn Provider {
         self.utility.as_deref().unwrap_or(self.provider.as_ref())
+    }
+
+    /// The utility profile's model, when one is configured; `None` means
+    /// side jobs run on the thread's own `model_label`.
+    pub fn utility_label(&self) -> Option<&str> {
+        self.utility_label.as_deref()
     }
 
     /// The title from the log's last `thread_renamed`, if any.

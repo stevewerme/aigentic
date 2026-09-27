@@ -235,8 +235,8 @@ pub async fn build_thread(
     {
         // A missing key for the utility profile is not fatal: the
         // thread's own model does the side jobs instead.
-        if let Ok((provider, _)) = providers.build(utility) {
-            runtime = runtime.with_utility(provider);
+        if let Ok((provider, label)) = providers.build(utility) {
+            runtime = runtime.with_utility(provider, label);
         }
     }
     if let Some(p) = profile {
@@ -417,5 +417,66 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(plain.runtime.identity().2, None);
+    }
+
+    /// Names each profile's model after the profile, so a test can tell
+    /// the thread's provider from the utility's: `Stub`'s one label
+    /// cannot.
+    struct PerProfile;
+
+    impl ProviderFactory for PerProfile {
+        fn build(&self, profile_name: &str) -> Result<(Box<dyn Provider>, String), BuildError> {
+            Ok((Box::new(Silent), format!("model-for-{profile_name}")))
+        }
+    }
+
+    /// Issue #18: a built thread records the utility profile's model, so
+    /// `memory_extracted` names the provider that ran the extraction;
+    /// with no `utility_profile` nothing is recorded, since the thread's
+    /// own model does the side jobs.
+    #[tokio::test]
+    async fn a_built_thread_carries_the_utility_profiles_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let root_dir = dir.path().join("p");
+        std::fs::create_dir_all(&root_dir).unwrap();
+        let profiles = "[profiles.main]\nprovider = \"anthropic\"\nmodel = \"m\"\napi_key_env = \"K\"\n\
+             [profiles.util]\nprovider = \"anthropic\"\nmodel = \"m\"\napi_key_env = \"K\"\n";
+        let config = Config::parse(&format!(
+            "default_profile = \"main\"\nutility_profile = \"util\"\n{profiles}"
+        ))
+        .unwrap();
+        let root = Root {
+            name: "p".into(),
+            root: root_dir.clone(),
+            threads_dir: dir.path().join("threads"),
+        };
+
+        let built = build_thread(
+            &config,
+            dir.path(),
+            &PerProfile,
+            &root,
+            &[],
+            Ulid::from_datetime(std::time::SystemTime::now()),
+            Some("main"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(built.runtime.utility_label(), Some("model-for-util"));
+
+        // No `utility_profile`: the thread's own model runs side jobs.
+        let bare = Config::parse(&format!("default_profile = \"main\"\n{profiles}")).unwrap();
+        let plain = build_thread(
+            &bare,
+            dir.path(),
+            &PerProfile,
+            &root,
+            &[],
+            Ulid::from_datetime(std::time::SystemTime::now()),
+            Some("main"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(plain.runtime.utility_label(), None);
     }
 }

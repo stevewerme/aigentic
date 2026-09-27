@@ -435,6 +435,8 @@ pub struct MemoryExtractedPayload {
     /// What landed in the files; empty when the model found nothing new.
     #[serde(default)]
     pub written: Vec<MemoryLine>,
+    /// The model that ran the extraction: the utility profile's when
+    /// one is configured, else the thread's `model_label` (issue #18).
     pub model: String,
     pub usage: Usage,
 }
