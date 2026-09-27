@@ -19,7 +19,7 @@ use aigentic_runtime::aigentic_core::{Author, ContentBlock, Event, EventKind};
 use aigentic_runtime::aigentic_log::{PermissionRequestedPayload, UserMessagePayload};
 use aigentic_runtime::{
     ASKED_HUMAN, Answered, CancelToken, Decisions, Mode, Outbox, Pending, Queued, Resumed, Runtime,
-    Signal, TurnOutcome, WindowUsage, inbox,
+    RuntimeError, Signal, TurnOutcome, WindowUsage, inbox,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -831,6 +831,25 @@ impl ThreadActor {
         self.shared.drop_guard();
     }
 
+    /// Which note a failed side job leaves, if any (issue #22). Both
+    /// side jobs are best-effort: a transient provider failure (a
+    /// dropped connection, a rate limit, an unavailable backend) is
+    /// deferred silently — the memory cursor does not advance and the
+    /// thread stays untitled, so the next run covers the stretch — and
+    /// says nothing. A refusal the model cannot recover from by waiting
+    /// (a 400, an auth failure) says so once, plainly. A non-provider
+    /// error keeps today's raw note.
+    ///
+    /// Free-standing and pure so the policy is readable and testable
+    /// without a runtime.
+    fn side_job_note(job: &str, e: &RuntimeError) -> Option<String> {
+        match e {
+            RuntimeError::Provider(p) if p.is_transient() => None,
+            RuntimeError::Provider(p) => Some(format!("{job} failed: {}", p.plain_line())),
+            other => Some(format!("{job} failed: {other}")),
+        }
+    }
+
     /// After the turns: memory extraction and a title for an untitled
     /// thread, on the utility model (phase 6 step 9). Their events reach
     /// subscribers like any other; a failure is a note, never an error
@@ -849,14 +868,22 @@ impl ThreadActor {
         match tokio::time::timeout(SIDE_JOB_LIMIT, self.runtime.extract_memory(&mut observe)).await
         {
             Ok(Ok(_)) => {}
-            Ok(Err(e)) => note(&self.shared, format!("memory extraction failed: {e}")),
+            Ok(Err(ref e)) => {
+                if let Some(text) = Self::side_job_note("memory extraction", e) {
+                    note(&self.shared, text);
+                }
+            }
             Err(_) => note(&self.shared, "memory extraction timed out".into()),
         }
         match tokio::time::timeout(SIDE_JOB_LIMIT, self.runtime.title_if_untitled(&mut observe))
             .await
         {
             Ok(Ok(_)) => {}
-            Ok(Err(e)) => note(&self.shared, format!("titling failed: {e}")),
+            Ok(Err(ref e)) => {
+                if let Some(text) = Self::side_job_note("titling", e) {
+                    note(&self.shared, text);
+                }
+            }
             Err(_) => note(&self.shared, "titling timed out".into()),
         }
     }
@@ -1007,5 +1034,74 @@ impl ThreadActor {
             }
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aigentic_runtime::aigentic_core::ProviderError;
+
+    fn provider(e: ProviderError) -> RuntimeError {
+        RuntimeError::Provider(e)
+    }
+
+    /// T11 (issue #22): a side job that failed on a transient provider
+    /// error leaves no note at all — the work is deferred, not lost
+    /// (memory cursor unadvanced, title retried), so nothing belongs on
+    /// screen.
+    #[test]
+    fn side_job_note_defers_transient() {
+        let transient = [
+            ProviderError::Transport("connection closed".into()),
+            ProviderError::Http {
+                status: 429,
+                body: "rate limited".into(),
+            },
+            ProviderError::Http {
+                status: 503,
+                body: "unavailable".into(),
+            },
+            ProviderError::RateLimited,
+        ];
+        for e in transient {
+            assert_eq!(
+                ThreadActor::side_job_note("memory extraction", &provider(e.clone())),
+                None,
+                "{e:?} is deferred silently"
+            );
+        }
+    }
+
+    /// T12 (issue #22): a refusal that waiting will not fix is said once,
+    /// plainly; a non-provider error keeps today's raw note.
+    #[test]
+    fn side_job_note_states_non_transient_plainly() {
+        let refused = ProviderError::Http {
+            status: 400,
+            body: "Budget has been exceeded! Current cost: 30.0, Max budget: 0.0".into(),
+        };
+        assert_eq!(
+            ThreadActor::side_job_note("memory extraction", &provider(refused.clone())),
+            Some(format!(
+                "memory extraction failed: {}",
+                refused.plain_line()
+            ))
+        );
+
+        let auth = ProviderError::Http {
+            status: 401,
+            body: "invalid api key".into(),
+        };
+        assert_eq!(
+            ThreadActor::side_job_note("titling", &provider(auth.clone())),
+            Some(format!("titling failed: {}", auth.plain_line()))
+        );
+
+        let other = RuntimeError::UnknownSkill("nope".into());
+        assert_eq!(
+            ThreadActor::side_job_note("titling", &other),
+            Some(format!("titling failed: {other}"))
+        );
     }
 }
