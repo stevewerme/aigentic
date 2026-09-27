@@ -22,6 +22,8 @@ use aigentic_runtime::{
     Signal, TurnOutcome, WindowUsage, inbox,
 };
 use tokio::sync::{mpsc, oneshot};
+
+use crate::awake::KeepAwake;
 use ulid::Ulid;
 
 /// What a session sends the actor. Every request carries a reply slot
@@ -160,9 +162,72 @@ struct Shared {
     /// The last window fill the runtime reported, re-sent when the queue
     /// changes or the turn ends so a status line stays current.
     last_usage: Mutex<Option<WindowUsage>>,
+    /// The keep-awake guard and whether a hold is outstanding (issue
+    /// #47), under one lock. `held` keeps hold and release paired, so a
+    /// turn interrupted while it was waiting cannot release twice, and
+    /// the pair is swapped in when the daemon installs its guard; a
+    /// test without one keeps the inert default.
+    guard: Mutex<Hold>,
+}
+
+/// A guard, whether it is held right now, and whether the turn is
+/// waiting on a person (issue #47). The last flag is what keeps a
+/// mid-turn message that arrives during an unanswered question from
+/// holding the machine awake again: a wait is not work.
+struct Hold {
+    guard: Arc<dyn KeepAwake>,
+    held: bool,
+    waiting: bool,
 }
 
 impl Shared {
+    /// The turn is working: take the machine's assertion, once per
+    /// working span (issue #47). `running` calls this, and `running` is
+    /// called when a turn starts and whenever a wait ends, so the
+    /// assertion is held exactly while work is happening.
+    fn acquire(&self) {
+        let mut hold = self.hold();
+        // The wait is over, whatever put the thread back to work.
+        hold.waiting = false;
+        if hold.held {
+            return;
+        }
+        hold.held = true;
+        hold.guard.hold();
+    }
+
+    /// The turn is waiting on a person: not work, so nothing is held
+    /// until whatever ends the wait calls `running` again.
+    fn wait(&self) {
+        let mut hold = self.hold();
+        hold.waiting = true;
+        if hold.held {
+            hold.held = false;
+            hold.guard.release();
+        }
+    }
+
+    /// Whether the thread is waiting on a person right now.
+    fn is_waiting(&self) -> bool {
+        self.hold().waiting
+    }
+
+    /// The turn stopped working — it is waiting for a person, or it has
+    /// ended: give the assertion back. Idempotent, so a turn that was
+    /// already waiting when it ended gives nothing back twice.
+    fn drop_guard(&self) {
+        let mut hold = self.hold();
+        if !hold.held {
+            return;
+        }
+        hold.held = false;
+        hold.guard.release();
+    }
+
+    fn hold(&self) -> std::sync::MutexGuard<'_, Hold> {
+        self.guard.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// `Notice::Usage` from the last fill, the turn's elapsed time and
     /// the queue; nothing until the first model call reported a fill.
     fn push_usage(&self) {
@@ -198,6 +263,9 @@ impl Shared {
     }
 
     fn running(&self, by: Author) {
+        // Work is happening (a turn started, or a wait ended): hold the
+        // machine awake until the turn stops working.
+        self.acquire();
         let queued = *self.queued.lock().unwrap_or_else(|e| e.into_inner());
         self.set_state(ThreadState::Running { by, queued });
     }
@@ -229,7 +297,13 @@ impl Shared {
                     if p.steer {
                         *self.steered.lock().unwrap_or_else(|e| e.into_inner()) += 1;
                     }
-                    self.running(turn_by.clone());
+                    // Unless the turn is waiting on a person: a
+                    // question left unanswered is not work, and the
+                    // message must not put the guard back up (issue
+                    // #47).
+                    if !self.is_waiting() {
+                        self.running(turn_by.clone());
+                    }
                     self.push_usage();
                     return;
                 }
@@ -274,45 +348,50 @@ impl Shared {
                 thread: self.thread,
                 call: call.clone(),
             }),
-            Signal::Waiting(pending) => self.set_state(match pending {
-                Pending::Permission { call_id, request } => {
-                    let PermissionRequestedPayload {
-                        call,
-                        class,
-                        reason,
-                    } = request.clone();
-                    ThreadState::AwaitingApproval {
-                        call_id: call_id.clone(),
-                        call,
-                        class,
-                        reason,
+            // A wait is not work: a person may take minutes, and the
+            // machine must be free to sleep meanwhile (issue #47).
+            Signal::Waiting(pending) => {
+                self.wait();
+                self.set_state(match pending {
+                    Pending::Permission { call_id, request } => {
+                        let PermissionRequestedPayload {
+                            call,
+                            class,
+                            reason,
+                        } = request.clone();
+                        ThreadState::AwaitingApproval {
+                            call_id: call_id.clone(),
+                            call,
+                            class,
+                            reason,
+                        }
                     }
-                }
-                Pending::Human {
-                    call_id,
-                    question,
-                    questions,
-                } => ThreadState::AwaitingHuman {
-                    call_id: call_id.clone(),
-                    question: question.clone(),
-                    questions: questions
-                        .iter()
-                        .map(|q| AskedQuestion {
-                            question: q.question.clone(),
-                            header: q.header.clone(),
-                            options: q
-                                .options
-                                .iter()
-                                .map(|o| AskedOption {
-                                    label: o.label.clone(),
-                                    description: o.description.clone(),
-                                })
-                                .collect(),
-                            multi: q.multi,
-                        })
-                        .collect(),
-                },
-            }),
+                    Pending::Human {
+                        call_id,
+                        question,
+                        questions,
+                    } => ThreadState::AwaitingHuman {
+                        call_id: call_id.clone(),
+                        question: question.clone(),
+                        questions: questions
+                            .iter()
+                            .map(|q| AskedQuestion {
+                                question: q.question.clone(),
+                                header: q.header.clone(),
+                                options: q
+                                    .options
+                                    .iter()
+                                    .map(|o| AskedOption {
+                                        label: o.label.clone(),
+                                        description: o.description.clone(),
+                                    })
+                                    .collect(),
+                                multi: q.multi,
+                            })
+                            .collect(),
+                    },
+                })
+            }
         }
     }
 }
@@ -364,6 +443,11 @@ impl ThreadActor {
             last_queued_by: Mutex::new(None),
             mode: Mutex::new(runtime.mode().name().to_owned()),
             identity: Mutex::new(runtime.identity()),
+            guard: Mutex::new(Hold {
+                guard: Arc::new(crate::awake::ProcessGuard::off()),
+                held: false,
+                waiting: false,
+            }),
         });
         let (tx, rx) = mpsc::unbounded_channel();
         let mut actor = Self {
@@ -376,6 +460,21 @@ impl ThreadActor {
         };
         actor.resume(torn)?;
         Ok((actor, tx))
+    }
+
+    /// Install the daemon's keep-awake guard (issue #47): from here on a
+    /// working turn holds the machine awake, and what the guard was
+    /// doing at the end of a turn lands in the thread's log. The reader
+    /// is read when a turn ends, never earlier, so a guard that failed
+    /// mid-run is reported by the turn it affected.
+    pub fn with_keep_awake(mut self, guard: Arc<dyn KeepAwake>) -> Self {
+        self.runtime.set_keep_awake(crate::awake::reader(&guard));
+        *self.shared.hold() = Hold {
+            guard,
+            held: false,
+            waiting: false,
+        };
+        self
     }
 
     /// Phase 2's resume: repair events are appended (and mirrored) and,
@@ -726,6 +825,10 @@ impl ThreadActor {
         self.shared.set_state(ThreadState::Idle);
         self.shared.push_usage();
         self.side_jobs().await;
+        // Nothing is working any more: the machine may sleep. Released
+        // after the side jobs, so a memory extraction or a title is
+        // covered too (issue #47).
+        self.shared.drop_guard();
     }
 
     /// After the turns: memory extraction and a title for an untitled

@@ -198,6 +198,10 @@ impl Server {
         let workspaces = crate::workspaces::load_all(&config_dir).unwrap_or_default();
         let mut server = server;
         server.projects = crate::workspaces::merge(server.projects, &workspaces);
+        // One keep-awake guard for the daemon, built once: `keep_awake =
+        // false` turns it off, and a machine without the program reports
+        // itself unavailable rather than pretending (issue #47).
+        let guard = crate::awake::detect(config.keep_awake);
         let config = Arc::new(config);
         let server = Arc::new(server);
         let threads_base = config
@@ -212,6 +216,7 @@ impl Server {
                 providers,
                 reports,
                 threads_base,
+                guard,
             )
             .with_profile(profile)
             .with_workspaces(workspaces),

@@ -19,6 +19,7 @@ use tokio::sync::oneshot;
 use ulid::Ulid;
 
 use crate::actor::{Mail, Mailbox, Reports, ThreadActor};
+use crate::awake::KeepAwake;
 use crate::build::{BuildError, ProviderFactory, Root, build_thread, project_context};
 use crate::config::{Config, ServerConfig};
 use crate::workspaces::Workspace;
@@ -50,6 +51,10 @@ pub struct ThreadTable {
     /// Workspace files (phase 6 section 9b); their projects are already
     /// merged into `server.projects`.
     workspaces: Vec<Workspace>,
+    /// The daemon's one keep-awake guard (issue #47). Every thread's
+    /// actor gets a clone of it, so one program holds the machine awake
+    /// for the whole daemon however many threads work at once.
+    guard: Arc<dyn KeepAwake>,
     entries: Mutex<HashMap<Ulid, Entry>>,
 }
 
@@ -79,6 +84,7 @@ impl ThreadTable {
         providers: Arc<dyn ProviderFactory>,
         reports: Arc<dyn Reports>,
         threads_base: PathBuf,
+        guard: Arc<dyn KeepAwake>,
     ) -> Self {
         Self {
             config,
@@ -87,10 +93,17 @@ impl ThreadTable {
             providers,
             reports,
             threads_base,
+            guard,
             profile_override: None,
             workspaces: Vec::new(),
             entries: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The guard every actor is built with: a test installs a recording
+    /// one here, so a thread built from the table can be watched.
+    pub fn guard(&self) -> Arc<dyn KeepAwake> {
+        self.guard.clone()
     }
 
     /// Build every thread from `profile` instead of its project's
@@ -298,6 +311,7 @@ impl ThreadTable {
         )
         .await?;
         let (actor, mailbox) = ThreadActor::new(built.runtime, built.torn, self.reports.clone())?;
+        let actor = actor.with_keep_awake(self.guard.clone());
         tokio::spawn(actor.run());
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         // Two sessions may have raced to build it; the first in wins and

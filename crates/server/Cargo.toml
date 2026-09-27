@@ -17,6 +17,11 @@ tokio = { workspace = true, features = ["sync", "macros", "rt", "time", "net", "
 toml.workspace = true
 ulid.workspace = true
 
+# The keep-awake guard kills the child's process group (issue #47), the
+# way runtime bash does.
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
+
 [dev-dependencies]
 aigentic-api = { workspace = true, features = ["client"] }
 futures-core.workspace = true

@@ -144,6 +144,9 @@ struct ConfigFile {
     skills: DeniedSection,
     #[serde(default)]
     display: DisplaySection,
+    /// Hold the machine awake while a turn works (issue #47).
+    #[serde(default)]
+    keep_awake: Option<bool>,
 }
 
 /// `[global]`: the owner's instructions file.
@@ -209,6 +212,12 @@ pub struct Config {
     pub denied_skills: Vec<String>,
     /// `[display]`: the tool-result caps; defaults when absent.
     pub display: DisplaySection,
+    /// Hold the machine awake while a turn works, so an idle machine
+    /// does not sleep through a long provider wait (issue #47). `true`
+    /// unless the file says otherwise: a build that sleeps silently is
+    /// the failure the issue is about, and turning it off is a
+    /// deliberate choice.
+    pub keep_awake: bool,
     /// Dotted paths of keys `config_spec` does not list, as the last
     /// parse found them (issue #37). Empty for a `Config` built by hand.
     pub unknown: Vec<String>,
@@ -231,6 +240,7 @@ pub const TOP_KEYS: &[&str] = &[
     "tools",
     "skills",
     "display",
+    "keep_awake",
 ];
 pub const PROFILE_KEYS: &[&str] = &[
     "provider",
@@ -449,6 +459,7 @@ fn parse_config(text: &str) -> Result<Config, ConfigError> {
             denied_tools: file.tools.denied,
             denied_skills: file.skills.denied,
             display: file.display,
+            keep_awake: file.keep_awake.unwrap_or(true),
             unknown: Vec::new(),
         })
     }
@@ -776,6 +787,7 @@ default_profile = "tensorx"
 utility_profile = "tensorx"
 user = "steve"
 threads_dir = "/tmp/t"
+keep_awake = false
 bundled_dir = "/tmp/b"
 
 [profiles.tensorx]
@@ -1011,6 +1023,9 @@ context_ceiling_tokens = 96_000
         let (c, unknown) = Config::parse_with(FULL_CONFIG).unwrap();
         assert_eq!(unknown, Vec::<String>::new(), "{FULL_CONFIG}");
         assert_eq!((c.display.result_lines, c.display.result_bytes), (4, 800));
+        // `FULL_CONFIG` turns the keep-awake guard off (issue #47), and
+        // the checklist test is where the key's value is read back.
+        assert!(!c.keep_awake);
     }
 
     #[test]

@@ -5,6 +5,7 @@
 
 pub mod actor;
 pub mod auth;
+pub mod awake;
 pub mod build;
 pub mod config;
 pub mod reports;
