@@ -9,8 +9,8 @@ use aigentic_runtime::aigentic_providers::ReasoningEffort;
 
 use crate::checks::{
     Check, GhCli, Status, check_api_key_env, check_config, check_env_ignored, check_github,
-    check_participants, check_probe, check_project, check_skills, check_threads_dir, check_window,
-    compare_efforts, origin_url, unknown_keys,
+    check_keep_awake, check_participants, check_probe, check_project, check_skills,
+    check_threads_dir, check_window, compare_efforts, origin_url, unknown_keys,
 };
 use crate::config;
 use crate::skills_cmd::SkillPaths;
@@ -144,6 +144,12 @@ pub async fn run(config_path: &Path, cwd: &Path, probe: bool, strict: bool) -> a
         None => (config.user_name(), "config.toml's user"),
     };
     checks.push(check_participants(project.as_ref(), &owner, source));
+    // Whether the daemon holding this machine's threads would hold the
+    // machine awake (issue #47): the same key and the same search the
+    // daemon uses, so the answer is the daemon's answer.
+    checks.push(check_keep_awake(
+        aigentic_server::awake::detect(config.keep_awake).as_ref(),
+    ));
     checks.push(check_env_ignored(
         project.as_ref().map_or(cwd, |p| p.root.as_path()),
     ));

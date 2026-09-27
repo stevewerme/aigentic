@@ -1242,6 +1242,12 @@ impl ClientRepl {
                     }
                 }
                 if let Ok(p) = serde_json::from_value::<TurnEndedPayload>(event.payload.clone()) {
+                    // After the summary, before the stop line, so a turn
+                    // that ended for any reason still says it slept
+                    // (issue #47).
+                    if let Some(line) = slept_line(&p) {
+                        out.line(&line);
+                    }
                     if p.reason == "done" || p.reason == ASKED_HUMAN || p.reason == INTERRUPTED {
                         return;
                     }
@@ -1356,7 +1362,30 @@ impl ClientRepl {
     }
 }
 
-pub fn author_name(author: &Author) -> String {
+/// The line a turn that slept shows once, right after its summary, or
+/// nothing when it did not sleep (issue #47). Minutes are whole minutes
+/// with the first one at a minute, and the guard's own status is
+/// appended only when the machine slept *and* the guard was not simply
+/// on: that is the case where the sleep was avoidable, or where the
+/// program was missing.
+pub(crate) fn slept_line(p: &TurnEndedPayload) -> Option<String> {
+    let slept = p.slept_secs?;
+    let mins = (slept / 60).max(1);
+    let mut line = format!("the machine slept {mins} min during this turn");
+    if slept.saturating_sub(p.slept_awaiting_secs.unwrap_or(0)) > 0 {
+        match p.keep_awake.as_deref() {
+            Some("on") | None => {}
+            Some("off") => line.push_str("; set keep_awake = true to prevent this"),
+            Some(status) => {
+                line.push_str("; ");
+                line.push_str(status);
+            }
+        }
+    }
+    Some(line)
+}
+
+pub(crate) fn author_name(author: &Author) -> String {
     match author {
         Author::User(u) => u.0.clone(),
         Author::Agent(a) => a.0.clone(),
@@ -2863,5 +2892,86 @@ mod tests {
         t.retry = Some((1, 3, "tensorx · not answering".into()));
         t.current = Some("bash cargo test".into());
         assert_eq!(t.activity(), "running");
+    }
+
+    /// A `turn_ended` payload as the runtime writes one (issue #47).
+    fn slept_payload(wall: u64, slept: u64, awaiting: u64, keep: Option<&str>) -> TurnEndedPayload {
+        TurnEndedPayload {
+            reason: "done".into(),
+            touched: Vec::new(),
+            wall_secs: Some(wall),
+            slept_secs: Some(slept),
+            slept_awaiting_secs: Some(awaiting),
+            keep_awake: keep.map(str::to_owned),
+        }
+    }
+
+    /// T12 (issue #47): the issue's own case — 750 s of wall over no
+    /// running time, the guard on. One line, whole minutes, and no
+    /// advice: nothing about this nap was avoidable.
+    #[test]
+    fn a_slept_turn_says_the_minutes() {
+        let line =
+            slept_line(&slept_payload(750, 750, 0, Some("on"))).expect("a slept turn says so");
+        assert_eq!(
+            line,
+            format!("the machine slept {} min during this turn", 750 / 60)
+        );
+    }
+
+    /// T13 (issue #47): with the guard off, and the sleep somewhere
+    /// other than a human wait, the line says what to do; with the whole
+    /// nap inside a wait, nothing is advised, because enabling the guard
+    /// could not have prevented it. Expected strings are built here from
+    /// the payload's own values.
+    #[test]
+    fn a_slept_turn_blames_the_guard_only_when_it_could_have_helped() {
+        let wall = 750;
+        let line =
+            slept_line(&slept_payload(wall, wall, 0, Some("off"))).expect("a slept turn says so");
+        assert_eq!(
+            line,
+            format!(
+                "the machine slept {} min during this turn; set keep_awake = true to prevent this",
+                wall / 60
+            )
+        );
+        let line = slept_line(&slept_payload(wall, wall, wall, Some("off")))
+            .expect("a slept turn says so");
+        assert_eq!(
+            line,
+            format!("the machine slept {} min during this turn", wall / 60),
+            "a nap parked on a person: the guard could not have prevented it"
+        );
+    }
+
+    /// T14 (issue #47): a guard that could not start names the missing
+    /// tool in its own words.
+    #[test]
+    fn a_slept_turn_quotes_a_guard_that_could_not_start() {
+        let status = "unavailable: no caffeinate on PATH";
+        let line =
+            slept_line(&slept_payload(750, 750, 0, Some(status))).expect("a slept turn says so");
+        assert!(
+            line.contains("caffeinate"),
+            "the line names the missing tool: {line}"
+        );
+        assert_eq!(
+            line,
+            format!(
+                "the machine slept {} min during this turn; {status}",
+                750 / 60
+            )
+        );
+    }
+
+    /// And a turn that did not sleep says nothing at all.
+    #[test]
+    fn a_turn_that_did_not_sleep_says_nothing() {
+        assert_eq!(
+            slept_line(&TurnEndedPayload::new("done")),
+            None,
+            "a turn without slept_secs renders exactly as it always did"
+        );
     }
 }

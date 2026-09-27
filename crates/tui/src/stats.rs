@@ -161,6 +161,16 @@ pub struct ThreadReport {
     pub tool_errors: u32,
     pub turns: BTreeMap<String, u32>,
     pub retries: u32,
+    /// Summed `wall_secs` over the thread's measured `turn_ended` lines,
+    /// and how much of that the machine spent asleep (issue #47). Both
+    /// come from the lines' own numbers, never from `created_at`, which
+    /// counts the idle time between two turns as turn time. Absent when
+    /// no line carried one — an old log, or a thread that slept nowhere
+    /// — so nothing is invented for a log that never measured itself.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wall_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slept_secs: Option<u64>,
 }
 
 /// `stats --issue <n>` (issue #40): every thread whose first own-user
@@ -638,6 +648,10 @@ fn thread_ids(dir: &Path) -> Vec<Ulid> {
 /// One group's running totals — a day or a project, folded the same way.
 #[derive(Default)]
 struct Accum {
+    /// The thread's summed `wall_secs` and `slept_secs` over the
+    /// `turn_ended` lines that carried them (issue #47).
+    wall_secs: Option<u64>,
+    slept_secs: Option<u64>,
     calls: u32,
     priced_calls: u32,
     price_estimated_calls: u32,
@@ -748,6 +762,8 @@ impl Accum {
             tool_errors: meta.tool_errors,
             turns: self.turns,
             retries: self.retries,
+            wall_secs: self.wall_secs,
+            slept_secs: self.slept_secs,
         }
     }
 }
@@ -861,6 +877,12 @@ fn absorb(
                 // http 503` is a `provider_error` turn.
                 let head = p.reason.split(':').next().unwrap_or("").to_owned();
                 *thread.turns.entry(head.clone()).or_default() += 1;
+                if let Some(wall) = p.wall_secs {
+                    *thread.wall_secs.get_or_insert(0) += wall;
+                }
+                if let Some(slept) = p.slept_secs {
+                    *thread.slept_secs.get_or_insert(0) += slept;
+                }
                 turn_days.push((day, head));
             }
             EventKind::ContextEvicted => {
@@ -1057,6 +1079,13 @@ pub fn render_thread(t: &ThreadReport) -> String {
         t.hit_rate * 100.0
     ));
     out.push_str(&format!("turns      {}\n", turns_line(&t.turns)));
+    // Only when a logged turn measured sleep: a thread whose turns all
+    // predate the field (or that slept nowhere) prints no `time` line at
+    // all, so the old rendering is untouched.
+    if let Some(line) = time_line(t) {
+        out.push_str(&line);
+        out.push('\n');
+    }
     if t.unstamped_calls > 0 {
         out.push_str(&format!(
             "stamping   {} calls predate model stamping \
@@ -1065,6 +1094,22 @@ pub fn render_thread(t: &ThreadReport) -> String {
         ));
     }
     out
+}
+
+/// The `time` line of a single-thread report, or nothing when the
+/// thread's turns never measured sleep (issue #47). Floor minutes, the
+/// same rounding the turn line uses; the wall part is left out when the
+/// log's lines were written before `wall_secs` existed.
+fn time_line(s: &ThreadReport) -> Option<String> {
+    let slept = s.slept_secs.filter(|secs| *secs > 0)?;
+    Some(match s.wall_secs {
+        Some(wall) => format!(
+            "time       wall {} min   slept {} min",
+            wall / 60,
+            slept / 60
+        ),
+        None => format!("time       slept {} min", slept / 60),
+    })
 }
 
 /// `stats --issue <n>`: the matched threads, costliest first, and the
@@ -1357,6 +1402,48 @@ api_key_env = "TENSORX_API_KEY"
                     "cost_usd": null,
                     "model": model,
                 }
+            },
+            "created_at": at,
+        })
+    }
+
+    /// A `turn_ended` line as the runtime writes one since issue #47:
+    /// the turn measured itself.
+    fn measured_turn_ended(
+        at: &str,
+        reason: &str,
+        wall: u64,
+        slept: u64,
+        awaiting: u64,
+        keep_awake: &str,
+    ) -> serde_json::Value {
+        json!({
+            "kind": "turn_ended",
+            "author": {"kind": "system"},
+            "payload": {
+                "reason": reason,
+                "touched": [],
+                "wall_secs": wall,
+                "slept_secs": slept,
+                "slept_awaiting_secs": awaiting,
+                "keep_awake": keep_awake,
+            },
+            "created_at": at,
+        })
+    }
+
+    /// A side job's line after a turn: written after `turn_ended`, so a
+    /// wall time derived from timestamps would count the time between
+    /// them as turn time (issue #47, amendment 2 item 3).
+    fn memory_extracted(at: &str) -> serde_json::Value {
+        json!({
+            "kind": "memory_extracted",
+            "author": {"kind": "system"},
+            "payload": {
+                "through_seq": 1,
+                "written": [],
+                "model": "m",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
             },
             "created_at": at,
         })
@@ -1952,6 +2039,92 @@ api_key_env = "TENSORX_API_KEY"
         // `--project` narrows the search: the same id is not in `beta`.
         assert!(collect_thread(dir.path(), Some("beta"), id, None, &book).is_err());
         assert!(collect_thread(dir.path(), Some("alpha"), id, None, &book).is_ok());
+    }
+
+    /// T15 (issue #47): a thread whose turns measured themselves reports
+    /// the wall time and the sleep their lines carry; one whose turns
+    /// predate the field prints no `time` line at all, so an old log
+    /// renders as it always did. The expected minutes come from the
+    /// fixture's own logged seconds, not from a hand-computed number,
+    /// and the hour the fixture idles between turns plus the side job
+    /// after a turn are not in the total (amendment 2 item 3).
+    #[test]
+    fn a_thread_reports_its_sleep_only_when_a_turn_measured_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("alpha");
+        let book = no_prices();
+
+        // Two measured turns with a `memory_extracted` side job between
+        // the first and a 41-minute idle gap before the second: the log
+        // spans far more than the turns did, and stats must say so.
+        let (first_wall, second_wall, slept) = (750u64, 240u64, 750u64);
+        let span_secs = 4370u64; // 11:27:30 to 12:40:20, the fixture's own gap
+        let measured = Ulid::generate();
+        write_thread(
+            &base,
+            measured,
+            &[
+                user("2026-09-27T11:27:30Z", "slept here"),
+                measured_turn_ended("2026-09-27T11:28:00Z", "done", first_wall, slept, 0, "on"),
+                memory_extracted("2026-09-27T11:28:10Z"),
+                user("2026-09-27T12:40:00Z", "and again"),
+                measured_turn_ended("2026-09-27T12:40:20Z", "done", second_wall, 0, 0, "on"),
+            ],
+        );
+        let report = collect_thread(dir.path(), None, measured, None, &book).unwrap();
+        let wall = first_wall + second_wall;
+        assert_eq!(report.wall_secs, Some(wall));
+        assert_eq!(report.slept_secs, Some(slept));
+        assert_ne!(
+            report.wall_secs,
+            Some(span_secs),
+            "idle time between turns is not turn time"
+        );
+        let text = render_thread(&report);
+        assert!(
+            text.contains(&format!(
+                "time       wall {} min   slept {} min",
+                wall / 60,
+                slept / 60
+            )),
+            "{text}"
+        );
+
+        // A thread from before the field existed: no line, old render.
+        let old = Ulid::generate();
+        write_thread(
+            &base,
+            old,
+            &[
+                user("2026-09-27T11:50:00Z", "no idea"),
+                turn_ended("2026-09-27T12:00:00Z", "done"),
+            ],
+        );
+        let report = collect_thread(dir.path(), None, old, None, &book).unwrap();
+        assert_eq!(report.wall_secs, None);
+        assert_eq!(report.slept_secs, None);
+        let text = render_thread(&report);
+        assert!(!text.contains("\ntime "), "no time line at all: {text}");
+
+        // A measured turn that slept nowhere: also no line, because a
+        // "slept 0 min" row would be noise on every thread.
+        let awake = Ulid::generate();
+        write_thread(
+            &base,
+            awake,
+            &[
+                user("2026-09-27T12:10:00Z", "awake"),
+                measured_turn_ended("2026-09-27T12:12:00Z", "done", 120, 0, 0, "on"),
+            ],
+        );
+        let report = collect_thread(dir.path(), None, awake, None, &book).unwrap();
+        assert_eq!(report.wall_secs, Some(120));
+        assert_eq!(report.slept_secs, Some(0));
+        let text = render_thread(&report);
+        assert!(
+            !text.contains("\ntime "),
+            "a nap-free thread is silent: {text}"
+        );
     }
 
     /// One thread per match shape, each named so the assertion can point

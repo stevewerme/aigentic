@@ -34,6 +34,12 @@ pub trait KeepAwake: Send + Sync {
     /// ends, so a guard that failed earlier in the run is reported by
     /// the turn it affected rather than frozen at startup.
     fn status(&self) -> String;
+    /// The program doing the holding, when the machine has one (issue
+    /// #47): the doctor names it, so `caffeinate` in `ps` is
+    /// explainable. `None` when nothing is holding.
+    fn program(&self) -> Option<&'static str> {
+        None
+    }
 }
 
 /// A status reader a `Runtime` can hold (issue #47 amendment 2), so
@@ -55,6 +61,9 @@ pub struct ProcessGuard {
     /// Outstanding holds, so the first one starts the child and the
     /// last one stops it.
     holds: AtomicUsize,
+    /// The program doing the holding, when a real one was found: named
+    /// by the doctor so a `caffeinate` in `ps` is explainable.
+    program: Option<&'static str>,
 }
 
 #[derive(Default)]
@@ -80,7 +89,14 @@ impl ProcessGuard {
             spawner: Some(spawner),
             inner: Mutex::new(Inner::default()),
             holds: AtomicUsize::new(0),
+            program: None,
         }
+    }
+
+    /// The same guard, with the program named in its status line.
+    pub fn with_program(mut self, program: &'static str) -> Self {
+        self.program = Some(program);
+        self
     }
 
     /// The guard installed when the config's `keep_awake` is `false`.
@@ -106,6 +122,7 @@ impl ProcessGuard {
                 ..Inner::default()
             }),
             holds: AtomicUsize::new(0),
+            program: None,
         }
     }
 
@@ -169,6 +186,10 @@ impl KeepAwake for ProcessGuard {
         }
         "on".to_owned()
     }
+
+    fn program(&self) -> Option<&'static str> {
+        self.program
+    }
 }
 
 impl Drop for ProcessGuard {
@@ -207,7 +228,21 @@ pub fn detect_with(path: Option<&OsStr>, keep_awake: bool) -> Arc<dyn KeepAwake>
         // either: the failure is knowable now and reported every turn.
         return Arc::new(ProcessGuard::unavailable(format!("no {program} on PATH")));
     }
-    Arc::new(ProcessGuard::with_spawner(Box::new(spawner(program))))
+    Arc::new(
+        ProcessGuard::with_spawner(Box::new(spawner(program)))
+            .with_program(program_static(program)),
+    )
+}
+
+/// The name the guard reports, as the `'static` one the trait hands the
+/// doctor: the two are fixed literals, so this is a match and not an
+/// allocation.
+fn program_static(program: &str) -> &'static str {
+    if program == "caffeinate" {
+        "caffeinate"
+    } else {
+        "systemd-inhibit"
+    }
 }
 
 /// The guard this machine gets: `off` when the config says so, else the

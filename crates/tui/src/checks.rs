@@ -17,6 +17,8 @@ use aigentic_runtime::project::{DOT_DIR, FILE_NAME, INSTRUCTIONS_FILE};
 use aigentic_runtime::{GlobalLayer, Knowledge, KnowledgeMode, Layers, Project};
 use futures_util::StreamExt;
 
+use aigentic_server::awake::KeepAwake;
+
 use crate::config::{Config, Profile, ProviderKind};
 use crate::skills_cmd::{SkillPaths, load_enabled};
 
@@ -241,6 +243,29 @@ pub fn check_env_ignored(root: &Path) -> Check {
             Status::Warn,
             ".env is not gitignored: it holds keys; add it to .gitignore",
         )
+    }
+}
+
+/// Whether this machine will stay awake while a turn works (issue #47).
+/// The daemon's own answer, from the same config key and the same search
+/// the daemon uses, so what the doctor says is what a turn will get.
+pub fn check_keep_awake(guard: &dyn KeepAwake) -> Check {
+    let program = guard.program().unwrap_or("the keep-awake program");
+    match guard.status().as_str() {
+        "on" => Check::ok(
+            "keep-awake",
+            format!("on: {program} holds the machine awake while a turn works"),
+        ),
+        "off" => Check::new(
+            "keep-awake",
+            Status::Warn,
+            "off (keep_awake = false): the machine may idle-sleep during a long turn",
+        ),
+        other => Check::new(
+            "keep-awake",
+            Status::Warn,
+            format!("{other}: the machine may idle-sleep during a long turn"),
+        ),
     }
 }
 
@@ -589,6 +614,7 @@ const PROMPT: &str = "Name the capital of France in one word. Answer with the wo
 mod tests {
     use super::*;
     use aigentic_runtime::aigentic_core::Capabilities;
+    use aigentic_server::awake::detect_with;
     use futures_core::Stream;
     use std::pin::Pin;
 
@@ -1196,5 +1222,45 @@ mod tests {
         assert_eq!(check_env_ignored(root).status, Status::Warn);
         std::fs::write(root.join(".gitignore"), ".env\n").unwrap();
         assert_eq!(check_env_ignored(root).status, Status::Ok);
+    }
+
+    /// T16 (issue #47): the doctor's keep-awake line follows the config
+    /// and the machine — on when the program is there, a warning that
+    /// names the key when `keep_awake = false`, and a warning that says
+    /// why when the program is missing. Which program is expected is the
+    /// platform's own rule, stated here rather than looked up.
+    #[test]
+    fn keep_awake_is_reported_by_config_and_machine() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("caffeinate"), b"#!/bin/sh\n").unwrap();
+        std::fs::write(dir.path().join("systemd-inhibit"), b"#!/bin/sh\n").unwrap();
+        let found = std::env::join_paths([dir.path()]).unwrap();
+        let empty = std::env::join_paths([dir.path().join("nothing")]).unwrap();
+        let expected = if cfg!(target_os = "macos") {
+            "caffeinate"
+        } else {
+            "systemd-inhibit"
+        };
+
+        let on = check_keep_awake(detect_with(Some(&found), true).as_ref());
+        assert_eq!(on.status, Status::Ok, "{}", on.message);
+        assert!(on.message.contains(expected), "{}", on.message);
+        assert!(on.message.contains("awake"), "{}", on.message);
+
+        let off = check_keep_awake(detect_with(Some(&found), false).as_ref());
+        assert_eq!(off.status, Status::Warn, "{}", off.message);
+        assert!(
+            off.message.contains("off") && off.message.contains("keep_awake = false"),
+            "the warning names the key: {}",
+            off.message
+        );
+
+        let missing = check_keep_awake(detect_with(Some(&empty), true).as_ref());
+        assert_eq!(missing.status, Status::Warn, "{}", missing.message);
+        assert!(
+            missing.message.contains("unavailable"),
+            "the warning says why: {}",
+            missing.message
+        );
     }
 }
