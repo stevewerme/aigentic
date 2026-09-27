@@ -142,10 +142,11 @@ enum Command {
         /// Also send one tiny completion per profile (the only network use).
         #[arg(long)]
         probe: bool,
-        /// Compare two efforts on `--profile`: `LOW,HIGH`, each an
-        /// integer or a label. Sends the same prompt twice and prints
-        /// both calls' output and reasoning tokens. The effort comes
-        /// from this flag, so the config is never edited.
+        /// Compare two efforts on `--profile`: `LOW,HIGH`, the first is
+        /// LOW, the second HIGH; each an integer or a label. Sends the
+        /// same prompt SAMPLES (3) times per effort and prints every
+        /// call's output and reasoning tokens, then the medians decide.
+        /// The effort comes from this flag, so the config is never edited.
         #[arg(long, value_name = "LOW,HIGH")]
         probe_effort: Option<String>,
         /// Exit non-zero on a warning too, unknown config keys included.

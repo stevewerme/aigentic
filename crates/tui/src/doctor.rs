@@ -8,16 +8,18 @@ use std::path::Path;
 use aigentic_runtime::aigentic_providers::ReasoningEffort;
 
 use crate::checks::{
-    Check, GhCli, Status, check_api_key_env, check_config, check_env_ignored, check_github,
-    check_keep_awake, check_participants, check_probe, check_project, check_skills,
-    check_threads_dir, check_window, compare_efforts, origin_url, unknown_keys,
+    Check, EffortVerdict, GhCli, JudgedMetric, SAMPLES, Status, check_api_key_env, check_config,
+    check_env_ignored, check_github, check_keep_awake, check_participants, check_probe,
+    check_project, check_skills, check_threads_dir, check_window, compare_efforts, compare_medians,
+    judged_metric, origin_url, unknown_keys,
 };
 use crate::config;
 use crate::skills_cmd::SkillPaths;
 
 /// `aigentic doctor --probe-effort LOW,HIGH [--profile NAME]`: one tiny
-/// prompt at each effort, both usages side by side. Prints the table and
-/// returns 0 when both calls answered, 2 when one did not (the doctor's
+/// prompt at each effort, `SAMPLES` times each, every usage printed and
+/// the medians compared. Prints the table and returns 0 when all
+/// `2 × SAMPLES` calls answered, 2 when one did not (the doctor's
 /// existing "cannot tell" code is 1; 2 keeps the two apart).
 pub async fn compare(
     config_path: &Path,
@@ -47,30 +49,66 @@ pub async fn compare(
         profile.model
     );
     match compare_efforts(profile, efforts).await {
-        Ok(calls) => {
+        Ok(samples) => {
             println!(
-                "{:<10} {:>14} {:>17}",
-                "effort", "output_tokens", "reasoning_tokens"
+                "{:<10} {:>7} {:>14} {:>17}",
+                "effort", "attempt", "output_tokens", "reasoning_tokens"
             );
-            for c in &calls {
-                let reasoning = c
-                    .reasoning_tokens
-                    .map_or_else(|| "-".to_owned(), |n| n.to_string());
-                println!("{:<10} {:>14} {:>17}", c.effort, c.output_tokens, reasoning);
+            for s in &samples {
+                print_sample(
+                    &s.call.effort,
+                    s.attempt.to_string(),
+                    s.call.output_tokens,
+                    s.call.reasoning_tokens,
+                );
             }
-            let [a, b] = &calls[..] else {
-                unreachable!("two calls were asked for");
+            // Effort-major, so the first `SAMPLES` are LOW and the next
+            // are HIGH; every sample is present or `compare_efforts` erred.
+            let (low_samples, high_samples) = samples.split_at(SAMPLES as usize);
+            let low_label = &low_samples[0].call.effort;
+            let high_label = &high_samples[0].call.effort;
+            for group in [low_samples, high_samples] {
+                let output = median(group.iter().map(|s| s.call.output_tokens));
+                let reasoning = median(
+                    group
+                        .iter()
+                        .map(|s| s.call.reasoning_tokens.unwrap_or_default()),
+                );
+                let all_reasoning = group.iter().all(|s| s.call.reasoning_tokens.is_some());
+                print_sample(
+                    &group[0].call.effort,
+                    "median".into(),
+                    output,
+                    all_reasoning.then_some(reasoning),
+                );
+            }
+            let metric = judged_metric(&samples);
+            let (low_median, high_median) = match metric {
+                JudgedMetric::Reasoning => (
+                    median(low_samples.iter().flat_map(|s| s.call.reasoning_tokens)),
+                    median(high_samples.iter().flat_map(|s| s.call.reasoning_tokens)),
+                ),
+                JudgedMetric::Output => (
+                    median(low_samples.iter().map(|s| s.call.output_tokens)),
+                    median(high_samples.iter().map(|s| s.call.output_tokens)),
+                ),
             };
-            if a.output_tokens == b.output_tokens && a.reasoning_tokens == b.reasoning_tokens {
-                println!(
-                    "no difference at efforts {} and {}: the endpoint looks like it ignores the field",
-                    a.effort, b.effort
-                );
-            } else {
-                println!(
-                    "efforts {} and {} differ: the endpoint honours the field",
-                    a.effort, b.effort
-                );
+            let metric_name = match metric {
+                JudgedMetric::Reasoning => "reasoning",
+                JudgedMetric::Output => "output",
+            };
+            println!("judged on {metric_name} tokens");
+            match compare_medians(low_median, high_median) {
+                EffortVerdict::Honours => {
+                    println!("efforts {low_label} and {high_label}: the endpoint honours the field")
+                }
+                EffortVerdict::NoClearDifference => println!(
+                    "no clear difference: the endpoint may ignore the field, or {low_label} and \
+                     {high_label} behave alike on a short prompt"
+                ),
+                EffortVerdict::Below => {
+                    println!("{high_label} reasoned less than {low_label}: inconclusive");
+                }
             }
             Ok(0)
         }
@@ -81,6 +119,21 @@ pub async fn compare(
             Ok(2)
         }
     }
+}
+
+/// One row of the table: an effort, what the row is (its attempt number or
+/// `median`), and its usage. `None` reasoning prints `-`.
+fn print_sample(effort: &str, row: String, output: u64, reasoning: Option<u64>) {
+    let reasoning = reasoning.map_or_else(|| "-".to_owned(), |n| n.to_string());
+    println!("{effort:<10} {row:>7} {output:>14} {reasoning:>17}");
+}
+
+/// The middle of an odd-length run of samples: `compare_efforts` returns
+/// `SAMPLES` (odd) per effort, so one sample is the median.
+fn median(values: impl Iterator<Item = u64>) -> u64 {
+    let mut values: Vec<u64> = values.collect();
+    values.sort_unstable();
+    values[values.len() / 2]
 }
 
 /// `1` or `low`: an integer or a label, the two shapes the config takes.

@@ -550,60 +550,130 @@ pub struct EffortCall {
     pub reasoning_tokens: Option<u64>,
 }
 
-/// Issue #44 (amendment 2.2): send the same tiny prompt through the
-/// profile at two efforts and report each call's usage side by side. A
-/// probe that answers `ok` proves only that the endpoint accepts the
-/// field; this shows whether it changes what the call produces. The
-/// configured effort is overridden per call, so no config is edited.
+/// One call of the comparison, tagged with which attempt at its effort it
+/// was (issue #45): the same effort goes out `SAMPLES` times so a median,
+/// not one noisy call, decides the verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffortSample {
+    pub attempt: u32,
+    pub call: EffortCall,
+}
+
+/// How many times each effort is sent (issue #45). Odd, so a median is
+/// always one of the samples; the issue's default is 3.
+pub const SAMPLES: u32 = 3;
+
+/// The verdict on a pair of medians (issue #45): which way, if any, HIGH
+/// moved away from LOW.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffortVerdict {
+    /// HIGH's median is clearly above LOW's.
+    Honours,
+    /// The medians are within the band: the endpoint may ignore the field,
+    /// or the two efforts behave alike on a short prompt.
+    NoClearDifference,
+    /// HIGH's median is clearly below LOW's — never "honours".
+    Below,
+}
+
+/// Which column the verdict is judged on (issue #45): reasoning tokens
+/// when the endpoint reports them for the whole run, else output tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JudgedMetric {
+    Reasoning,
+    Output,
+}
+
+/// The band, as the issue states it in integers: HIGH is clearly above
+/// LOW when it is above by more than the larger of 5 tokens and 25% of
+/// LOW. Comparing without rounding, clearly above ⇔ `4 * (high - low) >
+/// max(20, low)`; clearly below is the same test on `low - high`.
+pub fn compare_medians(low: u64, high: u64) -> EffortVerdict {
+    let slack = 20.max(low);
+    if 4 * high.saturating_sub(low) > slack {
+        EffortVerdict::Honours
+    } else if 4 * low.saturating_sub(high) > slack {
+        EffortVerdict::Below
+    } else {
+        EffortVerdict::NoClearDifference
+    }
+}
+
+/// The column the verdict uses: reasoning when *every* sample reports it,
+/// else output for the whole run, so a mixed run is never compared across
+/// two different metrics.
+pub fn judged_metric(samples: &[EffortSample]) -> JudgedMetric {
+    if !samples.is_empty() && samples.iter().all(|s| s.call.reasoning_tokens.is_some()) {
+        JudgedMetric::Reasoning
+    } else {
+        JudgedMetric::Output
+    }
+}
+
+/// Issue #44 (amendment 2.2), median-sampled by issue #45: send the same
+/// tiny prompt through the profile at two efforts and report each call's
+/// usage side by side. A probe that answers `ok` proves only that the
+/// endpoint accepts the field; sampling shows whether it changes what the
+/// calls produce. The configured effort is overridden per call, so no
+/// config is edited. Samples are ordered effort-major, then attempt 1..N.
 ///
+/// Any failed call keeps its `Err` — the command exits 2 rather than judge
+/// on a partial median, which would be the N=1 noise this came to kill.
 /// `Err` carries the endpoint's answer when a call failed, never a key.
 pub async fn compare_efforts(
     profile: &Profile,
     efforts: [aigentic_runtime::aigentic_providers::ReasoningEffort; 2],
-) -> Result<Vec<EffortCall>, String> {
+) -> Result<Vec<EffortSample>, String> {
     let key = profile
         .api_key()
         .map_err(|_| format!("{} is not set", profile.api_key_env))?;
-    let mut rows = Vec::new();
+    let mut samples = Vec::new();
     for effort in efforts {
         let label = effort.label();
-        let provider = profile.build_provider_with_effort(key.clone(), Some(effort));
-        let messages = [Message {
-            role: Role::User,
-            author: Author::User(UserId("doctor".into())),
-            blocks: vec![ContentBlock::Text(PROMPT.into())],
-        }];
-        let request = CompletionRequest {
-            messages: &messages,
-            tools: &[],
-            max_output_tokens: None,
-        };
-        let mut stream = provider.complete(&request);
-        let mut usage = None;
-        let mut failure = None;
-        while let Some(event) = stream.next().await {
-            match event {
-                ProviderEvent::Usage(u) => usage = Some(u),
-                ProviderEvent::Error(e) => {
-                    failure = Some(e.to_string());
-                    break;
+        for attempt in 1..=SAMPLES {
+            let provider = profile.build_provider_with_effort(key.clone(), Some(effort.clone()));
+            let messages = [Message {
+                role: Role::User,
+                author: Author::User(UserId("doctor".into())),
+                blocks: vec![ContentBlock::Text(PROMPT.into())],
+            }];
+            let request = CompletionRequest {
+                messages: &messages,
+                tools: &[],
+                max_output_tokens: None,
+            };
+            let mut stream = provider.complete(&request);
+            let mut usage = None;
+            let mut failure = None;
+            while let Some(event) = stream.next().await {
+                match event {
+                    ProviderEvent::Usage(u) => usage = Some(u),
+                    ProviderEvent::Error(e) => {
+                        failure = Some(e.to_string());
+                        break;
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
-        }
-        let Some(usage) = usage else {
-            return Err(match failure {
-                Some(e) => format!("effort {label}: {e}"),
-                None => format!("effort {label}: stream ended with no usage"),
+            let Some(usage) = usage else {
+                return Err(match failure {
+                    Some(e) => format!("effort {label} attempt {attempt}: {e}"),
+                    None => {
+                        format!("effort {label} attempt {attempt}: stream ended with no usage")
+                    }
+                });
+            };
+            samples.push(EffortSample {
+                attempt,
+                call: EffortCall {
+                    effort: label.clone(),
+                    output_tokens: usage.output_tokens,
+                    reasoning_tokens: usage.reasoning_tokens,
+                },
             });
-        };
-        rows.push(EffortCall {
-            effort: label,
-            output_tokens: usage.output_tokens,
-            reasoning_tokens: usage.reasoning_tokens,
-        });
+        }
     }
-    Ok(rows)
+    Ok(samples)
 }
 
 /// The comparison's prompt: small, deterministic, and the same for both
@@ -1262,5 +1332,141 @@ mod tests {
             "the warning says why: {}",
             missing.message
         );
+    }
+
+    /// T1 (issue #45): the band on the issue's real run. Medium 30,
+    /// high 21: high reasoned *less*, so the verdict is `Below`, never
+    /// `Honours`. Boundaries from the amendment's integer rule
+    /// `4 * (high - low) > max(20, low)`: at LOW 30 the band is 7.5, so
+    /// 37 is within and 38 is clearly above; 23 is within and 22 below.
+    #[test]
+    fn compare_medians_bands_the_issues_real_run() {
+        assert_eq!(compare_medians(30, 21), EffortVerdict::Below);
+        assert_ne!(
+            compare_medians(30, 21),
+            EffortVerdict::Honours,
+            "the issue's run must not print honours"
+        );
+        assert_eq!(compare_medians(30, 37), EffortVerdict::NoClearDifference);
+        assert_eq!(compare_medians(30, 38), EffortVerdict::Honours);
+        assert_eq!(compare_medians(30, 23), EffortVerdict::NoClearDifference);
+        assert_eq!(compare_medians(30, 22), EffortVerdict::Below);
+    }
+
+    /// T2 (issue #45): the 25% branch dominates once it is the larger
+    /// side. LOW 100 → band 25: 125 is within, 126 above; 75 within,
+    /// 74 below.
+    #[test]
+    fn compare_medians_bands_on_a_quarter_of_low() {
+        assert_eq!(compare_medians(100, 125), EffortVerdict::NoClearDifference);
+        assert_eq!(compare_medians(100, 126), EffortVerdict::Honours);
+        assert_eq!(compare_medians(100, 75), EffortVerdict::NoClearDifference);
+        assert_eq!(compare_medians(100, 74), EffortVerdict::Below);
+    }
+
+    /// T3 (issue #45): the 5-token floor dominates on small lows. LOW 4:
+    /// 9 is within, 10 above; LOW 0: 5 is within, 6 above.
+    #[test]
+    fn compare_medians_keeps_a_five_token_floor() {
+        assert_eq!(compare_medians(4, 9), EffortVerdict::NoClearDifference);
+        assert_eq!(compare_medians(4, 10), EffortVerdict::Honours);
+        assert_eq!(compare_medians(0, 5), EffortVerdict::NoClearDifference);
+        assert_eq!(compare_medians(0, 6), EffortVerdict::Honours);
+    }
+
+    fn sample(attempt: u32, output_tokens: u64, reasoning_tokens: Option<u64>) -> EffortSample {
+        EffortSample {
+            attempt,
+            call: EffortCall {
+                effort: "low".into(),
+                output_tokens,
+                reasoning_tokens,
+            },
+        }
+    }
+
+    /// T4 (issue #45): a run where every sample reports reasoning is
+    /// judged on reasoning; one `None` makes the whole run output-judged.
+    #[test]
+    fn judged_metric_is_reasoning_only_when_every_sample_has_it() {
+        let all = vec![
+            sample(1, 10, Some(5)),
+            sample(2, 11, Some(6)),
+            sample(3, 9, Some(4)),
+        ];
+        assert_eq!(judged_metric(&all), JudgedMetric::Reasoning);
+
+        let mut mixed = all;
+        mixed[1].call.reasoning_tokens = None;
+        assert_eq!(judged_metric(&mixed), JudgedMetric::Output);
+    }
+
+    /// T5 (issue #45): a stub answers a streamed usage body; each effort
+    /// is sent `SAMPLES` times, samples are effort-major then attempt
+    /// 1..N, and every request carries its own effort's value.
+    #[tokio::test]
+    async fn compare_efforts_samples_each_effort() {
+        // A usage chunk then `[DONE]`, the shape `openai_compat` reads.
+        const USAGE_SSE: &str = "data: {\"choices\":[{\"delta\":{}}],\"usage\":\
+            {\"prompt_tokens\":1,\"completion_tokens\":7,\
+            \"completion_tokens_details\":{\"reasoning_tokens\":3}}}\n\ndata: [DONE]\n\n";
+        let (base, seen) = stub_endpoint(200, USAGE_SSE);
+        let config = Config::parse(&format!(
+            "[profiles.a]\nbase_url = \"{base}\"\nmodel = \"m\"\napi_key_env = \"PATH\"\n"
+        ))
+        .unwrap();
+        let profile = config.profiles["a"].clone();
+        let efforts = [
+            aigentic_runtime::aigentic_providers::ReasoningEffort::Label("low".into()),
+            aigentic_runtime::aigentic_providers::ReasoningEffort::Label("high".into()),
+        ];
+        let samples = compare_efforts(&profile, efforts).await.unwrap();
+        assert_eq!(samples.len(), 2 * SAMPLES as usize);
+        let attempts: Vec<u32> = samples.iter().map(|s| s.attempt).collect();
+        assert_eq!(attempts, vec![1, 2, 3, 1, 2, 3]);
+        let labels: Vec<&str> = samples.iter().map(|s| s.call.effort.as_str()).collect();
+        assert_eq!(labels, vec!["low", "low", "low", "high", "high", "high"]);
+        assert_eq!(samples[0].call.reasoning_tokens, Some(3));
+
+        let asked = seen.lock().unwrap();
+        assert_eq!(asked.len(), 2 * SAMPLES as usize, "{asked:?}");
+        for (i, request) in asked.iter().enumerate() {
+            let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
+            let want = if i < SAMPLES as usize {
+                "\"reasoning_effort\":\"low\""
+            } else {
+                "\"reasoning_effort\":\"high\""
+            };
+            assert!(body.contains(want), "request {i}: {body}");
+        }
+    }
+
+    /// T6 (issue #45): a stub that answers `400` makes the first sample
+    /// fail with the effort and attempt named, and `doctor::compare`
+    /// returns the existing exit-2 contract rather than a verdict.
+    #[tokio::test]
+    async fn a_failed_sample_names_the_attempt_and_exits_two() {
+        let (base, _seen) = stub_endpoint(400, r#"{"error":{"message":"nope"}}"#);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            format!("[profiles.a]\nbase_url = \"{base}\"\nmodel = \"m\"\napi_key_env = \"PATH\"\n"),
+        )
+        .unwrap();
+        let config = Config::parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let profile = config.profiles["a"].clone();
+        let efforts = [
+            aigentic_runtime::aigentic_providers::ReasoningEffort::Label("low".into()),
+            aigentic_runtime::aigentic_providers::ReasoningEffort::Label("high".into()),
+        ];
+        let err = compare_efforts(&profile, efforts).await.unwrap_err();
+        assert!(err.contains("low"), "{err}");
+        assert!(err.contains("attempt 1"), "{err}");
+
+        let code = crate::doctor::compare(&path, Some("a"), "low,high")
+            .await
+            .unwrap();
+        assert_eq!(code, 2);
     }
 }
