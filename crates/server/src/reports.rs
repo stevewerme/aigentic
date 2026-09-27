@@ -63,6 +63,9 @@ pub struct Cost {
     pub extraction_lines: u32,
     pub extraction_input: u64,
     pub extraction_output: u64,
+    /// Sum of `cost_usd` over the extraction lines that carry one
+    /// (issue #46), the same stamping rule as `spent`.
+    pub extraction_spent: Option<f64>,
     /// Sum of `cost_usd` over the calls that carry one.
     pub spent: Option<f64>,
     /// Calls that carried a price / calls that did not.
@@ -103,6 +106,9 @@ pub fn cost_of(events: &[Event]) -> Cost {
         cost.extraction_input +=
             p.usage.input_tokens + p.usage.cache_read_tokens + p.usage.cache_write_tokens;
         cost.extraction_output += p.usage.output_tokens;
+        if let Some(usd) = p.usage.cost_usd {
+            cost.extraction_spent = Some(cost.extraction_spent.unwrap_or(0.0) + usd);
+        }
     }
     for event in events
         .iter()
@@ -189,11 +195,17 @@ impl fmt::Display for Cost {
         if self.extractions > 0 {
             writeln!(
                 f,
-                "memory     {} extractions, {} lines   tokens in {} out {}",
+                "memory     {} extractions, {} lines   tokens in {} out {}{}",
                 self.extractions,
                 self.extraction_lines,
                 self.extraction_input,
-                self.extraction_output
+                self.extraction_output,
+                // Only when the lines carry a price (issue #46), so an
+                // old thread's memory line is byte-identical to before.
+                match self.extraction_spent {
+                    Some(usd) => format!("   ${usd:.4} priced"),
+                    None => String::new(),
+                }
             )?;
         }
         // Only when the thread has prices to report, so a thread without
@@ -603,6 +615,7 @@ mod cost_tests {
                 extraction_lines: 2,
                 extraction_input: 300,
                 extraction_output: 20,
+                extraction_spent: None,
                 // No usage line in this fixture carries a model or a
                 // price, so nothing is claimed about spend (issue #31)
                 // and the text report stays what it always was. The two
@@ -634,6 +647,56 @@ mod cost_tests {
         );
         assert!(text.contains("reasoning             6"), "{text}");
         assert!(text.contains("total      in      1717"), "{text}");
+    }
+
+    /// Issue #46: a stamped extraction's dollars reach `/cost`, and its
+    /// token totals are what they always were. The stamp is a fixture
+    /// value, summed in-test; the line prints it to four places.
+    #[test]
+    fn a_stamped_extraction_reports_its_dollars() {
+        let stamped = 0.0375;
+        let extraction = |cost: Option<f64>| {
+            let mut usage = json!({"input_tokens": 300, "output_tokens": 20});
+            if let Some(c) = cost {
+                usage["cost_usd"] = json!(c);
+            }
+            event(
+                EventKind::MemoryExtracted,
+                json!({"through_seq": 5, "written": [], "model": "m", "usage": usage}),
+            )
+        };
+        let priced = cost_of(&[extraction(Some(stamped))]);
+        let bare = cost_of(&[extraction(None)]);
+
+        assert_eq!(priced.extraction_spent, Some(stamped));
+        assert_eq!(bare.extraction_spent, None);
+        // The stamp adds dollars and nothing else: the token totals are
+        // the same with it as without.
+        assert_eq!(
+            (
+                priced.extractions,
+                priced.extraction_input,
+                priced.extraction_output
+            ),
+            (
+                bare.extractions,
+                bare.extraction_input,
+                bare.extraction_output
+            )
+        );
+        assert_eq!(
+            (priced.extraction_input, priced.extraction_output),
+            (300, 20)
+        );
+
+        let text = priced.to_string();
+        assert!(text.contains("tokens in 300 out 20"), "{text}");
+        assert!(
+            text.contains(&format!("${stamped:.4} priced")),
+            "the stamp is missing: {text}"
+        );
+        // An unpriced line claims nothing about money.
+        assert!(!bare.to_string().contains("priced"), "{bare}");
     }
 
     /// Issue #31: a stamped thread's `/cost` shows the spend the usage
