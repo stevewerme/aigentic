@@ -74,6 +74,10 @@ impl Runtime {
         let payload = serde_json::to_value(TurnEndedPayload {
             reason: reason.to_owned(),
             touched: touched.clone(),
+            wall_secs: None,
+            slept_secs: None,
+            slept_awaiting_secs: None,
+            keep_awake: None,
         })
         .expect("serialisable");
         self.append(

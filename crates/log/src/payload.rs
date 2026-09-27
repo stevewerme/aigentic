@@ -242,6 +242,30 @@ pub struct TurnEndedPayload {
     /// phase 4 step 9.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub touched: Vec<String>,
+    /// Wall time from the turn's start to its end, on `SystemTime`
+    /// (issue #47): logged on every measured turn, so `stats` can sum a
+    /// thread's wall time without reconstructing it from event
+    /// timestamps (which count idle time between turns). Added, never
+    /// changed: `None` on old lines and on turns the runtime did not
+    /// measure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wall_secs: Option<u64>,
+    /// Wall time minus running time for the turn (issue #47): above the
+    /// threshold this is time the machine slept mid-turn, so a duration
+    /// is not silently inflated by a nap. `None` on old lines and on a
+    /// turn that did not sleep.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slept_secs: Option<u64>,
+    /// The part of `slept_secs` spent parked on a human (issue #47): a
+    /// permission prompt or an `ask_human`, which the keep-awake guard
+    /// deliberately releases for. `Some` only when `slept_secs` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slept_awaiting_secs: Option<u64>,
+    /// The daemon's keep-awake guard status during the turn (issue #47):
+    /// `"on"`, `"off"`, or `"unavailable: <reason>"`. `None` on old
+    /// lines and when no daemon set one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_awake: Option<String>,
 }
 
 impl TurnEndedPayload {
@@ -249,6 +273,10 @@ impl TurnEndedPayload {
         Self {
             reason: reason.into(),
             touched: Vec::new(),
+            wall_secs: None,
+            slept_secs: None,
+            slept_awaiting_secs: None,
+            keep_awake: None,
         }
     }
 }
@@ -735,6 +763,52 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<ProviderRetriedPayload>(value).unwrap(),
             payload
+        );
+    }
+
+    /// Issue #47: a `turn_ended` line written before the sleep fields
+    /// existed still parses — every new field is `None` — and none of
+    /// them is written back, so an old log re-serialises as it always
+    /// did.
+    #[test]
+    fn a_pre_sleep_turn_ended_line_gains_no_new_fields() {
+        let line = json!({"reason": "done", "touched": ["a.rs"]});
+        let p: TurnEndedPayload = serde_json::from_value(line.clone()).unwrap();
+        assert_eq!(p.wall_secs, None);
+        assert_eq!(p.slept_secs, None);
+        assert_eq!(p.slept_awaiting_secs, None);
+        assert_eq!(p.keep_awake, None);
+        let back = serde_json::to_value(&p).unwrap();
+        assert_eq!(back, line);
+        for absent in [
+            "wall_secs",
+            "slept_secs",
+            "slept_awaiting_secs",
+            "keep_awake",
+        ] {
+            assert!(
+                back.get(absent).is_none(),
+                "{absent} is absent from a pre-sleep line: {back}"
+            );
+        }
+
+        // A measured turn round-trips every field.
+        let measured = TurnEndedPayload {
+            reason: "done".into(),
+            touched: vec![],
+            wall_secs: Some(980),
+            slept_secs: Some(750),
+            slept_awaiting_secs: Some(120),
+            keep_awake: Some("on".into()),
+        };
+        let value = serde_json::to_value(&measured).unwrap();
+        assert_eq!(value["wall_secs"], 980);
+        assert_eq!(value["slept_secs"], 750);
+        assert_eq!(value["slept_awaiting_secs"], 120);
+        assert_eq!(value["keep_awake"], "on");
+        assert_eq!(
+            serde_json::from_value::<TurnEndedPayload>(value).unwrap(),
+            measured
         );
     }
 }
