@@ -845,3 +845,56 @@ async fn thread_01M3GS3QP6_replays_without_thrash() {
         "the replay must reach the regime the issue is about"
     );
 }
+
+/// Issue #51: the projection's argument stubs stay inside each tool's own
+/// schema, so a model that copies what it sees in history (the #17 lesson)
+/// still sends a call the tool accepts.
+#[test]
+fn argument_stubs_still_deserialise_as_their_tools_arguments() {
+    let command = format!(
+        "{}\necho done\ncd crates/log && cargo test\n",
+        "cargo test --workspace ".repeat(12)
+    );
+    let bash = ToolCall {
+        id: "c1".into(),
+        name: "bash".into(),
+        args: serde_json::json!({"command": command, "timeout_secs": 900}),
+    };
+    let ContentBlock::ToolCall(stub) = aigentic_log::shorten_call_args(&bash) else {
+        panic!("a tool call projects as a tool call");
+    };
+    assert_eq!(stub.name, "bash");
+    assert_eq!(stub.args["timeout_secs"], serde_json::json!(900));
+    assert!(
+        stub.args["command"].as_str().unwrap().chars().count()
+            < bash.args["command"].as_str().unwrap().chars().count(),
+        "the stub is shorter: {}",
+        stub.args["command"]
+    );
+    let _: aigentic_tools::BashArgs =
+        serde_json::from_value(stub.args.clone()).expect("the bash stub still fits BashArgs");
+
+    let update = ToolCall {
+        id: "c2".into(),
+        name: "update_tasks".into(),
+        args: serde_json::json!({"tasks": [
+            {"text": "read the plan", "state": "done"},
+            {"text": "implement the argument stubs ".repeat(12), "state": "active"},
+        ]}),
+    };
+    let ContentBlock::ToolCall(stub) = aigentic_log::shorten_call_args(&update) else {
+        panic!("a tool call projects as a tool call");
+    };
+    let parsed: aigentic_runtime::harness_tools::UpdateTasksArgs =
+        serde_json::from_value(stub.args.clone())
+            .expect("the update_tasks stub still fits UpdateTasksArgs");
+    assert_eq!(parsed.tasks.len(), 2, "the list keeps its length");
+    assert_eq!(
+        parsed.tasks[0].state,
+        aigentic_runtime::harness_tools::TaskState::Done
+    );
+    assert_eq!(
+        parsed.tasks[1].state,
+        aigentic_runtime::harness_tools::TaskState::Active
+    );
+}

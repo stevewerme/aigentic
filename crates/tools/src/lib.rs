@@ -17,7 +17,7 @@ mod registry;
 mod truncate;
 mod workdir;
 
-pub use bash::{BashTool, DEFAULT_TIMEOUT, MAX_TIMEOUT_SECS};
+pub use bash::{BashArgs, BashTool, DEFAULT_TIMEOUT, MAX_TIMEOUT_SECS};
 pub use files::{ReadFileTool, WriteFileTool};
 pub use fs::{DEFAULT_GREP_MATCHES, EditFileTool, GrepTool, ListDirTool};
 pub use knowledge::{

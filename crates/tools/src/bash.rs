@@ -24,9 +24,12 @@ pub const MAX_TIMEOUT_SECS: u64 = 900;
 /// How long the process group gets after SIGTERM before it is SIGKILLed.
 const TERM_GRACE: Duration = Duration::from_secs(2);
 
+/// The arguments of one `bash` call, as the model sends them. Public so
+/// the projection's argument stubs (issue #51) can be proved against the
+/// schema the tool actually accepts.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct BashArgs {
+pub struct BashArgs {
     /// Command to run with `bash -c`. The working directory persists between
     /// calls, so `cd` takes effect for later commands.
     command: String,
