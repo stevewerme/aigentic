@@ -36,6 +36,7 @@ pub mod seams;
 mod support;
 pub mod title;
 mod turn;
+pub mod workflow;
 
 pub use approver::{Answer, Approver, DenyAll};
 pub use audit::audit_tool_results;
