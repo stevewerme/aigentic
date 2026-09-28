@@ -23,6 +23,11 @@ so the rule can be judged, not just obeyed. The `brief`, `plan-check` and
   silently on #37 and #43. The implementer's `## Implementation` carries a
   ledger (T1, T2, … landed or not, with a reason); a planned test missing
   without a reason is `changes needed`.
+- **"0 tests ran" is never a pass.** `cargo test <name>` exits 0 when the
+  name matches nothing, and also when a stale test binary in `target/` predates
+  the test (#34: a commit-1 build in a worktree left one behind; the run said
+  `running 0 tests … 10 filtered out`). Confirm `1 passed`; if it says 0, touch
+  the file or rebuild before concluding anything.
 - **Check a ledger by matched count, and check quotes against the thread.**
   On #44 seven of fourteen ledger names matched no test, and `cargo test
   <wrong name>` still exits 0; the verifier caught it by counting matches.
