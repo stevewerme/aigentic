@@ -143,7 +143,7 @@ impl Runtime {
     /// Paths of `write_file` and `edit_file` calls since the last
     /// `turn_ended` whose result is not an error, in order, each once.
     pub(crate) fn touched_this_turn(&self) -> Result<Vec<String>, RuntimeError> {
-        let events = self.log.read_all()?;
+        let events = self.log.events();
         let start = events
             .iter()
             .rposition(|e| e.kind == EventKind::TurnEnded)

@@ -276,7 +276,7 @@ impl Runtime {
 
     /// The title from the log's last `thread_renamed`, if any.
     pub fn title(&self) -> Result<Option<String>, crate::RuntimeError> {
-        Ok(crate::title::title_of(&self.log.read_all()?))
+        Ok(crate::title::title_of(self.log.events()))
     }
 
     /// Set the title: a `thread_renamed` event by `author`.
@@ -314,11 +314,11 @@ impl Runtime {
         let Some(utility) = self.utility.as_deref() else {
             return Ok(None);
         };
-        let events = self.log.read_all()?;
-        if crate::title::title_of(&events).is_some() || !crate::title::has_finished_turn(&events) {
+        let events = self.log.events();
+        if crate::title::title_of(events).is_some() || !crate::title::has_finished_turn(events) {
             return Ok(None);
         }
-        let title = crate::title::propose_title(utility, &events).await?;
+        let title = crate::title::propose_title(utility, events).await?;
         if title.is_empty() {
             return Ok(None);
         }
@@ -664,7 +664,7 @@ impl Runtime {
     /// `asked_human`: the human's answer is recorded and the model has not
     /// yet seen it, so the client should `continue_turn`.
     pub fn awaiting_continuation(&self) -> Result<bool, crate::RuntimeError> {
-        let events = self.log.read_all()?;
+        let events = self.log.events();
         Ok(events.last().is_some_and(|e| {
             e.kind == aigentic_core::EventKind::TurnEnded
                 && serde_json::from_value::<aigentic_log::TurnEndedPayload>(e.payload.clone())

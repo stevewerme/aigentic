@@ -372,7 +372,7 @@ impl Runtime {
         let (file, text) = (file.to_owned(), text.to_owned());
         // The line's own audit trail: the seq of the event this
         // method appends once the write has decided what it says.
-        let at_seq = self.log.read_all()?.last().map_or(0, |e| e.seq + 1);
+        let at_seq = self.log.len();
         let date = time::OffsetDateTime::now_utc()
             .format(&Rfc3339)
             .unwrap_or_default();

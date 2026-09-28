@@ -196,9 +196,9 @@ impl Runtime {
         &mut self,
         observe: &mut (dyn FnMut(Signal<'_>) + Send),
     ) -> Result<bool, RuntimeError> {
-        let events = self.log.read_all()?;
-        let scan = Scan::of(&events);
-        let (kind, payload) = match self.decide(self.compaction, &events, &scan)? {
+        let events = self.log.events();
+        let scan = Scan::of(events);
+        let (kind, payload) = match self.decide(self.compaction, events, &scan)? {
             Decision::Hold => return Ok(false),
             Decision::Sweep { through_seq, .. } => (
                 EventKind::ContextEvicted,

@@ -207,8 +207,7 @@ impl Runtime {
                 }
                 return Err(e);
             }
-            let events = self.log.read_all()?;
-            let context = build_context(&self.prefix(), &events)?;
+            let context = build_context(&self.prefix(), self.log.events())?;
             let request = CompletionRequest {
                 messages: &context,
                 tools: &specs,

@@ -4,11 +4,14 @@
 use std::time::Duration;
 
 use aigentic_core::{
-    AgentId, Author, Budget, ContentBlock, EventKind, ProviderError, ProviderEvent, Role, ToolCall,
+    AgentId, Author, Budget, ContentBlock, EventKind, ProviderError, ProviderEvent, Role, Tool,
+    ToolCall,
 };
-use aigentic_log::{AssistantMessagePayload, ToolResultPayload, TurnEndedPayload};
-use aigentic_runtime::{Prices, RuntimeError, Signal};
+use aigentic_log::{AssistantMessagePayload, ThreadLog, ToolResultPayload, TurnEndedPayload};
+use aigentic_runtime::{Prices, Runtime, RuntimeError, Signal};
+use aigentic_tools::ToolRegistry;
 use serde_json::json;
+use std::sync::{Arc, Mutex};
 
 mod common;
 use common::*;
@@ -497,4 +500,69 @@ async fn an_unpriced_call_has_no_cost() {
     assert_eq!(u.profile.as_deref(), Some("free"));
     assert_eq!(u.cost_usd, None);
     assert_eq!(u.effort, None, "no effort set, none claimed");
+}
+
+/// The runtime reads the JSONL file once, at open: a turn over a log that
+/// was already on disk appends without a second file pass (issue #34).
+#[tokio::test]
+async fn turn_reads_the_file_only_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let thread = ulid::Ulid::generate();
+    let dirpath = dir.path().to_path_buf();
+
+    // A first runtime seeds the log with a two-step turn.
+    let log = ThreadLog::open(dir.path(), thread).unwrap();
+    let mut h = harness_with_log(
+        vec![
+            vec![
+                ProviderEvent::TextDelta("Working.".into()),
+                ProviderEvent::ToolCall(call("call_1", "a")),
+                done("tool_calls"),
+            ],
+            vec![ProviderEvent::TextDelta("Done.".into()), done("stop")],
+        ],
+        None,
+        dir,
+        log,
+    );
+    h.runtime
+        .run_turn(steve(), vec![ContentBlock::Text("hi".into())], &mut |_| {})
+        .await
+        .unwrap();
+    let seeded = h.runtime.log().len();
+    assert!(seeded > 0, "the first turn seeded the log");
+
+    // A new runtime over the same directory: the file is read at open...
+    let fresh = ThreadLog::open(&dirpath, thread).unwrap();
+    assert_eq!(
+        fresh.file_reads(),
+        1,
+        "a healthy open reads the file exactly once"
+    );
+    let (provider, _seen) = scripted(vec![
+        vec![
+            ProviderEvent::TextDelta("More.".into()),
+            ProviderEvent::ToolCall(call("call_2", "b")),
+            done("tool_calls"),
+        ],
+        vec![ProviderEvent::TextDelta("Finished.".into()), done("stop")],
+    ]);
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let registry: ToolRegistry = vec![Box::new(EchoTool(calls)) as Box<dyn Tool>].into();
+    let mut rt = Runtime::new(provider, registry, fresh, AgentId("worker".into()));
+    rt.run_turn(
+        steve(),
+        vec![ContentBlock::Text("go on".into())],
+        &mut |_| {},
+    )
+    .await
+    .unwrap();
+
+    // ...and never again, however many steps the turn takes.
+    assert_eq!(
+        rt.log().file_reads(),
+        1,
+        "no step of the turn re-reads the file"
+    );
+    assert!(rt.log().len() > seeded, "the turn appended events");
 }

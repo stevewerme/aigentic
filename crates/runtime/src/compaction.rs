@@ -28,12 +28,11 @@ impl Runtime {
         &mut self,
         observe: &mut (dyn FnMut(Signal<'_>) + Send),
     ) -> Result<bool, RuntimeError> {
-        let events = self.log.read_all()?;
-        let context = build_context(&self.prefix(), &events)?;
+        let context = build_context(&self.prefix(), self.log.events())?;
         if self.fill(&context) < self.window_line() {
             return Ok(false);
         }
-        let did = self.run_rules(&events, false, observe).await?;
+        let did = self.run_rules(false, observe).await?;
         Ok(!did.is_empty())
     }
 
@@ -42,8 +41,7 @@ impl Runtime {
         &mut self,
         observe: &mut (dyn FnMut(Signal<'_>) + Send),
     ) -> Result<Vec<CompactionStrategy>, RuntimeError> {
-        let events = self.log.read_all()?;
-        self.run_rules(&events, true, observe).await
+        self.run_rules(true, observe).await
     }
 
     /// Append a pinned fact. Pins live in the stable prefix.
@@ -88,27 +86,27 @@ impl Runtime {
     /// pressure check on rule 2 but never summarises the keep window.
     async fn run_rules(
         &mut self,
-        events: &[Event],
         force: bool,
         observe: &mut (dyn FnMut(Signal<'_>) + Send),
     ) -> Result<Vec<CompactionStrategy>, RuntimeError> {
         let mut done = Vec::new();
-        let Some((from, to)) = self.compactable_range(events) else {
+        let Some((from, to)) = self.compactable_range() else {
             return Ok(done);
         };
 
-        if let Some(strategy) = self.truncate(events, from, to, observe)? {
+        if let Some(strategy) = self.truncate(from, to, observe)? {
             done.push(strategy);
             if !force {
-                let events = self.log.read_all()?;
-                let context = build_context(&self.prefix(), &events)?;
+                // Re-check after the truncate append, as the rules always
+                // did: the cache makes the fresh read free.
+                let context = build_context(&self.prefix(), self.log.events())?;
                 if self.fill(&context) < self.window_line() {
                     return Ok(done);
                 }
             }
         }
 
-        if let Some(strategy) = self.summarise(events, from, to, observe).await? {
+        if let Some(strategy) = self.summarise(from, to, observe).await? {
             done.push(strategy);
         }
         Ok(done)
@@ -121,7 +119,8 @@ impl Runtime {
     /// summaries would let them accumulate. `None` when the boundary has
     /// not moved since the last summary, so the same range is never
     /// summarised twice.
-    fn compactable_range(&self, events: &[Event]) -> Option<(u64, u64)> {
+    fn compactable_range(&self) -> Option<(u64, u64)> {
+        let events = self.log.events();
         let compacted_through = project(events).ok()?.compacted_through;
         let ends: Vec<u64> = events
             .iter()
@@ -137,32 +136,36 @@ impl Runtime {
     /// still longer than `max_result_bytes` after existing truncations.
     fn truncate(
         &mut self,
-        events: &[Event],
         from: u64,
         to: u64,
         observe: &mut (dyn FnMut(Signal<'_>) + Send),
     ) -> Result<Option<CompactionStrategy>, RuntimeError> {
         let max = self.compaction.max_result_bytes;
-        let already: Vec<(u64, u64, usize)> = events
-            .iter()
-            .filter(|e| e.kind == EventKind::Compacted)
-            .filter_map(|e| serde_json::from_value::<CompactedPayload>(e.payload.clone()).ok())
-            .filter_map(|p| match p.strategy {
-                CompactionStrategy::TruncateResults { max_bytes } => {
-                    Some((p.from_seq, p.to_seq, max_bytes))
-                }
-                _ => None,
+        // Everything the decision needs, computed under one short borrow
+        // that ends before the append below.
+        let oversize = {
+            let events = self.log.events();
+            let already: Vec<(u64, u64, usize)> = events
+                .iter()
+                .filter(|e| e.kind == EventKind::Compacted)
+                .filter_map(|e| serde_json::from_value::<CompactedPayload>(e.payload.clone()).ok())
+                .filter_map(|p| match p.strategy {
+                    CompactionStrategy::TruncateResults { max_bytes } => {
+                        Some((p.from_seq, p.to_seq, max_bytes))
+                    }
+                    _ => None,
+                })
+                .collect();
+            events.iter().any(|e| {
+                e.kind == EventKind::ToolResult
+                    && (from..=to).contains(&e.seq)
+                    && serde_json::from_value::<ToolResultPayload>(e.payload.clone())
+                        .is_ok_and(|p| p.result.content.len() > max)
+                    && !already
+                        .iter()
+                        .any(|(f, t, m)| *f <= e.seq && e.seq <= *t && *m <= max)
             })
-            .collect();
-        let oversize = events.iter().any(|e| {
-            e.kind == EventKind::ToolResult
-                && (from..=to).contains(&e.seq)
-                && serde_json::from_value::<ToolResultPayload>(e.payload.clone())
-                    .is_ok_and(|p| p.result.content.len() > max)
-                && !already
-                    .iter()
-                    .any(|(f, t, m)| *f <= e.seq && e.seq <= *t && *m <= max)
-        });
+        };
         if !oversize {
             return Ok(None);
         }
@@ -174,13 +177,15 @@ impl Runtime {
     /// Rule 2: summarise the range with the same provider and a fixed prompt.
     async fn summarise(
         &mut self,
-        events: &[Event],
         from: u64,
         to: u64,
         observe: &mut (dyn FnMut(Signal<'_>) + Send),
     ) -> Result<Option<CompactionStrategy>, RuntimeError> {
-        // The range as the model would see it, with earlier compactions applied.
-        let in_range: Vec<Event> = events
+        // The range as the model would see it, with earlier compactions
+        // applied: owned, so the borrow of the log ends before the call.
+        let in_range: Vec<Event> = self
+            .log
+            .events()
             .iter()
             .filter(|e| e.seq <= to || e.kind == EventKind::Compacted)
             .cloned()
