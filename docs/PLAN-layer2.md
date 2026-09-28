@@ -366,16 +366,18 @@ lands where the run was. Added, never changed.
 
 | Kind | Payload |
 | --- | --- |
-| `run_started` | issue, workflow name, version, content hash, size, issue budget |
-| `step_started` | step id, role, profile, child thread id, attempt, step budget |
+| `run_started` | issue, workflow name, version, content hash, provisional issue budget (the workflow's full budget; the brief has not sized the issue yet) |
+| `step_started` | step id, role, profile, child thread id, attempt, step budget; every re-entry (send-back, continue, fresh thread) is a new one with attempt + 1 |
 | `step_finished` | step id, `done` \| `partial` \| `failed`, end reason, cost, child's `step_reported` event id |
 | `checks_run` | step id, per check: `pass` \| `flag` \| `fail`, detail |
-| `route_taken` | branch point, proposed, preconditions with results, taken, fallback reason |
+| `route_taken` | branch point, proposed, preconditions with results, taken, fallback reason, issue budget when the route sets it (the brief's) |
 | `checkpoint_asked` | gate kind, what was shown, options |
 | `checkpoint_answered` | answer, amendment text, reveal marks (`useful`, `noise`, `missed`) |
 | `budget_warned` | scope (`step` \| `issue`), spent, limit |
-| `pushed` | commits, remote ref before and after, installed binary's commit |
+| `pushed` | commits, remote ref before and after, installed binary's commit; appended after the push and install, which are idempotent |
 | `run_finished` | `closed` \| `stopped` \| `escalated`, cost, release impact |
+
+**Replay.** The last lead-thread event decides the runner's next move: `run_started` → start the first step; `step_started` → await that child; `step_finished` → run the step's checks; `checks_run` → send back, push or route by the outcome; `pushed` → install, close or route on; `route_taken` → follow it (never re-derive: preconditions read git state that can change across a crash); `checkpoint_asked` → wait; `checkpoint_answered` → act on the answer; `budget_warned` → the move of the event before it; `run_finished` → nothing. Per-step state (checks, pushed commits, step warnings) is kept per attempt.
 
 **Child thread:** `step_reported`, written by `finish_step` (the tool's
 effect is its own kind, as `remember` writes `memory_remembered`).
