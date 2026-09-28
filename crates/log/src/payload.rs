@@ -1,6 +1,7 @@
 //! Kind-specific payload shapes. `Event.payload` is free JSON on the wire;
 //! these structs are the contract for what each kind carries.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use aigentic_core::{Author, ContentBlock, ProviderError, RiskClass, ToolCall, ToolResult};
@@ -73,6 +74,16 @@ pub struct ThreadStartedPayload {
     pub project: Option<String>,
     pub root: PathBuf,
     pub created_by: Author,
+    /// The runner's child threads (layer 2, issue #53): the lead thread
+    /// this step was started from. `None` for a thread a person or the
+    /// TUI started, and for every line written before the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_thread: Option<Ulid>,
+    /// The workflow step this thread fills, set exactly when
+    /// `parent_thread` is (a step's child has one; the lead thread does
+    /// not). `None` on older lines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step: Option<String>,
 }
 
 /// Token usage for one model call, as persisted. The token fields mirror
@@ -530,6 +541,351 @@ pub struct MemoryRememberedPayload {
     pub written: bool,
 }
 
+// ---- The build runner's payloads (layer 2, issue #53) ------------------
+//
+// The runner's state is a projection of the lead thread's log, so every
+// fact it replays from has a shape here. Closed sets are enums with the
+// existing `snake_case` rule; a new variant is the only way to add one.
+
+/// How a step end left its work (PLAN-layer2 §4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StepStatus {
+    Done,
+    Partial,
+    Failed,
+}
+
+/// The `status` a child's `step_reported` may carry: a step that was cut
+/// short reports `partial` and hands off, it does not report `failed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReportStatus {
+    Done,
+    Partial,
+}
+
+/// One exact check's result (§6.1): `pass` and `flag` let the push
+/// through, `fail` blocks it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckResult {
+    Pass,
+    Flag,
+    Fail,
+}
+
+/// The judge's verdict (§6.5). What to do about `changes_needed` is
+/// [`FixSize`], a separate field: `fix is the judge's field`, and a
+/// verdict is not a route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Verdict {
+    Approve,
+    ChangesNeeded,
+}
+
+/// How much a `changes_needed` verdict needs: nothing, a small fix, or
+/// the full route. `None` serialises as `none`, the word the judge
+/// writes, not as `no_impact`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FixSize {
+    #[serde(rename = "none")]
+    None,
+    Trivial,
+    Full,
+}
+
+/// What a closed issue did to the release (ADR 0001). `NoImpact`
+/// serialises as `none`, the word the judge writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReleaseImpact {
+    #[serde(rename = "none")]
+    NoImpact,
+    Patch,
+    Minor,
+    Breaking,
+}
+
+/// Whether a planned test landed, as the implementer's ledger claims it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LedgerStatus {
+    Landed,
+    NotLanded,
+}
+
+/// How a run ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunOutcome {
+    /// The issue was closed.
+    Closed,
+    /// The run stopped at a recoverable point and left a handoff.
+    Stopped,
+    /// The run asked a human and could not go on.
+    Escalated,
+}
+
+/// A human's answer at a checkpoint (§5). `stop` is `exec`'s default
+/// when nobody is there; `go` never is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointAnswer {
+    Go,
+    Amend,
+    Stop,
+}
+
+/// How a human marked a reveal-stage finding (§5, §7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RevealMark {
+    Useful,
+    Noise,
+    Missed,
+}
+
+/// Whose budget a warning is about (§8): the step's or the issue's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BudgetScope {
+    Step,
+    Issue,
+}
+
+/// A route a step may take (§6.3). One variant today; a new route is a
+/// new variant, never a free-form string.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Route {
+    /// The step cannot go on; a human decides.
+    Escalate { reason: String },
+}
+
+/// One commit the runner pushed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitRef {
+    pub sha: String,
+    pub subject: String,
+}
+
+/// One exact check's outcome (§6.1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckOutcome {
+    pub id: String,
+    pub result: CheckResult,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// Payload of a `run_started` event (issue #53): the issue, the workflow
+/// the run began with (name, version and content hash, so a replay runs
+/// against that workflow), and the workflow's provisional full budget.
+/// The brief sizes the issue later, so there is no size here.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunStartedPayload {
+    pub issue: u64,
+    pub workflow: String,
+    /// `workflow.toml`'s `version`, an integer.
+    pub version: u32,
+    pub content_hash: String,
+    pub budget_usd: f64,
+}
+
+/// Payload of a `step_started` event: which step, who fills it, in which
+/// child thread, and at which attempt. Written before the child is
+/// awaited; every re-entry is a new event with `attempt + 1`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StepStartedPayload {
+    pub step: String,
+    pub role: String,
+    pub profile: String,
+    pub child_thread: Ulid,
+    /// 1-based: the first entry is attempt 1.
+    pub attempt: u32,
+    pub budget_usd: f64,
+}
+
+/// Payload of a `step_finished` event: how the child's turn ended, what
+/// it cost, and the child's `step_reported` event — `None` when the step
+/// failed before it could report.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StepFinishedPayload {
+    pub step: String,
+    pub status: StepStatus,
+    pub end_reason: String,
+    pub cost_usd: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_event: Option<Ulid>,
+}
+
+/// Payload of a `checks_run` event: the step's exact checks and their
+/// results. A `fail` blocks the push.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChecksRunPayload {
+    pub step: String,
+    pub checks: Vec<CheckOutcome>,
+}
+
+/// Payload of a `route_taken` event: the branch point, what the workflow
+/// proposed, the preconditions with their results, what was taken, why a
+/// fallback was needed, and the issue budget when the route set it (the
+/// brief's route does).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RouteTakenPayload {
+    pub branch: String,
+    pub proposed: String,
+    pub taken: String,
+    #[serde(default)]
+    pub preconditions: Vec<CheckOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_usd: Option<f64>,
+}
+
+/// Payload of a `checkpoint_asked` event: the gate, what the human was
+/// shown, and the options offered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointAskedPayload {
+    pub gate: String,
+    pub shown: Vec<String>,
+    pub options: Vec<String>,
+}
+
+/// One finding's mark at the reveal stage. `Missed` marks a purpose
+/// point of the human's own amendment that purpose-check did not raise
+/// (§5, §7).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FindingMark {
+    pub finding: String,
+    pub mark: RevealMark,
+}
+
+/// Payload of a `checkpoint_answered` event; the event's author is who
+/// answered. The gate it answers is the open `checkpoint_asked`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CheckpointAnsweredPayload {
+    pub answer: CheckpointAnswer,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amendment: Option<String>,
+    #[serde(default)]
+    pub marks: Vec<FindingMark>,
+}
+
+/// Payload of a `budget_warned` event: which budget, what was spent and
+/// the limit. Both numbers are kept because §8 warns twice at each scope
+/// (80% and 100%), so a restart needs the level, not just the scope.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BudgetWarnedPayload {
+    pub scope: BudgetScope,
+    pub spent_usd: f64,
+    pub limit_usd: f64,
+}
+
+/// Payload of a `pushed` event: the commits, the remote ref before and
+/// after, and the installed binary's commit. Appended after the push and
+/// install, which are idempotent.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PushedPayload {
+    pub commits: Vec<CommitRef>,
+    pub ref_before: String,
+    pub ref_after: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed: Option<String>,
+}
+
+/// Payload of a `run_finished` event: how the run ended, what it cost,
+/// and the release impact the closing comment states.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunFinishedPayload {
+    pub outcome: RunOutcome,
+    pub cost_usd: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_impact: Option<ReleaseImpact>,
+}
+
+/// One planned test: its id, what it checks, and how its expected value
+/// is derived (§4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlannedTest {
+    pub id: String,
+    pub what: String,
+    pub derivation: String,
+}
+
+/// One ledger row: a planned test and whether it landed, with the reason
+/// when it did not (§4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LedgerEntry {
+    pub id: String,
+    /// The test's name in the code.
+    pub name: String,
+    pub status: LedgerStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// A plan-check or purpose-check finding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Finding {
+    pub id: String,
+    pub text: String,
+}
+
+/// What a step hands over when it stops short (`status: partial`, §8):
+/// what is done, what comes next, and the files left dirty.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Handoff {
+    pub done: String,
+    pub next: String,
+    #[serde(default)]
+    pub dirty: Vec<String>,
+}
+
+/// Payload of a `step_reported` event: the child's `finish_step` report,
+/// §4's field table. Every field is optional because each step fills a
+/// subset — a planner sends `slots` and `planned_tests`, a judge sends
+/// `verdict` and `release_impact` — and none of them is written when
+/// absent.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct StepReport {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<ReportStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    /// Rendered template slots; `ui` is a bool, so the map holds JSON
+    /// values and not strings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slots: Option<BTreeMap<String, serde_json::Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planned_tests: Option<Vec<PlannedTest>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commits: Option<Vec<CommitRef>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ledger: Option<Vec<LedgerEntry>>,
+    /// Phrases the report attributes to the plan, checked verbatim
+    /// against it (§6.1 E8).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quotes: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<Verdict>,
+    /// The judge's route for a `changes_needed` verdict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fix: Option<FixSize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_impact: Option<ReleaseImpact>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub findings: Option<Vec<Finding>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<Route>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<Handoff>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -600,6 +956,8 @@ mod tests {
             project: Some("vendela".into()),
             root: PathBuf::from("/srv/vendela"),
             created_by: Author::User(aigentic_core::UserId("steve".into())),
+            parent_thread: None,
+            step: None,
         };
         let value = serde_json::to_value(&started).unwrap();
         assert_eq!(
@@ -1032,6 +1390,507 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<TurnEndedPayload>(value).unwrap(),
             p
+        );
+    }
+
+    // ---- The build runner's payloads (layer 2, issue #53) -------------
+    //
+    // One round trip per new payload, with the expected JSON written from
+    // the serde rule (`snake_case` keys, absent options omitted) rather
+    // than from a second renderer.
+
+    fn a_child_thread() -> Ulid {
+        Ulid::from_parts(1_700_000_000_000, 7)
+    }
+
+    #[test]
+    fn run_started_payload_round_trips() {
+        let p = RunStartedPayload {
+            issue: 53,
+            workflow: "build".into(),
+            version: 1,
+            content_hash: "abc123".into(),
+            budget_usd: 10.0,
+        };
+        let value = serde_json::to_value(&p).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "issue": 53,
+                "workflow": "build",
+                "version": 1,
+                "content_hash": "abc123",
+                "budget_usd": 10.0
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<RunStartedPayload>(value).unwrap(),
+            p
+        );
+    }
+
+    #[test]
+    fn step_started_payload_round_trips() {
+        let p = StepStartedPayload {
+            step: "plan".into(),
+            role: "planner".into(),
+            profile: "kimi".into(),
+            child_thread: a_child_thread(),
+            attempt: 1,
+            budget_usd: 3.0,
+        };
+        let value = serde_json::to_value(&p).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "step": "plan",
+                "role": "planner",
+                "profile": "kimi",
+                "child_thread": a_child_thread().to_string(),
+                "attempt": 1,
+                "budget_usd": 3.0
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<StepStartedPayload>(value).unwrap(),
+            p
+        );
+    }
+
+    #[test]
+    fn step_finished_payload_round_trips_with_and_without_a_report() {
+        let reported = Ulid::from_parts(1_700_000_000_000, 8);
+        let p = StepFinishedPayload {
+            step: "plan".into(),
+            status: StepStatus::Partial,
+            end_reason: "max_tokens".into(),
+            cost_usd: 0.42,
+            reported_event: Some(reported),
+        };
+        let value = serde_json::to_value(&p).unwrap();
+        assert_eq!(value["status"], "partial");
+        assert_eq!(value["reported_event"], reported.to_string());
+        assert_eq!(
+            value,
+            json!({
+                "step": "plan",
+                "status": "partial",
+                "end_reason": "max_tokens",
+                "cost_usd": 0.42,
+                "reported_event": reported.to_string()
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<StepFinishedPayload>(value).unwrap(),
+            p
+        );
+
+        // A step that failed before it could report writes no key at all.
+        let failed = StepFinishedPayload {
+            reported_event: None,
+            ..p
+        };
+        let value = serde_json::to_value(&failed).unwrap();
+        assert!(value.get("reported_event").is_none(), "{value}");
+        assert_eq!(
+            serde_json::from_value::<StepFinishedPayload>(value).unwrap(),
+            failed
+        );
+    }
+
+    #[test]
+    fn checks_run_payload_round_trips() {
+        let p = ChecksRunPayload {
+            step: "implement".into(),
+            checks: vec![
+                CheckOutcome {
+                    id: "E1".into(),
+                    result: CheckResult::Pass,
+                    detail: None,
+                },
+                CheckOutcome {
+                    id: "E8".into(),
+                    result: CheckResult::Fail,
+                    detail: Some("quotes do not appear in the plan".into()),
+                },
+                CheckOutcome {
+                    id: "E9".into(),
+                    result: CheckResult::Flag,
+                    detail: None,
+                },
+            ],
+        };
+        let value = serde_json::to_value(&p).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "step": "implement",
+                "checks": [
+                    {"id": "E1", "result": "pass"},
+                    {"id": "E8", "result": "fail",
+                     "detail": "quotes do not appear in the plan"},
+                    {"id": "E9", "result": "flag"}
+                ]
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<ChecksRunPayload>(value).unwrap(),
+            p
+        );
+    }
+
+    #[test]
+    fn route_taken_payload_round_trips() {
+        let p = RouteTakenPayload {
+            branch: "size".into(),
+            proposed: "full".into(),
+            taken: "trivial".into(),
+            preconditions: vec![CheckOutcome {
+                id: "small_diff".into(),
+                result: CheckResult::Pass,
+                detail: None,
+            }],
+            fallback_reason: Some("one-line fix".into()),
+            budget_usd: Some(2.5),
+        };
+        let value = serde_json::to_value(&p).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "branch": "size",
+                "proposed": "full",
+                "taken": "trivial",
+                "preconditions": [{"id": "small_diff", "result": "pass"}],
+                "fallback_reason": "one-line fix",
+                "budget_usd": 2.5
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<RouteTakenPayload>(value).unwrap(),
+            p
+        );
+
+        // A route that does not fix the budget leaves the key off; the
+        // preconditions list is always written, empty when none ran.
+        let bare = RouteTakenPayload {
+            preconditions: vec![],
+            fallback_reason: None,
+            budget_usd: None,
+            ..p
+        };
+        let value = serde_json::to_value(&bare).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "branch": "size",
+                "proposed": "full",
+                "taken": "trivial",
+                "preconditions": []
+            })
+        );
+    }
+
+    #[test]
+    fn checkpoint_asked_payload_round_trips() {
+        let p = CheckpointAskedPayload {
+            gate: "plan_gate".into(),
+            shown: vec!["## Plan".into(), "## Plan amendment".into()],
+            options: vec!["go".into(), "amend".into(), "stop".into()],
+        };
+        let value = serde_json::to_value(&p).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "gate": "plan_gate",
+                "shown": ["## Plan", "## Plan amendment"],
+                "options": ["go", "amend", "stop"]
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CheckpointAskedPayload>(value).unwrap(),
+            p
+        );
+    }
+
+    #[test]
+    fn checkpoint_answered_payload_round_trips() {
+        let p = CheckpointAnsweredPayload {
+            answer: CheckpointAnswer::Amend,
+            amendment: Some("the plan said T3, code says 32,000".into()),
+            marks: vec![FindingMark {
+                finding: "F2".into(),
+                mark: RevealMark::Missed,
+            }],
+        };
+        let value = serde_json::to_value(&p).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "answer": "amend",
+                "amendment": "the plan said T3, code says 32,000",
+                "marks": [{"finding": "F2", "mark": "missed"}]
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CheckpointAnsweredPayload>(value).unwrap(),
+            p
+        );
+
+        // `stop` is exec's default when nobody is there, so it is a real
+        // answer on the wire and not an absence.
+        let stopped = CheckpointAnsweredPayload {
+            answer: CheckpointAnswer::Stop,
+            amendment: None,
+            marks: vec![],
+        };
+        let value = serde_json::to_value(&stopped).unwrap();
+        assert_eq!(value, json!({"answer": "stop", "marks": []}));
+        assert_eq!(
+            serde_json::from_value::<CheckpointAnsweredPayload>(value).unwrap(),
+            stopped
+        );
+    }
+
+    #[test]
+    fn budget_warned_payload_round_trips() {
+        let p = BudgetWarnedPayload {
+            scope: BudgetScope::Issue,
+            spent_usd: 8.0,
+            limit_usd: 10.0,
+        };
+        let value = serde_json::to_value(&p).unwrap();
+        assert_eq!(
+            value,
+            json!({"scope": "issue", "spent_usd": 8.0, "limit_usd": 10.0})
+        );
+        assert_eq!(
+            serde_json::from_value::<BudgetWarnedPayload>(value).unwrap(),
+            p
+        );
+    }
+
+    #[test]
+    fn pushed_payload_round_trips() {
+        let p = PushedPayload {
+            commits: vec![CommitRef {
+                sha: "abc123".into(),
+                subject: "log: project a lead thread into a RunState".into(),
+            }],
+            ref_before: "abc000".into(),
+            ref_after: "abc123".into(),
+            installed: Some("abc123".into()),
+        };
+        let value = serde_json::to_value(&p).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "commits": [{"sha": "abc123",
+                             "subject": "log: project a lead thread into a RunState"}],
+                "ref_before": "abc000",
+                "ref_after": "abc123",
+                "installed": "abc123"
+            })
+        );
+        assert_eq!(serde_json::from_value::<PushedPayload>(value).unwrap(), p);
+
+        // An install that did not happen yet is absent, not null.
+        let uninstalled = PushedPayload {
+            installed: None,
+            ..p
+        };
+        let value = serde_json::to_value(&uninstalled).unwrap();
+        assert!(value.get("installed").is_none(), "{value}");
+    }
+
+    #[test]
+    fn run_finished_payload_round_trips() {
+        let p = RunFinishedPayload {
+            outcome: RunOutcome::Closed,
+            cost_usd: 1.25,
+            release_impact: Some(ReleaseImpact::NoImpact),
+        };
+        let value = serde_json::to_value(&p).unwrap();
+        // `none` is the word the judge writes, not the variant's own name.
+        assert_eq!(
+            value,
+            json!({"outcome": "closed", "cost_usd": 1.25, "release_impact": "none"})
+        );
+        assert_eq!(
+            serde_json::from_value::<RunFinishedPayload>(value).unwrap(),
+            p
+        );
+        assert_eq!(serde_json::to_value(ReleaseImpact::Patch).unwrap(), "patch");
+        assert_eq!(serde_json::to_value(ReleaseImpact::Minor).unwrap(), "minor");
+        assert_eq!(
+            serde_json::to_value(ReleaseImpact::Breaking).unwrap(),
+            "breaking"
+        );
+
+        let stopped = RunFinishedPayload {
+            outcome: RunOutcome::Stopped,
+            release_impact: None,
+            ..p
+        };
+        let value = serde_json::to_value(&stopped).unwrap();
+        assert_eq!(value, json!({"outcome": "stopped", "cost_usd": 1.25}));
+        assert_eq!(
+            serde_json::to_value(RunOutcome::Escalated).unwrap(),
+            "escalated"
+        );
+    }
+
+    /// Amendment item 4: `fix` is the judge's own field, its no-change
+    /// variant is the word `none`, and a verdict is not a route.
+    #[test]
+    fn fix_size_and_verdict_have_their_own_wire_names() {
+        assert_eq!(serde_json::to_value(FixSize::None).unwrap(), "none");
+        assert_eq!(serde_json::to_value(FixSize::Trivial).unwrap(), "trivial");
+        assert_eq!(serde_json::to_value(FixSize::Full).unwrap(), "full");
+        assert_eq!(
+            serde_json::to_value(Verdict::ChangesNeeded).unwrap(),
+            "changes_needed"
+        );
+        assert_eq!(serde_json::to_value(Verdict::Approve).unwrap(), "approve");
+    }
+
+    /// A route is tagged by `kind`, like the other tagged unions; a new
+    /// route is a new variant, never a free-form string.
+    #[test]
+    fn a_route_is_tagged_by_kind() {
+        let route = Route::Escalate {
+            reason: "the judge found the plan's premise false".into(),
+        };
+        let value = serde_json::to_value(&route).unwrap();
+        assert_eq!(
+            value,
+            json!({"kind": "escalate", "reason": "the judge found the plan's premise false"})
+        );
+        assert_eq!(serde_json::from_value::<Route>(value).unwrap(), route);
+    }
+
+    #[test]
+    fn a_full_step_report_round_trips() {
+        let p = StepReport {
+            status: Some(ReportStatus::Done),
+            body: Some("## Implementation".into()),
+            slots: Some(BTreeMap::from([
+                ("ui".to_string(), json!(true)),
+                ("issue".to_string(), json!(53)),
+            ])),
+            planned_tests: Some(vec![PlannedTest {
+                id: "T1".into(),
+                what: "the new kinds round-trip".into(),
+                derivation: "the enum's snake_case rule".into(),
+            }]),
+            commits: Some(vec![CommitRef {
+                sha: "abc123".into(),
+                subject: "core, log: add the build runner's event kinds and payloads".into(),
+            }]),
+            ledger: Some(vec![
+                LedgerEntry {
+                    id: "T1".into(),
+                    name: "the_runner_kinds_round_trip_under_the_snake_case_rule".into(),
+                    status: LedgerStatus::Landed,
+                    reason: None,
+                },
+                LedgerEntry {
+                    id: "T2".into(),
+                    name: "run_started_payload_round_trips".into(),
+                    status: LedgerStatus::NotLanded,
+                    reason: Some("the payload changed shape in an amendment".into()),
+                },
+            ]),
+            quotes: Some(vec!["no hand-computed literals".into()]),
+            verdict: Some(Verdict::ChangesNeeded),
+            fix: Some(FixSize::Trivial),
+            release_impact: Some(ReleaseImpact::Patch),
+            findings: Some(vec![Finding {
+                id: "F1".into(),
+                text: "the ledger's T9 has no test".into(),
+            }]),
+            route: Some(Route::Escalate {
+                reason: "an ordering the workflow cannot route".into(),
+            }),
+            handoff: Some(Handoff {
+                done: "kinds and payloads".into(),
+                next: "run_state.rs".into(),
+                dirty: vec!["crates/log/src/payload.rs".into()],
+            }),
+        };
+        let value = serde_json::to_value(&p).unwrap();
+        assert!(value.get("reported_event").is_none(), "not a report field");
+        // The `ui` slot is a bool (a later ticket's templates), and the
+        // map keeps it one.
+        assert_eq!(value["slots"]["ui"], json!(true));
+        assert_eq!(value["status"], "done");
+        assert_eq!(value["verdict"], "changes_needed");
+        assert_eq!(value["fix"], "trivial");
+        assert_eq!(value["release_impact"], "patch");
+        assert_eq!(value["ledger"][0]["status"], "landed");
+        assert_eq!(value["ledger"][1]["status"], "not_landed");
+        assert!(value["ledger"][0].get("reason").is_none(), "{value}");
+        assert_eq!(value["findings"][0]["id"], "F1");
+        assert_eq!(
+            value["route"],
+            json!({"kind": "escalate",
+            "reason": "an ordering the workflow cannot route"})
+        );
+        assert_eq!(
+            value["handoff"]["dirty"],
+            json!(["crates/log/src/payload.rs"])
+        );
+        assert_eq!(serde_json::from_value::<StepReport>(value).unwrap(), p);
+    }
+
+    /// A step fills a subset, so a report may carry one field and none of
+    /// the others — and the absent ones stay off the line.
+    #[test]
+    fn a_step_report_may_carry_only_a_body() {
+        let p = StepReport {
+            body: Some("## Review".into()),
+            ..StepReport::default()
+        };
+        let value = serde_json::to_value(&p).unwrap();
+        assert_eq!(value, json!({"body": "## Review"}));
+        assert_eq!(serde_json::from_value::<StepReport>(value).unwrap(), p);
+
+        // An empty report is still a valid shape: every field defaults.
+        let value = serde_json::to_value(StepReport::default()).unwrap();
+        assert_eq!(value, json!({}));
+        assert_eq!(
+            serde_json::from_value::<StepReport>(value).unwrap(),
+            StepReport::default()
+        );
+    }
+
+    /// T3 (issue #53): a `thread_started` line written before the runner
+    /// existed has neither key; it reads back as two `None`s and
+    /// re-serialises byte for byte, so old logs stay replayable.
+    #[test]
+    fn a_pre_runner_thread_started_line_gains_no_new_fields() {
+        let line = json!({
+            "project": "vendela",
+            "root": "/srv/vendela",
+            "created_by": {"kind": "user", "id": "steve"}
+        });
+        let p: ThreadStartedPayload = serde_json::from_value(line.clone()).unwrap();
+        assert_eq!(p.parent_thread, None);
+        assert_eq!(p.step, None);
+        assert_eq!(serde_json::to_value(&p).unwrap(), line);
+
+        // And a child thread's line carries both, so a replay can tell a
+        // step's thread from one a person started.
+        let child = ThreadStartedPayload {
+            parent_thread: Some(a_child_thread()),
+            step: Some("implement".into()),
+            ..p
+        };
+        let value = serde_json::to_value(&child).unwrap();
+        assert_eq!(value["parent_thread"], a_child_thread().to_string());
+        assert_eq!(value["step"], "implement");
+        assert_eq!(
+            serde_json::from_value::<ThreadStartedPayload>(value).unwrap(),
+            child
         );
     }
 }

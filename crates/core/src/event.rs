@@ -66,6 +66,65 @@ pub enum EventKind {
     /// and not as a slow model. Author `system`; the payload carries the
     /// attempt, the total, why, and the wait in ms.
     ProviderRetried,
+    /// The build runner began a run (layer 2, issue #53). Author
+    /// `agent:runner`; the payload names the issue, the workflow and its
+    /// version and content hash, and the provisional issue budget. It is
+    /// the first lead-thread event of a run, so a replay that finds none
+    /// is not looking at a run at all.
+    RunStarted,
+    /// The runner entered a step (layer 2, issue #53). Author
+    /// `agent:runner`; the payload names the step, role, profile, the
+    /// child thread and the attempt. Written before the child is
+    /// awaited, so a replay re-awaits instead of starting the step
+    /// twice. Every re-entry (send-back, continue, fresh thread) is a
+    /// new event with `attempt + 1`.
+    StepStarted,
+    /// A step's child turn ended (layer 2, issue #53). Author
+    /// `agent:runner`; the payload carries the status, the end reason,
+    /// the cost and the child's `step_reported` event id. Written after
+    /// the child ended and before the checks run.
+    StepFinished,
+    /// The runner ran a step's exact checks (layer 2, issue #53). Author
+    /// `agent:runner`; the payload carries each check's result. A `fail`
+    /// blocks the push, so a replay after this event decides send-back
+    /// or push from it rather than re-running the checks.
+    ChecksRun,
+    /// The runner took a route at a branch point (layer 2, issue #53).
+    /// Author `agent:runner`; the payload carries the branch, what was
+    /// proposed, the preconditions with their results, what was taken
+    /// and why a fallback was needed. Replay follows the logged decision:
+    /// preconditions read git state that a crash can change.
+    RouteTaken,
+    /// The runner asked a human at a checkpoint (layer 2, issue #53).
+    /// Author `agent:runner`; the payload carries the gate, what was
+    /// shown and the options. Written before the wait, so a replay waits
+    /// again instead of acting on an answer nobody gave.
+    CheckpointAsked,
+    /// A human answered a checkpoint (layer 2, issue #53). The author is
+    /// who answered; the payload carries the answer, an amendment and
+    /// the reveal marks. Written before the runner acts on it.
+    CheckpointAnswered,
+    /// The runner crossed a budget level (layer 2, issue #53). Author
+    /// `agent:runner`; the payload carries the scope, what was spent and
+    /// the limit, so a restart re-warns only at levels not yet reached.
+    /// Not a decision: replay sees the move of the event before it.
+    BudgetWarned,
+    /// The runner pushed the run's commits and installed the binary
+    /// (layer 2, issue #53). Author `agent:runner`; the payload carries
+    /// the commits, the remote ref before and after and the installed
+    /// binary's commit. Appended after push and install, which are
+    /// idempotent, so a replay resumes after the push.
+    Pushed,
+    /// The run ended (layer 2, issue #53). Author `agent:runner`; the
+    /// payload carries the outcome, the cost and the release impact.
+    /// The last lead-thread event of a run.
+    RunFinished,
+    /// A child step reported through `finish_step` (layer 2, issue #53).
+    /// Lives in the child thread, not the lead one; the payload is the
+    /// section 4 field table, every field optional because each step
+    /// fills a subset. Written by the tool — a later ticket's — and read
+    /// by the runner's `step_finished`.
+    StepReported,
 }
 
 /// One line of a thread's append-only log. The log is the source of truth;
@@ -191,6 +250,78 @@ mod tests {
                 steve_again(),
                 json!({"project": "vendela", "root": "/srv/vendela", "created_by": {"kind": "user", "id": "steve"}}),
             ),
+            // The build runner's kinds (issue #53), in the order a run
+            // appends them.
+            event(
+                12,
+                EventKind::RunStarted,
+                runner(),
+                json!({"issue": 53, "workflow": "build", "version": 1, "content_hash": "abc", "budget_usd": 10.0}),
+            ),
+            event(
+                13,
+                EventKind::StepStarted,
+                runner(),
+                json!({"step": "plan", "role": "planner", "profile": "kimi",
+                       "child_thread": child().to_string(), "attempt": 1, "budget_usd": 3.0}),
+            ),
+            event(
+                14,
+                EventKind::StepFinished,
+                runner(),
+                json!({"step": "plan", "status": "done", "end_reason": "done",
+                       "cost_usd": 0.4, "reported_event": child().to_string()}),
+            ),
+            event(
+                15,
+                EventKind::ChecksRun,
+                runner(),
+                json!({"step": "plan", "checks": [{"id": "E1", "result": "pass", "detail": null}]}),
+            ),
+            event(
+                16,
+                EventKind::RouteTaken,
+                runner(),
+                json!({"branch": "plan_gate", "proposed": "implement", "taken": "implement",
+                       "preconditions": [], "fallback_reason": null}),
+            ),
+            event(
+                17,
+                EventKind::CheckpointAsked,
+                runner(),
+                json!({"gate": "plan_gate_blind", "shown": ["plan"], "options": ["go", "amend", "stop"]}),
+            ),
+            event(
+                18,
+                EventKind::CheckpointAnswered,
+                steve_again(),
+                json!({"answer": "go", "amendment": null, "marks": []}),
+            ),
+            event(
+                19,
+                EventKind::BudgetWarned,
+                runner(),
+                json!({"scope": "issue", "spent_usd": 8.0, "limit_usd": 10.0}),
+            ),
+            event(
+                20,
+                EventKind::Pushed,
+                runner(),
+                json!({"commits": [{"sha": "abc123", "subject": "core: add kinds"}],
+                       "ref_before": "abc000", "ref_after": "abc123", "installed": "abc123"}),
+            ),
+            event(
+                21,
+                EventKind::RunFinished,
+                runner(),
+                json!({"outcome": "closed", "cost_usd": 0.9, "release_impact": "none"}),
+            ),
+            event(
+                22,
+                EventKind::StepReported,
+                agent_again(),
+                json!({"status": "done", "body": "## Plan", "commits": []}),
+            ),
         ];
         events[2].parent_event = Some(events[1].id);
         events[9].parent_event = Some(events[8].id);
@@ -205,6 +336,33 @@ mod tests {
         Author::Agent(AgentId("worker".into()))
     }
 
+    /// The build runner (issue #53) is an agent like any other.
+    fn runner() -> Author {
+        Author::Agent(AgentId("runner".into()))
+    }
+
+    fn child() -> Ulid {
+        Ulid::from_parts(1_700_000_000_000, 7)
+    }
+
+    /// The wire-name rule: `CamelCase` variant names become `snake_case`,
+    /// so the expected name is derived from the variant and not written
+    /// out by hand next to it.
+    fn snake_case(name: &str) -> String {
+        let mut out = String::new();
+        for (i, c) in name.char_indices() {
+            if c.is_uppercase() {
+                if i != 0 {
+                    out.push('_');
+                }
+                out.extend(c.to_lowercase());
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
     #[test]
     fn every_kind_round_trips_as_jsonl() {
         for event in one_of_each_kind() {
@@ -213,6 +371,47 @@ mod tests {
             let back: Event = serde_json::from_str(&line).unwrap();
             assert_eq!(back, event, "round trip failed for {line}");
         }
+    }
+
+    /// T1 (issue #53): the eleven new kinds round-trip and land on the
+    /// wire under the enum's snake_case rule — the name comes from the
+    /// variant, not from a hand-written pair.
+    #[test]
+    fn the_runner_kinds_round_trip_under_the_snake_case_rule() {
+        let kinds = [
+            EventKind::RunStarted,
+            EventKind::StepStarted,
+            EventKind::StepFinished,
+            EventKind::ChecksRun,
+            EventKind::RouteTaken,
+            EventKind::CheckpointAsked,
+            EventKind::CheckpointAnswered,
+            EventKind::BudgetWarned,
+            EventKind::Pushed,
+            EventKind::RunFinished,
+            EventKind::StepReported,
+        ];
+        let mut names: Vec<String> = Vec::new();
+        for kind in kinds {
+            let wire = serde_json::to_value(kind).unwrap();
+            let expected = snake_case(&format!("{kind:?}"));
+            assert_eq!(wire, serde_json::Value::String(expected.clone()));
+            // And the kind reads back the same way in a whole event.
+            let event = event(
+                0,
+                kind,
+                runner(),
+                json!({"any": "payload survives whatever the kind"}),
+            );
+            let line = serde_json::to_string(&event).unwrap();
+            assert_eq!(serde_json::from_str::<Event>(&line).unwrap(), event);
+            names.push(expected);
+        }
+        assert_eq!(names.len(), 11);
+        let mut unique = names.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), names.len(), "wire names are distinct");
     }
 
     #[test]

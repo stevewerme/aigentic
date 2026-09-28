@@ -1370,7 +1370,21 @@ impl ClientRepl {
             EventKind::Pinned
             | EventKind::PermissionRequested
             | EventKind::ThreadStarted
-            | EventKind::ContextEvicted => {}
+            | EventKind::ContextEvicted
+            // The build runner's events (issue #53): they belong to the
+            // lead thread's run view, not to any turn, so a turn view
+            // prints no line for them.
+            | EventKind::RunStarted
+            | EventKind::StepStarted
+            | EventKind::StepFinished
+            | EventKind::ChecksRun
+            | EventKind::RouteTaken
+            | EventKind::CheckpointAsked
+            | EventKind::CheckpointAnswered
+            | EventKind::BudgetWarned
+            | EventKind::Pushed
+            | EventKind::RunFinished
+            | EventKind::StepReported => {}
         }
     }
 }

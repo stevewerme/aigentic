@@ -439,7 +439,24 @@ pub fn project(events: &[Event]) -> Result<Projection, LogError> {
             | EventKind::ContextSaturated
             // A retry is a UI fact (issue #31), not context: the model
             // is told nothing about transport trouble.
-            | EventKind::ProviderRetried => {}
+            | EventKind::ProviderRetried
+            // The build runner's facts (issue #53) are about the lead
+            // thread's own machinery — which step is open, what the
+            // checks said, where a push landed. None of it is context,
+            // and a projection that carried it would change the prefix
+            // it exists to leave alone: the runner reads them from the
+            // log, the model never sees them.
+            | EventKind::RunStarted
+            | EventKind::StepStarted
+            | EventKind::StepFinished
+            | EventKind::ChecksRun
+            | EventKind::RouteTaken
+            | EventKind::CheckpointAsked
+            | EventKind::CheckpointAnswered
+            | EventKind::BudgetWarned
+            | EventKind::Pushed
+            | EventKind::RunFinished
+            | EventKind::StepReported => {}
         }
     }
 
@@ -620,7 +637,13 @@ pub fn project_body(events: &[Event]) -> Result<Vec<Message>, LogError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::payload::Usage;
+    use crate::payload::{
+        BudgetScope, BudgetWarnedPayload, CheckOutcome, CheckResult, CheckpointAnswer,
+        CheckpointAnsweredPayload, CheckpointAskedPayload, ChecksRunPayload, CommitRef,
+        PushedPayload, ReleaseImpact, ReportStatus, RouteTakenPayload, RunFinishedPayload,
+        RunOutcome, RunStartedPayload, StepFinishedPayload, StepReport, StepStartedPayload,
+        StepStatus, Usage,
+    };
     use aigentic_core::{AgentId, ToolCall, ToolResult, UserId};
     use serde_json::json;
     use time::macros::datetime;
@@ -1393,6 +1416,179 @@ mod tests {
                 ("c3".into(), long),
             ]
         );
+    }
+
+    /// T4 (issue #53): the build runner's events are the runner's own
+    /// machinery, never model context. A log with all eleven kinds woven
+    /// into a real exchange projects to exactly the same `Projection` as
+    /// the same log without them (equality of the projection, not of
+    /// literals), and no runner fact appears anywhere in it.
+    #[test]
+    fn the_runner_kinds_are_kept_out_of_the_projection() {
+        let child = Ulid::from_parts(1_700_000_000_000, 7);
+        let reported = Ulid::from_parts(1_700_000_000_000, 8);
+        let runner = Author::Agent(AgentId("runner".into()));
+        let runner_event =
+            |kind: EventKind, payload: serde_json::Value| ev(0, kind, runner.clone(), payload);
+        fn to_value<T: serde::Serialize>(v: &T) -> serde_json::Value {
+            serde_json::to_value(v).unwrap()
+        }
+
+        let exchange = vec![
+            user(0, "build it"),
+            call(1, "c1", "bash", json!({"command": "cargo test"})),
+            result(2, "c1", "ok"),
+            ended(3),
+        ];
+
+        // The eleven kinds, in the order a run writes them, built from
+        // the payload types rather than from hand-written JSON.
+        let run_started = runner_event(
+            EventKind::RunStarted,
+            to_value(&RunStartedPayload {
+                issue: 53,
+                workflow: "build".into(),
+                version: 1,
+                content_hash: "abc".into(),
+                budget_usd: 10.0,
+            }),
+        );
+        let step_started = runner_event(
+            EventKind::StepStarted,
+            to_value(&StepStartedPayload {
+                step: "implement".into(),
+                role: "implementer".into(),
+                profile: "flash".into(),
+                child_thread: child,
+                attempt: 1,
+                budget_usd: 3.0,
+            }),
+        );
+        let step_finished = runner_event(
+            EventKind::StepFinished,
+            to_value(&StepFinishedPayload {
+                step: "implement".into(),
+                status: StepStatus::Done,
+                end_reason: "done".into(),
+                cost_usd: 0.4,
+                reported_event: Some(reported),
+            }),
+        );
+        let checks_run = runner_event(
+            EventKind::ChecksRun,
+            to_value(&ChecksRunPayload {
+                step: "implement".into(),
+                checks: vec![CheckOutcome {
+                    id: "E1".into(),
+                    result: CheckResult::Pass,
+                    detail: None,
+                }],
+            }),
+        );
+        let route_taken = runner_event(
+            EventKind::RouteTaken,
+            to_value(&RouteTakenPayload {
+                branch: "review".into(),
+                proposed: "review".into(),
+                taken: "review".into(),
+                preconditions: vec![],
+                fallback_reason: None,
+                budget_usd: None,
+            }),
+        );
+        let checkpoint_asked = runner_event(
+            EventKind::CheckpointAsked,
+            to_value(&CheckpointAskedPayload {
+                gate: "plan_gate".into(),
+                shown: vec!["## Plan".into()],
+                options: vec!["go".into(), "stop".into()],
+            }),
+        );
+        let checkpoint_answered = ev(
+            0,
+            EventKind::CheckpointAnswered,
+            steve(),
+            to_value(&CheckpointAnsweredPayload {
+                answer: CheckpointAnswer::Go,
+                amendment: None,
+                marks: vec![],
+            }),
+        );
+        let budget_warned = runner_event(
+            EventKind::BudgetWarned,
+            to_value(&BudgetWarnedPayload {
+                scope: BudgetScope::Issue,
+                spent_usd: 8.0,
+                limit_usd: 10.0,
+            }),
+        );
+        let pushed = runner_event(
+            EventKind::Pushed,
+            to_value(&PushedPayload {
+                commits: vec![CommitRef {
+                    sha: "abc123".into(),
+                    subject: "log: add the runner's kinds".into(),
+                }],
+                ref_before: "abc000".into(),
+                ref_after: "abc123".into(),
+                installed: Some("abc123".into()),
+            }),
+        );
+        let run_finished = runner_event(
+            EventKind::RunFinished,
+            to_value(&RunFinishedPayload {
+                outcome: RunOutcome::Closed,
+                cost_usd: 0.9,
+                release_impact: Some(ReleaseImpact::NoImpact),
+            }),
+        );
+        let step_reported = ev(
+            0,
+            EventKind::StepReported,
+            agent(),
+            to_value(&StepReport {
+                status: Some(ReportStatus::Done),
+                body: Some("## Implementation".into()),
+                ..StepReport::default()
+            }),
+        );
+
+        let mut with = vec![
+            exchange[0].clone(),
+            run_started,
+            exchange[1].clone(),
+            step_started,
+            exchange[2].clone(),
+            step_finished,
+            checks_run,
+            route_taken,
+            checkpoint_asked,
+            checkpoint_answered,
+            budget_warned,
+            pushed,
+            exchange[3].clone(),
+            run_finished,
+            step_reported,
+        ];
+        // Gapless sequence numbers: the interleaving is positional only.
+        for (seq, e) in with.iter_mut().enumerate() {
+            e.seq = seq as u64;
+        }
+
+        let quiet = project(&exchange).unwrap();
+        let loud = project(&with).unwrap();
+        assert_eq!(quiet, loud);
+        assert!(
+            !loud.body.iter().any(|m| m.author == runner),
+            "no runner event becomes a message: {loud:?}"
+        );
+        let rendered = format!("{loud:?}");
+        for leaked in ["plan_gate", "ref_after", "content_hash", "budget_usd"] {
+            assert!(
+                !rendered.contains(leaked),
+                "{leaked} never reaches the projection: {rendered}"
+            );
+        }
     }
 
     #[test]

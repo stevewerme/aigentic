@@ -269,6 +269,8 @@ impl ThreadTable {
                 project: Some(project.to_owned()),
                 root: root.root.clone(),
                 created_by: by,
+                parent_thread: None,
+                step: None,
             })
             .expect("serialisable"),
             parent_event: None,
