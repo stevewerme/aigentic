@@ -5,7 +5,7 @@
 
 use aigentic_core::{
     Author, CompletionRequest, ContentBlock, Event, EventKind, Message, Provider, ProviderEvent,
-    Role,
+    Role, Usage,
 };
 use aigentic_log::{
     AssistantMessagePayload, ThreadRenamedPayload, TurnEndedPayload, UserMessagePayload,
@@ -91,9 +91,9 @@ fn first_text(events: &[Event], kind: EventKind) -> Option<String> {
 pub async fn propose_title(
     provider: &dyn Provider,
     events: &[Event],
-) -> Result<String, RuntimeError> {
+) -> Result<(String, Usage), RuntimeError> {
     let Some(asked) = first_text(events, EventKind::UserMessage) else {
-        return Ok(String::new());
+        return Ok((String::new(), Usage::default()));
     };
     let answered = first_text(events, EventKind::AssistantMessage).unwrap_or_default();
     let messages = vec![
@@ -120,15 +120,17 @@ pub async fn propose_title(
         max_output_tokens: Some(512),
     };
     let mut text = String::new();
+    let mut usage = Usage::default();
     let mut stream = provider.complete(&request);
     while let Some(event) = stream.next().await {
         match event {
             ProviderEvent::TextDelta(t) => text.push_str(&t),
+            ProviderEvent::Usage(u) => usage = u,
             ProviderEvent::Error(e) => return Err(RuntimeError::Provider(e)),
             _ => {}
         }
     }
-    Ok(clean(&text))
+    Ok((clean(&text), usage))
 }
 
 #[cfg(test)]

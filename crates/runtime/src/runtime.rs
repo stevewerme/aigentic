@@ -279,21 +279,43 @@ impl Runtime {
         Ok(crate::title::title_of(self.log.events()))
     }
 
-    /// Set the title: a `thread_renamed` event by `author`.
+    /// Set the title: a `thread_renamed` event by `author`, with no call
+    /// behind it (a person's `/rename`).
     pub fn rename(
         &mut self,
         author: aigentic_core::Author,
         title: &str,
         observe: &mut (dyn FnMut(Signal<'_>) + Send),
     ) -> Result<(), crate::RuntimeError> {
+        self.rename_with(author, title, None, None, observe)
+    }
+
+    /// Set the title with the utility call that proposed it: the
+    /// `model` and the call's `usage`, `cost_usd` stamped from the
+    /// utility profile's `[prices]` by the same rule as a memory
+    /// extraction (issues #46, #49). Both absent when no call stands
+    /// behind the line, and absent prices claim nothing about money.
+    pub fn rename_with(
+        &mut self,
+        author: aigentic_core::Author,
+        title: &str,
+        model: Option<String>,
+        usage: Option<aigentic_core::Usage>,
+        observe: &mut (dyn FnMut(Signal<'_>) + Send),
+    ) -> Result<(), crate::RuntimeError> {
         let title = crate::title::clean(title);
         if title.is_empty() {
             return Ok(());
         }
+        let usage = usage.map(|u| {
+            let mut usage = aigentic_log::Usage::reported(u);
+            usage.cost_usd = self.utility_prices.map(|p| p.cost_usd(&usage));
+            usage
+        });
         let payload = serde_json::to_value(aigentic_log::ThreadRenamedPayload {
             title,
-            model: None,
-            usage: None,
+            model,
+            usage,
         })
         .expect("serialisable");
         self.append(
@@ -318,15 +340,30 @@ impl Runtime {
         let Some(utility) = self.utility.as_deref() else {
             return Ok(None);
         };
-        let events = self.log.events();
-        if crate::title::title_of(events).is_some() || !crate::title::has_finished_turn(events) {
-            return Ok(None);
-        }
-        let title = crate::title::propose_title(utility, events).await?;
+        let model = self
+            .utility_label
+            .clone()
+            .unwrap_or_else(|| self.model_label.clone());
+        let (title, usage) = {
+            let events = self.log.events();
+            if crate::title::title_of(events).is_some() || !crate::title::has_finished_turn(events)
+            {
+                return Ok(None);
+            }
+            crate::title::propose_title(utility, events).await?
+        };
         if title.is_empty() {
             return Ok(None);
         }
-        self.rename(aigentic_core::Author::System, &title, observe)?;
+        // Stamped like a memory extraction (issues #46, #49) so `/cost`
+        // and the stats footer count what the title cost.
+        self.rename_with(
+            aigentic_core::Author::System,
+            &title,
+            Some(model),
+            Some(usage),
+            observe,
+        )?;
         Ok(Some(title))
     }
 
