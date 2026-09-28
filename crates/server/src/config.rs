@@ -511,6 +511,13 @@ impl Profile {
                     "compaction.context_ceiling_tokens must be at least 8192",
                 ));
             }
+            if let Some(p) = c.evict_min_free_percent
+                && p > 100
+            {
+                return Err(ConfigError::msg(format!(
+                    "compaction.evict_min_free_percent must be at most 100, got {p}"
+                )));
+            }
         }
         match self.provider {
             ProviderKind::OpenaiCompat => {

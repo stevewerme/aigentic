@@ -442,6 +442,10 @@ pub fn project(events: &[Event]) -> Result<Projection, LogError> {
             | EventKind::MemoryRemembered
             | EventKind::ThreadStarted
             | EventKind::ThreadRenamed
+            // Saturation is a UI and runner fact (issue #35), not
+            // context: it says what the sweep is doing, so projecting
+            // it would change the prefix it is trying to protect.
+            | EventKind::ContextSaturated
             // A retry is a UI fact (issue #31), not context: the model
             // is told nothing about transport trouble.
             | EventKind::ProviderRetried => {}
@@ -1295,6 +1299,46 @@ mod tests {
         };
         assert_eq!(blobs(1), 0, "behind the boundary: reasoning dropped");
         assert_eq!(blobs(3), 1, "the latest call keeps its reasoning");
+    }
+
+    #[test]
+    fn a_context_saturated_event_changes_no_context() {
+        // Issue #35: the line only tells the reader that the turn cannot
+        // be fitted any more. It carries no boundary of its own, so a log
+        // with one projects exactly as the same log without it.
+        let long = "line\n".repeat(200);
+        let events = vec![
+            user(0, "build it"),
+            call(1, "c1", "bash", json!({"command": "cargo test"})),
+            result(2, "c1", &long),
+            call(3, "c2", "read_file", json!({"path": "a.rs"})),
+            result(4, "c2", &long),
+            evicted(5, 4),
+            call(6, "c3", "bash", json!({"command": "cargo build"})),
+            result(7, "c3", &long),
+        ];
+        let mut with = events.clone();
+        with.push(ev(
+            8,
+            EventKind::ContextSaturated,
+            Author::System,
+            json!({"through_seq": 4, "tokens_at_floor": 137_000, "ceiling": 128_000}),
+        ));
+        let quiet = project(&events).unwrap();
+        let loud = project(&with).unwrap();
+        assert_eq!(quiet.body, loud.body);
+        assert_eq!(
+            results(&loud),
+            vec![
+                (
+                    "c1".into(),
+                    "[result of bash {\"command\":\"cargo test\"} · 200 lines · dropped from context; re-run it if you need it again]".into()
+                ),
+                // The last bash result of the turn stays, as before.
+                ("c2".into(), long.clone()),
+                ("c3".into(), long),
+            ]
+        );
     }
 
     #[test]

@@ -74,6 +74,13 @@ pub struct CompactionSettings {
     /// (issue #32): under it nothing is stubbed, so a turn that is still
     /// reading keeps what it read. Zero sweeps on call count alone.
     pub evict_above_tokens: u64,
+    /// The share, in percent, of `context_ceiling_tokens` a sweep must
+    /// free to be worth breaking the cached prefix for (issue #35): a
+    /// quarter, 32k at the 128k default. A sweep frees only the material
+    /// between the current boundary and the floor, so this is what spaces
+    /// the sweeps. Zero moves the boundary as soon as the floor advances,
+    /// however little that frees.
+    pub evict_min_free_percent: u32,
 }
 
 pub const DEFAULT_COMPACTION: CompactionSettings = CompactionSettings {
@@ -84,6 +91,7 @@ pub const DEFAULT_COMPACTION: CompactionSettings = CompactionSettings {
     keep_last_calls: 12,
     context_ceiling_tokens: 128_000,
     evict_above_tokens: 64_000,
+    evict_min_free_percent: crate::evict::EVICT_MIN_FREE_PERCENT,
 };
 
 /// One thread's runtime: the provider, the tool registry and the single

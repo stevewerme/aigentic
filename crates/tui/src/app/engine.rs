@@ -1354,12 +1354,38 @@ impl ClientRepl {
                     t.retry = Some((p.attempt, p.retries, p.reason));
                 }
             }
+            // Saturation (issue #35): the sweep can stub no deeper, so the
+            // turn is as small as it will get. A line naming the ceiling,
+            // so the person knows to start a fresh thread rather than read
+            // a thrashing one.
+            EventKind::ContextSaturated => {
+                if let Ok(p) = serde_json::from_value::<
+                    aigentic_runtime::aigentic_log::ContextSaturatedPayload,
+                >(event.payload.clone())
+                {
+                    self.flush_partial(out);
+                    out.line(&saturated_line(&p));
+                }
+            }
             EventKind::Pinned
             | EventKind::PermissionRequested
             | EventKind::ThreadStarted
             | EventKind::ContextEvicted => {}
         }
     }
+}
+
+/// The line a saturated turn shows once (issue #35): what the sweep is
+/// holding, and what it is holding it under, so the person can start a
+/// fresh thread instead of watching the same boundary move every call.
+pub(crate) fn saturated_line(
+    p: &aigentic_runtime::aigentic_log::ContextSaturatedPayload,
+) -> String {
+    format!(
+        "[context saturated: eviction already holds {} of the {}-token ceiling; \
+         start a fresh thread for the rest]",
+        p.tokens_at_floor, p.ceiling
+    )
 }
 
 /// The line a turn that slept shows once, right after its summary, or
@@ -3055,6 +3081,22 @@ mod tests {
         assert_eq!(lines, vec![expected], "{lines:#?}");
         assert!(!lines[0].contains('{'), "{lines:#?}");
         assert!(!lines[0].contains("provider_error"), "{lines:#?}");
+    }
+
+    /// Issue #35: the saturation line names what the sweep holds and the
+    /// ceiling, so the reader can tell the turn is as small as it will
+    /// get and start a fresh thread.
+    #[test]
+    fn a_saturation_line_names_the_ceiling_and_the_floor() {
+        let p = aigentic_runtime::aigentic_log::ContextSaturatedPayload {
+            through_seq: 312,
+            tokens_at_floor: 137_000,
+            ceiling: 128_000,
+        };
+        let line = saturated_line(&p);
+        assert!(line.contains("137000"), "{line}");
+        assert!(line.contains("128000"), "{line}");
+        assert!(line.contains("fresh thread"), "{line}");
     }
 
     /// T8 (issue #22): a payload without a structured error (an old log,

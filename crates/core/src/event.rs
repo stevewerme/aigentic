@@ -54,6 +54,13 @@ pub enum EventKind {
     /// originals stay in the log; the sweep appends one per block of
     /// calls, so the cached prefix is stable between sweeps.
     ContextEvicted,
+    /// The eviction sweep cannot fit the turn (issue #35): the
+    /// projection at the deepest legal boundary — the floor, the newest
+    /// calls — is still over `context_ceiling_tokens`, so no sweep the
+    /// turn could make would bring it down, and the thread is the one to
+    /// hand to a fresh one. Appended once per turn, in the turn it
+    /// happened in, and never projected into model context.
+    ContextSaturated,
     /// A provider retry (issue #31), appended live as the adapter starts
     /// waiting, so a turn that hangs on a dead endpoint reads as retries
     /// and not as a slow model. Author `system`; the payload carries the

@@ -23,7 +23,7 @@ pub mod config_keys;
 mod context;
 mod decisions;
 mod error;
-mod evict;
+pub mod evict;
 pub mod harness_tools;
 pub mod knowledge;
 pub mod layers;
@@ -45,6 +45,7 @@ pub use decisions::{
     Answered, CancelToken, DecisionError, Decisions, Inbox, Outbox, Pending, Queued, inbox,
 };
 pub use error::RuntimeError;
+pub use evict::{Decision, EVICT_BLOCK_CALLS, EVICT_MIN_FREE_PERCENT, min_free};
 pub use knowledge::{Knowledge, KnowledgeMode};
 pub use layers::{Decided, GlobalLayer, Layers, WorkspaceLayer};
 pub use memory::{MEMORY_FILES, MEMORY_PROMPT};

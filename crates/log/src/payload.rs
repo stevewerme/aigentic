@@ -348,6 +348,26 @@ pub struct ContextEvictedPayload {
     pub through_seq: u64,
 }
 
+/// Payload of a `context_saturated` event (issue #35): the eviction sweep
+/// found the turn's material at the deepest legal boundary still over the
+/// ceiling, so no move it can make fits the turn, and the thread is the
+/// one to hand over. Machine-readable for whoever does: what the floor
+/// holds, and what we are willing to pay for per call.
+///
+/// The event is never projected into model context, so this payload moves
+/// no context whatever it says — the boundary it names is for the reader,
+/// and may sit above the last one a `context_evicted` recorded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextSaturatedPayload {
+    /// The floor's own boundary: the last call the sweep would stub,
+    /// inclusive. Zero when the turn has no call it may stub yet.
+    pub through_seq: u64,
+    /// Estimated tokens the projection holds at that boundary.
+    pub tokens_at_floor: u64,
+    /// The ceiling it does not fit under.
+    pub ceiling: u64,
+}
+
 /// Payload of a `provider_retried` event (issue #31): which retry is
 /// starting, out of how many, why the call is quiet, and how long the
 /// backoff waits before the next attempt.
@@ -600,6 +620,24 @@ mod tests {
         let p: ToolResultPayload = serde_json::from_value(line).unwrap();
         assert_eq!(p.result.id, "c1");
         assert_eq!(p.policy, None);
+    }
+
+    #[test]
+    fn context_saturated_round_trips_with_three_fields() {
+        let p = ContextSaturatedPayload {
+            through_seq: 41,
+            tokens_at_floor: 137_000,
+            ceiling: 128_000,
+        };
+        let value = serde_json::to_value(&p).unwrap();
+        assert_eq!(
+            value,
+            json!({"through_seq": 41, "tokens_at_floor": 137_000, "ceiling": 128_000})
+        );
+        assert_eq!(
+            serde_json::from_value::<ContextSaturatedPayload>(value).unwrap(),
+            p
+        );
     }
 
     #[test]

@@ -45,6 +45,7 @@ pub const COMPACTION_KEYS: &[&str] = &[
     "keep_last_calls",
     "context_ceiling_tokens",
     "evict_above_tokens",
+    "evict_min_free_percent",
 ];
 pub const TOOLS_SECTION_KEYS: &[&str] = &["allow", "bash_timeout_secs"];
 pub const KNOWLEDGE_SECTION_KEYS: &[&str] = &["threshold_fraction", "max_hits"];
@@ -354,6 +355,10 @@ pub struct CompactionConfig {
     /// The sweep runs only over this many tokens (issue #32).
     #[serde(default)]
     pub evict_above_tokens: Option<u64>,
+    /// The share of the ceiling a sweep must free to be worth its cache
+    /// break (issue #35); zero is the pre-#35 rule.
+    #[serde(default)]
+    pub evict_min_free_percent: Option<u32>,
 }
 
 impl CompactionConfig {
@@ -370,6 +375,9 @@ impl CompactionConfig {
                 .context_ceiling_tokens
                 .unwrap_or(base.context_ceiling_tokens),
             evict_above_tokens: self.evict_above_tokens.unwrap_or(base.evict_above_tokens),
+            evict_min_free_percent: self
+                .evict_min_free_percent
+                .unwrap_or(base.evict_min_free_percent),
         }
     }
 
@@ -784,6 +792,7 @@ enabled = ["implement"]
             "budget.max_wall_time_secs",
             "compaction.context_ceiling_tokens",
             "compaction.evict_above_tokens",
+            "compaction.evict_min_free_percent",
             "compaction.keep_last_calls",
             "compaction.keep_turns",
             "compaction.max_result_bytes",
