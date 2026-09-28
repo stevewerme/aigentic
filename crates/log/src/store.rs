@@ -57,6 +57,16 @@ pub enum LogError {
         #[source]
         source: serde_json::Error,
     },
+    /// The runner's events are out of order on a lead thread (issue #53).
+    /// Replay lands where the run was only if the log is well formed, so
+    /// a gap in `run_started` → step → checks → `run_finished` is an
+    /// error and never a guess. `kind` is the offending event.
+    #[error("event seq {seq} ({kind:?}) breaks the run's order: {detail}")]
+    RunOrdering {
+        seq: u64,
+        kind: EventKind,
+        detail: String,
+    },
     #[error("could not generate a monotonic ulid")]
     UlidOverflow,
 }
