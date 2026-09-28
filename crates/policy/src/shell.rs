@@ -683,6 +683,204 @@ fn segments(pieces: Vec<Piece>) -> Vec<Segment> {
     segs
 }
 
+/// One segment of a step thread's command line, read for the deny
+/// overlay (issue #55): the words a command entry is matched against,
+/// the substitutions inside it, and whether its command word could not
+/// be read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SegRead {
+    /// The effective words: leading assignments and introducers,
+    /// `command`/`builtin`, `env`'s own words and `git`'s global options
+    /// are gone, and `git add --all` reads as `git add -A`. A
+    /// redirection's target is kept, on the end, because the overlay's
+    /// `.env` rule reads the same list and the command entries only look
+    /// at the front.
+    pub words: Vec<String>,
+    /// The literal words only, paths among them: the `.env` rule is a
+    /// literal-only guard, so a word holding an unresolved `$var` or a
+    /// substitution is not a path it can read.
+    pub literal: Vec<String>,
+    /// The text of every `$(...)` and backtick substitution in the
+    /// segment — and of a `sh -c` payload — for the caller to read as
+    /// command lines of their own.
+    pub subs: Vec<String>,
+    /// The command word, or a `-c` payload, is broken, a substitution or
+    /// an unresolved `$var`: nothing about what would run can be read.
+    pub unreadable: bool,
+}
+
+/// Every segment of a command line, its substitutions expanded, as the
+/// deny overlay reads it (issue #55). One read serves every entry.
+pub(crate) fn segment_reads(command: &str) -> Vec<SegRead> {
+    let mut out = Vec::new();
+    reads_within(command, &mut out, 0);
+    out
+}
+
+fn reads_within(src: &str, out: &mut Vec<SegRead>, depth: usize) {
+    if depth > MAX_DEPTH {
+        // Deeper than the classifier goes: the overlay cannot read it
+        // either, so it says so instead of guessing.
+        out.push(SegRead {
+            words: Vec::new(),
+            literal: Vec::new(),
+            subs: Vec::new(),
+            unreadable: true,
+        });
+        return;
+    }
+    let mut nested: Vec<String> = Vec::new();
+    for seg in segments(Scanner::scan(src)) {
+        let (read, inner) = read_segment(&seg);
+        nested.extend(inner);
+        out.push(read);
+    }
+    for sub in nested {
+        reads_within(&sub, out, depth + 1);
+    }
+}
+
+/// One segment: its effective words, and the command lines hiding in it
+/// (substitutions, and a `sh -c` payload).
+fn read_segment(seg: &Segment) -> (SegRead, Vec<String>) {
+    let mut unreadable = false;
+    let mut nested: Vec<String> = Vec::new();
+    let mut subs: Vec<String> = Vec::new();
+    // Every substitution runs, whatever the word is for.
+    for word in &seg.words {
+        unreadable |= word.broken;
+        nested.extend(word.subs.iter().cloned());
+    }
+    let mut literal: Vec<String> = Vec::new();
+    for (kind, target) in &seg.redirects {
+        unreadable |= target.broken;
+        nested.extend(target.subs.iter().cloned());
+        if matches!(kind, Redir::Proc) {
+            // `>(cmd)` runs a command of its own, not a path.
+            nested.push(target.text.clone());
+        } else if target.literal() {
+            literal.push(target.text.clone());
+        }
+    }
+    subs.extend(nested.iter().cloned());
+
+    // The command word, past leading assignments and introducers, the
+    // two builtins that only forward to it, and `env`'s own words.
+    let words: Vec<&Word> = seg.words.iter().collect();
+    let mut at = 0;
+    while at < words.len() && (is_assignment(words[at]) || introduces(words[at])) {
+        at += 1;
+    }
+    while at < words.len() && names(words[at], &["command", "builtin"]) {
+        at += 1;
+    }
+    if at < words.len() && names(words[at], &["env"]) {
+        at += 1;
+        while at < words.len()
+            && (is_assignment(words[at])
+                || (words[at].literal() && words[at].text.starts_with('-')))
+        {
+            at += 1;
+        }
+    }
+    if words
+        .get(at)
+        .is_some_and(|cmd| cmd.broken || cmd.var || !cmd.subs.is_empty())
+    {
+        unreadable = true;
+    }
+
+    let mut effective: Vec<String> = Vec::new();
+    if words.get(at).is_some_and(|w| names(w, &["git"])) {
+        effective.push("git".to_owned());
+        let mut j = at + 1;
+        while let Some(opt) = words.get(j) {
+            let takes_value = opt.literal()
+                && matches!(
+                    opt.text.as_str(),
+                    "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace" | "--exec-path"
+                );
+            let joined = opt.literal()
+                && ["--git-dir=", "--work-tree=", "--namespace=", "--exec-path="]
+                    .iter()
+                    .any(|p| opt.text.starts_with(p));
+            if takes_value {
+                if words.get(j + 1).is_none() {
+                    // The option swallowed what would have followed.
+                    unreadable = true;
+                    break;
+                }
+                j += 2;
+            } else if joined {
+                j += 1;
+            } else {
+                break;
+            }
+        }
+        at = j;
+    }
+
+    for word in words.iter().skip(at) {
+        if !word.text.is_empty() {
+            effective.push(word.text.clone());
+            if word.literal() {
+                literal.push(word.text.clone());
+            }
+        }
+    }
+    // `git add --all` is the same entry as `git add -A`.
+    if effective.len() >= 3
+        && effective[0] == "git"
+        && effective[1] == "add"
+        && effective[2] == "--all"
+    {
+        effective[2] = "-A".to_owned();
+    }
+
+    if words
+        .get(at)
+        .is_some_and(|w| names(w, &["sh", "bash", "dash", "zsh"]))
+        && let Some(payload) = dash_c(&words[at + 1..])
+    {
+        if payload.broken || payload.var || !payload.subs.is_empty() {
+            unreadable = true;
+        } else {
+            nested.push(payload.text.clone());
+        }
+    }
+
+    (
+        SegRead {
+            words: effective,
+            literal,
+            subs,
+            unreadable,
+        },
+        nested,
+    )
+}
+
+/// The word a `sh -c` option gives the shell to run: the first option
+/// cluster carrying a `c` (`-c`, `-lc`), and the word after it.
+fn dash_c<'a>(rest: &[&'a Word]) -> Option<&'a Word> {
+    for (n, word) in rest.iter().enumerate() {
+        let text = word.text.as_str();
+        if word.literal()
+            && text.starts_with('-')
+            && !text.starts_with("--")
+            && text[1..].contains('c')
+        {
+            return rest.get(n + 1).copied();
+        }
+    }
+    None
+}
+
+/// A word that is exactly one of `names`, and nothing else.
+fn names(word: &Word, names: &[&str]) -> bool {
+    word.literal() && names.contains(&word.text.as_str())
+}
+
 /// A line the old marker check would have called compound: more than
 /// one segment, or a substitution anywhere in it.
 pub(crate) fn is_compound(src: &str) -> bool {

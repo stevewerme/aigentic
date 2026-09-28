@@ -7,6 +7,7 @@
 mod roles;
 mod rules;
 mod shell;
+mod step;
 
 use std::path::{Component, Path, PathBuf};
 
@@ -19,6 +20,7 @@ pub use rules::{
     prefix_of, riskiest_segment,
 };
 pub use shell::main_segment;
+pub use step::{DenyParseError, StepOverlay};
 
 /// What policy says about one call.
 #[derive(Debug, Clone, PartialEq, Eq)]
