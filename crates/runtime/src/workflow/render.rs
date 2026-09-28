@@ -234,10 +234,7 @@ impl Parser<'_> {
     }
 
     fn check_name(&self, open: usize, name: &str) -> Result<(), WorkflowError> {
-        let ok = !name.is_empty()
-            && name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_');
+        let ok = !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
         if ok {
             return Ok(());
         }
@@ -298,7 +295,11 @@ mod tests {
             slot("strict", "bool", "runner", true),
             slot("count", "string", "runner", true)
         );
-        let loaded = one_step(root.path(), &slots, "{{issue}} {{strict}} {{count}} {{issue}}");
+        let loaded = one_step(
+            root.path(),
+            &slots,
+            "{{issue}} {{strict}} {{count}} {{issue}}",
+        );
         let text = "a<b & \"c\"";
         let out = loaded
             .render(

@@ -57,7 +57,9 @@ pub enum WorkflowError {
     #[error("{path}: optional slot `{slot}` is used outside its own section")]
     OptionalOutsideSection { path: PathBuf, slot: String },
     /// A step's `template` is absolute or walks out of the folder.
-    #[error("{dir}: step `{step}` names template `{template}`, not a relative path inside the folder")]
+    #[error(
+        "{dir}: step `{step}` names template `{template}`, not a relative path inside the folder"
+    )]
     TemplatePath {
         dir: PathBuf,
         step: String,
@@ -334,10 +336,8 @@ impl WorkflowFile {
         }
         for step in &self.steps {
             let rel = Path::new(&step.template);
-            let inside = !rel.is_absolute()
-                && !rel
-                    .components()
-                    .any(|c| matches!(c, Component::ParentDir));
+            let inside =
+                !rel.is_absolute() && !rel.components().any(|c| matches!(c, Component::ParentDir));
             if !inside {
                 return Err(WorkflowError::TemplatePath {
                     dir: dir.to_path_buf(),
@@ -379,9 +379,8 @@ impl WorkflowFile {
         target: &str,
         ids: &BTreeSet<&str>,
     ) -> Result<(), WorkflowError> {
-        let known = ids.contains(target)
-            || self.routes.contains_key(target)
-            || TERMINALS.contains(&target);
+        let known =
+            ids.contains(target) || self.routes.contains_key(target) || TERMINALS.contains(&target);
         if known {
             return Ok(());
         }
@@ -464,12 +463,13 @@ fn check_nodes(
         match node {
             render::Node::Text(_) => {}
             render::Node::Slot(name) => {
-                let slot = declared
-                    .get(name.as_str())
-                    .ok_or_else(|| WorkflowError::UndeclaredSlot {
-                        path: template.path().to_path_buf(),
-                        slot: name.clone(),
-                    })?;
+                let slot =
+                    declared
+                        .get(name.as_str())
+                        .ok_or_else(|| WorkflowError::UndeclaredSlot {
+                            path: template.path().to_path_buf(),
+                            slot: name.clone(),
+                        })?;
                 let inside_its_section = enclosing.iter().any(|open| open == name);
                 if !slot.required && !inside_its_section {
                     return Err(WorkflowError::OptionalOutsideSection {
@@ -535,7 +535,8 @@ pub(crate) mod tests {
     use std::fs;
 
     /// A valid header, every fixture starts from it.
-    pub(crate) const HEAD: &str = "name = \"test\"\nversion = 1\n\n[budget]\ntrivial = 3.0\nfull = 10.0\nmax_raise = 2.0\n\n";
+    pub(crate) const HEAD: &str =
+        "name = \"test\"\nversion = 1\n\n[budget]\ntrivial = 3.0\nfull = 10.0\nmax_raise = 2.0\n\n";
 
     pub(crate) fn slot(name: &str, kind: &str, filled_by: &str, required: bool) -> String {
         format!(
@@ -712,11 +713,7 @@ pub(crate) mod tests {
     #[test]
     fn missing_template_file_is_refused() {
         let root = temp();
-        write_folder(
-            &root.path().join("test"),
-            &format!("{HEAD}{}", body()),
-            &[],
-        );
+        write_folder(&root.path().join("test"), &format!("{HEAD}{}", body()), &[]);
         assert!(matches!(
             load(root.path(), "test"),
             Err(WorkflowError::MissingTemplate { .. })
@@ -776,10 +773,7 @@ pub(crate) mod tests {
         write_folder(
             &root.path().join("test"),
             &format!("{HEAD}{}", body()),
-            &[(
-                "templates/b.md",
-                "{{#flag}}{{#flag}}x{{/flag}}{{/flag}}\n",
-            )],
+            &[("templates/b.md", "{{#flag}}{{#flag}}x{{/flag}}{{/flag}}\n")],
         );
         assert!(matches!(
             load(root.path(), "test"),
