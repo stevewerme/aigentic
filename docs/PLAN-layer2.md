@@ -54,8 +54,8 @@ the portfolio orchestrator (phase 8) and its model-facing tools.
 
 | Crate | Gains |
 | --- | --- |
-| `core` | `EventKind` variants (section 9); `StepReport` and `Handoff` payload types; no new dependency |
-| `log` | Projections: `RunState` from a lead thread, `StepReport` from a child |
+| `core` | `EventKind` variants (section 9); no new dependency |
+| `log` | Payload types beside the others in `payload.rs` (`StepReport`, `Handoff`, one per new kind); projections: `RunState` from a lead thread, `StepReport` from a child |
 | `runtime` | `runner` module: workflow loading, template rendering, the step loop, checks, routes, budgets; the `finish_step` harness tool; a `Forge` seam over `gh` and `git push` |
 | `policy` | A per-step overlay: the workflow's `deny` list applied to threads whose `thread_started.step` is set |
 | `api` | `Request::Build { issue, workflow }`, `Request::AnswerCheckpoint { .. }`; `Notice::Run { .. }` for the lead thread's progress |
@@ -139,7 +139,7 @@ marker = "## Implementation"
 writes = true                       # one writing step at a time per repo
 checks = ["E1", "E2", "E3", "E4", "E5", "E7"]
 push = true                         # the runner pushes after checks pass
-deny = ["git push", "git commit --amend", "git rebase", "cp .env", "cat .env >"]
+deny = ["git push", "git rebase", "git reset", "git checkout --", "git stash", "git clean", "git add -A", "copy .env"]
 next = "done"
 
 [[steps]]
@@ -160,15 +160,19 @@ Templates carry every fixed rule verbatim: role header, the safety line,
 the gate (with `timeout_secs: 900`, run once, log searched), the trailer
 (the runner fills `<model>` from the profile's `model` without the
 provider prefix), the ledger format, "the amendment wins", the pty `.env`
-rule. They take named slots only:
+rule. They take named slots only, as `{{name}}`, plus `{{#name}}…{{/name}}`
+sections kept when the slot is set and non-empty (no nesting, no loops):
 
 | Slot | Filled by | Used by |
 | --- | --- | --- |
 | `issue`, `title` | runner | all |
 | `model` | runner, from the profile | writing steps |
+| `gate_log` | runner, `<temp dir>/aigentic-gate-<issue>.log` | writing steps, checks E4 and E5 |
+| `budget_trivial`, `budget_full`, `max_raise` | runner, from `[budget]` | brief |
 | `pointers` (file, line, what it holds) | brief | planner, implementer |
 | `purpose`, `must_not_undo` | brief | planner, plan-check, purpose-check, judge |
 | `size`, `budgets` | brief | runner |
+| `design`, `planned_tests` | brief when trivial, planner otherwise | implementer |
 | `commits` (named messages) | brief when trivial, planner otherwise | implementer, check E2 |
 | `reference_check` | brief or planner | implementer, verifier |
 | `ui` (pty check needed) | brief | implementer, verifier |
@@ -203,7 +207,8 @@ with.
 | `commits` (sha, subject) | writing steps |
 | `ledger` (T-id, name in code, `landed` \| `not_landed`, reason) | implementer, fix |
 | `quotes` (phrases the report attributes to the plan) | implementer, fix, verifier |
-| `verdict`: `approve` \| `changes_needed`, `fix`, `release_impact` | judge |
+| `verdict`: `approve` \| `changes_needed`, `fix` | judge |
+| `release_impact` | judge; the implementer when it works alone |
 | `findings` (id, text) | plan-check, purpose-check |
 | `route`: `escalate` + reason | any |
 | `handoff` (done, next, dirty files) | when `partial` |
@@ -281,7 +286,10 @@ green. A failed precondition takes the longer route and records why in
 ### 6.4 The runner pushes
 
 1. The writing step commits and calls `finish_step`; its policy overlay
-   denies `git push`, amend-after-push, rebase and copying `.env`.
+   denies `git push`, rebase, the destructive tree commands and copying
+   `.env`. Amend stays allowed: a step's commits are unpushed until the
+   runner pushes them, and the runner's plain push is rejected if a
+   pushed commit was rewritten, which it then escalates.
 2. The runner runs the step's exact checks.
 3. On failure it posts the failures into the same thread once ("fix
    these; the commits are unpushed, so amending is fine"), then
@@ -390,7 +398,9 @@ that the supervisor missed goes into `lessons.md`.
    `/build`; the workflow folder, loader and template renderer with the
    brief and implementer templates; `finish_step` and `step_reported`;
    the runner posting comments through `Forge`; checks E1–E5 and E7; the
-   runner's push and install; the step policy overlay; the lead-thread
+   runner's push and install, and closing the issue after an
+   implement-alone push with the report's `release_impact`; the step
+   policy overlay; the lead-thread
    events from section 9 that this path uses; replay on daemon start;
    per-turn cap continue-once and the missing-report stop. *Accepted
    when* one real trivial issue goes from `aigentic build` to pushed with
