@@ -470,13 +470,27 @@ impl Runtime {
     /// The ratio is learned from the log, by the same named rule the turn
     /// loop uses (issue #52): every call's own reported usage — read off
     /// its `assistant_message` — against the estimate of the probe
-    /// context just built, so a replayed thread is priced out of the log
-    /// alone, with no manual calibration. It starts at this runtime's
-    /// ratio (1.0 unless the runtime itself has run turns) and is left
-    /// there for the caller to read. Doc-hidden: the replay check in the
-    /// test suite is its only caller.
+    /// context just built, plus the schema overhead this runtime's
+    /// registry would put on the wire (`tool_specs`, exactly as the turn
+    /// loop reads it at `turn.rs`), so a replayed thread is priced out
+    /// of the log alone, with no manual calibration. It starts at this
+    /// runtime's ratio (1.0 unless the runtime itself has run turns) and
+    /// is left there for the caller to read. The rule is the turn loop's;
+    /// what differs is the input — an old log's recorded counts are the
+    /// requests that run sent, which before #51 carried arguments today's
+    /// shortened projection no longer shows — so a replay's learnt ratio
+    /// is evidence about the log, not the factor a live runtime settles
+    /// on. Doc-hidden: the replay check in the test suite is its only
+    /// caller.
     #[doc(hidden)]
     pub fn sweep_decisions(&mut self, events: &[Event]) -> Result<Vec<Decision>, RuntimeError> {
+        // The turn loop reads `overhead` off the specs it is about to
+        // send (issue #52), so the replay must do the same before it
+        // prices anything: the learning sample divides by
+        // `estimate + overhead`, and both the comparison and the sample
+        // want the schema term the live rule has.
+        let specs = self.tool_specs();
+        self.overhead = schemas_tokens(&specs);
         let mut out = Vec::new();
         let mut ratio = self.ratio;
         let mut start = 0;

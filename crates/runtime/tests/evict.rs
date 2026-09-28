@@ -16,12 +16,14 @@ use aigentic_core::{
     AgentId, Author, Capabilities, CompletionRequest, ContentBlock, Event, EventKind, Message,
     Provider, ProviderEvent, Role, ToolCall, Usage,
 };
-use aigentic_log::{ContextEvictedPayload, ThreadLog, project_body};
+use aigentic_log::{ContextEvictedPayload, ContextSaturatedPayload, ThreadLog, project_body};
 use aigentic_runtime::{
     Answer, Approver, DEFAULT_COMPACTION, Decision, EVICT_MIN_FREE_PERCENT, RATIO_MAX,
     RATIO_SMOOTHING, Runtime, calibrated, min_free, next_ratio,
 };
 use futures_core::Stream;
+
+mod common;
 
 /// Every request's messages.
 type Seen = Arc<Mutex<Vec<Vec<Message>>>>;
@@ -280,6 +282,186 @@ async fn run_turn_with(
         marks,
         runtime,
     }
+}
+
+/// One reply of the T3 script: an `echo` call, then the finish reason
+/// that sends the runtime off to run it.
+fn call_reply(id: &str, msg: &str) -> Vec<ProviderEvent> {
+    vec![
+        ProviderEvent::ToolCall(common::call(id, msg)),
+        common::done("tool_calls"),
+    ]
+}
+
+/// Runs one scripted turn against the echo tool: the double reports
+/// `k ×` its own count of every request it was sent, tools included
+/// ([`common::reporting_scripted`]), and the ceiling is `ceiling`. The
+/// events come back with the ratio the sweep learnt (T3).
+async fn run_scripted(script: Vec<Vec<ProviderEvent>>, k: f64, ceiling: u64) -> Ran {
+    let iterations = script.len() as u32;
+    let dir = tempfile::tempdir().unwrap();
+    let log = ThreadLog::open(dir.path(), ulid::Ulid::generate()).unwrap();
+    let (provider, seen) = common::reporting_scripted(script, k);
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let registry: aigentic_tools::ToolRegistry =
+        vec![Box::new(common::EchoTool(calls)) as Box<dyn aigentic_core::Tool>].into();
+    let mut runtime = Runtime::new(provider, registry, log, AgentId("worker".into()))
+        .with_approver(Box::new(Yes))
+        .with_compaction(aigentic_runtime::CompactionSettings {
+            context_ceiling_tokens: ceiling,
+            ..DEFAULT_COMPACTION
+        })
+        .with_budget(aigentic_core::Budget {
+            max_iterations: iterations + 20,
+            max_tokens: u64::MAX,
+            max_wall_time: std::time::Duration::from_secs(300),
+            cache_read_price_ratio: 0.25,
+        })
+        .with_model_label("scripted");
+    let outcome = runtime
+        .run_turn(
+            Author::User(aigentic_core::UserId("steve".into())),
+            vec![ContentBlock::Text("build it".into())],
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome.reason, "done", "{} iterations", outcome.iterations);
+    let events: Vec<Event> = runtime.log().read_all().unwrap();
+    let marks = events.iter().map(|e| e.kind).collect();
+    Ran {
+        seen,
+        events,
+        marks,
+        runtime,
+    }
+}
+
+/// The `ratio` each `context_evicted` recorded, in order (T3).
+fn sweep_ratios(events: &[Event]) -> Vec<Option<f64>> {
+    events
+        .iter()
+        .filter(|e| e.kind == EventKind::ContextEvicted)
+        .map(|e| {
+            serde_json::from_value::<ContextEvictedPayload>(e.payload.clone())
+                .expect("an eviction payload")
+                .ratio
+        })
+        .collect()
+}
+
+/// The `through_seq` of each `context_saturated` in the log, in order.
+fn saturation_seqs(events: &[Event]) -> Vec<u64> {
+    events
+        .iter()
+        .filter(|e| e.kind == EventKind::ContextSaturated)
+        .map(|e| {
+            serde_json::from_value::<ContextSaturatedPayload>(e.payload.clone())
+                .expect("a saturation payload")
+                .through_seq
+        })
+        .collect()
+}
+
+/// T3, issue #52: the calibration is a rescaling of the ceiling, proved
+/// end to end over the whole decision path. The same script runs twice:
+/// once with a double reporting `k ×` its own count (tools included)
+/// against the shipped ceiling `C`, once with a double reporting that
+/// count unscaled against `C / k`. The named rule prices a context as
+/// `calibrated(est) = round(ratio·(est + overhead))`, so once the second
+/// run's ratio has reached `k` its prices are `k ×` the first run's and
+/// `C` is `k × (C/k)`: the same calls are evicted and the same call
+/// saturates. `C/k` is an integer, so the two ceilings differ by exactly
+/// `k`.
+///
+/// The ratio seeds at 1.0, so the run needs calls *under* the pressure
+/// line to converge before it has any price to compare — the warm-up is
+/// those calls, and its length is derived from `RATIO_SMOOTHING`.
+#[tokio::test]
+async fn the_same_script_sweeps_at_the_same_calls_scaled_or_not() {
+    let ki = 2u64;
+    let k = ki as f64;
+    let ceiling = 32_000u64;
+    assert_eq!(ceiling % ki, 0, "C/k must be a whole number of tokens");
+
+    // The seed is 1.0 and each call moves `RATIO_SMOOTHING` of the way to
+    // its sample, so after `n` clean calls the ratio is
+    // `k − (k−1)·(1−S)^n` away from `k`. Invert that for the tolerance
+    // instead of typing a call count.
+    let tolerance = 0.01_f64;
+    let warmup = ((tolerance / (k - 1.0)).ln() / (1.0 - RATIO_SMOOTHING).ln()).ceil() as usize;
+    assert!(warmup > 1, "the warm-up is derived, not one call: {warmup}");
+
+    // Calls under the line: tiny, so nothing is stubbed while the ratio
+    // converges.
+    let mut script: Vec<Vec<ProviderEvent>> = (0..warmup)
+        .map(|i| call_reply(&format!("w{i}"), "w"))
+        .collect();
+    // Calls that carry the context past the line and keep it there, so
+    // the run sweeps more than once.
+    script.extend((0..40).map(|i| call_reply(&format!("m{i}"), &"m".repeat(2_000))));
+    // One call the floor can no longer fit: the deepest legal boundary
+    // itself goes over the ceiling and the run has to saturate.
+    script.push(call_reply("huge", &"h".repeat(60_000)));
+    script.push(vec![
+        ProviderEvent::TextDelta("done".into()),
+        common::done("stop"),
+    ]);
+
+    let scaled = run_scripted(script.clone(), k, ceiling).await;
+    let plain = run_scripted(script, 1.0, ceiling / ki).await;
+
+    // The scenario is real: several sweeps, then exactly one saturation
+    // spell in each run.
+    assert!(
+        scaled.sweeps() >= 3 && plain.sweeps() >= 3,
+        "the script must sweep: {} scaled, {} plain",
+        scaled.sweeps(),
+        plain.sweeps()
+    );
+    assert_eq!(
+        (scaled.saturations(), plain.saturations()),
+        (1, 1),
+        "the script must saturate exactly once"
+    );
+
+    // The identity: the same boundaries, the same saturation call.
+    assert_eq!(
+        sweep_seqs(&scaled.events),
+        sweep_seqs(&plain.events),
+        "the same script must evict at the same calls"
+    );
+    assert_eq!(
+        saturation_seqs(&scaled.events),
+        saturation_seqs(&plain.events),
+        "the same script must saturate at the same call"
+    );
+
+    // The warm-up, made explicit: the ratio the first sweep was priced
+    // with is within the tolerance of `k` — the seed has converged — and
+    // that sweep comes after the warm-up calls, so it converged under the
+    // pressure line where no decision could depend on it.
+    let ratios = sweep_ratios(&scaled.events);
+    let first = ratios[0].expect("the live rule records its ratio");
+    assert!(
+        (first - k).abs() <= tolerance,
+        "the ratio at the first sweep was {first}, not within {tolerance} of {k}"
+    );
+    let swept_calls = turn_calls(&scaled.events)
+        .iter()
+        .take_while(|seq| **seq <= sweep_seqs(&scaled.events)[0])
+        .count();
+    assert!(
+        swept_calls > warmup,
+        "the first sweep came after {swept_calls} calls, not the {warmup} warm-up"
+    );
+    // The unscaled run learnt nothing to calibrate: its prices are the
+    // estimate's, so its ratio stays at the 1.0 seed.
+    let plain_first = sweep_ratios(&plain.events)[0].expect("the live rule records its ratio");
+    assert!(
+        (plain_first - 1.0).abs() <= tolerance,
+        "the unscaled run's ratio at its first sweep was {plain_first}"
+    );
 }
 
 fn flat_text(messages: &[Message]) -> String {
@@ -844,6 +1026,18 @@ async fn zero_evict_min_free_percent_sweeps_as_soon_as_the_floor_advances() {
 /// turn loop uses, so the replay runs at the plain 128k and that manual
 /// compensation is gone. Every assertion below is the rule's, not a
 /// tuned number.
+///
+/// The rule is the turn loop's — the schema overhead is read off the
+/// registry this replay would put on the wire, exactly as `turn.rs`
+/// does — but its *inputs* are not what a live runtime would see. The
+/// pairing is this: the log's recorded counts are the requests the run
+/// sent, full arguments and all, before #51 shortened the projection;
+/// the estimates are today's #51-shortened projection. So the numerator
+/// carries arguments the denominator no longer shows, the ratio this
+/// replay learns is inflated against what the live runtime would learn
+/// from the same calls, and it is evidence about the direction and the
+/// size of the log's under-count — not the factor a live runtime would
+/// settle on.
 #[tokio::test]
 // The plan's name, the thread's ULID as written in it.
 #[allow(non_snake_case)]
@@ -896,8 +1090,21 @@ async fn thread_01M3GS3QP6_replays_without_thrash() {
     // The ratio the replay priced its decisions with, learned from the
     // log's own counts (issue #52): it seeds at 1.0 and warms up over the
     // first calls, and what it ends at is this log's own factor as the
-    // named rule reads it, not the fixed one #35 had to hand-compute.
+    // named rule reads it, not the fixed one #35 had to hand-compute. The
+    // samples it learned from pair the run's recorded counts with today's
+    // #51-shortened projection, so this is not the factor a live runtime
+    // would settle on from the same calls — only how far up this pairing
+    // pulls it.
     let ratio = runtime.eviction_ratio();
+    // The log's own pairwise factor, from the two figures printed below:
+    // the fullest count the run recorded over the estimate of that same
+    // context. It is the direction and size this log shows — the run's
+    // counts sit above the estimate — and the bound on the ratio.
+    let pairwise = counted as f64 / estimated as f64;
+    // What the registry's schemas cost on the wire, the term the live
+    // rule adds to every estimate: read the same way `turn.rs` reads it,
+    // and the term this replay now prices with (issue #52, review item 2).
+    let overhead = aigentic_runtime::schemas_tokens(&runtime.tool_specs());
     let sweeps: Vec<u64> = decisions
         .iter()
         .filter_map(|d| match d {
@@ -954,8 +1161,11 @@ async fn thread_01M3GS3QP6_replays_without_thrash() {
         "{} calls replayed in {:?} over {} turns: {} sweeps, the log has {in_log}; \
          {saturation_decisions} saturation decisions (one per call), {spells} saturation spells \
          (events the runtime would append, once per turn — the shipped rule); ceiling {ceiling} \
-         est (the run counted {counted} over {estimated} est: the compensation that is gone); \
-         learned ratio {ratio:.4}, material {material}, bound {bound}",
+         est (the run counted {counted} over {estimated} est, schema overhead {overhead}: the \
+         compensation that is gone, replaced by the calibration); the log's own pairwise factor \
+         {pairwise:.4} against learned ratio {ratio:.4} — the replay pairs pre-#51 counts with a \
+         #51-shortened projection, so that ratio is not what a live runtime would learn; \
+         material {material}, bound {bound}",
         decisions.len(),
         clock.elapsed(),
         turn_counts.len(),
@@ -981,12 +1191,20 @@ async fn thread_01M3GS3QP6_replays_without_thrash() {
         "the replay thrashes as much as the log did: {} vs {in_log}",
         sweeps.len()
     );
-    // The calibration's own bounds, and the direction this log taught it:
-    // the run's counts run above the estimate, so the ratio ends above
-    // the 1.0 it seeds at and inside the clamp.
+    // What the pairing supports, and all it supports. Direction: the
+    // run's counts sit above today's estimate of the same context —
+    // `counted > estimated` above, this log's own figures — so the rule
+    // moves up from the 1.0 it seeds at and ends above 1.0. Size: it is
+    // a smoothing over per-call samples and stays inside the clamp the
+    // rule sets, and below the log's own pairwise factor `counted /
+    // estimated`, the fullest count the run recorded over that call's
+    // estimate. Neither number is typed here: both are read from the log
+    // above, and the ratio the replay prints is what those samples made
+    // of them — inflated by the pre-#51 counts, so it is not the factor
+    // a live runtime would learn from the same calls.
     assert!(
-        ratio > 1.0 && ratio <= RATIO_MAX,
-        "the learned ratio {ratio} is outside (1.0, {RATIO_MAX}]"
+        ratio > 1.0 && ratio < pairwise && ratio <= RATIO_MAX,
+        "the learned ratio {ratio} is outside (1.0, {pairwise}] or past the clamp {RATIO_MAX}"
     );
     // #35's regime check, kept: a replay too cheap to saturate would not
     // be exercising the path #52 is about either.
