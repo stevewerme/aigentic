@@ -11,6 +11,7 @@ use aigentic_api::ReportKind;
 use aigentic_runtime::aigentic_core::{Author, Event, EventKind};
 use aigentic_runtime::aigentic_log::{
     AssistantMessagePayload, CompactedPayload, CompactionStrategy, MemoryExtractedPayload,
+    ThreadRenamedPayload,
 };
 use aigentic_runtime::aigentic_policy::Decision;
 use aigentic_runtime::project::{DOT_DIR, INSTRUCTIONS_FILE};
@@ -61,11 +62,20 @@ pub struct Cost {
     pub summary_output: u64,
     pub extractions: u32,
     pub extraction_lines: u32,
-    pub extraction_input: u64,
-    pub extraction_output: u64,
-    /// Sum of `cost_usd` over the extraction lines that carry one
-    /// (issue #46), the same stamping rule as `spent`.
-    pub extraction_spent: Option<f64>,
+    /// Utility title calls (issue #49): a `thread_renamed` line that
+    /// carries a usage, which is what the runtime stamps one with. A
+    /// line without it — every line written before #49, and a person's
+    /// `/rename` — is no call and is not counted, so an old title is
+    /// never priced after the fact.
+    pub titles: u32,
+    /// Tokens the side jobs sent and produced: the extractions' and the
+    /// title calls' (issues #46, #49).
+    pub side_input: u64,
+    pub side_output: u64,
+    /// Sum of `cost_usd` over the side-job lines that carry one (issues
+    /// #46, #49), the same stamping rule as `spent`. `/cost` does no
+    /// retro pricing: a line without a stamp puts no dollars here.
+    pub side_spent: Option<f64>,
     /// Sum of `cost_usd` over the calls that carry one.
     pub spent: Option<f64>,
     /// Calls that carried a price / calls that did not.
@@ -103,11 +113,26 @@ pub fn cost_of(events: &[Event]) -> Cost {
         };
         cost.extractions += 1;
         cost.extraction_lines += p.written.len() as u32;
-        cost.extraction_input +=
+        cost.side_input +=
             p.usage.input_tokens + p.usage.cache_read_tokens + p.usage.cache_write_tokens;
-        cost.extraction_output += p.usage.output_tokens;
+        cost.side_output += p.usage.output_tokens;
         if let Some(usd) = p.usage.cost_usd {
-            cost.extraction_spent = Some(cost.extraction_spent.unwrap_or(0.0) + usd);
+            cost.side_spent = Some(cost.side_spent.unwrap_or(0.0) + usd);
+        }
+    }
+    for event in events.iter().filter(|e| e.kind == EventKind::ThreadRenamed) {
+        let Ok(p) = serde_json::from_value::<ThreadRenamedPayload>(event.payload.clone()) else {
+            continue;
+        };
+        // Issue #49: a line with a usage is the utility call behind the
+        // title. One without it is an old title or a person's rename,
+        // and counts for nothing.
+        let Some(usage) = p.usage else { continue };
+        cost.titles += 1;
+        cost.side_input += usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens;
+        cost.side_output += usage.output_tokens;
+        if let Some(usd) = usage.cost_usd {
+            cost.side_spent = Some(cost.side_spent.unwrap_or(0.0) + usd);
         }
     }
     for event in events
@@ -157,6 +182,25 @@ pub fn cost_of(events: &[Event]) -> Cost {
     cost
 }
 
+/// What the side-jobs line says the jobs were, in its own wording:
+/// `1 extraction, 2 lines`, `1 title`, or both (issues #46, #49).
+fn side_parts(extractions: u32, lines: u32, titles: u32) -> String {
+    let mut parts = Vec::new();
+    if extractions > 0 {
+        parts.push(format!(
+            "{extractions} extraction{}, {lines} lines",
+            if extractions == 1 { "" } else { "s" }
+        ));
+    }
+    if titles > 0 {
+        parts.push(format!(
+            "{titles} title{}",
+            if titles == 1 { "" } else { "s" }
+        ));
+    }
+    parts.join(", ")
+}
+
 impl fmt::Display for Cost {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(
@@ -192,17 +236,16 @@ impl fmt::Display for Cost {
                 self.summary_output
             )?;
         }
-        if self.extractions > 0 {
+        if self.extractions + self.titles > 0 {
             writeln!(
                 f,
-                "memory     {} extractions, {} lines   tokens in {} out {}{}",
-                self.extractions,
-                self.extraction_lines,
-                self.extraction_input,
-                self.extraction_output,
-                // Only when the lines carry a price (issue #46), so an
-                // old thread's memory line is byte-identical to before.
-                match self.extraction_spent {
+                "side jobs  {}   tokens in {} out {}{}",
+                side_parts(self.extractions, self.extraction_lines, self.titles),
+                self.side_input,
+                self.side_output,
+                // Only when the lines carry a price (issues #46, #49):
+                // an unpriced line claims nothing about money.
+                match self.side_spent {
                     Some(usd) => format!("   ${usd:.4} priced"),
                     None => String::new(),
                 }
@@ -246,8 +289,8 @@ impl fmt::Display for Cost {
                 + self.cache_write
                 + self.estimated_input
                 + self.summary_input
-                + self.extraction_input,
-            self.output + self.estimated_output + self.summary_output + self.extraction_output
+                + self.side_input,
+            self.output + self.estimated_output + self.summary_output + self.side_output
         )
     }
 }
@@ -613,9 +656,10 @@ mod cost_tests {
                 summary_output: 50,
                 extractions: 1,
                 extraction_lines: 2,
-                extraction_input: 300,
-                extraction_output: 20,
-                extraction_spent: None,
+                titles: 0,
+                side_input: 300,
+                side_output: 20,
+                side_spent: None,
                 // No usage line in this fixture carries a model or a
                 // price, so nothing is claimed about spend (issue #31)
                 // and the text report stays what it always was. The two
@@ -629,7 +673,7 @@ mod cost_tests {
         );
         assert!(
             cost.to_string()
-                .contains("memory     1 extractions, 2 lines   tokens in 300 out 20"),
+                .contains("side jobs  1 extraction, 2 lines   tokens in 300 out 20"),
             "{cost}"
         );
         let text_all = cost.to_string();
@@ -668,26 +712,15 @@ mod cost_tests {
         let priced = cost_of(&[extraction(Some(stamped))]);
         let bare = cost_of(&[extraction(None)]);
 
-        assert_eq!(priced.extraction_spent, Some(stamped));
-        assert_eq!(bare.extraction_spent, None);
+        assert_eq!(priced.side_spent, Some(stamped));
+        assert_eq!(bare.side_spent, None);
         // The stamp adds dollars and nothing else: the token totals are
         // the same with it as without.
         assert_eq!(
-            (
-                priced.extractions,
-                priced.extraction_input,
-                priced.extraction_output
-            ),
-            (
-                bare.extractions,
-                bare.extraction_input,
-                bare.extraction_output
-            )
+            (priced.extractions, priced.side_input, priced.side_output),
+            (bare.extractions, bare.side_input, bare.side_output)
         );
-        assert_eq!(
-            (priced.extraction_input, priced.extraction_output),
-            (300, 20)
-        );
+        assert_eq!((priced.side_input, priced.side_output), (300, 20));
 
         let text = priced.to_string();
         assert!(text.contains("tokens in 300 out 20"), "{text}");
@@ -697,6 +730,46 @@ mod cost_tests {
         );
         // An unpriced line claims nothing about money.
         assert!(!bare.to_string().contains("priced"), "{bare}");
+    }
+
+    /// T8 (issue #49): a stamped title line reaches `/cost` — one title,
+    /// its own tokens, its own dollars, and no retro pricing: a line
+    /// without a stamp is no call and claims nothing.
+    #[test]
+    fn a_stamped_title_reports_its_dollars() {
+        let stamped = 0.0125;
+        let title = |usage: serde_json::Value| {
+            event(
+                EventKind::ThreadRenamed,
+                json!({"title": "Deps check", "model": "utility-model", "usage": usage}),
+            )
+        };
+        let titled = cost_of(&[title(
+            json!({"input_tokens": 300, "output_tokens": 20, "cost_usd": stamped}),
+        )]);
+        // A line with a usage but no stamp: counted, and no dollars.
+        let bare = cost_of(&[title(json!({"input_tokens": 300, "output_tokens": 20}))]);
+        // The old shape, and a person's `/rename`: no usage, no call.
+        let old = cost_of(&[event(
+            EventKind::ThreadRenamed,
+            json!({"title": "An old title"}),
+        )]);
+
+        assert_eq!(titled.titles, 1);
+        assert_eq!(titled.side_spent, Some(stamped));
+        assert_eq!((titled.side_input, titled.side_output), (300, 20));
+        assert_eq!(bare.titles, 1);
+        assert_eq!(bare.side_spent, None);
+        assert_eq!(old.titles, 0);
+        assert_eq!(old.side_input, 0);
+
+        let text = titled.to_string();
+        assert!(text.contains("1 title"), "{text}");
+        assert!(text.contains("tokens in 300 out 20"), "{text}");
+        assert!(text.contains(&format!("${stamped:.4} priced")), "{text}");
+        // A title-only line has no prices to report and prints no line.
+        assert_eq!(old.to_string(), Cost::default().to_string());
+        assert!(!old.to_string().contains("side jobs"), "{old}");
     }
 
     /// Issue #31: a stamped thread's `/cost` shows the spend the usage
