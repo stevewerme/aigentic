@@ -8,12 +8,12 @@ use aigentic_core::{
     ProviderEvent, Role, ToolCall, Usage,
 };
 use aigentic_log::{CompactedPayload, CompactionStrategy, ThreadLog};
-use aigentic_runtime::{CompactionSettings, Runtime, SUMMARY_PROMPT};
+use aigentic_runtime::{CompactionSettings, RATIO_SMOOTHING, Runtime, SUMMARY_PROMPT};
 use futures_core::Stream;
 use serde_json::json;
 
 mod common;
-use common::EchoTool;
+use common::{EchoTool, reporting_scripted};
 
 const WINDOW: u64 = 8_000;
 
@@ -303,5 +303,62 @@ async fn compact_now_reports_what_it_did_and_pin_lands_in_the_prefix() {
     );
     assert!(
         matches!(&last[1].blocks[0], ContentBlock::Text(t) if t.starts_with("[Summary of events 0 to"))
+    );
+}
+
+/// T2, issue #52: a scripted provider reporting `k ×` its own count of the
+/// request it was sent — `Growing` above is the precedent, with the factor
+/// made visible. After one call the runtime's ratio is T1's formula for
+/// the sample that provider's numbers give, computed from the code: the
+/// reported count over the estimate of the request plus the schemas that
+/// went with it.
+#[tokio::test]
+async fn one_call_teaches_the_ratio_the_reporting_factor() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = ThreadLog::open(dir.path(), ulid::Ulid::generate()).unwrap();
+    let k = 2.0;
+    let (provider, seen) = reporting_scripted(
+        vec![vec![
+            ProviderEvent::TextDelta("hi".into()),
+            ProviderEvent::Done {
+                finish_reason: "stop".into(),
+            },
+        ]],
+        k,
+    );
+    let mut rt = Runtime::new(
+        provider,
+        aigentic_tools::ToolRegistry::empty(),
+        log,
+        AgentId("worker".into()),
+    )
+    .with_compaction(CompactionSettings {
+        keep_turns: 1,
+        ..aigentic_runtime::DEFAULT_COMPACTION
+    });
+    assert_eq!(rt.eviction_ratio(), 1.0, "the seed");
+
+    rt.run_turn(
+        Author::User(aigentic_core::UserId("steve".into())),
+        vec![ContentBlock::Text("count this".into())],
+        &mut |_| {},
+    )
+    .await
+    .unwrap();
+
+    // What the provider reported, and what the runtime estimated for the
+    // same request: the sample, and the ratio one EWMA step leaves.
+    let over = rt.tool_specs();
+    let overhead = aigentic_runtime::schemas_tokens(&over);
+    let seen = seen.lock().unwrap();
+    let request = seen.last().expect("the turn's request");
+    let est = estimate(request);
+    let reported = (k * (est + overhead) as f64).round();
+    let sample = reported / (est + overhead) as f64;
+    let expected = 1.0 + RATIO_SMOOTHING * (sample - 1.0);
+    assert!(
+        (rt.eviction_ratio() - expected).abs() < 1e-9,
+        "ratio {} is not {expected} after one sample of {sample}",
+        rt.eviction_ratio()
     );
 }

@@ -18,7 +18,8 @@ use aigentic_core::{
 };
 use aigentic_log::{ContextEvictedPayload, ThreadLog, project_body};
 use aigentic_runtime::{
-    Answer, Approver, DEFAULT_COMPACTION, Decision, EVICT_MIN_FREE_PERCENT, Runtime, min_free,
+    Answer, Approver, DEFAULT_COMPACTION, Decision, EVICT_MIN_FREE_PERCENT, RATIO_SMOOTHING,
+    Runtime, calibrated, min_free, next_ratio,
 };
 use futures_core::Stream;
 
@@ -27,7 +28,11 @@ type Seen = Arc<Mutex<Vec<Vec<Message>>>>;
 
 /// Keeps the turn going: one tool call per reply for `calls` iterations
 /// (a read, a write and an edit per three), then a bare text reply.
-/// Reports usage from the same estimate the runtime uses.
+/// Reports usage as the runtime's own model of a request's cost (issue
+/// #52): the estimate of the messages plus the schemas that went with
+/// them, so this double behaves like a backend whose tokenizer is the
+/// estimator — the ratio it teaches stays 1.0 and the tests below
+/// measure the rule, not the calibration's warm-up.
 struct Building {
     seen: Seen,
     iteration: Mutex<u32>,
@@ -35,6 +40,10 @@ struct Building {
     /// Lines in the read fixture and in each written file; sizes the
     /// turn's material.
     lines: usize,
+    /// Whether it reports usage at all (issue #52, T4): a backend whose
+    /// replies carry no counts leaves the runtime nothing to calibrate
+    /// against.
+    usage: bool,
 }
 
 fn estimate(context: &[Message]) -> u64 {
@@ -47,21 +56,23 @@ impl Provider for Building {
         request: &CompletionRequest<'_>,
     ) -> Pin<Box<dyn Stream<Item = ProviderEvent> + Send + '_>> {
         self.seen.lock().unwrap().push(request.messages.to_vec());
-        let prompt = estimate(request.messages);
+        let prompt = estimate(request.messages) + aigentic_runtime::schemas_tokens(request.tools);
         let mut iteration = self.iteration.lock().unwrap();
         *iteration += 1;
+        let counts = |output: u64| {
+            self.usage.then_some(ProviderEvent::Usage(Usage {
+                input_tokens: prompt,
+                output_tokens: output,
+                ..Default::default()
+            }))
+        };
         let events = if *iteration > self.calls {
-            vec![
-                ProviderEvent::TextDelta("done building".into()),
-                ProviderEvent::Usage(Usage {
-                    input_tokens: prompt,
-                    output_tokens: 10,
-                    ..Default::default()
-                }),
-                ProviderEvent::Done {
-                    finish_reason: "stop".into(),
-                },
-            ]
+            let mut events = vec![ProviderEvent::TextDelta("done building".into())];
+            events.extend(counts(10));
+            events.push(ProviderEvent::Done {
+                finish_reason: "stop".into(),
+            });
+            events
         } else {
             let i = *iteration;
             let (name, args) = match i % 3 {
@@ -82,21 +93,16 @@ impl Provider for Building {
                     }),
                 ),
             };
-            vec![
-                ProviderEvent::ToolCall(ToolCall {
-                    id: format!("call_{i}"),
-                    name: name.into(),
-                    args,
-                }),
-                ProviderEvent::Usage(Usage {
-                    input_tokens: prompt,
-                    output_tokens: 20,
-                    ..Default::default()
-                }),
-                ProviderEvent::Done {
-                    finish_reason: "tool_calls".into(),
-                },
-            ]
+            let mut events = vec![ProviderEvent::ToolCall(ToolCall {
+                id: format!("call_{i}"),
+                name: name.into(),
+                args,
+            })];
+            events.extend(counts(20));
+            events.push(ProviderEvent::Done {
+                finish_reason: "tool_calls".into(),
+            });
+            events
         };
         Box::pin(futures_util::stream::iter(events))
     }
@@ -200,6 +206,16 @@ impl Ran {
 
 /// Runs one `Building` turn and returns what it left behind.
 async fn run_turn(calls: u32, lines: usize, settings: aigentic_runtime::CompactionSettings) -> Ran {
+    run_turn_with(calls, lines, settings, true).await
+}
+
+/// `run_turn`, with the fixture's usage reports switchable (T4).
+async fn run_turn_with(
+    calls: u32,
+    lines: usize,
+    settings: aigentic_runtime::CompactionSettings,
+    usage: bool,
+) -> Ran {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("out")).unwrap();
     std::fs::write(dir.path().join("big.txt"), "seed line\n".repeat(lines)).unwrap();
@@ -209,6 +225,7 @@ async fn run_turn(calls: u32, lines: usize, settings: aigentic_runtime::Compacti
         iteration: Mutex::new(0),
         calls,
         lines,
+        usage,
     };
     let registry = aigentic_tools::ToolRegistry::builtin(
         aigentic_tools::Workdir::new(dir.path()),
@@ -570,6 +587,101 @@ async fn the_cached_prefix_is_stable_between_sweeps() {
     assert_eq!(broken, sweeps, "only sweeps may break the prefix");
 }
 
+/// T3, issue #52: the calibration is a rescaling of the ceiling, not a
+/// tuned number. The rule prices a context as `calibrated(est)`; a context
+/// the estimator prices at `e` and the provider counted at `c` teaches the
+/// ratio `c/e`, and with that ratio the price is `c` — so a ceiling `C` is
+/// compared with what the provider counted for the context, the same
+/// comparison the estimate makes against `C` scaled by the gap. The gap
+/// is the fixture's (a provider that counted 30 for a context the
+/// estimator makes 18 of); every expected price is the code's own.
+#[test]
+fn the_calibration_prices_a_context_as_the_provider_counted_it() {
+    // 72 bytes of text: the estimator's own rate, not a hand-computed 18.
+    let text = "x".repeat(72);
+    let context = vec![Message {
+        role: Role::User,
+        author: Author::User(aigentic_core::UserId("steve".into())),
+        blocks: vec![ContentBlock::Text(text)],
+    }];
+    let est = estimate(&context);
+    let counted = 30;
+    assert!(
+        counted > est,
+        "the fixture's provider counts more than the estimator does"
+    );
+    let gap = counted as f64 / est as f64;
+
+    // Warm-up: the seed 1.0 moves `RATIO_SMOOTHING` of the way to the
+    // sample, so the price reaches the count after several calls, not one.
+    let mut ratio = 1.0;
+    let mut calls = 0;
+    while calibrated(est, 0, ratio) != counted {
+        ratio = next_ratio(ratio, counted, est, 0);
+        calls += 1;
+        assert!(
+            calls < 1_000,
+            "the price stopped at {} short of the count {counted}",
+            calibrated(est, 0, ratio)
+        );
+    }
+    assert!(calls > 1, "one call already priced it: {calls}");
+
+    // With the ratio at the gap, the line the rule draws over a ceiling
+    // `c` is the estimate's own line over `c` scaled by the gap.
+    let c = est * 64;
+    for factor in [8u64, 128] {
+        let e = est * factor;
+        assert_eq!(
+            calibrated(e, 0, ratio) > c,
+            (e as f64) > (c as f64) / gap,
+            "the price of {e} against {c}"
+        );
+    }
+}
+
+/// T4, issue #52: a turn whose provider reports no usage never calibrates
+/// — the ratio keeps its seed — and its sweeps still run on the estimate
+/// alone. The assertions are `the_cached_prefix_is_stable_between_sweeps`'s
+/// own, run against a provider that reports nothing, so the default path
+/// cannot drift once calibration exists.
+#[tokio::test]
+async fn a_turn_that_reports_no_usage_keeps_the_ratio_at_its_seed() {
+    let count_only = aigentic_runtime::CompactionSettings {
+        evict_above_tokens: 0,
+        ..DEFAULT_COMPACTION
+    };
+    let ran = run_turn_with(120, 900, count_only, false).await;
+    assert_eq!(
+        ran.runtime.eviction_ratio(),
+        1.0,
+        "no reported usage, nothing learned"
+    );
+    assert_ne!(
+        ran.runtime.eviction_ratio(),
+        1.0 + RATIO_SMOOTHING,
+        "the seed is the untouched starting point"
+    );
+    let sweeps = ran.sweeps();
+    assert!(
+        sweeps >= 3,
+        "the turn must sweep to test stability, got {sweeps}"
+    );
+    let requests = ran.seen.lock().unwrap();
+    // Between sweeps the context only grows at the end, as in the
+    // reporting fixture: the sweep is the only thing that breaks the
+    // provider's cached prefix.
+    let mut broken = 0;
+    for pair in requests.windows(2) {
+        let (before, after) = (&pair[0], &pair[1]);
+        let extends = after.len() >= before.len() && after[..before.len()] == before[..];
+        if !extends {
+            broken += 1;
+        }
+    }
+    assert_eq!(broken, sweeps, "only sweeps may break the prefix");
+}
+
 /// The settings of the floor-over-ceiling fixture (T1, T2): a 30k
 /// ceiling, with the default 64k pressure line lowered to it by the
 /// runtime.
@@ -763,7 +875,7 @@ async fn thread_01M3GS3QP6_replays_without_thrash() {
 
     let dir = tempfile::tempdir().unwrap();
     let log = ThreadLog::open(dir.path(), ulid::Ulid::generate()).unwrap();
-    let runtime = Runtime::new(
+    let mut runtime = Runtime::new(
         Box::new(Counting),
         aigentic_tools::ToolRegistry::builtin(
             aigentic_tools::Workdir::new(dir.path()),

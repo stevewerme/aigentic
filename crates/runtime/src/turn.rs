@@ -159,6 +159,11 @@ impl Runtime {
         self.refresh_knowledge()?;
         self.refresh_memory()?;
         let specs: Vec<ToolSpec> = self.tool_specs();
+        // What the request's schemas cost on the wire, at the estimator's
+        // own rate, read here so a registry change between turns is
+        // picked up (issue #52). The model that runs this turn is the one
+        // whose reported counts teach `self.ratio` below.
+        self.overhead = crate::evict::schemas_tokens(&specs);
         // What a stream held back (issue #33): a message posted mid-call
         // waits here, and leaves the log only where the model can first
         // read it — `steer` at the top of the loop below, `steer` unset
@@ -306,12 +311,20 @@ impl Runtime {
             flush_text(&mut text, &mut blocks);
             spent.iterations += 1;
             let agent = Author::Agent(self.agent.clone());
-            self.measured = usage.as_ref().map(|u| {
-                (
-                    u.input_tokens + u.cache_read_tokens + u.cache_write_tokens,
-                    context.len(),
-                )
-            });
+            // The one place both numbers exist for the same context
+            // (issue #52): what the provider counted against what the
+            // estimator makes of the same messages. Memory extraction and
+            // titles run on the utility provider and never reach here, so
+            // only the thread's own model teaches the ratio.
+            let prompt = usage
+                .as_ref()
+                .map(|u| u.input_tokens + u.cache_read_tokens + u.cache_write_tokens);
+            self.measured = prompt.map(|p| (p, context.len()));
+            if let Some(reported) = prompt {
+                let estimate = self.provider.count_tokens(&context);
+                self.ratio =
+                    crate::evict::next_ratio(self.ratio, reported, estimate, self.overhead);
+            }
             observe(Signal::Usage(self.window_usage(&context)));
             let mut usage = usage.unwrap_or_else(|| self.estimate_usage(&context, &agent, &blocks));
             usage.profile = self.profile.clone();

@@ -389,7 +389,9 @@ pub struct ContextSaturatedPayload {
     /// The floor's own boundary: the last call the sweep would stub,
     /// inclusive. Zero when the turn has no call it may stub yet.
     pub through_seq: u64,
-    /// Estimated tokens the projection holds at that boundary.
+    /// What the projection holds at that boundary in reported tokens
+    /// (issue #52): the estimate the rule priced with, calibrated
+    /// against the provider's own counts when the caller had a ratio.
     pub tokens_at_floor: u64,
     /// The ceiling it does not fit under.
     pub ceiling: u64,

@@ -626,3 +626,33 @@ async fn a_utility_without_prices_leaves_the_extraction_unpriced() {
     assert_eq!(p.usage.cost_usd, None);
     assert_eq!(p.model, "utility-model");
 }
+
+/// T6, issue #52: extraction runs on the utility provider — a different
+/// model with a different tokenizer — so its numbers must never move the
+/// thread's ratio. The utility here reports the most absurd count a wrong
+/// sample could give, and the thread's own turn (which reports no usage)
+/// leaves the ratio at its seed.
+#[tokio::test]
+async fn the_utility_model_never_calibrates_the_thread() {
+    let dir = project_dir("");
+    let (thread, _thread_seen) = scripted(one_turn());
+    let (utility, utility_seen) = scripted(vec![vec![text(REPLY), usage(9_999_999, 1)]]);
+    let mut rt =
+        runtime_with(&dir, thread, "thread-model").with_utility(utility, "utility-model", None);
+
+    say(&mut rt, "For the record, use Swedish in the UI.").await;
+    assert_eq!(
+        rt.eviction_ratio(),
+        1.0,
+        "the thread's own turn reported nothing"
+    );
+
+    let extracted = rt.extract_memory(&mut |_| {}).await.unwrap();
+    assert!(extracted.is_some(), "the extraction ran");
+    assert_eq!(utility_seen.lock().unwrap().len(), 1, "on the utility");
+    assert_eq!(
+        rt.eviction_ratio(),
+        1.0,
+        "an absurd utility count moved the thread's ratio"
+    );
+}

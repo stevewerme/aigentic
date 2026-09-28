@@ -70,15 +70,24 @@ impl Runtime {
         }
     }
 
-    /// Window fill: the last call's reported prompt size plus an estimate of
-    /// what was appended since; the estimate alone when nothing was reported
-    /// or the prefix changed (a compaction or a pin resets the measure).
+    /// Window fill: the last call's reported prompt size — already a real
+    /// count — plus what was appended since, estimated and calibrated
+    /// into reported tokens (issue #52); the estimate alone, calibrated
+    /// the same way, when nothing was reported or the prefix changed (a
+    /// compaction or a pin resets the measure).
     pub fn fill(&self, context: &[Message]) -> u64 {
         match self.measured {
             Some((prompt, at_len)) if at_len <= context.len() => {
-                prompt + self.provider.count_tokens(&context[at_len..])
+                prompt
+                    + crate::evict::calibrated_delta(
+                        self.provider.count_tokens(&context[at_len..]),
+                        self.ratio,
+                    )
             }
-            _ => self.provider.count_tokens(context),
+            _ => {
+                let estimate = self.provider.count_tokens(context);
+                crate::evict::calibrated(estimate, self.overhead, self.ratio)
+            }
         }
     }
 

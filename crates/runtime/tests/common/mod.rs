@@ -80,10 +80,47 @@ pub fn gate() -> (Gate, Parked) {
     )
 }
 
+/// How a scripted double counts, and what it reports (issue #52).
+#[derive(Clone, Copy)]
+enum Count {
+    /// The fixed 7 the older tests were written against, and no usage
+    /// reported: a provider whose numbers say nothing about tokenizers.
+    Fixed,
+    /// The runtime's own estimator, with no usage reported, so a test can
+    /// see what the sweep does when it has nothing to calibrate against.
+    Estimated,
+    /// The estimator, reporting `k ×` its own count of the request it was
+    /// sent, tools included — the runtime's model of a backend whose
+    /// tokenizer is `k` times the estimate's.
+    Reported(f64),
+}
+
+impl Count {
+    fn tokens(&self, context: &[Message]) -> u64 {
+        match self {
+            Count::Fixed => 7,
+            Count::Estimated | Count::Reported(_) => estimate(context),
+        }
+    }
+
+    /// What the reply reports for this request, when it reports at all.
+    fn reported(&self, request: &CompletionRequest<'_>) -> Option<u64> {
+        match self {
+            Count::Fixed | Count::Estimated => None,
+            Count::Reported(k) => Some(
+                (*k * (estimate(request.messages) + aigentic_runtime::schemas_tokens(request.tools))
+                    as f64)
+                    .round() as u64,
+            ),
+        }
+    }
+}
+
 /// Replays scripted responses in order and records every request's messages.
 pub struct ScriptedProvider {
     script: Mutex<VecDeque<Vec<Step>>>,
     seen: Seen,
+    count: Count,
 }
 
 pub fn scripted(script: Vec<Vec<ProviderEvent>>) -> (Box<dyn Provider>, Seen) {
@@ -95,6 +132,41 @@ pub fn scripted(script: Vec<Vec<ProviderEvent>>) -> (Box<dyn Provider>, Seen) {
     )
 }
 
+fn plain(script: Vec<Vec<ProviderEvent>>) -> VecDeque<Vec<Step>> {
+    script
+        .into_iter()
+        .map(|reply| reply.into_iter().map(Step::Event).collect())
+        .collect()
+}
+
+/// `scripted`, but the provider counts with the runtime's own estimator
+/// instead of the fixed 7. Its replies report nothing, so the runtime's
+/// calibration never learns anything from it (issue #52, T4).
+pub fn counting_scripted(script: Vec<Vec<ProviderEvent>>) -> (Box<dyn Provider>, Seen) {
+    let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+    let p = ScriptedProvider {
+        script: Mutex::new(plain(script)),
+        seen: seen.clone(),
+        count: Count::Estimated,
+    };
+    (Box::new(p), seen)
+}
+
+/// `scripted`, but the provider counts with the runtime's own estimator and
+/// every reply reports `k ×` its own count of the request it was sent,
+/// tools included (issue #52): a faithful stand-in for a backend whose
+/// tokenizer is `k` times the estimate's, so a test can watch the
+/// calibration learn to price a context as that backend counts it.
+pub fn reporting_scripted(script: Vec<Vec<ProviderEvent>>, k: f64) -> (Box<dyn Provider>, Seen) {
+    let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+    let p = ScriptedProvider {
+        script: Mutex::new(plain(script)),
+        seen: seen.clone(),
+        count: Count::Reported(k),
+    };
+    (Box::new(p), seen)
+}
+
 /// `scripted`, but a reply is a list of steps, and a step can be a
 /// [`gate`]: the stream parks there until the test opens it, so a
 /// message can land between two deltas of one reply.
@@ -103,6 +175,7 @@ pub fn gated(script: Vec<Vec<Step>>) -> (Box<dyn Provider>, Seen) {
     let p = ScriptedProvider {
         script: Mutex::new(script.into()),
         seen: seen.clone(),
+        count: Count::Fixed,
     };
     (Box::new(p), seen)
 }
@@ -113,13 +186,16 @@ impl Provider for ScriptedProvider {
         request: &CompletionRequest<'_>,
     ) -> Pin<Box<dyn Stream<Item = ProviderEvent> + Send + '_>> {
         self.seen.lock().unwrap().push(request.messages.to_vec());
-        let steps: VecDeque<Step> = self
+        let mut steps: VecDeque<Step> = self
             .script
             .lock()
             .unwrap()
             .pop_front()
             .expect("script exhausted")
             .into();
+        if let Some(counted) = self.count.reported(request) {
+            steps.push_back(Step::Event(usage(counted, 1)));
+        }
         // One step per poll: a gate parks inside its own poll, yielding
         // while it holds, so the turn keeps running around it.
         Box::pin(futures_util::stream::unfold(
@@ -135,8 +211,8 @@ impl Provider for ScriptedProvider {
             },
         ))
     }
-    fn count_tokens(&self, _: &[Message]) -> u64 {
-        7
+    fn count_tokens(&self, context: &[Message]) -> u64 {
+        self.count.tokens(context)
     }
     fn capabilities(&self) -> Capabilities {
         Capabilities {
@@ -199,6 +275,11 @@ pub fn usage(i: u64, o: u64) -> ProviderEvent {
         output_tokens: o,
         ..Default::default()
     })
+}
+
+/// The runtime's own estimator, so a double can count the way it does.
+fn estimate(context: &[Message]) -> u64 {
+    aigentic_providers::estimate::estimate_tokens(context)
 }
 
 pub struct Harness {

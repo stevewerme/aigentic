@@ -132,6 +132,18 @@ pub struct Runtime {
     /// The last call's reported prompt size and the context length it was
     /// measured at, so window fill is exact plus the estimated growth.
     pub(crate) measured: Option<(u64, usize)>,
+    /// The calibration between the estimator and the provider's own count
+    /// (issue #52): a smoothed `reported / (estimate + overhead)`, seeded
+    /// at 1.0 and learned from every call that reported a usage. It never
+    /// resets with the prefix — the tokenizer relation does not change
+    /// with it — only where the provider does.
+    pub(crate) ratio: f64,
+    /// What this thread's tool schemas cost on the wire, at the
+    /// estimator's rate (issue #52): the part of a request
+    /// `estimate_tokens` does not cover, so a probe can be priced as
+    /// `ratio · (estimate + overhead)`. Measured once per turn from the
+    /// specs the turn sends, so a registry change is picked up.
+    pub(crate) overhead: u64,
     /// The harness's standing instructions in the prefix; off unless the
     /// builder asks, so the library's own context stays exactly what its
     /// caller put in.
@@ -194,6 +206,8 @@ impl Runtime {
             effort: None,
             prices: None,
             measured: None,
+            ratio: 1.0,
+            overhead: 0,
             harness_instructions: None,
             utility: None,
             utility_label: None,
@@ -232,6 +246,9 @@ impl Runtime {
         self.prices = ctx.prices;
         self.session_grants.clear();
         self.measured = None;
+        // Another project is another provider and another tool registry.
+        self.ratio = 1.0;
+        self.overhead = 0;
         if self.layers.project.is_none() {
             self.knowledge = Knowledge::default();
         }
@@ -462,6 +479,10 @@ impl Runtime {
         self.profile = profile;
         self.prices = prices;
         self.measured = None;
+        // A different model tokenizes differently: the old ratio is about
+        // the old one, so the next calls learn this one from scratch.
+        self.ratio = 1.0;
+        self.overhead = 0;
         self.reload_knowledge()
     }
 
