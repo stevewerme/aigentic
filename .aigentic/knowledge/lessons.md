@@ -39,11 +39,20 @@ so the rule can be judged, not just obeyed. The `brief`, `plan-check` and
   And on #52 an addendum described a T3 (90 replies, a 48,000 ceiling, a
   boundary list) that was never in the code; the shipped test used 32,000.
   A report's numbers and names are claims too: grep them against the diff.
+  It runs the other way too: #53's report listed a "corrected" literal
+  (`amend: bool`) that the code never had; the code followed the amendment.
+  The verifier caught it by reading the code a correction points at, not
+  only the quotes.
 - **Someone reads the plan before implementing.** Both trial plans had a
   flaw a second reader caught (#38: pipe filters counted as extra work,
   undoing #21; #31: retries collected and emitted after the fact, defeating
   live display). Corrections go in a separate `## Plan amendment` comment;
-  the plan's text stays as written.
+  the plan's text stays as written. Plan-check reads for mechanics, not
+  for the design's purpose: on #53 it raised 3 points, and a blind
+  supervisor check found 10, including replay holes (an answered gate that
+  replayed as unanswered, a send-back with no event written ahead of it).
+  When a ticket's purpose is a behaviour (replay, live display), read the
+  plan against that behaviour case by case.
 
 ## Plans and tests
 
