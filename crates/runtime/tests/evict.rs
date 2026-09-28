@@ -898,3 +898,123 @@ fn argument_stubs_still_deserialise_as_their_tools_arguments() {
         aigentic_runtime::harness_tools::TaskState::Active
     );
 }
+
+/// Estimated tokens of one text, through the same estimator the runtime
+/// uses; used for the argument-share numbers below.
+fn estimate_text(text: &str) -> u64 {
+    estimate(&[Message {
+        role: Role::User,
+        author: Author::System,
+        blocks: vec![ContentBlock::Text(text.into())],
+    }])
+}
+
+/// Issue #51's reference check: the projection's floor at the deepest
+/// boundary the real build thread recorded, before and after the
+/// argument stubs. Ignored by default; run it with
+/// `AIGENTIC_REPLAY_LOG=<thread>.jsonl cargo test -p aigentic-runtime
+/// --test evict floor -- --ignored --nocapture`.
+///
+/// "Before" is recomputed from the projection: every call whose projected
+/// arguments differ from the log's own is restored by id from the log,
+/// then estimated again. Nothing below is a typed literal, and the only
+/// assertions are directional.
+#[tokio::test]
+// The plan's name, the thread's ULID as written in it.
+#[allow(non_snake_case)]
+#[ignore = "needs a real thread log; set AIGENTIC_REPLAY_LOG"]
+async fn thread_01M3GS3QP6_floor_shrinks_at_deepest_boundary() {
+    let path = std::env::var("AIGENTIC_REPLAY_LOG").expect("set AIGENTIC_REPLAY_LOG");
+    let text = std::fs::read_to_string(&path).expect("the thread log");
+    let events: Vec<Event> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("a log line"))
+        .collect();
+
+    // The deepest boundary in the log: the eviction with the greatest
+    // `through_seq`, and the log truncated at that event.
+    let (at, through) = events
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.kind == EventKind::ContextEvicted)
+        .map(|(i, e)| {
+            (
+                i,
+                serde_json::from_value::<ContextEvictedPayload>(e.payload.clone())
+                    .expect("an eviction payload")
+                    .through_seq,
+            )
+        })
+        .max_by_key(|(_, through)| *through)
+        .expect("the log has an eviction");
+    let truncated = &events[..=at];
+
+    // Every call the log holds, by id: what the projection is compared
+    // against.
+    let full: std::collections::HashMap<String, (String, serde_json::Value)> = truncated
+        .iter()
+        .filter(|e| e.kind == EventKind::AssistantMessage)
+        .filter_map(|e| {
+            serde_json::from_value::<aigentic_log::AssistantMessagePayload>(e.payload.clone()).ok()
+        })
+        .flat_map(|p| p.blocks)
+        .filter_map(|b| match b {
+            ContentBlock::ToolCall(c) => Some((c.id, (c.name, c.args))),
+            _ => None,
+        })
+        .collect();
+
+    let after = project_body(truncated).unwrap();
+    let mut before = after.clone();
+    let mut stubbed = 0usize;
+    for message in &mut before {
+        for block in &mut message.blocks {
+            let ContentBlock::ToolCall(c) = block else {
+                continue;
+            };
+            let Some((_, args)) = full.get(&c.id) else {
+                continue;
+            };
+            if &c.args != args {
+                stubbed += 1;
+                c.args = args.clone();
+            }
+        }
+    }
+
+    // The bash `command` share, measured with the same estimator over the
+    // commands the two projections carry.
+    let bash_share = |messages: &[Message]| {
+        let text: String = messages
+            .iter()
+            .flat_map(|m| m.blocks.iter())
+            .filter_map(|b| match b {
+                ContentBlock::ToolCall(c) if c.name == "bash" => {
+                    Some(c.args.get("command")?.as_str()?.to_owned())
+                }
+                _ => None,
+            })
+            .collect();
+        estimate_text(&text)
+    };
+    let (floor_after, floor_before) = (estimate(&after), estimate(&before));
+    let (bash_after, bash_before) = (bash_share(&after), bash_share(&before));
+
+    println!(
+        "boundary at event {at} (through_seq {through}): {} calls shortened; \
+         floor {floor_before} est before, {floor_after} est after ({} saved); \
+         bash command share {bash_before} est before, {bash_after} est after",
+        stubbed,
+        floor_before.saturating_sub(floor_after),
+    );
+
+    assert!(stubbed > 0, "the deepest boundary stubs calls");
+    assert!(
+        floor_after < floor_before,
+        "the argument stubs must lower the floor: {floor_after} vs {floor_before}"
+    );
+    assert!(
+        bash_after < bash_before,
+        "the bash share must shrink: {bash_after} vs {bash_before}"
+    );
+}
