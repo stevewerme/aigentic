@@ -48,9 +48,21 @@ pub struct ProjectSwitchedPayload {
 }
 
 /// `thread_renamed`: the thread's title.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ThreadRenamedPayload {
     pub title: String,
+    /// The provider that proposed the title, when a side job wrote this
+    /// line: the utility profile's model name (issue #49). A person's
+    /// `/rename` makes no call and carries neither this nor a usage, and
+    /// neither did any line written before the runtime recorded them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// What that call cost in tokens, with `cost_usd` stamped from the
+    /// utility profile's `[prices]` by the same rule as
+    /// `memory_extracted` (issues #46, #49). Absent whenever no call
+    /// stands behind the line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
 }
 
 /// Payload of a `thread_started` event, the first event of a thread the
@@ -617,6 +629,35 @@ mod tests {
         }))
         .unwrap();
         assert!(bare.written.is_empty());
+    }
+
+    #[test]
+    fn thread_renamed_keeps_its_old_shape_without_a_call_behind_it() {
+        // An old line, and a person's `/rename`: a title and nothing
+        // else, written back byte for byte (issue #49).
+        let bare: ThreadRenamedPayload = serde_json::from_value(json!({"title": "x"})).unwrap();
+        assert_eq!(bare.model, None);
+        assert_eq!(bare.usage, None);
+        assert_eq!(serde_json::to_value(&bare).unwrap(), json!({"title": "x"}));
+
+        // A utility model's line carries the model and the call's usage,
+        // and round-trips.
+        let called = ThreadRenamedPayload {
+            title: "x".into(),
+            model: Some("utility-model".into()),
+            usage: Some(Usage::reported(aigentic_core::Usage {
+                input_tokens: 300,
+                output_tokens: 20,
+                ..Default::default()
+            })),
+        };
+        let value = serde_json::to_value(&called).unwrap();
+        assert_eq!(value["model"], "utility-model");
+        assert_eq!(value["usage"]["input_tokens"], 300);
+        assert_eq!(
+            serde_json::from_value::<ThreadRenamedPayload>(value).unwrap(),
+            called
+        );
     }
 
     #[test]

@@ -290,8 +290,12 @@ impl Runtime {
         if title.is_empty() {
             return Ok(());
         }
-        let payload = serde_json::to_value(aigentic_log::ThreadRenamedPayload { title })
-            .expect("serialisable");
+        let payload = serde_json::to_value(aigentic_log::ThreadRenamedPayload {
+            title,
+            model: None,
+            usage: None,
+        })
+        .expect("serialisable");
         self.append(
             aigentic_core::EventKind::ThreadRenamed,
             author,
