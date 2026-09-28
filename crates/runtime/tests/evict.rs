@@ -18,8 +18,8 @@ use aigentic_core::{
 };
 use aigentic_log::{ContextEvictedPayload, ThreadLog, project_body};
 use aigentic_runtime::{
-    Answer, Approver, DEFAULT_COMPACTION, Decision, EVICT_MIN_FREE_PERCENT, RATIO_SMOOTHING,
-    Runtime, calibrated, min_free, next_ratio,
+    Answer, Approver, DEFAULT_COMPACTION, Decision, EVICT_MIN_FREE_PERCENT, RATIO_MAX,
+    RATIO_SMOOTHING, Runtime, calibrated, min_free, next_ratio,
 };
 use futures_core::Stream;
 
@@ -829,21 +829,21 @@ async fn zero_evict_min_free_percent_sweeps_as_soon_as_the_floor_advances() {
     );
 }
 
-/// T3's fixture lives in the log crate (a `context_saturated` event
-/// changes no projection); T4's is a payload round-trip there too.
-///
-/// The reference check, issue #35: the rule replayed over the real build
-/// thread that thrashed. Ignored by default; run it with
+/// The reference check, issues #35 and #52: the rule replayed over the
+/// real build thread that thrashed. Ignored by default; run it with
 /// `AIGENTIC_REPLAY_LOG=<thread>.jsonl cargo test -p aigentic-runtime
 /// --test evict replay -- --ignored --nocapture`.
 ///
-/// The run recorded the provider's own token counts, and on this log the
-/// estimate under-counts them by about 1.4x, so replaying at the default
-/// 128k would put the replay in the fitting regime while the run itself
-/// was pressed against the ceiling. The replay's ceiling is therefore the
-/// run's 128k in the estimate's units, both numbers read from the log:
-/// the biggest recorded input against the estimate of the same context.
-/// Every assertion below is the rule's, not a tuned number.
+/// The run recorded the provider's own token counts, and the runtime's
+/// estimate of the same context is smaller — on this log the run counted
+/// 137,877 at its fullest call over an estimate of 70,640 — so before
+/// #52 the replay could not run at the shipped ceiling: it scaled the
+/// ceiling into the estimate's units instead, `128k · estimated /
+/// counted`, one fixed factor of about 65,600 est. The calibration now
+/// learns that factor from the log alone, by the same named rule the
+/// turn loop uses, so the replay runs at the plain 128k and that manual
+/// compensation is gone. Every assertion below is the rule's, not a
+/// tuned number.
 #[tokio::test]
 // The plan's name, the thread's ULID as written in it.
 #[allow(non_snake_case)]
@@ -857,8 +857,10 @@ async fn thread_01M3GS3QP6_replays_without_thrash() {
         .collect();
 
     // What the provider counted at its fullest call, against what the
-    // estimate says of the same context: the run's own ceiling in the
-    // estimate's units.
+    // estimate says of the same context: printed for the record — it is
+    // the number the old manual compensation was computed from — and
+    // used only to assert the direction this log teaches the
+    // calibration. The replay is sized by the shipped ceiling.
     let (seq, counted) = events
         .iter()
         .filter_map(|e| {
@@ -870,7 +872,11 @@ async fn thread_01M3GS3QP6_replays_without_thrash() {
         .expect("a recorded call");
     let at = events.iter().position(|e| e.seq == seq).expect("the call");
     let estimated = estimate(&project_body(&events[..=at]).unwrap());
-    let ceiling = DEFAULT_COMPACTION.context_ceiling_tokens * estimated / counted;
+    assert!(
+        counted > estimated,
+        "this check is about a log the estimate under-counts: {counted} over {estimated}"
+    );
+    let ceiling = DEFAULT_COMPACTION.context_ceiling_tokens;
     let must_free = min_free(ceiling, EVICT_MIN_FREE_PERCENT);
 
     let dir = tempfile::tempdir().unwrap();
@@ -884,12 +890,14 @@ async fn thread_01M3GS3QP6_replays_without_thrash() {
         log,
         AgentId("worker".into()),
     )
-    .with_compaction(aigentic_runtime::CompactionSettings {
-        context_ceiling_tokens: ceiling,
-        ..DEFAULT_COMPACTION
-    });
+    .with_compaction(DEFAULT_COMPACTION);
     let clock = std::time::Instant::now();
     let decisions = runtime.sweep_decisions(&events).unwrap();
+    // The ratio the replay priced its decisions with, learned from the
+    // log's own counts (issue #52): it seeds at 1.0 and warms up over the
+    // first calls, and what it ends at is this log's own factor as the
+    // named rule reads it, not the fixed one #35 had to hand-compute.
+    let ratio = runtime.eviction_ratio();
     let sweeps: Vec<u64> = decisions
         .iter()
         .filter_map(|d| match d {
@@ -924,15 +932,15 @@ async fn thread_01M3GS3QP6_replays_without_thrash() {
         }
         buckets.push((turn, *count, swept, saturated, usize::from(saturated > 0)));
     }
+    assert_eq!(cursor, decisions.len(), "every decision belongs to a turn");
     let in_log = events
         .iter()
         .filter(|e| e.kind == EventKind::ContextEvicted)
         .count();
 
-    // Every sweep paid for its cache break, and no sweep could come
-    // before the turn had added that much evictable material again: the
-    // freed material of a sweep is all of it that had not been stubbed
-    // before, so the sweeps are bounded by the turn's own material.
+    // Every sweep paid for its cache break — in the calibrated tokens the
+    // rule prices with — and no sweep could come before the turn had
+    // added that much evictable material again.
     for (i, freed) in sweeps.iter().enumerate() {
         assert!(
             *freed >= must_free,
@@ -946,7 +954,8 @@ async fn thread_01M3GS3QP6_replays_without_thrash() {
         "{} calls replayed in {:?} over {} turns: {} sweeps, the log has {in_log}; \
          {saturation_decisions} saturation decisions (one per call), {spells} saturation spells \
          (events the runtime would append, once per turn — the shipped rule); ceiling {ceiling} \
-         est (the run counted {counted} over {estimated} est), material {material}, bound {bound}",
+         est (the run counted {counted} over {estimated} est: the compensation that is gone); \
+         learned ratio {ratio:.4}, material {material}, bound {bound}",
         decisions.len(),
         clock.elapsed(),
         turn_counts.len(),
@@ -956,6 +965,11 @@ async fn thread_01M3GS3QP6_replays_without_thrash() {
         println!(
             "  turn {turn}: calls={count} sweeps={swept} saturation_decisions={saturated} spells={sp}"
         );
+    }
+    // The shipped rule appends at most one `context_saturated` event per
+    // turn, however many of its calls decide to saturate.
+    for (turn, _, _, _, sp) in &buckets {
+        assert!(*sp <= 1, "turn {turn} saturated more than once");
     }
     assert!(
         (sweeps.len() as u64) <= bound,
@@ -967,6 +981,15 @@ async fn thread_01M3GS3QP6_replays_without_thrash() {
         "the replay thrashes as much as the log did: {} vs {in_log}",
         sweeps.len()
     );
+    // The calibration's own bounds, and the direction this log taught it:
+    // the run's counts run above the estimate, so the ratio ends above
+    // the 1.0 it seeds at and inside the clamp.
+    assert!(
+        ratio > 1.0 && ratio <= RATIO_MAX,
+        "the learned ratio {ratio} is outside (1.0, {RATIO_MAX}]"
+    );
+    // #35's regime check, kept: a replay too cheap to saturate would not
+    // be exercising the path #52 is about either.
     assert!(
         spells > 0,
         "the replay must reach the regime the issue is about"
