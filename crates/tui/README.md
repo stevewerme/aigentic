@@ -114,7 +114,9 @@ For work of three steps or more the model keeps a checklist
 (`update_tasks`); it shows above the turn line with the active step marked
 and stays in the transcript when it is all done or the turn ends. `@` opens a fuzzy file picker over the project
 root (gitignored files skipped), `/` at the line's start the command list
-with descriptions; Up and Down move, Tab or Enter accepts, Esc closes. A
+with descriptions; Up and Down move, Tab accepts, Esc closes. Enter
+accepts too, except that a line already holding a complete command or
+skill name (`/why`, `/copy 2`) submits in one press. A
 permission request is a block above the
 composer, which keeps its draft: `y` once, `a` this session, `p` allow this
 command's leading words from now on (written to the project's
@@ -214,7 +216,8 @@ the decision prints with it. Streamed text prints as its lines complete.
 
 Slash commands: `/cost` (input and output tokens for the thread, reported and
 estimated shown separately, plus cache reads and writes, the reasoning share,
-compactions and memory extractions), `/why` (the last turn's raw stop
+compactions, and the side jobs: memory extractions and thread titles,
+with their dollars where the call was priced), `/why` (the last turn's raw stop
 reason, when the turn ended on a provider failure: the plain line is on
 screen and this is the machine text), `/pin <text>` (a fact for the stable
 prefix, never summarised), `/remember [decision|constraint|fact] <text>`
