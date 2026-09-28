@@ -495,6 +495,29 @@ fn check_nodes(
 }
 
 impl LoadedWorkflow {
+    /// Render one step's template from a slot map. The map is
+    /// `StepReport.slots`, so a runner passes what a step reported
+    /// untouched.
+    pub fn render(
+        &self,
+        step_id: &str,
+        slots: &BTreeMap<String, serde_json::Value>,
+    ) -> Result<String, WorkflowError> {
+        let step = self
+            .workflow
+            .steps
+            .iter()
+            .find(|step| step.id == step_id)
+            .ok_or_else(|| WorkflowError::UnknownStep {
+                step: step_id.to_string(),
+            })?;
+        let template = self
+            .templates
+            .get(&step.template)
+            .expect("templates were parsed in the same load");
+        template.render(slots)
+    }
+
     /// One declared slot by name.
     pub fn slot(&self, name: &str) -> Option<&SlotDecl> {
         self.workflow.slots.iter().find(|slot| slot.name == name)
@@ -570,6 +593,17 @@ pub(crate) mod tests {
                 bundled: None,
             },
         )
+    }
+
+    /// A workflow of one step `s` over the given slot declarations,
+    /// loaded — the shape the render tests need.
+    pub(crate) fn one_step(root: &Path, slots: &str, template: &str) -> LoadedWorkflow {
+        let toml = format!(
+            "{HEAD}{slots}{}",
+            step("s", "templates/x.md", "next = \"done\"\n")
+        );
+        write_folder(&root.join("test"), &toml, &[("templates/x.md", template)]);
+        load(root, "test").expect("the fixture loads")
     }
 
     /// T1 — an unknown key is refused, not ignored.
