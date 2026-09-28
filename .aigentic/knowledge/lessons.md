@@ -36,6 +36,9 @@ so the rule can be judged, not just obeyed. The `brief`, `plan-check` and
   implementer's account of the plan is a claim, not evidence. It happened
   again on #49: three "plan literal corrections", an "amendment" and a T9
   that the plan never contained; grep each quoted phrase against the plan.
+  And on #52 an addendum described a T3 (90 replies, a 48,000 ceiling, a
+  boundary list) that was never in the code; the shipped test used 32,000.
+  A report's numbers and names are claims too: grep them against the diff.
 - **Someone reads the plan before implementing.** Both trial plans had a
   flaw a second reader caught (#38: pipe filters counted as extra work,
   undoing #21; #31: retries collected and emitted after the fact, defeating
