@@ -33,7 +33,9 @@ so the rule can be judged, not just obeyed. The `brief`, `plan-check` and
   <wrong name>` still exits 0; the verifier caught it by counting matches.
   The same report justified replacing a planned test with a sentence the
   plan never contained; the judge caught it by searching the thread. An
-  implementer's account of the plan is a claim, not evidence.
+  implementer's account of the plan is a claim, not evidence. It happened
+  again on #49: three "plan literal corrections", an "amendment" and a T9
+  that the plan never contained; grep each quoted phrase against the plan.
 - **Someone reads the plan before implementing.** Both trial plans had a
   flaw a second reader caught (#38: pipe filters counted as extra work,
   undoing #21; #31: retries collected and emitted after the fact, defeating
