@@ -91,12 +91,15 @@ phase 8 orchestrator.
 
 ## 3. The workflow folder
 
-A workflow is data, resolved like skills (project, then user, then
-bundled) but never in a model's context and never offered as
-`load_skill`:
+A workflow is data, resolved like skills (project
+`.aigentic/workflows/<name>/`, then user `~/.config/aigentic/workflows/<name>/`,
+then bundled `<bundled>/workflows/<name>/`, where `<bundled>` is the
+directory skills are bundled from, `default_bundled_dir()`) but never in a
+model's context and never offered as `load_skill`. This repository ships
+the bundled `build` workflow:
 
 ```
-.aigentic/workflows/build/
+workflows/build/
   workflow.toml
   templates/brief.md
   templates/planner.md
