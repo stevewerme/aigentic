@@ -426,8 +426,19 @@ async fn a_two_hundred_call_turn_with_large_results_and_edits_stays_under_128k()
         // last 12 plus the last of each distinct tool in full.
         let stubs = flat.matches("dropped from context; re-run it").count();
         assert!((150..=200).contains(&stubs), "{stubs} stubs");
-        let edits = flat.matches("lines]").count();
-        assert!((80..=200).contains(&edits), "{edits} edit stubs");
+        // Calls stub their arguments inside their own keys too: the
+        // fixture's long-argument call is the every-third write_file
+        // (`read_file`'s path and `edit_file`'s three short strings stay
+        // under the cap), and its `content` keeps only a shortened head
+        // with the `… [+N chars]` marker. The last of each tool and the
+        // calls above the floor keep their arguments, so the count sits
+        // between half and all of them.
+        let long_args = (1..=200u32).filter(|i| i % 3 == 2).count();
+        let shortened_args = flat.matches("… [+").count();
+        assert!(
+            long_args / 2 < shortened_args && shortened_args <= long_args,
+            "{shortened_args} argument stubs of {long_args} long-argument calls"
+        );
     }
 
     // The stubs persist after the turn closes: a later, small turn still
