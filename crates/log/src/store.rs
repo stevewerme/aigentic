@@ -85,12 +85,25 @@ pub struct NewEvent {
 /// The single writer for one thread's JSONL file.
 ///
 /// One turn at a time, one append at a time: hold one `ThreadLog` per thread
-/// and route every write through it.
+/// and route every write through it. The events are kept in memory as they
+/// were read at open and as every append adds them, so [`read_all`] and
+/// [`events`] are cache reads: the file itself is read only at open (and
+/// again after a torn-tail repair), never per call.
+///
+/// [`read_all`]: ThreadLog::read_all
+/// [`events`]: ThreadLog::events
 #[derive(Debug)]
 pub struct ThreadLog {
     thread_id: Ulid,
     path: PathBuf,
     next_seq: u64,
+    /// What the file held at open plus every append since, in order. The
+    /// store is the only writer, so this is the file.
+    events: Vec<Event>,
+    /// Full-file passes this log has made: one at a healthy open, two when
+    /// a torn tail was repaired (the failed pass plus the re-read of the
+    /// truncated file), none for a path that did not exist.
+    file_reads: u64,
     ids: Generator,
 }
 
@@ -112,14 +125,14 @@ impl ThreadLog {
     ) -> Result<(Self, Option<u64>), LogError> {
         let path = dir.as_ref().join(format!("{thread_id}.jsonl"));
         let mut cut = None;
-        let next_seq = if path.exists() {
+        let mut file_reads = 0u64;
+        let events = if path.exists() {
+            file_reads += 1;
             match read_file(&path, thread_id) {
-                Ok(events) => events.len() as u64,
-                Err(LogError::TruncatedTail {
-                    offset,
-                    good_events,
-                    ..
-                }) if repair == Repair::TruncateTornTail => {
+                Ok(events) => events,
+                Err(LogError::TruncatedTail { offset, .. })
+                    if repair == Repair::TruncateTornTail =>
+                {
                     let io = |source| LogError::Io {
                         path: path.clone(),
                         source,
@@ -132,18 +145,24 @@ impl ThreadLog {
                         .set_len(offset)
                         .map_err(io)?;
                     cut = Some(len - offset);
-                    good_events as u64
+                    // Re-read the file the repair left, so the cache and the
+                    // next `seq` are provably consistent with its bytes.
+                    file_reads += 1;
+                    read_file(&path, thread_id)?
                 }
                 Err(e) => return Err(e),
             }
         } else {
-            0
+            Vec::new()
         };
+        let next_seq = events.len() as u64;
         Ok((
             Self {
                 thread_id,
                 path,
                 next_seq,
+                events,
+                file_reads,
                 ids: Generator::new(),
             },
             cut,
@@ -186,6 +205,20 @@ impl ThreadLog {
         self.next_seq == 0
     }
 
+    /// The events the log holds: the file as it was read at open plus every
+    /// append since, oldest first. The store is the single writer, so this
+    /// is the file; it is never re-read.
+    pub fn events(&self) -> &[Event] {
+        &self.events
+    }
+
+    /// Full-file read passes this log has made: one at a healthy open, two
+    /// when a torn tail was repaired, none for a path that did not exist.
+    /// The test seam for "the file is read only on open".
+    pub fn file_reads(&self) -> u64 {
+        self.file_reads
+    }
+
     /// Append one event and return it as stored. The line is flushed and
     /// synced before this returns.
     pub fn append(&mut self, new: NewEvent) -> Result<Event, LogError> {
@@ -214,17 +247,20 @@ impl ThreadLog {
         file.write_all(&line).map_err(io)?;
         file.sync_data().map_err(io)?;
 
+        // The cache is mutated only after the write succeeded: a failed
+        // append never dirties it.
+        self.events.push(event.clone());
         self.next_seq += 1;
         Ok(event)
     }
 
-    /// Replay the whole file, oldest first, validating thread id and gapless
-    /// `seq` on the way.
+    /// The events this log holds, owned: the same as [`events`]. The file
+    /// is not re-read — it was read once at open, and every append since
+    /// went through this struct, its single writer.
+    ///
+    /// [`events`]: ThreadLog::events
     pub fn read_all(&self) -> Result<Vec<Event>, LogError> {
-        if !self.path.exists() {
-            return Ok(Vec::new());
-        }
-        read_file(&self.path, self.thread_id)
+        Ok(self.events.clone())
     }
 }
 
@@ -397,7 +433,9 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         std::fs::write(log.path(), format!("{}\n{}\n", lines[0], lines[2])).unwrap();
 
-        let err = log.read_all().unwrap_err();
+        // A fresh open reads and validates the file; the cache the live
+        // log holds is stale, exactly as the single-writer rule allows.
+        let err = ThreadLog::open(dir.path(), thread).unwrap_err();
         match err {
             LogError::SeqGap {
                 line,
@@ -409,10 +447,11 @@ mod tests {
             }
             other => panic!("expected SeqGap, got {other:?}"),
         }
-        assert!(matches!(
-            ThreadLog::open(dir.path(), thread).unwrap_err(),
-            LogError::SeqGap { .. }
-        ));
+        assert_eq!(
+            log.read_all().unwrap().len(),
+            third.seq as usize + 1,
+            "the live log serves its cache, not the doctored file"
+        );
     }
 
     #[test]
@@ -429,7 +468,7 @@ mod tests {
         let cut = first_len + (text.len() - first_len) / 2;
         std::fs::write(log.path(), &text[..cut]).unwrap();
 
-        match log.read_all().unwrap_err() {
+        match ThreadLog::open(dir.path(), thread).unwrap_err() {
             LogError::TruncatedTail {
                 line,
                 good_events,
@@ -516,7 +555,7 @@ mod tests {
         let text = std::fs::read_to_string(log.path()).unwrap();
         std::fs::write(log.path(), text.trim_end()).unwrap();
         assert!(matches!(
-            log.read_all().unwrap_err(),
+            ThreadLog::open(dir.path(), thread).unwrap_err(),
             LogError::TruncatedTail { good_events: 0, .. }
         ));
     }
@@ -532,7 +571,7 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         std::fs::write(log.path(), format!("{{not json}}\n{}\n", lines[1])).unwrap();
         assert!(matches!(
-            log.read_all().unwrap_err(),
+            ThreadLog::open(dir.path(), thread).unwrap_err(),
             LogError::Malformed { line: 1, .. }
         ));
     }
