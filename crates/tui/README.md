@@ -44,6 +44,9 @@ api_key_env = "ANTHROPIC_API_KEY"
 # keep_turns = 8                          # verbatim tail after a summary
 # max_result_bytes = 4096                 # truncation target for old tool results
 # summary_max_output_tokens = 2048
+# context_ceiling_tokens = 128000         # what one call's context may cost; 0 = no ceiling
+# evict_above_tokens = 64000              # sweep only above this line; 0 = sweep on call count alone
+# evict_min_free_percent = 25             # share of the ceiling a sweep must free; 0 = sweep as soon as the floor advances
 
 # utility_profile = "flash"               # side jobs: thread titles, memory extraction
 # keep_awake = true                      # hold off idle sleep while a turn works (default);

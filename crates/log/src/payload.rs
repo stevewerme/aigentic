@@ -357,6 +357,11 @@ pub struct ContextEvictedPayload {
 /// The event is never projected into model context, so this payload moves
 /// no context whatever it says — the boundary it names is for the reader,
 /// and may sit above the last one a `context_evicted` recorded.
+///
+/// Appended at most once per turn: the open turn's own scan keeps the
+/// fact sticky from its first `context_saturated` until its `turn_ended`,
+/// and a `context_evicted` does not re-arm it — the floor only grows
+/// within a turn, so a spell and a turn coincide.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextSaturatedPayload {
     /// The floor's own boundary: the last call the sweep would stub,

@@ -64,7 +64,10 @@ pub struct CompactionSettings {
     pub summary_max_output_tokens: u64,
     /// Calls of the running turn kept in full before in-turn eviction
     /// stubs the rest (issue #30). Failed results and the last result of
-    /// each distinct tool always stay on top of these.
+    /// each distinct tool always stay on top of these. Read only when
+    /// `context_ceiling_tokens = 0`: with a ceiling set the sweep's depth
+    /// is the floor instead — all but the last `EVICT_BLOCK_CALLS` calls —
+    /// so this has no effect.
     pub keep_last_calls: usize,
     /// What one call's context may cost, whatever the model's window:
     /// compaction's trigger line and the in-turn sweep both aim under

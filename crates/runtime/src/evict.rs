@@ -24,10 +24,11 @@
 //!
 //! When even the floor is over `context_ceiling_tokens` the turn cannot
 //! be fitted by eviction at all, and only the handoff to a fresh thread
-//! can help. The sweep says so, once per turn, with a
-//! `context_saturated` event, and goes on evicting what it can: the
-//! alternative — holding until a probe fits again — never holds, since
-//! the floor only grows.
+//! can help. The sweep says so once per turn — a spell and a turn
+//! coincide, since the floor only grows within a turn, so a later
+//! `context_evicted` can never unsay it — with a `context_saturated`
+//! event, and goes on evicting what it can: the alternative — holding
+//! until a probe fits again — never holds, since the floor only grows.
 
 use aigentic_core::{Author, ContentBlock, Event, EventKind};
 use aigentic_log::{
@@ -66,7 +67,8 @@ pub enum Decision {
     Hold,
     /// The same hold, with the deepest legal boundary itself still over
     /// the ceiling: this turn cannot be fitted by eviction at all, which
-    /// is worth saying once per turn.
+    /// is worth saying once per turn (the floor only grows within a
+    /// turn, so a spell and a turn coincide).
     Saturated {
         through_seq: u64,
         tokens_at_floor: u64,
@@ -82,6 +84,9 @@ pub enum Decision {
 struct Scan {
     calls: Vec<u64>,
     through: Option<u64>,
+    /// Whether the open turn already appended a `context_saturated`: set
+    /// by any such event in the turn, cleared only by its `turn_ended`,
+    /// so the event is once per turn.
     saturated: bool,
 }
 
@@ -107,6 +112,11 @@ impl Scan {
                         scan.through = Some(scan.through.unwrap_or(0).max(p.through_seq));
                     }
                 }
+                // Sticky for the rest of the turn: any `context_saturated`
+                // in it means the turn has already said this, and only
+                // the next `turn_ended` clears it. A later
+                // `context_evicted` does not re-arm — the floor only grows
+                // within a turn, so a spell and a turn coincide.
                 EventKind::ContextSaturated => scan.saturated = true,
                 _ => {}
             }
@@ -194,8 +204,10 @@ impl Runtime {
                 EventKind::ContextEvicted,
                 serde_json::to_value(ContextEvictedPayload { through_seq }).expect("serialisable"),
             ),
-            // One saturation line per spell: the turn said it once, and
-            // the next thing that can unsay it is a turn that ends.
+            // Once per turn, not once per sweep: the turn has already
+            // said it, and only the next `turn_ended` clears the flag — a
+            // `context_evicted` does not re-arm it, because the floor only
+            // grows within a turn, so a spell and a turn coincide.
             Decision::Saturated { .. } if scan.saturated => return Ok(false),
             Decision::Saturated {
                 through_seq,

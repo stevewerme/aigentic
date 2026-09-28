@@ -288,6 +288,42 @@ fn turn_calls(events: &[Event]) -> Vec<u64> {
         .collect()
 }
 
+/// The `through_seq` of each `context_evicted` in the log, in order.
+fn sweep_seqs(events: &[Event]) -> Vec<u64> {
+    events
+        .iter()
+        .filter(|e| e.kind == EventKind::ContextEvicted)
+        .map(|e| {
+            serde_json::from_value::<ContextEvictedPayload>(e.payload.clone())
+                .expect("an eviction payload")
+                .through_seq
+        })
+        .collect()
+}
+
+/// Each turn's completed calls, in log order: one count per `turn_ended`
+/// segment (plus a trailing segment if the log does not end on one).
+/// `Runtime::sweep_decisions` returns one decision per call in this same
+/// order, so these counts bucket its flat list back into turns.
+fn turn_call_counts(events: &[Event]) -> Vec<usize> {
+    let mut counts = Vec::new();
+    let mut start = 0;
+    while start < events.len() {
+        let end = events[start..]
+            .iter()
+            .position(|e| e.kind == EventKind::TurnEnded)
+            .map_or(events.len(), |i| start + i + 1);
+        counts.push(
+            events[start..end]
+                .iter()
+                .filter(|e| e.kind == EventKind::ToolResult)
+                .count(),
+        );
+        start = end;
+    }
+    counts
+}
+
 /// Estimated tokens of the projection with the boundary moved to
 /// `through_seq`, over the log as it stands: the sweep's own probe, run
 /// from the test instead of the runtime.
@@ -623,6 +659,49 @@ async fn the_boundary_holds_while_saturated() {
     );
 }
 
+/// Issue #35, review item 3: what `evict_min_free_percent = 0` actually
+/// does. With no minimum, `freed < min_free(ceiling, 0) = 0` never holds,
+/// so the boundary moves to the floor the moment a call advances it — one
+/// sweep per call past the block, however little each frees. That is not
+/// the pre-#35 rule: the sweep still targets the floor; it just never
+/// waits for the move to be worth anything.
+#[tokio::test]
+async fn zero_evict_min_free_percent_sweeps_as_soon_as_the_floor_advances() {
+    let zero = aigentic_runtime::CompactionSettings {
+        evict_min_free_percent: 0,
+        ..saturated()
+    };
+    let ran = run_turn(60, 1_400, zero).await;
+    let calls = turn_calls(&ran.events);
+    let seqs = sweep_seqs(&ran.events);
+    assert!(seqs.len() >= 2, "the fixture must sweep: {:?}", ran.marks);
+    // Every sweep moves the boundary by exactly one call: the floor
+    // advanced by one, and nothing waited for it to be worth it.
+    for pair in seqs.windows(2) {
+        let from = calls
+            .iter()
+            .position(|s| *s == pair[0])
+            .expect("a sweep's call");
+        let to = calls
+            .iter()
+            .position(|s| *s == pair[1])
+            .expect("a sweep's call");
+        assert_eq!(
+            to,
+            from + 1,
+            "the boundary jumped from call {from} to call {to}"
+        );
+    }
+    // The gated default on the same fixture sweeps far less often.
+    let gated = run_turn(60, 1_400, saturated()).await;
+    assert!(
+        seqs.len() > gated.sweeps(),
+        "zero swept {} times, the gated default {}",
+        seqs.len(),
+        gated.sweeps()
+    );
+}
+
 /// T3's fixture lives in the log crate (a `context_saturated` event
 /// changes no projection); T4's is a payload round-trip there too.
 ///
@@ -691,10 +770,33 @@ async fn thread_01M3GS3QP6_replays_without_thrash() {
             _ => None,
         })
         .collect();
-    let saturations = decisions
-        .iter()
-        .filter(|d| matches!(d, Decision::Saturated { .. }))
-        .count();
+    // `sweep_decisions` returns one decision per completed call, turn by
+    // turn, so each turn's call count buckets the flat list back into
+    // turns. A `Saturated` *decision* is per call; the runtime appends a
+    // `context_saturated` *event* at most once per turn (the shipped
+    // rule), so a turn with any saturated decision contributes one spell.
+    let turn_counts = turn_call_counts(&events);
+    let mut buckets = Vec::new();
+    let mut cursor = 0;
+    let mut saturation_decisions = 0usize;
+    let mut spells = 0usize;
+    for (turn, count) in turn_counts.iter().enumerate() {
+        let slice = &decisions[cursor..cursor + count];
+        cursor += count;
+        let swept = slice
+            .iter()
+            .filter(|d| matches!(d, Decision::Sweep { .. }))
+            .count();
+        let saturated = slice
+            .iter()
+            .filter(|d| matches!(d, Decision::Saturated { .. }))
+            .count();
+        saturation_decisions += saturated;
+        if saturated > 0 {
+            spells += 1;
+        }
+        buckets.push((turn, *count, swept, saturated, usize::from(saturated > 0)));
+    }
     let in_log = events
         .iter()
         .filter(|e| e.kind == EventKind::ContextEvicted)
@@ -714,13 +816,20 @@ async fn thread_01M3GS3QP6_replays_without_thrash() {
     let material = unswept_material(&events);
     let bound = material / must_free + 1;
     println!(
-        "{} calls replayed in {:?}: {} sweeps, the log has {in_log}; {saturations} saturations \
-         spells, ceiling {ceiling} est (the run counted {counted} over {estimated} est), \
-         material {material}, bound {bound}",
+        "{} calls replayed in {:?} over {} turns: {} sweeps, the log has {in_log}; \
+         {saturation_decisions} saturation decisions (one per call), {spells} saturation spells \
+         (events the runtime would append, once per turn — the shipped rule); ceiling {ceiling} \
+         est (the run counted {counted} over {estimated} est), material {material}, bound {bound}",
         decisions.len(),
         clock.elapsed(),
+        turn_counts.len(),
         sweeps.len(),
     );
+    for (turn, count, swept, saturated, sp) in &buckets {
+        println!(
+            "  turn {turn}: calls={count} sweeps={swept} saturation_decisions={saturated} spells={sp}"
+        );
+    }
     assert!(
         (sweeps.len() as u64) <= bound,
         "{} sweeps over the {bound} the log's material allows",
@@ -732,7 +841,7 @@ async fn thread_01M3GS3QP6_replays_without_thrash() {
         sweeps.len()
     );
     assert!(
-        saturations > 0,
+        spells > 0,
         "the replay must reach the regime the issue is about"
     );
 }

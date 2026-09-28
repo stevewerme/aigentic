@@ -1010,6 +1010,22 @@ context_ceiling_tokens = 96_000
         assert_eq!(DEFAULT_BUDGET.cache_read_price_ratio, 0.25);
     }
 
+    /// Issue #35, review item 3: the new key's upper bound. The check is
+    /// `Profile::validate`, and the message names the dotted path and the
+    /// value it refused.
+    #[test]
+    fn an_evict_min_free_percent_above_one_hundred_is_refused() {
+        let err = Config::parse(
+            "[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n[profiles.a.compaction]\nevict_min_free_percent = 101\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("compaction.evict_min_free_percent must be at most 100, got 101"),
+            "the message must name the key and the value: {err}"
+        );
+    }
+
     #[test]
     fn display_caps_default_override_and_reject_the_unknown() {
         let c = Config::parse(FLAT).unwrap();

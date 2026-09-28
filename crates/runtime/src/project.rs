@@ -346,7 +346,9 @@ pub struct CompactionConfig {
     #[serde(default)]
     pub summary_max_output_tokens: Option<u64>,
     /// Calls of the running turn kept in full before in-turn eviction
-    /// stubs the rest (issue #30).
+    /// stubs the rest (issue #30). Read only when
+    /// `context_ceiling_tokens = 0`; with a ceiling set the depth is the
+    /// floor instead, so this has no effect.
     #[serde(default)]
     pub keep_last_calls: Option<usize>,
     /// What one call's context may cost, whatever the window (issue #30).
@@ -356,7 +358,9 @@ pub struct CompactionConfig {
     #[serde(default)]
     pub evict_above_tokens: Option<u64>,
     /// The share of the ceiling a sweep must free to be worth its cache
-    /// break (issue #35); zero is the pre-#35 rule.
+    /// break (issue #35). Zero moves the boundary as soon as the floor
+    /// advances, however little that frees — the sweep runs on nearly
+    /// every call.
     #[serde(default)]
     pub evict_min_free_percent: Option<u32>,
 }
