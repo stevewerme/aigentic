@@ -55,9 +55,6 @@ struct CallResult {
     /// The turn the result belongs to, keyed like [`Eviction::turn`].
     turn: Option<u64>,
     is_error: bool,
-    /// For a successful `edit_file` / `write_file`: its result's diff
-    /// shape, `-removed/+added`, for the argument stub.
-    diff: Option<(u64, u64)>,
 }
 
 /// Project events into the canonical messages a provider sees, oldest
@@ -67,9 +64,12 @@ struct CallResult {
 /// its range with one user-role message from the system author (later
 /// summaries win where ranges overlap); truncations shorten tool results in
 /// their range; a `context_evicted` event stubs the tool results at or
-/// before its `through_seq` within its own turn, and the arguments of their
-/// successful `edit_file` / `write_file` calls with the diff shape, except
-/// failed results and the last result of each distinct tool, which stay;
+/// before its `through_seq` within its own turn, and shortens the
+/// arguments of their calls inside the call's own keys — a `bash`
+/// `command` to its first line, an `update_tasks` item's `text`, and any
+/// other top-level value over [`STUB_ARG_MAX_CHARS`] cut with a
+/// `… [+N chars]` marker — except failed results and the last result of
+/// each distinct tool, which stay whole;
 /// provider blobs are dropped from every assistant message
 /// that predates the latest summary compaction; an interrupted event
 /// becomes a short note; a loaded skill becomes a user-role message from
@@ -175,15 +175,12 @@ pub fn project(events: &[Event]) -> Result<Projection, LogError> {
                 let Some((name, _)) = calls.get(&p.result.id) else {
                     continue;
                 };
-                let is_edit = name == "edit_file" || name == "write_file";
                 results.insert(
                     p.result.id.clone(),
                     CallResult {
                         seq: event.seq,
                         turn,
                         is_error: p.result.is_error,
-                        diff: (!p.result.is_error && is_edit)
-                            .then(|| diff_lines(&p.result.content)),
                     },
                 );
                 last_of_tool.insert((turn, name.clone()), event.seq);
@@ -311,16 +308,10 @@ pub fn project(events: &[Event]) -> Result<Projection, LogError> {
                     .blocks
                     .into_iter()
                     .map(|b| match &b {
-                        // A successful edit whose result is stubbed loses
-                        // its old/new strings: the diff shape is enough,
-                        // and the file can be re-read.
-                        ContentBlock::ToolCall(c)
-                            if stubbed.contains(&c.id)
-                                && (c.name == "edit_file" || c.name == "write_file") =>
-                        {
-                            let diff = results.get(&c.id).and_then(|r| r.diff).unwrap_or((0, 0));
-                            stub_call_args(c, diff)
-                        }
+                        // Every call whose result is stubbed loses the bulk
+                        // of its arguments too, inside its own keys (issue
+                        // #51): the payload was the floor's largest part.
+                        ContentBlock::ToolCall(c) if stubbed.contains(&c.id) => shorten_call_args(c),
                         _ => b,
                     })
                     .filter(|b| !(drop_blobs && matches!(b, ContentBlock::ProviderBlob(_))))
@@ -494,37 +485,100 @@ fn short_args(args: &serde_json::Value) -> String {
     }
 }
 
-/// A successful edit/write call whose result is stubbed: the arguments
-/// become the diff shape, read off the result before it was stubbed.
-fn stub_call_args(call: &aigentic_core::ToolCall, diff: (u64, u64)) -> ContentBlock {
-    let path = call
-        .args
-        .get("path")
-        .and_then(|p| p.as_str())
-        .unwrap_or_default();
-    let (removed, added) = diff;
-    let stub = format!("[edited {path}: -{removed}/+{added} lines]");
+/// The most characters an argument value keeps behind the eviction
+/// boundary (issue #51). Every value longer than this is cut and
+/// marked; shorter calls project byte-identical.
+pub const STUB_ARG_MAX_CHARS: usize = 120;
+
+/// A call whose result is stubbed: the arguments lose the bulk of every
+/// long value, inside the call's own keys, so the call still looks like
+/// the tool it was and the model is taught nothing false (issue #51; the
+/// old `{"evicted": …}` shape was copied back verbatim, #17).
+///
+/// Per family: a `bash` `command` becomes its first line, cut at
+/// [`STUB_ARG_MAX_CHARS`]; an `update_tasks` item keeps its `state` and
+/// gets the same cut on its `text`; every other tool's top-level string
+/// values are cut the same way. Each cut value gets `… [+N chars]`,
+/// where N counts every character dropped (later lines included). Keys
+/// are never added or removed, so a stub still deserialises.
+pub fn shorten_call_args(call: &aigentic_core::ToolCall) -> ContentBlock {
     ContentBlock::ToolCall(aigentic_core::ToolCall {
         id: call.id.clone(),
         name: call.name.clone(),
-        args: serde_json::json!({ "evicted": stub }),
+        args: shorten_args(&call.name, &call.args),
     })
 }
 
-/// The `-removed/+added` line counts of a unified diff, headers excluded.
-fn diff_lines(content: &str) -> (u64, u64) {
-    let (mut removed, mut added) = (0, 0);
-    for line in content.lines() {
-        if line.starts_with("---") || line.starts_with("+++") {
-            continue;
-        }
-        match line.as_bytes().first() {
-            Some(b'-') => removed += 1,
-            Some(b'+') => added += 1,
-            _ => {}
-        }
+/// One call's arguments with the bulk of every long value cut.
+fn shorten_args(name: &str, args: &serde_json::Value) -> serde_json::Value {
+    let serde_json::Value::Object(map) = args else {
+        return args.clone();
+    };
+    let mut out = serde_json::Map::new();
+    for (key, value) in map {
+        let short = match (name, key.as_str(), value) {
+            // A shell command is read for what it ran: the first line is
+            // enough, and the marker says how much of the rest is gone.
+            ("bash", "command", serde_json::Value::String(command)) => {
+                serde_json::Value::String(shorten_first_line(command))
+            }
+            // The live task list is the latest call's; behind the
+            // boundary only the shape of the list matters.
+            ("update_tasks", "tasks", serde_json::Value::Array(items)) => {
+                serde_json::Value::Array(items.iter().map(shorten_task).collect())
+            }
+            (_, _, serde_json::Value::String(text)) => {
+                serde_json::Value::String(shorten_value(text))
+            }
+            (_, _, other) => other.clone(),
+        };
+        out.insert(key.clone(), short);
     }
-    (removed, added)
+    serde_json::Value::Object(out)
+}
+
+/// One `update_tasks` item: `text` cut, everything else (its `state`)
+/// untouched, no key added or removed.
+fn shorten_task(item: &serde_json::Value) -> serde_json::Value {
+    let serde_json::Value::Object(map) = item else {
+        return item.clone();
+    };
+    let mut out = serde_json::Map::new();
+    for (key, value) in map {
+        let short = match (key.as_str(), value) {
+            ("text", serde_json::Value::String(text)) => {
+                serde_json::Value::String(shorten_value(text))
+            }
+            _ => value.clone(),
+        };
+        out.insert(key.clone(), short);
+    }
+    serde_json::Value::Object(out)
+}
+
+/// A value cut to [`STUB_ARG_MAX_CHARS`] characters, with a marker
+/// counting everything dropped. A value already within the cap is
+/// returned as it was.
+fn shorten_value(value: &str) -> String {
+    let total = value.chars().count();
+    if total <= STUB_ARG_MAX_CHARS {
+        return value.to_owned();
+    }
+    let head: String = value.chars().take(STUB_ARG_MAX_CHARS).collect();
+    format!("{head}… [+{} chars]", total - head.chars().count())
+}
+
+/// A command's first line, cut to [`STUB_ARG_MAX_CHARS`] characters; the
+/// marker counts every character dropped, later lines included.
+fn shorten_first_line(command: &str) -> String {
+    let total = command.chars().count();
+    let line = command.lines().next().unwrap_or_default();
+    let head: String = line.chars().take(STUB_ARG_MAX_CHARS).collect();
+    let removed = total - head.chars().count();
+    if removed == 0 {
+        return command.to_owned();
+    }
+    format!("{head}… [+{removed} chars]")
 }
 
 fn payload<T: serde::de::DeserializeOwned>(event: &Event) -> Result<T, LogError> {
@@ -1344,6 +1398,9 @@ mod tests {
     #[test]
     fn evicted_results_stub_but_failures_and_the_last_per_tool_stay() {
         let long = "line\n".repeat(200);
+        // A long write payload: behind the boundary its arguments keep
+        // their keys and their shape, with the content cut.
+        let payload = "row\n".repeat(100);
         let events = vec![
             user(0, "build it"),
             call(1, "c1", "bash", json!({"command": "cargo test"})),
@@ -1358,7 +1415,7 @@ mod tests {
                 9,
                 "c5",
                 "write_file",
-                json!({"path": "src/new.rs", "content": "one\ntwo\n"}),
+                json!({"path": "src/new.rs", "content": payload}),
             ),
             result(
                 10,
@@ -1386,6 +1443,10 @@ mod tests {
             result(15, "c6", "edited src/new.rs at line 1"),
         ];
         let p = project(&events).unwrap();
+        let stub_c5 = format!(
+            "[result of write_file {} · 6 lines · dropped from context; re-run it if you need it again]",
+            short_args(&json!({"path": "src/new.rs", "content": payload}))
+        );
         assert_eq!(
             results(&p),
             vec![
@@ -1396,10 +1457,7 @@ mod tests {
                 ("c2".into(), long.clone()), // last read_file of the turn
                 ("c3".into(), long),         // last bash result of the turn
                 ("c4".into(), "no matches".into()), // failures stay
-                (
-                    "c5".into(),
-                    "[result of write_file {\"content\":\"one\\ntwo\\n\",\"path\":\"src/new.rs\"} · 6 lines · dropped from context; re-run it if you need it again]".into()
-                ),
+                ("c5".into(), stub_c5),
                 // The last write_file result stays, in range though it is.
                 (
                     "c7".into(),
@@ -1412,16 +1470,30 @@ mod tests {
         assert!(p.body.iter().any(|m| m.role == Role::Tool
             && m.author == Author::System
             && matches!(&m.blocks[0], ContentBlock::ToolResult(r) if r.id == "c1" && !r.is_error)));
-        // Successful edit/write arguments stub with the diff shape; the
-        // last of a tool and the call after the boundary keep theirs.
+        // Successful edit/write arguments whose result is stubbed keep
+        // their own keys, with the long value cut; the last of a tool and
+        // the call after the boundary keep theirs.
+        let args = call_args(&p);
         assert_eq!(
-            call_args(&p),
-            vec![
+            args[..4],
+            [
                 json!({"command": "cargo test"}),
                 json!({"path": "a.rs"}),
                 json!({"command": "cargo test"}),
                 json!({"pattern": "x"}),
-                json!({"evicted": "[edited src/new.rs: -0/+2 lines]"}),
+            ]
+        );
+        let c5 = args[4].as_object().expect("an object, as it was sent");
+        let mut keys: Vec<&String> = c5.keys().collect();
+        keys.sort();
+        assert_eq!(keys, ["content", "path"], "no key added or removed");
+        assert_eq!(c5["path"], json!("src/new.rs"));
+        let head: String = payload.chars().take(STUB_ARG_MAX_CHARS).collect();
+        let removed = payload.chars().count() - head.chars().count();
+        assert_eq!(c5["content"], json!(format!("{head}… [+{removed} chars]")));
+        assert_eq!(
+            args[5..],
+            [
                 json!({"path": "src/other.rs", "content": "x\n"}),
                 json!({"path": "src/new.rs", "old_string": "one", "new_string": "ONE"}),
             ]
@@ -1498,5 +1570,208 @@ mod tests {
             "{stub}"
         );
         assert!(stub.len() < 200, "{stub}");
+    }
+
+    /// The fixture of T1/T2/T3: a bash call whose `command` is several
+    /// lines and longer than the cap, with a `timeout_secs` beside it.
+    fn long_bash_args() -> (String, serde_json::Value) {
+        let first = "cargo test --workspace ".repeat(9);
+        let command = format!("{first}\necho done\ncd crates/log && cargo test\n");
+        assert!(
+            command.chars().count() > STUB_ARG_MAX_CHARS,
+            "the fixture must exceed the cap"
+        );
+        let args = json!({"command": command, "timeout_secs": 900});
+        (command, args)
+    }
+
+    #[test]
+    fn a_long_bash_command_behind_the_boundary_projects_as_its_first_line() {
+        let (command, args) = long_bash_args();
+        let events = vec![
+            user(0, "build it"),
+            call(1, "c1", "bash", args.clone()),
+            result(2, "c1", "ok"),
+            call(3, "c2", "bash", json!({"command": "cargo build"})),
+            result(4, "c2", "ok"),
+            evicted(5, 2),
+        ];
+        let p = project(&events).unwrap();
+        let first_line = command.lines().next().unwrap();
+        let head: String = first_line.chars().take(STUB_ARG_MAX_CHARS).collect();
+        let removed = command.chars().count() - head.chars().count();
+        assert_eq!(
+            call_args(&p)[0],
+            json!({
+                "command": format!("{head}… [+{removed} chars]"),
+                "timeout_secs": 900,
+            }),
+            "the first line within the cap plus a marker for the whole rest"
+        );
+        // The log's own payload still holds the command whole.
+        assert_eq!(events[1].payload["blocks"][0]["args"], args);
+    }
+
+    #[test]
+    fn a_bash_call_ahead_of_the_boundary_keeps_its_arguments_whole() {
+        let (_, args) = long_bash_args();
+        let events = vec![
+            user(0, "build it"),
+            call(1, "c1", "bash", json!({"command": "ls"})),
+            result(2, "c1", "ok"),
+            evicted(3, 2),
+            call(4, "c2", "bash", args.clone()),
+            result(5, "c2", "ok"),
+        ];
+        let p = project(&events).unwrap();
+        assert_eq!(
+            call_args(&p)[1],
+            args,
+            "ahead of the boundary the call is untouched"
+        );
+        // And it is stubbed on the other side of the same fixture, so the
+        // comparison above is not vacuous.
+        assert!(results(&p)[0].1.starts_with("[result of bash"));
+    }
+
+    #[test]
+    fn projecting_a_stub_never_mutates_the_input_events() {
+        let (_, args) = long_bash_args();
+        let events = vec![
+            user(0, "build it"),
+            call(1, "c1", "bash", args),
+            result(2, "c1", "ok"),
+            call(3, "c2", "bash", json!({"command": "cargo build"})),
+            result(4, "c2", "ok"),
+            evicted(5, 2),
+        ];
+        let before = events.clone();
+        let p = project(&events).unwrap();
+        assert_eq!(events, before, "the log's events are never mutated");
+        let stub = call_args(&p)[0]["command"].as_str().unwrap().to_owned();
+        assert!(stub.contains("… [+"), "a stub happened: {stub}");
+    }
+
+    #[test]
+    fn a_short_grep_call_behind_the_boundary_keeps_its_arguments_byte_identical() {
+        let args = json!({"pattern": "x"});
+        let events = vec![
+            user(0, "find it"),
+            call(1, "c1", "grep", args.clone()),
+            result(2, "c1", "one match"),
+            call(3, "c2", "grep", json!({"pattern": "y"})),
+            result(4, "c2", "another match"),
+            evicted(5, 4),
+        ];
+        let p = project(&events).unwrap();
+        assert!(
+            results(&p)[0].1.starts_with("[result of grep"),
+            "c1 is behind the boundary"
+        );
+        assert_eq!(
+            serde_json::to_string(&call_args(&p)[0]).unwrap(),
+            serde_json::to_string(&args).unwrap(),
+            "a short call projects byte-identical"
+        );
+    }
+
+    #[test]
+    fn an_update_tasks_call_behind_the_boundary_keeps_its_states_and_shrinks_its_texts() {
+        let long = "implement the eviction change ".repeat(10);
+        let tasks = json!([
+            {"text": "read the plan", "state": "done"},
+            {"text": long, "state": "active"},
+            {"text": "commit"},
+        ]);
+        let events = vec![
+            user(0, "go"),
+            call(1, "c1", "update_tasks", json!({"tasks": tasks})),
+            result(2, "c1", "3 tasks"),
+            call(3, "c2", "update_tasks", json!({"tasks": []})),
+            result(4, "c2", "0 tasks"),
+            evicted(5, 4),
+        ];
+        let p = project(&events).unwrap();
+        let stub = call_args(&p)[0].clone();
+        let got = stub["tasks"].as_array().expect("a list, as it was sent");
+        let sent = tasks.as_array().unwrap();
+        assert_eq!(got.len(), sent.len(), "the list keeps its length");
+        for (got, sent) in got.iter().zip(sent) {
+            let keys: Vec<&String> = got.as_object().unwrap().keys().collect();
+            let sent_keys: Vec<&String> = sent.as_object().unwrap().keys().collect();
+            assert_eq!(keys, sent_keys, "no key added or removed");
+            assert_eq!(got.get("state"), sent.get("state"), "state unchanged");
+            let text = sent["text"].as_str().unwrap();
+            let head: String = text.chars().take(STUB_ARG_MAX_CHARS).collect();
+            let removed = text.chars().count() - head.chars().count();
+            let expected = if removed == 0 {
+                text.to_owned()
+            } else {
+                format!("{head}… [+{removed} chars]")
+            };
+            assert_eq!(got["text"], json!(expected));
+        }
+        assert!(
+            got[1]["text"].as_str().unwrap().chars().count() < long.chars().count(),
+            "the long text is the one that shrank"
+        );
+    }
+
+    #[test]
+    fn no_projected_call_arguments_contain_an_evicted_key() {
+        // An edit and a write whose results are stubbed too, so the old
+        // `{"evicted": …}` shape would show here if anything still made it.
+        let events = vec![
+            user(0, "go"),
+            call(
+                1,
+                "c1",
+                "write_file",
+                json!({"path": "a.rs", "content": "z".repeat(400)}),
+            ),
+            result(2, "c1", "wrote 400 bytes to a.rs"),
+            call(
+                3,
+                "c2",
+                "edit_file",
+                json!({"path": "a.rs", "old_string": "z", "new_string": "q"}),
+            ),
+            result(4, "c2", "edited a.rs at line 1"),
+            call(
+                5,
+                "c3",
+                "write_file",
+                json!({"path": "b.rs", "content": "b\n"}),
+            ),
+            result(6, "c3", "wrote b.rs"),
+            call(
+                7,
+                "c4",
+                "edit_file",
+                json!({"path": "b.rs", "old_string": "b", "new_string": "B"}),
+            ),
+            result(8, "c4", "edited b.rs at line 1"),
+            call(9, "c5", "bash", json!({"command": "cargo test"})),
+            result(10, "c5", "ok"),
+            evicted(11, 10),
+            call(12, "c6", "bash", json!({"command": "cargo build"})),
+            result(13, "c6", "ok"),
+        ];
+        let p = project(&events).unwrap();
+        let args = call_args(&p);
+        assert_eq!(args.len(), 6, "every call still projects");
+        for (i, a) in args.iter().enumerate() {
+            let text = a.to_string();
+            assert!(!text.contains("evicted"), "call {i}: {text}");
+        }
+        let write = args[0].as_object().expect("the stubbed write's own keys");
+        assert!(
+            write.contains_key("path") && write.contains_key("content"),
+            "{write:?}"
+        );
+        assert!(
+            write["content"].as_str().unwrap().contains("… [+"),
+            "{write:?}"
+        );
     }
 }

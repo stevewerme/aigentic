@@ -21,6 +21,7 @@ pub use payload::{
     TurnEndedPayload, Usage, UserMessagePayload,
 };
 pub use projection::{
-    Projection, project, project_body, skill_marker, summary_marker, truncate_middle,
+    Projection, STUB_ARG_MAX_CHARS, project, project_body, shorten_call_args, skill_marker,
+    summary_marker, truncate_middle,
 };
 pub use store::{LogError, NewEvent, Repair, ThreadLog};
