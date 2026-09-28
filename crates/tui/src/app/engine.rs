@@ -3090,6 +3090,7 @@ mod tests {
     fn a_saturation_line_names_the_ceiling_and_the_floor() {
         let p = aigentic_runtime::aigentic_log::ContextSaturatedPayload {
             through_seq: 312,
+            ratio: None,
             tokens_at_floor: 137_000,
             ceiling: 128_000,
         };

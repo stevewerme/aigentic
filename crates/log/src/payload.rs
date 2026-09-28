@@ -354,10 +354,20 @@ pub struct PinnedPayload {
 /// arguments of their successful `edit_file` / `write_file` calls are
 /// stubbed in projection, except failed results and the last result of
 /// each distinct tool. The originals stay in the log.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `ratio` (issue #52) is the calibration the sweep priced this move
+/// with: the runtime's smoothed reported/estimate ratio, so a replay
+/// reads the factor the decisions were taken under instead of
+/// back-computing it from the log. Absent on logs written before it, and
+/// on probes (`Runtime::sweep_decisions` decides the same way, but its
+/// synthetic events are never stored).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContextEvictedPayload {
     /// The last stubbed event's seq, inclusive.
     pub through_seq: u64,
+    /// The sweep's calibration, when one was applied (issue #52).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ratio: Option<f64>,
 }
 
 /// Payload of a `context_saturated` event (issue #35): the eviction sweep
@@ -374,7 +384,7 @@ pub struct ContextEvictedPayload {
 /// fact sticky from its first `context_saturated` until its `turn_ended`,
 /// and a `context_evicted` does not re-arm it — the floor only grows
 /// within a turn, so a spell and a turn coincide.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContextSaturatedPayload {
     /// The floor's own boundary: the last call the sweep would stub,
     /// inclusive. Zero when the turn has no call it may stub yet.
@@ -383,6 +393,10 @@ pub struct ContextSaturatedPayload {
     pub tokens_at_floor: u64,
     /// The ceiling it does not fit under.
     pub ceiling: u64,
+    /// The sweep's calibration (issue #52); see
+    /// [`ContextEvictedPayload::ratio`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ratio: Option<f64>,
 }
 
 /// Payload of a `provider_retried` event (issue #31): which retry is
@@ -674,6 +688,7 @@ mod tests {
             through_seq: 41,
             tokens_at_floor: 137_000,
             ceiling: 128_000,
+            ratio: None,
         };
         let value = serde_json::to_value(&p).unwrap();
         assert_eq!(
@@ -688,13 +703,65 @@ mod tests {
 
     #[test]
     fn context_evicted_round_trips_with_one_field() {
-        let p = ContextEvictedPayload { through_seq: 41 };
+        let p = ContextEvictedPayload {
+            through_seq: 41,
+            ratio: None,
+        };
         let value = serde_json::to_value(&p).unwrap();
         assert_eq!(value, json!({"through_seq": 41}));
         assert_eq!(
             serde_json::from_value::<ContextEvictedPayload>(value).unwrap(),
             p
         );
+    }
+
+    /// T5, issue #52: the sweep's learned calibration is logged, so a
+    /// replay reads the factor the decisions were taken under rather
+    /// than back-computing it. A payload written without it (every log
+    /// before #52) still reads back, with the ratio absent.
+    #[test]
+    fn sweep_payloads_round_trip_with_and_without_the_calibration() {
+        let evicted = ContextEvictedPayload {
+            through_seq: 41,
+            ratio: Some(1.39),
+        };
+        let value = serde_json::to_value(&evicted).unwrap();
+        assert_eq!(value, json!({"through_seq": 41, "ratio": 1.39}));
+        assert_eq!(
+            serde_json::from_value::<ContextEvictedPayload>(value).unwrap(),
+            evicted
+        );
+
+        let saturated = ContextSaturatedPayload {
+            through_seq: 41,
+            tokens_at_floor: 137_000,
+            ceiling: 128_000,
+            ratio: Some(1.39),
+        };
+        let value = serde_json::to_value(&saturated).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "through_seq": 41,
+                "tokens_at_floor": 137_000,
+                "ceiling": 128_000,
+                "ratio": 1.39,
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<ContextSaturatedPayload>(value).unwrap(),
+            saturated
+        );
+
+        // Legacy JSON: the field is absent, and absence is `None`.
+        let legacy = json!({"through_seq": 17});
+        let p: ContextEvictedPayload = serde_json::from_value(legacy).unwrap();
+        assert_eq!(p.through_seq, 17);
+        assert_eq!(p.ratio, None);
+        let legacy = json!({"through_seq": 17, "tokens_at_floor": 5, "ceiling": 4});
+        let p: ContextSaturatedPayload = serde_json::from_value(legacy).unwrap();
+        assert_eq!(p.tokens_at_floor, 5);
+        assert_eq!(p.ratio, None);
     }
 
     #[test]

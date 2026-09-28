@@ -180,7 +180,11 @@ fn synthetic(after: &Event, through_seq: u64) -> Event {
         seq: after.seq + 1,
         kind: EventKind::ContextEvicted,
         author: Author::System,
-        payload: serde_json::to_value(ContextEvictedPayload { through_seq }).expect("serialisable"),
+        payload: serde_json::to_value(ContextEvictedPayload {
+            through_seq,
+            ratio: None,
+        })
+        .expect("serialisable"),
         parent_event: None,
         created_at: after.created_at,
     }
@@ -202,7 +206,11 @@ impl Runtime {
             Decision::Hold => return Ok(false),
             Decision::Sweep { through_seq, .. } => (
                 EventKind::ContextEvicted,
-                serde_json::to_value(ContextEvictedPayload { through_seq }).expect("serialisable"),
+                serde_json::to_value(ContextEvictedPayload {
+                    through_seq,
+                    ratio: None,
+                })
+                .expect("serialisable"),
             ),
             // Once per turn, not once per sweep: the turn has already
             // said it, and only the next `turn_ended` clears the flag — a
@@ -217,6 +225,7 @@ impl Runtime {
                 EventKind::ContextSaturated,
                 serde_json::to_value(ContextSaturatedPayload {
                     through_seq,
+                    ratio: None,
                     tokens_at_floor,
                     ceiling,
                 })
@@ -370,8 +379,11 @@ impl Runtime {
             .is_some_and(|e| e.kind == EventKind::ContextEvicted);
         if rewrite {
             let last = projected.last_mut().expect("checked above");
-            last.payload =
-                serde_json::to_value(ContextEvictedPayload { through_seq }).expect("serialisable");
+            last.payload = serde_json::to_value(ContextEvictedPayload {
+                through_seq,
+                ratio: None,
+            })
+            .expect("serialisable");
         } else if let Some(last) = projected.last().cloned() {
             projected.push(synthetic(&last, through_seq));
         }

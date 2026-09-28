@@ -336,7 +336,11 @@ fn tokens_with_boundary(events: &[Event], through_seq: u64) -> u64 {
         seq: last.seq + 1,
         kind: EventKind::ContextEvicted,
         author: Author::System,
-        payload: serde_json::to_value(ContextEvictedPayload { through_seq }).unwrap(),
+        payload: serde_json::to_value(ContextEvictedPayload {
+            through_seq,
+            ratio: None,
+        })
+        .unwrap(),
         parent_event: None,
         created_at: last.created_at,
     });
