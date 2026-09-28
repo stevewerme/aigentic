@@ -1,0 +1,141 @@
+name = "build"
+version = 1
+
+# What the runner may raise a step's budget to, without a human: a
+# trivial issue gets `trivial` USD, a full one `full`, and `max_raise` is
+# a multiplier.
+[budget]
+trivial = 3.0
+full = 10.0
+max_raise = 2.0
+
+# The slot set both templates are checked against at load. A tag naming
+# anything else fails when the workflow loads, not when a build reaches
+# the step.
+[[slots]]
+name = "issue"
+kind = "string"
+filled_by = "runner"
+
+[[slots]]
+name = "title"
+kind = "string"
+filled_by = "runner"
+
+[[slots]]
+name = "model"
+kind = "string"
+filled_by = "runner"
+
+[[slots]]
+name = "gate_log"
+kind = "string"
+filled_by = "runner"
+
+[[slots]]
+name = "budget_trivial"
+kind = "string"
+filled_by = "runner"
+
+[[slots]]
+name = "budget_full"
+kind = "string"
+filled_by = "runner"
+
+[[slots]]
+name = "max_raise"
+kind = "string"
+filled_by = "runner"
+
+[[slots]]
+name = "purpose"
+kind = "string"
+filled_by = "brief"
+
+[[slots]]
+name = "must_not_undo"
+kind = "string"
+filled_by = "brief"
+
+[[slots]]
+name = "pointers"
+kind = "string"
+filled_by = "brief"
+
+[[slots]]
+name = "design"
+kind = "string"
+filled_by = "brief"
+
+[[slots]]
+name = "planned_tests"
+kind = "string"
+filled_by = "brief"
+
+[[slots]]
+name = "commits"
+kind = "string"
+filled_by = "brief"
+
+# Present only when the brief ran a reference check, so its section is
+# dropped when it did not.
+[[slots]]
+name = "reference_check"
+kind = "string"
+required = false
+filled_by = "brief"
+
+# Present only when the change is visible in the terminal.
+[[slots]]
+name = "ui"
+kind = "bool"
+required = false
+filled_by = "brief"
+
+# Filled by the runner only when a check sent the step back (#57).
+[[slots]]
+name = "check_failures"
+kind = "string"
+required = false
+filled_by = "runner"
+
+# Step 1: size the work and prepare the implementer's inputs. It routes
+# on the size it reports: a trivial issue goes straight to the
+# implementer, a full one stops to ask the human. A `full = "plan"` route
+# waits for the planner step (a later slice-1 ticket); until it exists
+# this route would name no step and fail the loader's target rule.
+[[steps]]
+id = "brief"
+role = "brief"
+profile = "kimi"
+template = "templates/brief.md"
+marker = "## Brief"
+budget = 1.5
+wall_secs = 900
+route_by = "size"
+routes = { trivial = "implement-alone", full = "ask" }
+
+# Step 2: implement a trivial issue in one thread. The commit message
+# carries the model that wrote the code.
+[[steps]]
+id = "implement-alone"
+role = "implementer"
+profile = "flash"
+template = "templates/implementer.md"
+marker = "## Implementation"
+budget = 2.5
+wall_secs = 3600
+writes = true
+checks = ["E1", "E2", "E3", "E4", "E5", "E7"]
+push = true
+deny = [
+    "git push",
+    "git rebase",
+    "git reset",
+    "git checkout --",
+    "git stash",
+    "git clean",
+    "git add -A",
+    "copy .env",
+]
+next = "done"

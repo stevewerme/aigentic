@@ -606,6 +606,93 @@ pub(crate) mod tests {
         load(root, "test").expect("the fixture loads")
     }
 
+    /// T15 — the bundled `workflows/build` is checked in and loads: its deny
+    /// list is the issue's eight entries, and both its templates render
+    /// from a slot map of every required slot (no optional one) and again
+    /// with every optional slot present, leaving no tag and no run of
+    /// blank lines behind.
+    #[test]
+    fn bundled_build_workflow_loads_and_renders() {
+        let bundled = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("workflows");
+        let loaded = WorkflowFile::load(
+            "build",
+            &WorkflowRoots {
+                project: None,
+                user: None,
+                bundled: Some(bundled),
+            },
+        )
+        .expect("the bundled build workflow loads");
+        assert_eq!(loaded.origin, WorkflowOrigin::Bundled);
+        assert_eq!(loaded.workflow.name, "build");
+        assert_eq!(loaded.workflow.version, 1);
+        assert_eq!(
+            loaded.workflow.budget,
+            Budget {
+                trivial: 3.0,
+                full: 10.0,
+                max_raise: 2.0
+            }
+        );
+
+        // The deny list is `## Templates`'s eight entries, verbatim.
+        let step = loaded.step("implement-alone").expect("the step is there");
+        assert_eq!(
+            step.deny,
+            [
+                "git push",
+                "git rebase",
+                "git reset",
+                "git checkout --",
+                "git stash",
+                "git clean",
+                "git add -A",
+                "copy .env",
+            ]
+        );
+
+        let mut slots: BTreeMap<String, serde_json::Value> = loaded
+            .workflow
+            .slots
+            .iter()
+            .filter(|slot| slot.required)
+            .map(|slot| {
+                let value = match slot.kind {
+                    SlotKind::Bool => serde_json::Value::Bool(true),
+                    SlotKind::String => serde_json::Value::String(format!("<{}>", slot.name)),
+                };
+                (slot.name.clone(), value)
+            })
+            .collect();
+
+        for step_id in ["brief", "implement-alone"] {
+            let out = loaded.render(step_id, &slots).expect("it renders");
+            assert!(!out.contains("{{"), "{step_id} left a tag behind");
+            assert!(!out.contains("\n\n\n"), "{step_id} left blank lines");
+        }
+
+        // And with every optional slot present: the sections appear, and
+        // still nothing is doubled.
+        for (name, value) in [
+            ("reference_check", serde_json::Value::from("<check>")),
+            ("ui", serde_json::Value::Bool(true)),
+            ("check_failures", serde_json::Value::from("<failed>")),
+        ] {
+            slots.insert(name.to_string(), value);
+        }
+        for step_id in ["brief", "implement-alone"] {
+            let out = loaded.render(step_id, &slots).expect("it renders");
+            assert!(!out.contains("{{"), "{step_id} left a tag behind");
+            assert!(!out.contains("\n\n\n"), "{step_id} left blank lines");
+        }
+        let out = loaded.render("implement-alone", &slots).unwrap();
+        assert!(out.contains("## Reference check"), "the section is kept");
+        assert!(out.contains("## Sent back by the runner"), "kept");
+        assert!(out.contains("<failed>"), "the slot inside it is filled");
+    }
+
     /// T1 — an unknown key is refused, not ignored.
     #[test]
     fn unknown_key_is_refused() {
