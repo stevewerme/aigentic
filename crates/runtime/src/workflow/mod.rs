@@ -495,9 +495,11 @@ fn check_nodes(
 }
 
 impl LoadedWorkflow {
-    /// Render one step's template from a slot map. The map is
-    /// `StepReport.slots`, so a runner passes what a step reported
-    /// untouched.
+    /// Render one step's template from a slot map, the same type as
+    /// `StepReport.slots`. The runner builds it: its own slots merged with
+    /// what a step reported, with typed report fields such as
+    /// `planned_tests` rendered to text first, since a list used as
+    /// `{{name}}` is an error.
     pub fn render(
         &self,
         step_id: &str,

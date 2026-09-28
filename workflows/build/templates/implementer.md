@@ -34,7 +34,7 @@ Your earlier report failed these checks. Fix each one, then run the gate again a
 
 {{commits}}
 
-Stage files by name and commit with `git commit -F <file>`, never a heredoc. The message file holds the subject exactly as named above, a blank line, any body, a blank line, then exactly this line:
+Run `cargo fmt` before each commit, so formatting lands in the commit it belongs to and not in an extra one. Stage files by name and commit with `git commit -F <file>`, never a heredoc. The message file holds the subject exactly as named above, a blank line, any body, a blank line, then exactly this line:
 
     Co-Authored-By: aigentic ({{model}}) <332865255+aigentic-bot@users.noreply.github.com>
 
