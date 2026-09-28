@@ -92,6 +92,19 @@ impl Popup {
     }
 }
 
+/// Whether Enter submits the composer as typed: a Commands popup whose
+/// typed name is exactly one of its entries, the composer starting at `/`.
+///
+/// The highlighted entry is not consulted: the list is fuzzy-ranked, so an
+/// exact name is not guaranteed first. Membership in the popup's items is
+/// the "real command" check (`items` comes from `COMMANDS` plus the
+/// enabled user-invoked skills).
+pub fn submits_as_typed(popup: &Popup, text: &str) -> bool {
+    popup.kind == Kind::Commands
+        && text.trim_start().starts_with('/')
+        && popup.items.iter().any(|(name, _)| name == &popup.query)
+}
+
 /// The token under the cursor that a popup completes: `@query` or, at
 /// the line's start, `/query`. `(start, kind, query)`.
 pub fn token_at(line: &str, cursor: usize) -> Option<(usize, Kind, String)> {
@@ -179,6 +192,133 @@ pub fn open(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::commands::COMMANDS;
+
+    /// The command fixture exactly as `mod.rs` builds it: `COMMANDS` plus
+    /// the enabled user-invoked skills.
+    fn commands() -> Vec<(String, String)> {
+        COMMANDS
+            .iter()
+            .map(|(n, d)| ((*n).to_owned(), (*d).to_owned()))
+            .chain(std::iter::once((
+                "brief".to_owned(),
+                "a user-invoked skill".to_owned(),
+            )))
+            .collect()
+    }
+
+    /// A command name looked up in `COMMANDS`, never typed as a literal.
+    fn named(name: &str) -> String {
+        COMMANDS
+            .iter()
+            .map(|(n, _)| *n)
+            .find(|n| *n == name)
+            .unwrap_or_else(|| panic!("{name} is not in COMMANDS"))
+            .to_owned()
+    }
+
+    /// A walkable file index, which `open` needs even for a command popup.
+    fn a_file_index() -> (tempfile::TempDir, FileIndex) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "").unwrap();
+        let index = FileIndex::walk(dir.path());
+        (dir, index)
+    }
+
+    // T1: `/why` + one Enter leaves the arm for `Action::Submit`, which
+    // submits `/why`; here at the level the code permits without a terminal.
+    #[test]
+    fn enter_submits_a_complete_command() {
+        let (_dir, files) = a_file_index();
+        let commands = commands();
+        let why = named("why");
+        let line = format!("/{why}");
+        let p = open(&line, line.chars().count(), &files, &commands).unwrap();
+        assert_eq!(p.kind, Kind::Commands);
+        assert!(submits_as_typed(&p, &line));
+    }
+
+    // T2: `/copy 2`, cursor inside the name. The predicate ignores the
+    // argument, and the new branch skips `accepted()`, so the arguments
+    // survive.
+    #[test]
+    fn a_complete_name_with_arguments_still_submits() {
+        let (_dir, files) = a_file_index();
+        let commands = commands();
+        let copy = named("copy");
+        let line = format!("/{copy} 2");
+        let name_end = copy.chars().count() + 1;
+        assert_eq!(
+            token_at(&line, name_end),
+            Some((0, Kind::Commands, copy.clone()))
+        );
+        let p = open(&line, name_end, &files, &commands).unwrap();
+        assert_eq!(p.query, copy);
+        assert!(submits_as_typed(&p, &line));
+        // The accept value that the new branch does not apply.
+        assert_eq!(p.accepted(), Some(format!("/{copy} ")));
+        // Cursor after the argument: no popup, Enter submits directly today.
+        assert!(open(&line, line.chars().count(), &files, &commands).is_none());
+    }
+
+    // T3: a partial name accepts and never submits. Which of
+    // compact/copy/cost ranks first is nucleo's call, so the expected
+    // accept is read from the popup's own selection.
+    #[test]
+    fn a_partial_name_accepts_and_never_submits() {
+        let (_dir, files) = a_file_index();
+        let commands = commands();
+        let line = "/co";
+        let p = open(line, line.chars().count(), &files, &commands).unwrap();
+        assert_eq!(p.kind, Kind::Commands);
+        assert!(!submits_as_typed(&p, line));
+        assert_eq!(p.accepted(), Some(format!("/{} ", p.items[p.selected].0)));
+    }
+
+    // T4: Tab on a complete name still only accepts.
+    #[test]
+    fn tab_on_a_complete_name_accepts() {
+        let (_dir, files) = a_file_index();
+        let commands = commands();
+        let why = named("why");
+        let line = format!("/{why}");
+        let p = open(&line, line.chars().count(), &files, &commands).unwrap();
+        assert_eq!(p.accepted(), Some(format!("/{why} ")));
+    }
+
+    // T5: an exact name submits even when it is not the highlighted entry.
+    #[test]
+    fn an_exact_name_submits_even_when_not_highlighted() {
+        let exact = named("why");
+        let other = named("cost");
+        assert_ne!(exact, other);
+        let p = Popup {
+            kind: Kind::Commands,
+            start: 0,
+            query: exact.clone(),
+            items: vec![
+                (other, "another command".to_owned()),
+                (exact.clone(), "the exact one".to_owned()),
+            ],
+            selected: 0,
+        };
+        assert!(submits_as_typed(&p, &format!("/{exact}")));
+    }
+
+    // T6: the `@` picker is never a submission.
+    #[test]
+    fn the_file_picker_never_submits() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "").unwrap();
+        let files = FileIndex::walk(dir.path());
+        let commands = commands();
+        let line = "@src/ma";
+        let p = open(line, line.chars().count(), &files, &commands).unwrap();
+        assert_eq!(p.kind, Kind::Files);
+        assert!(!submits_as_typed(&p, line));
+        assert_eq!(p.accepted(), Some("@src/main.rs ".to_owned()));
+    }
 
     #[test]
     fn tokens_are_found_under_the_cursor() {

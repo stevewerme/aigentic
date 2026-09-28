@@ -796,12 +796,26 @@ async fn run_shell(
                                     p.down();
                                     continue;
                                 }
-                                K::Tab | K::Enter => {
+                                K::Tab => {
                                     if let Some(text) = p.accepted() {
                                         composer.replace_before_cursor(p.start, &text);
                                     }
                                     popup = None;
                                     continue;
+                                }
+                                K::Enter => {
+                                    if completion::submits_as_typed(p, &composer.text()) {
+                                        // A complete command submits in one
+                                        // press: close the popup and fall
+                                        // through to the keymap's Submit.
+                                        popup = None;
+                                    } else {
+                                        if let Some(text) = p.accepted() {
+                                            composer.replace_before_cursor(p.start, &text);
+                                        }
+                                        popup = None;
+                                        continue;
+                                    }
                                 }
                                 K::Esc => {
                                     // Close it by breaking the token.
