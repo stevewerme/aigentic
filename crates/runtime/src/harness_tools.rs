@@ -4,10 +4,14 @@
 //! tools crate never sees them.
 
 use aigentic_core::{Author, EventKind, RiskClass, ToolCall, ToolResult, ToolSpec};
-use aigentic_log::{Invoker, PinnedPayload, SkillLoadedPayload};
+use aigentic_log::{
+    CommitRef, Finding, FixSize, Handoff, Invoker, LedgerEntry, PinnedPayload, PlannedTest,
+    ReleaseImpact, ReportStatus, Route, SkillLoadedPayload, StepReport, Verdict,
+};
 use aigentic_skills::Invocation;
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::BTreeMap;
 
 use crate::{Runtime, RuntimeError, Signal};
 
@@ -18,6 +22,10 @@ pub const LOAD_SKILL: &str = "load_skill";
 /// whole list is in its arguments, so a client draws it from the call and
 /// a replay of the log shows every version.
 pub const UPDATE_TASKS: &str = "update_tasks";
+/// The step thread's report (issue #55, PLAN-layer2 §2). Offered in a
+/// step thread and nowhere else; a call in an ordinary thread is
+/// refused with a result, and no `StepReported` event is written.
+pub const FINISH_STEP: &str = "finish_step";
 
 /// The harness's standing instructions, one system block after the
 /// person's global ones. A tool description alone did not make GLM 5.3
@@ -143,9 +151,66 @@ struct LoadSkillArgs {
     name: String,
 }
 
+/// A `finish_step` call's arguments: the §4 field table, spelled out
+/// rather than flattened, because serde ignores `deny_unknown_fields`
+/// next to `flatten` and a typo the model sends must be named back, not
+/// dropped. `deny` is not among them — the runner derives it from the
+/// workflow, so a step never tells itself what to allow.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinishStepArgs {
+    #[serde(default)]
+    pub status: Option<ReportStatus>,
+    #[serde(default)]
+    pub body: Option<String>,
+    #[serde(default)]
+    pub slots: Option<BTreeMap<String, serde_json::Value>>,
+    #[serde(default)]
+    pub planned_tests: Option<Vec<PlannedTest>>,
+    #[serde(default)]
+    pub commits: Option<Vec<CommitRef>>,
+    #[serde(default)]
+    pub ledger: Option<Vec<LedgerEntry>>,
+    #[serde(default)]
+    pub quotes: Option<Vec<String>>,
+    #[serde(default)]
+    pub verdict: Option<Verdict>,
+    #[serde(default)]
+    pub fix: Option<FixSize>,
+    #[serde(default)]
+    pub release_impact: Option<ReleaseImpact>,
+    #[serde(default)]
+    pub findings: Option<Vec<Finding>>,
+    #[serde(default)]
+    pub route: Option<Route>,
+    #[serde(default)]
+    pub handoff: Option<Handoff>,
+}
+
+impl From<FinishStepArgs> for StepReport {
+    fn from(args: FinishStepArgs) -> Self {
+        StepReport {
+            status: args.status,
+            body: args.body,
+            slots: args.slots,
+            planned_tests: args.planned_tests,
+            commits: args.commits,
+            ledger: args.ledger,
+            quotes: args.quotes,
+            verdict: args.verdict,
+            fix: args.fix,
+            release_impact: args.release_impact,
+            findings: args.findings,
+            route: args.route,
+            handoff: args.handoff,
+        }
+    }
+}
+
 /// The harness tools' specs, in name order. `load_skill` is offered only
-/// when a model-invoked skill is enabled.
-pub fn harness_specs(offer_load_skill: bool) -> Vec<ToolSpec> {
+/// when a model-invoked skill is enabled; `finish_step` only in a step
+/// thread (issue #55).
+pub fn harness_specs(offer_load_skill: bool, offer_finish_step: bool) -> Vec<ToolSpec> {
     let mut specs = vec![
         ToolSpec {
             name: ASK_HUMAN.into(),
@@ -223,6 +288,64 @@ pub fn harness_specs(offer_load_skill: bool) -> Vec<ToolSpec> {
             }),
         });
     }
+    if offer_finish_step {
+        specs.push(ToolSpec {
+            name: FINISH_STEP.into(),
+            description: "Report the step's §4 fields and end the turn. Fill every field your role's template names: the runner reads the report, not the thread. `status: partial` needs `handoff`. The runtime writes the report as a `step_reported` event and ends the turn with `step_reported`; a second call in the same turn is refused.".into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string", "enum": ["done", "partial"], "description": "`partial` needs `handoff`."},
+                    "body": {"type": "string", "description": "The report's prose."},
+                    "slots": {"type": "object", "description": "Rendered template slots, by name."},
+                    "planned_tests": {"type": "array", "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "what": {"type": "string"},
+                            "derivation": {"type": "string", "description": "How the expected value is derived, not a hand-computed literal."}
+                        },
+                        "required": ["id", "what", "derivation"]
+                    }},
+                    "commits": {"type": "array", "items": {
+                        "type": "object",
+                        "properties": {"sha": {"type": "string"}, "subject": {"type": "string"}},
+                        "required": ["sha", "subject"]
+                    }},
+                    "ledger": {"type": "array", "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "name": {"type": "string", "description": "The test's name in the code."},
+                            "status": {"type": "string", "enum": ["landed", "not_landed"]},
+                            "reason": {"type": "string", "description": "Why, when it did not land."}
+                        },
+                        "required": ["id", "name", "status"]
+                    }},
+                    "quotes": {"type": "array", "items": {"type": "string"}, "description": "Phrases the report attributes to the plan, verbatim."},
+                    "verdict": {"type": "string", "enum": ["approve", "changes_needed"]},
+                    "fix": {"type": "string", "enum": ["none", "trivial", "full"]},
+                    "release_impact": {"type": "string", "enum": ["none", "patch", "minor", "breaking"]},
+                    "findings": {"type": "array", "items": {
+                        "type": "object",
+                        "properties": {"id": {"type": "string"}, "text": {"type": "string"}},
+                        "required": ["id", "text"]
+                    }},
+                    "route": {"type": "object", "properties": {"escalate": {
+                        "type": "object",
+                        "properties": {"reason": {"type": "string"}},
+                        "required": ["reason"]
+                    }}},
+                    "handoff": {"type": "object", "properties": {
+                        "done": {"type": "string"},
+                        "next": {"type": "string"},
+                        "dirty": {"type": "array", "items": {"type": "string"}}
+                    }, "required": ["done", "next"]}
+                },
+                "required": ["status"]
+            }),
+        });
+    }
     specs.sort_by(|a, b| a.name.cmp(&b.name));
     specs
 }
@@ -238,9 +361,14 @@ pub fn harness_names() -> Vec<String> {
     ]
 }
 
-/// Whether the runtime answers this tool itself.
+/// Whether the runtime answers this tool itself. `finish_step` is in the
+/// list so the arm can refuse it honestly in an ordinary thread; it is
+/// not in `harness_names`, which says what is always available.
 pub fn is_harness_tool(name: &str) -> bool {
-    matches!(name, PIN | ASK_HUMAN | LOAD_SKILL | UPDATE_TASKS)
+    matches!(
+        name,
+        PIN | ASK_HUMAN | LOAD_SKILL | UPDATE_TASKS | FINISH_STEP
+    )
 }
 
 /// Every harness tool is `safe`.
@@ -370,9 +498,66 @@ impl Runtime {
                 }
                 Err(e) => err(format!("invalid arguments: {e}")),
             },
+            // A step thread's report (issue #55). The event is written
+            // before the turn ends, so the runner's `step_finished` has
+            // it; a call in an ordinary thread, or a second call in one
+            // turn, is refused with no event.
+            FINISH_STEP => {
+                let Some(step) = self.step().map(str::to_owned) else {
+                    return Ok((
+                        err("finish_step is only offered to a step thread".into()),
+                        by,
+                    ));
+                };
+                if self.reported_this_turn() {
+                    return Ok((
+                        err("finish_step already ran; the report was recorded".into()),
+                        by,
+                    ));
+                }
+                let reported = format!("step reported for {step}; this ends the turn");
+                match serde_json::from_value::<FinishStepArgs>(call.args.clone()) {
+                    Err(e) => err(format!("invalid arguments: {e}")),
+                    Ok(args) if args.status.is_none() => {
+                        err("status is required: done | partial (partial needs handoff)".into())
+                    }
+                    Ok(args) if args.status == Some(ReportStatus::Partial) => {
+                        if args.handoff.is_none() {
+                            err("a partial report must carry handoff { done, next, dirty }".into())
+                        } else {
+                            self.append_step_reported(args, observe)?;
+                            ok(reported)
+                        }
+                    }
+                    Ok(args) => {
+                        self.append_step_reported(args, observe)?;
+                        ok(reported)
+                    }
+                }
+            }
             other => err(format!("unknown harness tool: {other}")),
         };
         Ok((result, by))
+    }
+
+    /// Append `step_reported` for a step's report (issue #55). The author
+    /// is the agent — the report is the step's own. Written before the
+    /// turn ends, so a `step_finished` that follows can name it.
+    fn append_step_reported(
+        &mut self,
+        args: FinishStepArgs,
+        observe: &mut (dyn FnMut(Signal<'_>) + Send),
+    ) -> Result<(), RuntimeError> {
+        let report: StepReport = args.into();
+        let payload = serde_json::to_value(&report).expect("serialisable");
+        self.append(
+            EventKind::StepReported,
+            Author::Agent(self.agent.clone()),
+            payload,
+            None,
+            observe,
+        )?;
+        Ok(())
     }
 
     /// Append `skill_loaded` for an enabled skill. The author is the agent

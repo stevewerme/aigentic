@@ -16,8 +16,8 @@ use futures_util::StreamExt;
 use aigentic_log::{Invoker, NewEvent, PolicyRecord};
 
 use crate::decisions::{CancelToken, Inbox, Queued};
-use crate::harness_tools::{ASK_HUMAN, HARNESS_CLASS, harness_specs, is_harness_tool};
-use crate::runtime::{ASKED_HUMAN, INTERRUPTED};
+use crate::harness_tools::{ASK_HUMAN, FINISH_STEP, HARNESS_CLASS, harness_specs, is_harness_tool};
+use crate::runtime::{ASKED_HUMAN, INTERRUPTED, STEP_REPORTED};
 use crate::seams::{Verdict, author_name, denial_text};
 use crate::support::{Spent, append_queued, block_start, flush_text};
 use crate::{Runtime, RuntimeError, Signal, TurnOutcome, build_context};
@@ -364,6 +364,9 @@ impl Runtime {
             }
 
             let mut answered = false;
+            // A step's report also ends the turn at once (issue #55): the
+            // runner reads the report, not the rest of the batch.
+            let mut reported = false;
             let mut calls = calls.into_iter();
             for call in calls.by_ref() {
                 self.drain_inbox(inbox, observe)?;
@@ -379,6 +382,7 @@ impl Runtime {
                     )
                     .await?;
                 answered |= call.name == ASK_HUMAN && !result.is_error;
+                reported |= call.name == FINISH_STEP && !result.is_error;
                 let payload = serde_json::to_value(ToolResultPayload::new(result, record))
                     .expect("serialisable");
                 // An answered `ask_human` is the human's event, like a
@@ -424,6 +428,13 @@ impl Runtime {
                     synthetic.push(call.id);
                 }
                 return self.interrupt_turn(by, synthetic, &spent, &mut held, observe);
+            }
+            // A step reporting is the step ending: the report is written, the
+            // turn's reason says so, and the runner's `step_finished`
+            // follows. Checked before `answered` because a report is the
+            // step's own end, whatever else the batch held.
+            if reported {
+                return self.end_turn(STEP_REPORTED, None, &spent, &mut held, observe);
             }
             // A human's answer starts a turn: everything after it is new
             // work with its own budget. The client continues at once.
@@ -608,14 +619,25 @@ impl Runtime {
     /// sorted by name. What the model sees.
     pub fn tool_specs(&self) -> Vec<ToolSpec> {
         let mut specs = self.registry.specs();
-        specs.extend(harness_specs(!self.skills.model_invoked().is_empty()));
-        specs.retain(|s| self.layers.decided_tool(&s.name) == crate::Decided::Allowed);
+        specs.extend(harness_specs(
+            !self.skills.model_invoked().is_empty(),
+            // Offered exactly in a step thread (issue #55).
+            self.step.is_some(),
+        ));
+        specs.retain(|s| self.tool_visible(&s.name));
         specs.sort_by(|a, b| a.name.cmp(&b.name));
         specs
     }
 
-    /// Whether the layers let the model see this tool.
+    /// Whether the layers let the model see this tool. `finish_step` is
+    /// answerable in any thread — the offered list cannot gate a call a
+    /// model can always emit, so the arm decides (## Plan amendment 2
+    /// item 3); its spec is offered in a step thread alone, whatever the
+    /// project's allow list says.
     pub fn tool_visible(&self, name: &str) -> bool {
+        if name == FINISH_STEP {
+            return true;
+        }
         self.layers.decided_tool(name) == crate::Decided::Allowed
     }
 }

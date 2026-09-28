@@ -3,7 +3,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use aigentic_core::{AgentId, Budget, Event, Provider, ToolCall};
 use aigentic_log::ThreadLog;
-use aigentic_policy::Policy;
+use aigentic_policy::{Policy, StepOverlay};
 use aigentic_skills::SkillSet;
 use aigentic_tools::ToolRegistry;
 
@@ -110,6 +110,11 @@ pub struct Runtime {
     pub(crate) session_grants: Vec<SessionGrant>,
     /// The permission mode; session state, never persisted.
     pub(crate) mode: Mode,
+    /// Per-step context when this thread is a step thread (issue #55):
+    /// the step's name in the group and its deny overlay. Held here, not
+    /// on `Policy`, so `set_project` or a whole `Policy` swap cannot
+    /// drop it (`## Plan amendment 2` item 2).
+    pub(crate) step: Option<StepContext>,
     pub(crate) skills: SkillSet,
     pub(crate) log: ThreadLog,
     pub(crate) agent: AgentId,
@@ -192,6 +197,7 @@ impl Runtime {
             decisions: None,
             session_grants: Vec::new(),
             mode: Mode::default(),
+            step: None,
             skills: SkillSet::default(),
             log,
             agent,
@@ -228,6 +234,17 @@ impl Runtime {
         by: aigentic_core::Author,
         observe: &mut (dyn FnMut(Signal<'_>) + Send),
     ) -> Result<(), crate::RuntimeError> {
+        // A step thread keeps its overlay for its whole life (issue #55,
+        // `## Plan amendment 2` item 2). `set_project` swaps the policy
+        // wholesale, and with it the rules the overlay stands in front
+        // of, so a step thread refuses the move rather than run with an
+        // overlay over a policy nobody chose.
+        if let Some(step) = &self.step {
+            return Err(crate::RuntimeError::StepThread(format!(
+                "`{}` is a step thread and cannot switch project",
+                step.name
+            )));
+        }
         let from = self.layers.project.as_ref().map(|p| p.name.clone());
         let payload = aigentic_log::ProjectSwitchedPayload {
             from,
@@ -395,6 +412,29 @@ impl Runtime {
     pub fn with_policy(mut self, policy: Policy) -> Self {
         self.policy = policy;
         self
+    }
+
+    /// Make this thread a step thread (issue #55): `step` is its name in
+    /// the group, `deny` the workflow's deny list. The list is parsed
+    /// once, here, so a typo fails where the thread is built rather than
+    /// at the first call. The overlay stands *before* the rules, so no
+    /// project rule or mode can talk a step past it.
+    pub fn with_step(
+        mut self,
+        step: impl Into<String>,
+        deny: &[String],
+    ) -> Result<Self, aigentic_policy::DenyParseError> {
+        let overlay = StepOverlay::parse(deny)?;
+        self.step = Some(StepContext {
+            name: step.into(),
+            overlay,
+        });
+        Ok(self)
+    }
+
+    /// This thread's step name, `None` for a thread that is not a step.
+    pub fn step(&self) -> Option<&str> {
+        self.step.as_ref().map(|s| s.name.as_str())
     }
 
     /// Phase 5: permission requests and `ask_human` questions park the
@@ -734,9 +774,35 @@ impl Runtime {
         }))
     }
 
+    /// Whether the current turn already reported (## Plan amendment 2
+    /// item 1): a `step_reported` event later than the latest
+    /// `user_message`. Derived from the log, so a send-back — a new turn
+    /// whose user message follows the report — can report again, while a
+    /// second call in one turn cannot.
+    pub(crate) fn reported_this_turn(&self) -> bool {
+        let events = self.log.events();
+        let turn_start = events
+            .iter()
+            .rev()
+            .find(|e| e.kind == aigentic_core::EventKind::UserMessage)
+            .map(|e| e.seq);
+        events
+            .iter()
+            .any(|e| e.kind == aigentic_core::EventKind::StepReported && turn_start < Some(e.seq))
+    }
+
     pub fn budget(&self) -> &Budget {
         &self.budget
     }
+}
+
+/// A step thread's context (issue #55): the step's name in the group,
+/// and the deny overlay the runtime asks before the rules. It is session
+/// state and never persisted: the step's own log holds what it reported.
+#[derive(Debug, Clone)]
+pub struct StepContext {
+    pub(crate) name: String,
+    pub(crate) overlay: StepOverlay,
 }
 
 /// What a client sees while a turn runs. Everything durable is also an
@@ -806,6 +872,12 @@ pub const INTERRUPTED: &str = "interrupted";
 /// is in the log as the call's result, and the client continues with
 /// `continue_turn`, a new turn with a fresh budget.
 pub const ASKED_HUMAN: &str = "asked_human";
+
+/// The `turn_ended` reason when a step called `finish_step` (issue #55):
+/// the step reported, so the runner's `step_finished` has something to
+/// read. A reason of its own rather than `done`, so the runner's
+/// bookkeeping can tell a report from a turn that simply stopped.
+pub const STEP_REPORTED: &str = "step_reported";
 
 /// How a turn ended. The same information is in the `turn_ended` event.
 #[derive(Debug, Clone, PartialEq, Eq)]

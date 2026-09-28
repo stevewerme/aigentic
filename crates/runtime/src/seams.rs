@@ -78,7 +78,18 @@ impl Runtime {
         cancel: &CancelToken,
         observe: &mut (dyn FnMut(Signal<'_>) + Send),
     ) -> Result<Verdict, RuntimeError> {
-        let reason = match self.policy.decide(call, class) {
+        // The step overlay is asked before the rules, the project and the
+        // mode (issue #55): what it denies, nothing else may allow, and
+        // its rule name is what the log records.
+        let overlay = self
+            .step
+            .as_ref()
+            .and_then(|step| step.overlay.decide(call));
+        let outcome = match overlay {
+            Some(outcome) => outcome,
+            None => self.policy.decide(call, class),
+        };
+        let reason = match outcome {
             Outcome::Allow { rule } => {
                 return Ok(Verdict::Run(PolicyRecord::rule(rule, "allow")));
             }

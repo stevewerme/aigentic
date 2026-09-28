@@ -108,7 +108,7 @@ fn ask_human_takes_questions_and_the_old_shape() {
 /// no "Other" row of the model's own.
 #[test]
 fn the_spec_and_instructions_ask_for_questions_in_the_call() {
-    let spec = aigentic_runtime::harness_tools::harness_specs(false)
+    let spec = aigentic_runtime::harness_tools::harness_specs(false, false)
         .into_iter()
         .find(|s| s.name == "ask_human")
         .unwrap();

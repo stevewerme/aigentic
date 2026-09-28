@@ -17,4 +17,8 @@ pub enum RuntimeError {
     NoProject,
     #[error(transparent)]
     Project(#[from] crate::ProjectError),
+    /// A step thread may not switch project (issue #55): the move would
+    /// replace the policy its deny overlay stands in front of.
+    #[error("step thread: {0}")]
+    StepThread(String),
 }

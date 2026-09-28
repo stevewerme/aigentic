@@ -58,6 +58,6 @@ pub use project::{Project, ProjectError, ProjectFile};
 pub use resume::{INTERRUPTED_RESULT, Resumed};
 pub use runtime::{
     ASKED_HUMAN, CompactionSettings, DEFAULT_BUDGET, DEFAULT_COMPACTION, INTERRUPTED, Prices,
-    ProjectContext, Runtime, Signal, TurnOutcome, WindowUsage,
+    ProjectContext, Runtime, STEP_REPORTED, Signal, TurnOutcome, WindowUsage,
 };
 pub use seams::{SessionGrant, Verdict};
