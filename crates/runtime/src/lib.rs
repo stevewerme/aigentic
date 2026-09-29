@@ -32,6 +32,7 @@ mod memory;
 pub mod mode;
 pub mod project;
 mod resume;
+pub mod runner;
 mod runtime;
 pub mod seams;
 mod support;
