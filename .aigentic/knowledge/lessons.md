@@ -53,6 +53,11 @@ so the rule can be judged, not just obeyed. The `brief`, `plan-check` and
   replayed as unanswered, a send-back with no event written ahead of it).
   When a ticket's purpose is a behaviour (replay, live display), read the
   plan against that behaviour case by case.
+  Evidence-first binds the supervisor too: on #53 the supervisor claimed
+  the suite was not re-run after a late edit, from a log scan that cut
+  each command at 110 characters; the full command re-ran it. #56's
+  plan-check caught it by reading the log. Never state what a call did
+  from a truncated view of it.
 
 ## Plans and tests
 
