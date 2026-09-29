@@ -258,6 +258,11 @@ struct SegClass {
     /// The risk is a substitution's, and this is the substitution's
     /// own riskiest prefix.
     sub: Option<Vec<String>>,
+    /// A `Write` came from the segment's command — a writing flag or a
+    /// command folded out of a `$(…)` — and not only from a
+    /// redirection. A caller that exempts a redirection has to tell the
+    /// two apart.
+    write_from_command: bool,
 }
 
 /// The worst kind so far, and where it came from.
@@ -265,10 +270,17 @@ struct Worst {
     kind: Kind,
     sub: Option<Vec<String>>,
     redirect: bool,
+    /// See [`SegClass::write_from_command`]. Set whenever a fold brings
+    /// the write in, even when the kind was `Write` already: a
+    /// redirection's write must not hide the command's.
+    write_from_command: bool,
 }
 
 impl Worst {
     fn fold(&mut self, kind: Kind, sub: Option<Vec<String>>, redirect: bool) {
+        if kind == Kind::Write && !redirect {
+            self.write_from_command = true;
+        }
         if kind > self.kind {
             self.kind = kind;
             self.sub = sub;
@@ -289,6 +301,7 @@ fn classify_segment(seg: &Segment, allow: &[String], grants: &[String], depth: u
         kind: Kind::Harmless,
         sub: None,
         redirect: false,
+        write_from_command: false,
     };
 
     // Redirections: to a file writes; a process substitution runs a
@@ -384,6 +397,7 @@ fn classify_segment(seg: &Segment, allow: &[String], grants: &[String], depth: u
         pattern,
         prefix,
         sub: w.sub,
+        write_from_command: w.write_from_command,
     }
 }
 
@@ -928,6 +942,11 @@ pub struct ScanSegment {
     pub redirects: Vec<String>,
     /// What the segment is, under the default allow list and no grants.
     pub kind: Kind,
+    /// Whether the `Write` came from the command itself — a writing
+    /// flag (`sed -i`, `sort -o`) or a command folded out of a `$(…)`
+    /// in one of its words — rather than only from its redirections.
+    /// `false` on a segment that does not write at all.
+    pub write_from_command: bool,
 }
 
 /// Split a command line into segments and classify each one, against
@@ -946,11 +965,15 @@ pub fn scan(command: &str) -> Vec<ScanSegment> {
         // segment with neither words nor redirections is not a part of
         // the line.
         .filter(|seg| !(seg.words.is_empty() && seg.redirects.is_empty()))
-        .map(|seg| ScanSegment {
-            text: segment_text(seg),
-            words: segment_words(seg).iter().map(|w| w.to_string()).collect(),
-            redirects: seg.redirects.iter().map(|(_, w)| w.text.clone()).collect(),
-            kind: classify_segment(seg, &allow, &[], 0).kind,
+        .map(|seg| {
+            let class = classify_segment(seg, &allow, &[], 0);
+            ScanSegment {
+                text: segment_text(seg),
+                words: segment_words(seg).iter().map(|w| w.to_string()).collect(),
+                redirects: seg.redirects.iter().map(|(_, w)| w.text.clone()).collect(),
+                kind: class.kind,
+                write_from_command: class.write_from_command,
+            }
         })
         .collect()
 }
@@ -1399,6 +1422,38 @@ mod tests {
         // on its own is harmless.
         assert_eq!(scan("flake8 .")[0].kind, Kind::Unknown);
         assert_eq!(scan("LOG=/tmp/x")[0].kind, Kind::Harmless);
+    }
+
+    /// The write's source is kept: a caller that exempts a redirection
+    /// has to know whether the segment's own command writes too (issue
+    /// #56's review). The kind is the same `Write` either way.
+    #[test]
+    fn the_scan_says_whether_the_write_is_the_commands_own() {
+        let redirected = scan("sed -i 's/a/b/' crates/runtime/src/checks/mod.rs > /tmp/d");
+        assert_eq!(redirected.len(), 1);
+        assert_eq!(redirected[0].kind, Kind::Write);
+        assert_eq!(redirected[0].redirects, vec!["/tmp/d"]);
+        assert!(
+            redirected[0].write_from_command,
+            "the flag writes, the redirection just collects it"
+        );
+
+        let substituted = scan("echo $(sed -i 's/a/b/' crates/runtime/src/checks/mod.rs) > /tmp/d");
+        assert_eq!(substituted.len(), 1);
+        assert_eq!(substituted[0].kind, Kind::Write);
+        assert!(
+            substituted[0].write_from_command,
+            "the `$(…)` writes, its carrier only prints"
+        );
+
+        // A redirection on its own is a write of the redirection's, and
+        // a read-only segment writes nowhere at all.
+        let plain = scan("cargo test > /tmp/gate.log 2>&1");
+        assert_eq!(plain[0].kind, Kind::Write);
+        assert!(!plain[0].write_from_command);
+        let read = scan("git log --oneline -5");
+        assert_eq!(read[0].kind, Kind::Harmless);
+        assert!(!read[0].write_from_command);
     }
 
     /// The redirection targets are kept, and a descriptor on its own is
