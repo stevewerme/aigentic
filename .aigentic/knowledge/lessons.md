@@ -59,6 +59,23 @@ so the rule can be judged, not just obeyed. The `brief`, `plan-check` and
   plan-check caught it by reading the log. Never state what a call did
   from a truncated view of it.
 
+- **Code that judges runs gets run on real runs.** #56's checks passed
+  their plan, their fixtures, a verifier and a judge; running them on
+  #56's own implementer thread found four more bugs: check ids in the
+  wrong case for the workflow, a full suite hidden by a flag, every real
+  gate rejected for its leading `cd`, and a debugging run no send-back
+  could clear. A verifier or supervisor runs such code on the step's own
+  thread before the judge.
+- **A judge that probes beats a judge that reads.** #56's judges built an
+  out-of-tree probe against the shipped functions and found a hole each
+  round, one of them in the supervisor's own fix: a temp redirection
+  laundering `cp`/`tee`/`python3 -c`, then a digit filter that hid
+  `echo x > 1`. A fix by the supervisor gets the same judge as anyone's.
+- **Models chain the gate.** Both #56 builders ran
+  `cargo fmt && cargo clippy … | tail -30` as one call; the pipe makes
+  the exit status `tail`'s, so a failing clippy reads green. The template
+  says one command per call and E4 now enforces it.
+
 ## Plans and tests
 
 - **Check the design against the issue's purpose, not only its words.**
