@@ -317,10 +317,7 @@ fn classify_segment(seg: &Segment, allow: &[String], grants: &[String], depth: u
             // that is not a number is the old `> word` spelling, which
             // writes (issue #15 lists the harmless forms).
             Redir::Dup => {
-                let digits = target.literal()
-                    && !target.text.is_empty()
-                    && target.text.bytes().all(|b| b.is_ascii_digit());
-                if !digits {
+                if !duplicates_a_descriptor(*kind, target) {
                     w.fold(redirect_kind(target), None, true);
                 }
             }
@@ -927,6 +924,15 @@ pub fn main_segment(command: &str) -> String {
     classify(command, &crate::rules::default_bash_allow(), &[]).main
 }
 
+/// `2>&1`, `>&2`: a duplication onto a descriptor number, which writes no
+/// file. `>&word` with anything else is the old `> word` spelling.
+fn duplicates_a_descriptor(kind: Redir, target: &Word) -> bool {
+    kind == Redir::Dup
+        && target.literal()
+        && !target.text.is_empty()
+        && target.text.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// One segment of a command line, for callers that need the parts
 /// rather than the whole line's verdict.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -938,7 +944,10 @@ pub struct ScanSegment {
     /// The same words, one to an entry; `segment_text`'s words exactly,
     /// so a caller can compare either.
     pub words: Vec<String>,
-    /// The target of each of its redirections, in order.
+    /// The target of each of its redirections, in order, except a
+    /// descriptor duplication (`2>&1`, `>&2`), which names no file. A
+    /// digit target of any other redirection (`> 1`, `2>1`) is a file
+    /// and stays (#56's third review).
     pub redirects: Vec<String>,
     /// What the segment is, under the default allow list and no grants.
     pub kind: Kind,
@@ -970,7 +979,12 @@ pub fn scan(command: &str) -> Vec<ScanSegment> {
             ScanSegment {
                 text: segment_text(seg),
                 words: segment_words(seg).iter().map(|w| w.to_string()).collect(),
-                redirects: seg.redirects.iter().map(|(_, w)| w.text.clone()).collect(),
+                redirects: seg
+                    .redirects
+                    .iter()
+                    .filter(|(kind, target)| !duplicates_a_descriptor(*kind, target))
+                    .map(|(_, w)| w.text.clone())
+                    .collect(),
                 kind: class.kind,
                 write_from_command: class.write_from_command,
             }
@@ -1462,8 +1476,9 @@ mod tests {
     fn the_scan_keeps_redirection_targets_and_drops_bare_descriptors() {
         let segs = scan("cargo test > /tmp/gate.log 2>&1");
         assert_eq!(segs.len(), 1);
-        // `2>&1` is a dup: the target is the descriptor, not `&1`.
-        assert_eq!(segs[0].redirects, vec!["/tmp/gate.log", "1"]);
+        // `2>&1` duplicates a descriptor and names no file, so it is not
+        // among the targets.
+        assert_eq!(segs[0].redirects, vec!["/tmp/gate.log"]);
         assert_eq!(segs[0].words, vec!["cargo", "test"]);
         assert_eq!(segs[0].words, segs[0].text.split(' ').collect::<Vec<_>>());
         assert_eq!(segs[0].text, "cargo test");
@@ -1499,7 +1514,12 @@ mod tests {
         assert_eq!(chain.len(), 2);
         assert_eq!(chain[0].words, vec!["cargo", "fmt"]);
         assert_eq!(chain[1].words, vec!["cargo", "test"]);
-        assert_eq!(chain[1].redirects, vec!["/tmp/x.log", "1"]);
+        assert_eq!(chain[1].redirects, vec!["/tmp/x.log"]);
+
+        // A digit target of a plain redirection is a file named `1`.
+        assert_eq!(scan("echo x > 1")[0].redirects, vec!["1"]);
+        assert_eq!(scan("echo x 2>1")[0].redirects, vec!["1"]);
+        assert!(scan("echo x >&2")[0].redirects.is_empty());
     }
 
     /// The `bash` row's text (issue #21): the segment that carries the

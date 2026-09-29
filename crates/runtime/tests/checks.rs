@@ -603,6 +603,12 @@ fn e4_edit_table_row_by_row() {
             false,
         ),
         ("cp /tmp/a crates/runtime/src/lib.rs 2>&1", true),
+        // A digit target of a plain redirection is a file named `1` in
+        // the repo, not a descriptor (#56's third review).
+        ("echo x > 1", true),
+        ("echo x 2>1", true),
+        ("echo x > 12", true),
+        ("echo x >&2", false),
     ];
     for (command, wanted) in rows {
         assert_eq!(is_an_edit(command), wanted, "{command}");
@@ -613,6 +619,7 @@ fn e4_edit_table_row_by_row() {
     for (command, is_edit) in [
         ("touch crates/runtime/src/new.rs", true),
         ("cp /tmp/evil.rs crates/runtime/src/lib.rs > /tmp/d", true),
+        ("echo payload > 1", true),
         ("git log --oneline -5", false),
     ] {
         let mut log = Log::new();

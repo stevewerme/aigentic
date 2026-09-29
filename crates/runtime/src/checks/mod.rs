@@ -751,16 +751,12 @@ fn segment_is_an_edit(segment: &ScanSegment) -> bool {
     // `python3 -c` into a non-edit (#56's second review); and so is a
     // relative target: it resolves inside the repo, so that way fails
     // safe.
-    // A descriptor duplication (`2>&1`, which the scan reports as the
-    // target `1`) writes no file.
-    let files: Vec<&String> = segment
-        .redirects
-        .iter()
-        .filter(|target| !target.chars().all(|c| c.is_ascii_digit()))
-        .collect();
+    // The scan leaves descriptor duplications (`2>&1`) out of
+    // `redirects`: they write no file. A digit target of a plain
+    // redirection (`> 1`) is a file in the repo and stays.
     if segment.kind == Kind::Write
         && !segment.write_from_command
-        && files.iter().all(|target| to_temp(target))
+        && segment.redirects.iter().all(|target| to_temp(target))
         && reads_only_without_redirects(segment)
     {
         return false;
@@ -799,15 +795,14 @@ fn reads_only_without_redirects(segment: &ScanSegment) -> bool {
             .all(|segment| matches!(segment.kind, Kind::ReadOnly | Kind::Harmless))
 }
 
-/// An absolute path under a temp directory, with no `.` or `..` in it:
+/// An absolute path under a temp directory, with no `..` in it:
 /// `/tmp/../Users/…` names the repo, not the temp directory (#56's
-/// second review).
+/// second review). A `.` cannot leave a prefix, and `components()`
+/// drops it anyway.
 fn to_temp(target: &str) -> bool {
     let path = Path::new(target);
     path.is_absolute()
-        && !path
-            .components()
-            .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+        && !path.components().any(|c| c == Component::ParentDir)
         && (path.starts_with("/tmp")
             || path.starts_with("/var/folders")
             || path.starts_with(std::env::temp_dir()))
