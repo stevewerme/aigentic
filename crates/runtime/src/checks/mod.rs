@@ -14,7 +14,7 @@
 pub mod git;
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Component, Path};
 
 use aigentic_core::{ContentBlock, Event, EventKind};
 use aigentic_log::{
@@ -377,6 +377,10 @@ fn e7_named_runs(input: &CheckInput<'_>) -> Result<(), String> {
         };
         latest.insert(name, index);
     }
+    // The key is the name filter alone: a later run of the same filter
+    // under another target selection (`--lib x`, then `--test t x`)
+    // supersedes the earlier one. That is intended: the name did run and
+    // pass in the end (#56's second review).
     // In the log's order, so the detail names the earliest name at fault.
     let mut judged: Vec<(usize, &String)> = latest.iter().map(|(name, at)| (*at, name)).collect();
     judged.sort_by_key(|(at, _)| *at);
@@ -389,7 +393,11 @@ fn e7_named_runs(input: &CheckInput<'_>) -> Result<(), String> {
             return Err(format!("{name:?}: output not in the log (redirected)"));
         }
         if passed_count(&answer.content) == 0 {
-            return Err(format!("running 0 tests for {name:?}"));
+            let failed = failed_count(&answer.content);
+            if failed == 0 {
+                return Err(format!("running 0 tests for {name:?}"));
+            }
+            return Err(format!("{name:?}: 0 passed, {failed} failed"));
         }
     }
     Ok(())
@@ -584,7 +592,10 @@ fn named_run(command: &str) -> Option<String> {
     scan(command).iter().find_map(cargo_test_args)?.name
 }
 
-/// Does this flag take the next word as its value?
+/// Does this flag take the next word as its value? Every option of
+/// `cargo test --help` (cargo 1.98) that takes one, plus the test
+/// binary's `--skip`; a flag missing here would read its value as a name
+/// filter (#56's second review: `--target-dir`).
 fn takes_a_value(flag: &str) -> bool {
     matches!(
         flag,
@@ -600,6 +611,14 @@ fn takes_a_value(flag: &str) -> bool {
             | "--jobs"
             | "-j"
             | "--manifest-path"
+            | "-m"
+            | "--target"
+            | "--target-dir"
+            | "--config"
+            | "--color"
+            | "--message-format"
+            | "--profile"
+            | "-Z"
     )
 }
 
@@ -612,6 +631,18 @@ fn passed_count(output: &str) -> u64 {
             let rest = line.split("test result:").nth(1)?;
             // " ok. 1 passed; 0 failed; …" -> "1".
             let before = rest.split(" passed").next()?;
+            before.split_whitespace().next_back()?.parse::<u64>().ok()
+        })
+        .sum()
+}
+
+/// The tests the run's own `test result:` lines report as failed.
+fn failed_count(output: &str) -> u64 {
+    output
+        .lines()
+        .filter_map(|line| {
+            let rest = line.split("test result:").nth(1)?;
+            let before = rest.split(" failed").next()?;
             before.split_whitespace().next_back()?.parse::<u64>().ok()
         })
         .sum()
@@ -710,26 +741,73 @@ fn segment_is_an_edit(segment: &ScanSegment) -> bool {
     {
         return false;
     }
-    // A `Write` whose own command writes nothing and whose every
-    // redirection lands in a temp directory is not an edit: the report
-    // and pty scratch files of a real build. A write that came from the
-    // command (or from a `$(…)` inside it) is always an edit — the
-    // redirection only collects it (issue #56's review) — and so is a
+    // A `Write` whose every redirection lands in a temp directory, and
+    // whose command read without those redirections is read-only or
+    // harmless, is not an edit: the report and pty scratch files of a
+    // real build. A write that came from the command (or from a `$(…)`
+    // inside it) is always an edit, the redirection only collects it
+    // (#56's first review); so is a command the classifier cannot read,
+    // since a temp redirection must not launder `cp`, `tee` or
+    // `python3 -c` into a non-edit (#56's second review); and so is a
     // relative target: it resolves inside the repo, so that way fails
     // safe.
+    // A descriptor duplication (`2>&1`, which the scan reports as the
+    // target `1`) writes no file.
+    let files: Vec<&String> = segment
+        .redirects
+        .iter()
+        .filter(|target| !target.chars().all(|c| c.is_ascii_digit()))
+        .collect();
     if segment.kind == Kind::Write
         && !segment.write_from_command
-        && !segment.redirects.is_empty()
-        && segment.redirects.iter().all(|target| to_temp(target))
+        && files.iter().all(|target| to_temp(target))
+        && reads_only_without_redirects(segment)
     {
         return false;
     }
     !matches!(segment.kind, Kind::ReadOnly | Kind::Harmless)
 }
 
+/// The segment's command with its redirections left out, classified on
+/// its own: read-only or harmless, or not. A word with anything but
+/// plain characters is quoted as it was read, so nothing is expanded
+/// twice; a plain word stays bare, so the allow list still matches it.
+fn reads_only_without_redirects(segment: &ScanSegment) -> bool {
+    if segment.words.is_empty() {
+        return true;
+    }
+    let line = segment
+        .words
+        .iter()
+        .map(|word| {
+            let plain = !word.is_empty()
+                && word
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "_./:=@%+,-".contains(c));
+            if plain {
+                word.clone()
+            } else {
+                format!("'{}'", word.replace('\'', "'\\''"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let read = scan(&line);
+    !read.is_empty()
+        && read
+            .iter()
+            .all(|segment| matches!(segment.kind, Kind::ReadOnly | Kind::Harmless))
+}
+
+/// An absolute path under a temp directory, with no `.` or `..` in it:
+/// `/tmp/../Users/…` names the repo, not the temp directory (#56's
+/// second review).
 fn to_temp(target: &str) -> bool {
     let path = Path::new(target);
     path.is_absolute()
+        && !path
+            .components()
+            .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
         && (path.starts_with("/tmp")
             || path.starts_with("/var/folders")
             || path.starts_with(std::env::temp_dir()))

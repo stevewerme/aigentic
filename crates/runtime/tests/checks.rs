@@ -578,6 +578,31 @@ fn e4_edit_table_row_by_row() {
             "echo $(sed -i 's/a/b/' crates/runtime/src/checks/mod.rs) > /tmp/d",
             true,
         ),
+        // A temp redirection does not launder a command the classifier
+        // cannot read, and `..` does not keep a target in temp (#56's
+        // second review).
+        ("cp /tmp/evil.rs crates/runtime/src/lib.rs > /tmp/d", true),
+        (
+            "cat /tmp/evil.rs | tee crates/runtime/src/lib.rs > /tmp/d",
+            true,
+        ),
+        (
+            "python3 -c \"open('crates/runtime/src/lib.rs','w').write('x')\" > /tmp/d",
+            true,
+        ),
+        (
+            "echo x > /tmp/../Users/steve/Projects/aigentic/crates/runtime/src/lib.rs",
+            true,
+        ),
+        ("echo hi > /tmp/d", false),
+        // `2>&1` duplicates a descriptor and writes no file: the gate and
+        // a piped named run are not edits.
+        ("cargo test > /tmp/issue56-gate.log 2>&1", false),
+        (
+            "cargo test -p aigentic-runtime checks 2>&1 | tail -30",
+            false,
+        ),
+        ("cp /tmp/a crates/runtime/src/lib.rs 2>&1", true),
     ];
     for (command, wanted) in rows {
         assert_eq!(is_an_edit(command), wanted, "{command}");
@@ -587,6 +612,7 @@ fn e4_edit_table_row_by_row() {
     // format and the suite fails, a read-only call does not.
     for (command, is_edit) in [
         ("touch crates/runtime/src/new.rs", true),
+        ("cp /tmp/evil.rs crates/runtime/src/lib.rs > /tmp/d", true),
         ("git log --oneline -5", false),
     ] {
         let mut log = Log::new();
@@ -780,6 +806,18 @@ fn e5_reads_a_full_suite_with_flags() {
     .expect_err("two full suites");
     assert!(got.contains("seq 1 and seq 3"), "{got}");
 
+    // A value-taking flag's value is not a name filter (#56's second
+    // review: `--target-dir`).
+    let got = verdict_of(
+        &pair(
+            "cargo test --target-dir /tmp/t > /tmp/one 2>&1",
+            "cargo test --target-dir /tmp/t > /tmp/two 2>&1",
+        ),
+        "E5",
+    )
+    .expect_err("two full suites behind --target-dir");
+    assert!(got.contains("seq 1 and seq 3"), "{got}");
+
     for partial in [
         "cargo test -p aigentic-runtime > /tmp/one 2>&1",
         "cargo test --test checks > /tmp/one 2>&1",
@@ -791,6 +829,24 @@ fn e5_reads_a_full_suite_with_flags() {
             "{partial} is a partial run, not a full suite"
         );
     }
+}
+
+/// E7's detail says what the latest run reported: a run whose tests
+/// failed is not "running 0 tests" (supervisor, #56's fix round).
+#[test]
+fn e7_names_a_failed_run_as_failed() {
+    let mut log = Log::new();
+    let call = log.bash(
+        1,
+        "cargo test -p aigentic-policy --lib the_scan_keeps 2>&1 | tail -20",
+    );
+    log.ok(
+        2,
+        &call,
+        "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 44 filtered out",
+    );
+    let got = verdict_of(&log.take(), "E7").expect_err("a failed run");
+    assert_eq!(got, "\"the_scan_keeps\": 0 passed, 1 failed");
 }
 
 /// T21 (`## Plan amendment 2` item 1): a gate whose suite failed is not a
