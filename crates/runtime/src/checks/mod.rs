@@ -91,27 +91,33 @@ pub enum ChecksError {
 }
 
 /// §6.2: run the named checks in order and report each one's outcome.
+/// The ids are §6.1's, as the workflow writes them (`E1`…`E5`, `E7`); an
+/// id with no check is an error, never a silent pass.
 pub fn run_checks(
     ids: &[String],
     input: &CheckInput<'_>,
 ) -> Result<Vec<CheckOutcome>, ChecksError> {
     let mut outcomes = Vec::with_capacity(ids.len());
     for id in ids {
-        let verdict = match id.as_str() {
-            "e1" => e1_commit_trailers(input),
-            "e2" => e2_named_subjects(input),
-            "e3" => e3_forbidden_paths(input),
-            "e4" => e4_gate(input),
-            "e5" => e5_full_suites(input),
-            "e7" => e7_named_runs(input),
+        // The result a check reports when it has something to say: `fail`
+        // blocks the push, `flag` does not (`§6.1`, f591e51). E5 is the
+        // one flag — a step cannot remove a run already in its log, so
+        // the flag is what a step back cites.
+        let (verdict, on_failure) = match id.as_str() {
+            "E1" => (e1_commit_trailers(input), CheckResult::Fail),
+            "E2" => (e2_named_subjects(input), CheckResult::Fail),
+            "E3" => (e3_forbidden_paths(input), CheckResult::Fail),
+            "E4" => (e4_gate(input), CheckResult::Fail),
+            "E5" => (e5_full_suites(input), CheckResult::Flag),
+            "E7" => (e7_named_runs(input), CheckResult::Fail),
             other => return Err(ChecksError::UnknownId(other.to_string())),
         };
-        outcomes.push(outcome(id, verdict));
+        outcomes.push(outcome(id, verdict, on_failure));
     }
     Ok(outcomes)
 }
 
-fn outcome(id: &str, verdict: Result<(), String>) -> CheckOutcome {
+fn outcome(id: &str, verdict: Result<(), String>, on_failure: CheckResult) -> CheckOutcome {
     match verdict {
         Ok(()) => CheckOutcome {
             id: id.to_string(),
@@ -120,7 +126,7 @@ fn outcome(id: &str, verdict: Result<(), String>) -> CheckOutcome {
         },
         Err(detail) => CheckOutcome {
             id: id.to_string(),
-            result: CheckResult::Fail,
+            result: on_failure,
             detail: Some(detail),
         },
     }
@@ -249,15 +255,13 @@ impl Call {
 /// E4: the gate ran in template form — `cargo fmt`, then `cargo clippy
 /// --all-targets -- -D warnings`, then `cargo test > <log> 2>&1` — each
 /// before the last, all three passing, nothing edited between the format
-/// and the suite, and the tested tree committed.
+/// and the suite, and the tested tree committed. A gate command may carry
+/// one leading `cd <dir> &&` (the shared working directory's habit,
+/// `## Supervisor findings` item 3); nothing else may precede it.
 fn e4_gate(input: &CheckInput<'_>) -> Result<(), String> {
     let calls = calls(input.events);
-    let format = calls
-        .iter()
-        .rfind(|call| call.command() == Some("cargo fmt"));
-    let clippy = calls
-        .iter()
-        .rfind(|call| call.command() == Some("cargo clippy --all-targets -- -D warnings"));
+    let format = calls.iter().rfind(|call| is_gate(call, GATE_FORMAT));
+    let clippy = calls.iter().rfind(|call| is_gate(call, GATE_CLIPPY));
     let suite = calls
         .iter()
         .rfind(|call| call.command().is_some_and(is_gate_suite));
@@ -330,8 +334,12 @@ fn e4_gate(input: &CheckInput<'_>) -> Result<(), String> {
 }
 
 /// E5: two full-suite runs with no edit between them are the same work
-/// twice. A full suite is any call with a bare `cargo test` segment, piped
-/// or chained (`## Plan amendment` item 1); a named run is not one.
+/// twice — reported as a `flag`, not a `fail` (§6.1, f591e51: a step
+/// cannot remove a run already in its log, so the flag is what a step
+/// back cites). A full suite is a `cargo test` segment that selects no
+/// package and no target and names no filter, piped or chained
+/// (`## Plan amendment` item 1, `## Supervisor findings` item 2); a partial
+/// run is not one.
 fn e5_full_suites(input: &CheckInput<'_>) -> Result<(), String> {
     let calls = calls(input.events);
     let runs: Vec<&Call> = calls
@@ -353,16 +361,27 @@ fn e5_full_suites(input: &CheckInput<'_>) -> Result<(), String> {
     Ok(())
 }
 
-/// E7: a run that names a test must have run it — at least one `passed` in
-/// its own result, or the output never came back.
+/// E7: a run that names a test must have run it — at least one `passed`
+/// in its own result, or the output never came back. Per name filter
+/// only the latest run counts (`## Supervisor findings` item 4): a
+/// debugging run that found nothing is superseded by the run that
+/// repeats it, so a name is judged by the last word in the log about it,
+/// not the first. The rule is #34's: `running 0 tests` is never a pass
+/// unless a later run of the same filter says otherwise.
 fn e7_named_runs(input: &CheckInput<'_>) -> Result<(), String> {
-    for call in calls(input.events) {
-        let Some(command) = call.command() else {
+    let calls = calls(input.events);
+    let mut latest: HashMap<String, usize> = HashMap::new();
+    for (index, call) in calls.iter().enumerate() {
+        let Some(name) = call.command().and_then(named_run) else {
             continue;
         };
-        let Some(name) = named_run(command) else {
-            continue;
-        };
+        latest.insert(name, index);
+    }
+    // In the log's order, so the detail names the earliest name at fault.
+    let mut judged: Vec<(usize, &String)> = latest.iter().map(|(name, at)| (*at, name)).collect();
+    judged.sort_by_key(|(at, _)| *at);
+    for (index, name) in judged {
+        let call = &calls[index];
         let Some(answer) = &call.answer else {
             return Err(format!("{name:?}: output not in the log (redirected)"));
         };
@@ -420,10 +439,41 @@ fn calls(events: &[Event]) -> Vec<Call> {
     calls
 }
 
+/// The gate's two fixed commands, verbatim, behind one optional `cd`.
+const GATE_FORMAT: &str = "cargo fmt";
+const GATE_CLIPPY: &str = "cargo clippy --all-targets -- -D warnings";
+
+/// A gate command, behind the one leading `cd` a build habitually uses.
+fn is_gate(call: &Call, form: &str) -> bool {
+    call.command()
+        .is_some_and(|command| behind_a_leading_cd(command) == form)
+}
+
+/// The command behind one leading `cd <dir> &&`, when that is all that
+/// precedes it: a build changes into its directory and runs the gate
+/// there (`## Supervisor findings` item 3). The directory may be a
+/// substitution (`cd "$(git rev-parse --show-toplevel)"`), but it may not
+/// hide another command: a `;`, a pipe, a second `&&` or a redirection in
+/// it means something else came first, and nothing is stripped then.
+fn behind_a_leading_cd(command: &str) -> &str {
+    let Some(rest) = command.strip_prefix("cd ") else {
+        return command;
+    };
+    let Some(at) = rest.find(" &&") else {
+        return command;
+    };
+    let dir = &rest[..at];
+    if dir.is_empty() || dir.contains([';', '|', '&', '<', '>']) {
+        return command;
+    }
+    rest[at + 3..].trim_start()
+}
+
 /// The gate's suite form: exactly `cargo test > <one plain-word log>
-/// 2>&1`, one segment and nothing after it.
+/// 2>&1`, behind the optional leading `cd`, one segment and nothing
+/// after it.
 fn is_gate_suite(command: &str) -> bool {
-    let command = command.trim();
+    let command = behind_a_leading_cd(command.trim()).trim();
     let Some(rest) = command.strip_prefix("cargo test > ") else {
         return false;
     };
@@ -435,27 +485,47 @@ fn is_gate_suite(command: &str) -> bool {
         && !log.contains(['|', '&', ';', '<', '>'])
 }
 
-/// A full suite: some segment's words are exactly `cargo test`.
+/// A full suite: a `cargo test` segment that selects no package and no
+/// target and names no filter, so the whole workspace runs
+/// (`## Supervisor findings` item 2). Flags that take a value
+/// (`--manifest-path`, `--features`) keep their value out of the
+/// filter's way; a `--list` run runs nothing and is no suite.
 fn is_full_suite(command: &str) -> bool {
     scan(command)
         .iter()
-        .any(|segment| segment.words == ["cargo", "test"])
+        .any(|segment| match cargo_test_args(segment) {
+            Some(args) => !args.lists && !args.selection && args.name.is_none(),
+            None => false,
+        })
 }
 
-/// The test name a `cargo test` call filters on, when it names one. A call
-/// with `--list` runs nothing, so it names none (`## Plan amendment 2`
-/// item 4).
-fn named_run(command: &str) -> Option<String> {
-    let segments = scan(command);
-    let segment = segments.iter().find(|segment| {
-        segment.words.len() >= 2 && segment.words[0] == "cargo" && segment.words[1] == "test"
-    })?;
-    if segment.words.iter().any(|word| word == "--list") {
+/// What a `cargo test` segment asks for.
+struct TestArgs {
+    /// The name filter, when it names one. `--list` runs nothing, so it
+    /// names none.
+    name: Option<String>,
+    /// A package or a target kind is selected: a partial run.
+    selection: bool,
+    /// `--list`: nothing runs.
+    lists: bool,
+}
+
+/// The arguments of a `cargo test` segment, when the segment is one.
+/// `named_run` and `is_full_suite` read the same walk of the words, so
+/// they agree on what a package, a target and a filter are.
+fn cargo_test_args(segment: &ScanSegment) -> Option<TestArgs> {
+    let words = &segment.words;
+    if words.len() < 2 || words[0] != "cargo" || words[1] != "test" {
         return None;
     }
+    let mut args = TestArgs {
+        name: None,
+        selection: false,
+        lists: false,
+    };
     let mut after_separator = false;
     let mut skip = false;
-    for word in segment.words.iter().skip(2) {
+    for word in words.iter().skip(2) {
         if skip {
             skip = false;
             continue;
@@ -464,18 +534,54 @@ fn named_run(command: &str) -> Option<String> {
             after_separator = true;
             continue;
         }
-        if word.starts_with('-') && !after_separator {
-            if takes_a_value(word) {
+        if word.starts_with('-') {
+            // A flag before `--` may take the next word as its value; a
+            // flag after it is the test binary's own.
+            if !after_separator && takes_a_value(word) && !word.contains('=') {
                 skip = true;
+            }
+            if selects_a_target(word) {
+                args.selection = true;
+            }
+            if word == "--list" {
+                args.lists = true;
             }
             continue;
         }
-        if word.starts_with('-') {
-            continue;
+        if args.name.is_none() {
+            args.name = Some(word.clone());
         }
-        return Some(word.clone());
     }
-    None
+    if args.lists {
+        args.name = None;
+    }
+    Some(args)
+}
+
+/// A flag that picks what runs: a package or a target kind
+/// (`## Supervisor findings` item 2).
+fn selects_a_target(flag: &str) -> bool {
+    matches!(
+        flag.split('=').next().unwrap_or(flag),
+        "-p" | "--package"
+            | "--lib"
+            | "--bin"
+            | "--bins"
+            | "--test"
+            | "--tests"
+            | "--example"
+            | "--examples"
+            | "--bench"
+            | "--benches"
+            | "--doc"
+    )
+}
+
+/// The test name a `cargo test` call filters on, when it names one. A
+/// call with `--list` runs nothing, so it names none (`## Plan
+/// amendment 2` item 4).
+fn named_run(command: &str) -> Option<String> {
+    scan(command).iter().find_map(cargo_test_args)?.name
 }
 
 /// Does this flag take the next word as its value?
@@ -493,6 +599,7 @@ fn takes_a_value(flag: &str) -> bool {
             | "--exclude"
             | "--jobs"
             | "-j"
+            | "--manifest-path"
     )
 }
 
@@ -603,10 +710,15 @@ fn segment_is_an_edit(segment: &ScanSegment) -> bool {
     {
         return false;
     }
-    // A `Write` only when every redirection lands in a temp directory: the
-    // report and pty scratch files of a real build. A relative target
-    // resolves inside the repo, so it is an edit — that way fails safe.
+    // A `Write` whose own command writes nothing and whose every
+    // redirection lands in a temp directory is not an edit: the report
+    // and pty scratch files of a real build. A write that came from the
+    // command (or from a `$(…)` inside it) is always an edit — the
+    // redirection only collects it (issue #56's review) — and so is a
+    // relative target: it resolves inside the repo, so that way fails
+    // safe.
     if segment.kind == Kind::Write
+        && !segment.write_from_command
         && !segment.redirects.is_empty()
         && segment.redirects.iter().all(|target| to_temp(target))
     {
