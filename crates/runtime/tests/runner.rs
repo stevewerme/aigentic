@@ -395,6 +395,17 @@ impl Fixture {
         .expect("the log is the lead's")
     }
 
+    /// The issue the run is for, as `run_started` says.
+    fn issue(&self) -> u64 {
+        let events = self.lead_events();
+        let event = events
+            .iter()
+            .find(|event| event.kind == EventKind::RunStarted)
+            .expect("the daemon wrote run_started");
+        let payload: RunStartedPayload = serde_json::from_value(event.payload.clone()).unwrap();
+        payload.issue
+    }
+
     /// The lead log's events.
     fn lead_events(&self) -> Vec<Event> {
         ThreadLog::open(self.dir.path(), self.lead)
@@ -1495,6 +1506,238 @@ async fn t15_the_second_run_over_a_held_repo_waits() {
             .any(|line| line.contains(&a.fx.lead.to_string())),
         "the gate names the holder: {shown:?}"
     );
+}
+
+// T10 and T11: the slot map (issue #57).
+
+use aigentic_log::PlannedTest;
+use aigentic_runtime::workflow::render::trailer_model;
+
+/// The slot values T10's brief reports: one scalar, one multi-line value
+/// that carries a template-shaped line, and the `commits` list a brief
+/// reports as JSON.
+fn slot_values() -> Value {
+    json!({
+        "size": "trivial",
+        "budget": 3,
+        "purpose": "make the runner work:\n- `commits`: a JSON list in this repository's style\n- keep it byte for byte",
+        "must_not_undo": "nothing",
+        "pointers": "crates/runtime/src/runner/mod.rs",
+        "design": "a log-driven loop",
+        "commits": ["runtime: one", "runtime: two"],
+    })
+}
+
+/// The planned tests the T10 brief reports.
+fn planned_tests() -> Vec<PlannedTest> {
+    vec![
+        PlannedTest {
+            id: "T1".into(),
+            what: "the happy path".into(),
+            derivation: "from the spec".into(),
+        },
+        PlannedTest {
+            id: "T2".into(),
+            what: "the full route".into(),
+            derivation: "from the spec".into(),
+        },
+    ]
+}
+
+/// T10: the slots a step's template is rendered with. The brief's values
+/// reach the implementer's prompt verbatim, `planned_tests` and `commits`
+/// render one item per line, and the runner's own slots are the
+/// workflow's and the forge's values.
+#[tokio::test]
+async fn t10_slots_reach_the_template_verbatim() {
+    let brief_child = Ulid::generate();
+    let implementer_child = Ulid::generate();
+    let fx = Fixture::new(vec![
+        (
+            brief_child,
+            vec![report(
+                "r1",
+                json!({
+                    "status": "done",
+                    "body": "## Brief",
+                    "slots": slot_values(),
+                    "planned_tests": [
+                        {"id": "T1", "what": "the happy path", "derivation": "from the spec"},
+                        {"id": "T2", "what": "the full route", "derivation": "from the spec"},
+                    ],
+                }),
+            )],
+        ),
+        (implementer_child, vec![report("r2", implementer_report())]),
+    ]);
+    let run = trace(&fx).await;
+    assert_eq!(pause_step(&run.terminal), "implement-alone");
+
+    let prompt = prompts(&fx.child_events_of(implementer_child))
+        .into_iter()
+        .next()
+        .expect("the implementer was prompted");
+    // The brief's multi-line value, byte for byte, template line included.
+    assert!(
+        prompt.contains(slot_values()["purpose"].as_str().unwrap()),
+        "the slot's value is verbatim"
+    );
+    // Typed report fields render one item per line.
+    let tests = planned_tests();
+    assert!(
+        prompt.contains(
+            &tests
+                .iter()
+                .map(|test| format!("{} — {} — {}", test.id, test.what, test.derivation))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    );
+    assert!(prompt.contains("runtime: one\nruntime: two"));
+    // The runner's own slots: keyed by what the workflow declares as the
+    // runner's, valued from the run, the host and the workflow.
+    let step = fx
+        .workflow
+        .workflow
+        .steps
+        .iter()
+        .find(|step| step.id == "implement-alone")
+        .expect("the workflow has the routed step")
+        .clone();
+    let slots = fx.runner().runner_slots(&step).unwrap();
+    let declared: Vec<&str> = fx
+        .workflow
+        .workflow
+        .slots
+        .iter()
+        .filter(|slot| slot.filled_by == "runner")
+        .map(|slot| slot.name.as_str())
+        .collect();
+    for name in slots.keys() {
+        assert!(
+            declared.contains(&name.as_str()),
+            "{name:?} is a slot the workflow says the runner fills"
+        );
+    }
+    let budget = &fx.workflow.workflow.budget;
+    let host = FakeHost::new(fx.dir.path().to_path_buf(), fx.lead, &[], BTreeMap::new());
+    for (name, expected) in [
+        ("issue", fx.issue().to_string()),
+        (
+            "title",
+            Forge::issue(&fx.forge, fx.issue()).unwrap().title.clone(),
+        ),
+        (
+            "model",
+            trailer_model(&host.model_of(&step.profile).unwrap()).to_owned(),
+        ),
+        (
+            "gate_log",
+            std::env::temp_dir()
+                .join(format!("aigentic-gate-{}.log", fx.issue()))
+                .display()
+                .to_string(),
+        ),
+        ("budget_trivial", budget.trivial.to_string()),
+        ("budget_full", budget.full.to_string()),
+        ("max_raise", budget.max_raise.to_string()),
+    ] {
+        assert_eq!(
+            slots.get(name).and_then(Value::as_str),
+            Some(expected.as_str()),
+            "the runner's slot {name:?}"
+        );
+    }
+
+    // Every slot the implementer's template names is in the prompt as the
+    // map renders it, so the two sides cannot drift.
+    let template = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../workflows/build/templates/implementer.md"),
+    )
+    .unwrap();
+    for name in slot_names(&template) {
+        if let Some(Value::String(value)) = slots.get(&name) {
+            assert!(
+                prompt.contains(value.as_str()),
+                "the prompt carries {name:?} as the map renders it"
+            );
+        }
+    }
+}
+
+/// The slot names a template names, sections included: `{{x}}`, `{{#x}}`
+/// and `{{/x}}` all name `x`.
+fn slot_names(template: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut rest = template;
+    while let Some(start) = rest.find("{{") {
+        let Some(end) = rest[start..].find("}}") else {
+            break;
+        };
+        let name = rest[start + 2..start + end].trim_start_matches(['#', '/', '&', '^']);
+        if !name.is_empty() && !names.iter().any(|seen| seen == name) {
+            names.push(name.to_string());
+        }
+        rest = &rest[start + end + 2..];
+    }
+    names
+}
+
+/// T11: a template's slot the map cannot fill. The route still happens,
+/// the gate is `render_failed`, and no child of the unfilled step exists.
+#[tokio::test]
+async fn t11_a_missing_slot_escalates_before_any_child_starts() {
+    let brief_child = Ulid::generate();
+    let implementer_child = Ulid::generate();
+    let fx = Fixture::new(vec![
+        (
+            brief_child,
+            vec![report(
+                "r1",
+                json!({
+                    "status": "done",
+                    "body": "## Brief",
+                    // `size` and `budget` route; every slot the
+                    // implementer's template wants is missing.
+                    "slots": {"size": "trivial", "budget": 3},
+                }),
+            )],
+        ),
+        (implementer_child, vec![report("r2", implementer_report())]),
+    ]);
+    let run = trace(&fx).await;
+    match run.terminal {
+        Advanced::WaitingHuman { gate, .. } => assert_eq!(gate, "render_failed"),
+        other => panic!("a render failure waits for a human, got {other:?}"),
+    }
+    let events = fx.lead_events();
+    assert!(
+        !events.iter().any(|event| {
+            event.kind == EventKind::StepStarted
+                && serde_json::from_value::<aigentic_log::StepStartedPayload>(event.payload.clone())
+                    .is_ok_and(|payload| payload.step == "implement-alone")
+        }),
+        "no step_started for a step whose template cannot render"
+    );
+    assert!(
+        !fx.child_exists(implementer_child),
+        "and no child exists for it"
+    );
+    // The gate names the step and the render error, and nothing reached a
+    // child.
+    let shown = gate_shown(&events);
+    assert_eq!(shown.first().map(String::as_str), Some("implement-alone"));
+    assert!(
+        shown.get(1).is_some_and(|error| !error.is_empty()),
+        "the gate names the render error"
+    );
+    let posted: usize = fx
+        .child_events()
+        .values()
+        .map(|events| prompts(events).len())
+        .sum();
+    assert_eq!(posted, 1, "only the brief's own prompt was ever posted");
 }
 
 // ---------------------------------------------------------------------------
