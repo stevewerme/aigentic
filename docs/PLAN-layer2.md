@@ -264,10 +264,15 @@ Sources: git, the child's log (every bash call and its exit status), the
 | E2 | Commit subjects equal the named messages | #47 |
 | E3 | Nothing under `.scratch/`; `.aigentic/rules.toml` untouched | rule |
 | E4 | After the last edit: `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, full `cargo test`, all exit 0 | every issue |
-| E5 | No full-suite re-run without an edit in between | #40, five runs |
+| E5 | No full-suite re-run without an edit in between; reports `flag`, not `fail` (see below) | #40, five runs |
 | E6 | Every planned T-id is in the ledger; each `landed` name matches exactly one added `fn` in the diff | #44, 7 of 14 matched nothing |
 | E7 | Each named test run reported at least `1 passed` | #34, `running 0 tests` |
 | E8 | Each `quotes` phrase occurs verbatim in the plan or an amendment | #49 |
+
+E5 is the one exact check that reports `flag`: once two full-suite runs
+with no edit between them are in a step's log, nothing the step does
+later removes them, so a send-back could never pass it (decided on #56's
+review). The judge weighs it as waste.
 
 ### 6.2 Flags (code finds, the judge weighs; never block)
 
