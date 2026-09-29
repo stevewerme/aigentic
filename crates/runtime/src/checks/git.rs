@@ -14,9 +14,19 @@ use super::ObservedCommit;
 
 /// Read `base..HEAD` in `repo`: sha, subject, message, trailers, paths.
 pub fn read_commits(repo: &Path, base: &str) -> std::io::Result<Vec<ObservedCommit>> {
+    read_commits_between(repo, base, "HEAD")
+}
+
+/// Read `base..topic`, the same way. The end is named so a replay can read
+/// a thread's own range rather than everything up to today's HEAD.
+pub fn read_commits_between(
+    repo: &Path,
+    base: &str,
+    topic: &str,
+) -> std::io::Result<Vec<ObservedCommit>> {
     let listed = git(
         repo,
-        &["log", "--format=%H%x1f%s", &format!("{base}..HEAD")],
+        &["log", "--format=%H%x1f%s", &format!("{base}..{topic}")],
     )?;
     let mut commits = Vec::new();
     for line in listed.lines() {
@@ -43,6 +53,21 @@ pub fn read_commits(repo: &Path, base: &str) -> std::io::Result<Vec<ObservedComm
         });
     }
     Ok(commits)
+}
+
+/// The tracked paths git reports modified now: untracked files excluded,
+/// so `.scratch/` and `.aigentic/rules.toml` never show up here.
+pub fn read_uncommitted(repo: &Path) -> std::io::Result<Vec<String>> {
+    Ok(
+        git(repo, &["status", "--porcelain", "--untracked-files=no"])?
+            .lines()
+            .filter_map(|line| {
+                let (_, path) = line.split_at(line.len().min(3));
+                let path = path.trim();
+                (!path.is_empty()).then(|| path.to_string())
+            })
+            .collect(),
+    )
 }
 
 /// `git interpret-trailers --parse`'s output for one message.
