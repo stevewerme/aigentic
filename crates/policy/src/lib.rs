@@ -19,7 +19,7 @@ pub use rules::{
     Decision, MEMORY_PREFIX, MEMORY_REASON, Riskiest, Rule, default_bash_allow, default_rules,
     prefix_of, riskiest_segment,
 };
-pub use shell::main_segment;
+pub use shell::{Kind, ScanSegment, main_segment, scan};
 pub use step::{DenyParseError, StepOverlay};
 
 /// What policy says about one call.

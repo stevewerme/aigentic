@@ -20,7 +20,7 @@ use std::collections::VecDeque;
 /// the risk order too: the riskiest segment a line has is the worst
 /// kind, the last of the worst.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum Kind {
+pub enum Kind {
     /// An allow-list command with no writing flag: `grep -n x file`.
     ReadOnly,
     /// Nothing happens on its own: `cd dir`, an assignment, emptiness.
@@ -223,14 +223,19 @@ fn classify_within(src: &str, allow: &[String], grants: &[String], depth: usize)
 /// redirections gone, a trailing bare fd (`2` of a `2>&1`) dropped —
 /// words that never closed are skipped, for they are not shell.
 fn segment_text(seg: &Segment) -> String {
+    segment_words(seg).join(" ")
+}
+
+/// The words of one segment, in order, with a bare descriptor number
+/// dropped: a trailing number on a redirecting segment is the `2` of
+/// `2>&1`, plumbing rather than a word.
+fn segment_words(seg: &Segment) -> Vec<&str> {
     let mut words: Vec<&str> = seg
         .words
         .iter()
         .filter(|w| !w.broken && !w.text.is_empty())
         .map(|w| w.text.as_str())
         .collect();
-    // A bare number on the end of a redirecting segment is a
-    // descriptor (`2>&1`): plumbing, not a word.
     if !seg.redirects.is_empty()
         && words
             .last()
@@ -238,7 +243,7 @@ fn segment_text(seg: &Segment) -> String {
     {
         words.pop();
     }
-    words.join(" ")
+    words
 }
 
 /// One segment, classified.
@@ -908,6 +913,48 @@ pub fn main_segment(command: &str) -> String {
     classify(command, &crate::rules::default_bash_allow(), &[]).main
 }
 
+/// One segment of a command line, for callers that need the parts
+/// rather than the whole line's verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanSegment {
+    /// The segment's words, quotes stripped, joined by a space, with a
+    /// bare descriptor number on a redirection dropped (`2>&1` is
+    /// plumbing, not a word).
+    pub text: String,
+    /// The same words, one to an entry; `segment_text`'s words exactly,
+    /// so a caller can compare either.
+    pub words: Vec<String>,
+    /// The target of each of its redirections, in order.
+    pub redirects: Vec<String>,
+    /// What the segment is, under the default allow list and no grants.
+    pub kind: Kind,
+}
+
+/// Split a command line into segments and classify each one, against
+/// the default allow list and no grants: the parts, not the verdict.
+///
+/// The rules for a whole line ([`classify`] through `main_segment`)
+/// read a line as one thing; a caller that has to recognise an exact
+/// command — the same segment, nothing chained after it — needs the
+/// segments themselves, with the words and the redirection targets
+/// unjoined.
+pub fn scan(command: &str) -> Vec<ScanSegment> {
+    let allow = crate::rules::default_bash_allow();
+    segments(Scanner::scan(command))
+        .iter()
+        // A heredoc leaves an empty segment behind its terminator; a
+        // segment with neither words nor redirections is not a part of
+        // the line.
+        .filter(|seg| !(seg.words.is_empty() && seg.redirects.is_empty()))
+        .map(|seg| ScanSegment {
+            text: segment_text(seg),
+            words: segment_words(seg).iter().map(|w| w.to_string()).collect(),
+            redirects: seg.redirects.iter().map(|(_, w)| w.text.clone()).collect(),
+            kind: classify_segment(seg, &allow, &[], 0).kind,
+        })
+        .collect()
+}
+
 struct Scanner {
     chars: Vec<char>,
     at: usize,
@@ -1318,6 +1365,86 @@ mod tests {
         classify(cmd, &default_bash_allow(), &[])
             .riskiest
             .map(|w| w.join(" "))
+    }
+
+    /// `scan` is the parts, not the verdict: the words of every segment
+    /// in order, so a caller can recognise an exact command. The kinds
+    /// are the same ones the whole line's verdict folds.
+    #[test]
+    fn the_scan_splits_a_line_into_its_classified_segments() {
+        let segs = scan("cd /repo && cargo clippy --all-targets -- -D warnings");
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[0].text, "cd /repo");
+        assert_eq!(segs[0].words, vec!["cd", "/repo"]);
+        assert_eq!(segs[0].kind, Kind::Harmless);
+        assert!(segs[0].redirects.is_empty());
+        assert_eq!(
+            segs[1].words,
+            vec!["cargo", "clippy", "--all-targets", "--", "-D", "warnings"]
+        );
+        // An allow-listed command with no writing flag is harmless:
+        // `Kind::ReadOnly` is the least of the kinds and only ever a
+        // line's starting point, so `classify_segment` never folds down
+        // to it (the `Worst` it folds into starts at `Harmless`).
+        assert_eq!(segs[1].kind, Kind::Harmless);
+
+        // `cargo fmt` is allow-listed too; the caller that needs it as
+        // an edit decides that, not the scanner.
+        let fmt = scan("cargo fmt");
+        assert_eq!(fmt.len(), 1);
+        assert_eq!(fmt[0].text, "cargo fmt");
+        assert_eq!(fmt[0].kind, Kind::Harmless);
+
+        // A command the rules cannot read is `Unknown`; an assignment
+        // on its own is harmless.
+        assert_eq!(scan("flake8 .")[0].kind, Kind::Unknown);
+        assert_eq!(scan("LOG=/tmp/x")[0].kind, Kind::Harmless);
+    }
+
+    /// The redirection targets are kept, and a descriptor on its own is
+    /// not a word: not an edit's business to guess from `text`.
+    #[test]
+    fn the_scan_keeps_redirection_targets_and_drops_bare_descriptors() {
+        let segs = scan("cargo test > /tmp/gate.log 2>&1");
+        assert_eq!(segs.len(), 1);
+        // `2>&1` is a dup: the target is the descriptor, not `&1`.
+        assert_eq!(segs[0].redirects, vec!["/tmp/gate.log", "1"]);
+        assert_eq!(segs[0].words, vec!["cargo", "test"]);
+        assert_eq!(segs[0].words, segs[0].text.split(' ').collect::<Vec<_>>());
+        assert_eq!(segs[0].text, "cargo test");
+        // A redirection to a file is a write segment.
+        assert_eq!(segs[0].kind, Kind::Write);
+
+        // Relative target, same table: the caller resolves it.
+        let rel = scan("cargo test > gate.log");
+        assert_eq!(rel[0].redirects, vec!["gate.log"]);
+    }
+
+    /// A chained call is several segments; the words keep the line's
+    /// shape, so `echo "exit=$?"` reads as itself and not as the test's.
+    #[test]
+    fn the_scan_reads_a_chain_and_a_heredoc_as_the_words_written() {
+        let segs = scan("cargo test > /tmp/x.log 2>&1; echo \"exit=$?\"");
+        assert_eq!(segs.len(), 2);
+        // A substitution in a word is folded and shows nothing of its
+        // own: the word reads as the text around it.
+        assert_eq!(segs[1].words, vec!["echo", "exit="]);
+
+        // A heredoc is one segment: the body is not a word, the marker
+        // reads as a target of its own, and the empty segment the
+        // terminator leaves behind is dropped.
+        let heredoc = scan("cat > /tmp/msg.txt <<'MSG'\nbody line\nMSG\n");
+        assert_eq!(heredoc.len(), 1);
+        assert_eq!(heredoc[0].words, vec!["cat"]);
+        assert_eq!(heredoc[0].redirects, vec!["/tmp/msg.txt", "MSG"]);
+        assert!(!heredoc[0].text.contains("body"));
+
+        // A chain is one segment each, `&&` not among the words.
+        let chain = scan("cargo fmt && cargo test > /tmp/x.log 2>&1");
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[0].words, vec!["cargo", "fmt"]);
+        assert_eq!(chain[1].words, vec!["cargo", "test"]);
+        assert_eq!(chain[1].redirects, vec!["/tmp/x.log", "1"]);
     }
 
     /// The `bash` row's text (issue #21): the segment that carries the
