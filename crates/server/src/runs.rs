@@ -295,19 +295,7 @@ impl LeadLock {
     /// Take `lead`'s lock under `threads_dir`, or say who holds it.
     fn take(threads_dir: &std::path::Path, lead: Ulid) -> Result<Self, String> {
         let path = threads_dir.join(format!("{lead}.lock"));
-        if let Err(e) = std::fs::create_dir_all(threads_dir) {
-            return Err(format!("cannot make {}: {e}", threads_dir.display()));
-        }
-        let file = match std::fs::File::options()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&path)
-        {
-            Ok(file) => file,
-            Err(e) => return Err(format!("cannot open {}: {e}", path.display())),
-        };
+        let file = open_lock_file(threads_dir, &path)?;
         match file.try_lock() {
             Ok(()) => Ok(Self { file, path }),
             // Someone else — another daemon — holds it. `unlock` says
@@ -332,6 +320,74 @@ impl Drop for LeadLock {
         // Closing the file would release it anyway; unlocking says so.
         let _ = self.file.unlock();
     }
+}
+
+/// The OS claim on starting a run for one issue (issue #58, review 2).
+///
+/// [`LeadLock`] is keyed by the lead, so it cannot exist before the lead
+/// does: two processes that both find no unfinished run for an issue
+/// would each create a lead, and each would drive its own. This lock, on
+/// `<threads_dir>/issue-<n>.lock`, is held across the whole
+/// check-and-create, so the second process waits, then finds the first
+/// one's lead and is refused (or attaches) rather than starting another.
+/// Like the lead's lock, the file is left in place.
+pub struct IssueLock {
+    file: std::fs::File,
+}
+
+impl IssueLock {
+    /// How long a `Build` waits for another process's check-and-create.
+    /// That window is a few file writes, so waiting this long means the
+    /// holder is stuck; the caller is refused rather than kept waiting.
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// Take `issue`'s lock under `threads_dir`, waiting while another
+    /// process holds it.
+    pub async fn take(threads_dir: &std::path::Path, issue: u64) -> Result<Self, String> {
+        let path = threads_dir.join(format!("issue-{issue}.lock"));
+        let file = open_lock_file(threads_dir, &path)?;
+        let deadline = tokio::time::Instant::now() + Self::WAIT;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(Self { file }),
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(format!(
+                            "another aigentic process has been starting a run for issue #{issue} for {}s; try again",
+                            Self::WAIT.as_secs()
+                        ));
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Err(std::fs::TryLockError::Error(e)) => {
+                    return Err(format!("cannot lock {}: {e}", path.display()));
+                }
+            }
+        }
+    }
+}
+
+impl Drop for IssueLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+/// Open (creating it if needed) a lock file under `threads_dir`.
+fn open_lock_file(
+    threads_dir: &std::path::Path,
+    path: &std::path::Path,
+) -> Result<std::fs::File, String> {
+    if let Err(e) = std::fs::create_dir_all(threads_dir) {
+        return Err(format!("cannot make {}: {e}", threads_dir.display()));
+    }
+    std::fs::File::options()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|e| format!("cannot open {}: {e}", path.display()))
 }
 
 /// Which leads a task owns, and who watches each of them.

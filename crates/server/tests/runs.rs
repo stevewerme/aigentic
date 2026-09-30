@@ -2175,6 +2175,96 @@ async fn t15_one_writer_per_lead_across_processes() {
     let _ = first.stop().await;
 }
 
+/// T15c — two daemons that `Build` one issue with no lead yet, at the
+/// same moment, make one lead between them (issue #58, review 2). The
+/// lead's own lock cannot cover this window, because the lead does not
+/// exist yet; the issue's OS lock does. The test holds that lock itself,
+/// standing in for a third process mid-create: both `Build`s must wait on
+/// it, and once it is released exactly one lead is made and the other
+/// daemon is refused with the reason.
+#[tokio::test]
+async fn t15c_two_processes_racing_a_fresh_build_make_one_lead() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let fixture = Fixture::new(Vec::new());
+    let twin = fixture.twin();
+    let project_threads = fixture.threads.join("p");
+    std::fs::create_dir_all(&project_threads).unwrap();
+    let held = std::fs::File::options()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(project_threads.join("issue-58.lock"))
+        .unwrap();
+    held.try_lock().expect("nobody holds the issue's lock yet");
+
+    let scripts = Scripts::of([vec![report("r1", brief_report_full())]]);
+    let first = fixture.daemon(scripts.clone(), false).await;
+    let other = twin.daemon(scripts, false).await;
+    let (client, _) = first.connect("steve").await;
+    let (client2, _) = other.connect("magnus").await;
+
+    let build = Request::Build {
+        project: "p".into(),
+        issue: 58,
+        workflow: None,
+    };
+    let (a_done, b_done) = (AtomicBool::new(false), AtomicBool::new(false));
+    let lead_logs = || -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(&project_threads)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"))
+            .filter(|p| {
+                std::fs::read_to_string(p)
+                    .unwrap_or_default()
+                    .contains("\"run_started\"")
+            })
+            .collect()
+    };
+    let (a, b, ()) = tokio::join!(
+        async {
+            let r = client.request(build.clone()).await.unwrap();
+            a_done.store(true, Ordering::SeqCst);
+            r
+        },
+        async {
+            let r = client2.request(build.clone()).await.unwrap();
+            b_done.store(true, Ordering::SeqCst);
+            r
+        },
+        async {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            assert!(
+                !a_done.load(Ordering::SeqCst) && !b_done.load(Ordering::SeqCst),
+                "both `Build`s wait while another process holds the issue's lock"
+            );
+            assert!(lead_logs().is_empty(), "no lead is made while it is held");
+            held.unlock().unwrap();
+        },
+    );
+
+    assert_eq!(lead_logs().len(), 1, "one lead for issue 58: {a:?} / {b:?}");
+    let (made, refused) = match (a, b) {
+        (Response::Run { lead, resumed }, Response::Refused { reason })
+        | (Response::Refused { reason }, Response::Run { lead, resumed }) => {
+            ((lead, resumed), reason)
+        }
+        (a, b) => panic!("one daemon makes the lead, the other is refused: {a:?} / {b:?}"),
+    };
+    assert!(!made.1, "the lead is new, not resumed");
+    assert_eq!(
+        refused,
+        format!("run {} is being driven by another aigentic process", made.0),
+        "the loser found the winner's lead and says who holds it"
+    );
+
+    let _ = other.stop().await;
+    let _ = first.stop().await;
+}
+
 /// T16 — `Report` on a run-owned thread is served from its log, with no
 /// actor started: a running child and its lead both answer (issue #58
 /// fix 3).

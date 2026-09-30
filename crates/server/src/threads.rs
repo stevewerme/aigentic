@@ -23,7 +23,7 @@ use crate::actor::{Mail, Mailbox, Reports, ThreadActor};
 use crate::awake::KeepAwake;
 use crate::build::{BuildError, ProviderFactory, Root, build_thread, project_context};
 use crate::config::{Config, ServerConfig};
-use crate::runs::{Answer, Claim, ProdDeps, RunDeps, RunWorld, Runs, drive};
+use crate::runs::{Answer, Claim, IssueLock, ProdDeps, RunDeps, RunWorld, Runs, drive};
 use crate::skills::SkillPaths;
 use crate::workspaces::Workspace;
 
@@ -76,8 +76,8 @@ pub struct ThreadTable {
     /// `Server::new`.
     run_deps: Mutex<Arc<dyn RunDeps>>,
     /// Serialises the "is there an unfinished run for this issue?" check
-    /// and the lead it creates under it, so two concurrent `Build`s for
-    /// one issue cannot both find nothing and both start a run.
+    /// and the lead it creates under it within this process; the issue's
+    /// OS lock ([`IssueLock`]) does the same across processes.
     build_lock: AsyncMutex<()>,
     entries: Mutex<HashMap<Ulid, Entry>>,
 }
@@ -646,10 +646,10 @@ impl ThreadTable {
     /// Start a run for `(project, issue)`, or resume the one already
     /// there, and answer with its lead. `resumed` says which happened.
     ///
-    /// The whole check-and-create runs under one lock per table, so two
-    /// concurrent `Build`s for one issue cannot both find no run and both
-    /// create one. Exactly one task ever drives a lead: [`Runs::claim`]
-    /// decides it.
+    /// The whole check-and-create runs under the table's lock and the
+    /// issue's OS lock, so two concurrent `Build`s for one issue, in one
+    /// process or in two, cannot both find no run and both create one.
+    /// Exactly one task ever drives a lead: [`Runs::claim`] decides it.
     pub async fn build_run(
         &self,
         project: &str,
@@ -659,6 +659,12 @@ impl ThreadTable {
     ) -> Result<(Ulid, bool), ThreadError> {
         let _serial = self.build_lock.lock().await;
         let world = self.run_world(project)?;
+        // Held until the lead exists and is claimed: another process's
+        // `Build` for this issue then finds the lead instead of making
+        // a second one.
+        let _issue = IssueLock::take(&world.root.threads_dir, issue)
+            .await
+            .map_err(ThreadError::Refused)?;
         if let Some(lead) = self.unfinished_run(project, issue)? {
             self.claim_or_attach(lead, &world)?;
             return Ok((lead, true));
