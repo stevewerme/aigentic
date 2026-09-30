@@ -1462,6 +1462,8 @@ mod tests {
                 child_thread: child,
                 attempt: 1,
                 budget_usd: 3.0,
+                head_at_start: None,
+                remote_at_start: None,
             }),
         );
         let step_finished = runner_event(

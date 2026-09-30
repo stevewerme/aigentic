@@ -575,6 +575,8 @@ mod tests {
                 child_thread,
                 attempt,
                 budget_usd: 3.0,
+                head_at_start: None,
+                remote_at_start: None,
             },
         )
     }

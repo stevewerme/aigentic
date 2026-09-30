@@ -707,6 +707,17 @@ pub struct StepStartedPayload {
     /// 1-based: the first entry is attempt 1.
     pub attempt: u32,
     pub budget_usd: f64,
+    /// The repository's HEAD when a writing step started, on the first
+    /// attempt only: the base every check and the push read the step's
+    /// commits from. `None` on later attempts, and on a step that does
+    /// not write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_at_start: Option<String>,
+    /// The remote's head for the step's branch when the step started, on
+    /// the first attempt only. `None` when the remote had no such branch,
+    /// and on a step that does not write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_at_start: Option<String>,
 }
 
 /// Payload of a `step_finished` event: how the child's turn ended, what
@@ -1431,6 +1442,9 @@ mod tests {
 
     #[test]
     fn step_started_payload_round_trips() {
+        // A writing step's first attempt records where it started (#65):
+        // the head its commits are read from and the remote ref its push
+        // is judged against.
         let p = StepStartedPayload {
             step: "plan".into(),
             role: "planner".into(),
@@ -1438,6 +1452,8 @@ mod tests {
             child_thread: a_child_thread(),
             attempt: 1,
             budget_usd: 3.0,
+            head_at_start: Some("a".repeat(40)),
+            remote_at_start: Some("b".repeat(40)),
         };
         let value = serde_json::to_value(&p).unwrap();
         assert_eq!(
@@ -1448,12 +1464,40 @@ mod tests {
                 "profile": "kimi",
                 "child_thread": a_child_thread().to_string(),
                 "attempt": 1,
-                "budget_usd": 3.0
+                "budget_usd": 3.0,
+                "head_at_start": "a".repeat(40),
+                "remote_at_start": "b".repeat(40),
             })
         );
         assert_eq!(
             serde_json::from_value::<StepStartedPayload>(value).unwrap(),
             p
+        );
+
+        // A step that does not write records neither, and the fields are
+        // left out of the line rather than written as nulls.
+        let quiet = StepStartedPayload {
+            head_at_start: None,
+            remote_at_start: None,
+            ..p.clone()
+        };
+        let value = serde_json::to_value(&quiet).unwrap();
+        assert!(value.get("head_at_start").is_none(), "{value}");
+        assert!(value.get("remote_at_start").is_none(), "{value}");
+
+        // An event written before #65 has neither field: it still reads,
+        // with both `None`, so an old log replays.
+        let old = json!({
+            "step": "plan",
+            "role": "planner",
+            "profile": "kimi",
+            "child_thread": a_child_thread().to_string(),
+            "attempt": 1,
+            "budget_usd": 3.0
+        });
+        assert_eq!(
+            serde_json::from_value::<StepStartedPayload>(old).unwrap(),
+            quiet
         );
     }
 
