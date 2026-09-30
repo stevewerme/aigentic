@@ -163,14 +163,10 @@ pub async fn serve(
     };
     let author = Author::User(UserId(user.clone()));
 
-    // A served daemon picks up the runs the last one left behind, right
-    // here: a run at a checkpoint gets a task that waits for an answer,
-    // one mid-step resumes. `claim` makes it idempotent, so the second
-    // session does nothing. An embedded daemon never does this: opening
-    // the terminal must not silently resume someone's build and push.
-    if config.resume_runs {
-        threads.resume_runs();
-    }
+    // No start-up scan here (issue #58 fix 5): `serve()` runs the one
+    // scan, behind `resume_runs`, before it accepts a connection. A
+    // per-connection scan would repeat it for every client and race the
+    // first scan's tasks.
 
     // Open threads: the mailbox of the thread's actor when it has one
     // (a run-owned thread has none, issue #58), and the task forwarding
@@ -479,6 +475,17 @@ async fn handle(
             }
         }
         Request::Report { thread, report } => {
+            // A report only reads, so a run-owned thread answers it from
+            // its own log (rule 5c). `mutates_run` does not list it, and
+            // it must not fall through to a mailbox that does not exist
+            // (#58 fix 3): the run's task is the thread's only writer,
+            // and rendering writes nothing.
+            if threads.run_thread(thread) != RunThread::No {
+                return match threads.report_of(thread, report).await {
+                    Ok(text) => Response::Text { text },
+                    Err(e) => thread_error(e),
+                };
+            }
             ask_actor(threads, open, thread, |reply| Mail::Report {
                 kind: report,
                 reply,

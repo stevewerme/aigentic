@@ -42,6 +42,31 @@ pub trait KeepAwake: Send + Sync {
     }
 }
 
+/// One outstanding hold, given back when it drops (#58 fix).
+///
+/// `hold()` and `release()` come in pairs, and a loop with early
+/// returns, `?` or a panic can leak one: a run that let a hold go
+/// missing would keep the machine awake for the daemon's whole life. A
+/// task holds `Held` instead, so every path back out of the loop
+/// releases exactly what it took.
+pub struct Held {
+    guard: Arc<dyn KeepAwake>,
+}
+
+impl Held {
+    /// Take a hold: the first outstanding one starts the assertion.
+    pub fn take(guard: Arc<dyn KeepAwake>) -> Self {
+        guard.hold();
+        Self { guard }
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.guard.release();
+    }
+}
+
 /// A status reader a `Runtime` can hold (issue #47 amendment 2), so
 /// what the guard was doing at the end of a turn reaches the log.
 pub fn reader(guard: &Arc<dyn KeepAwake>) -> Arc<dyn Fn() -> Option<String> + Send + Sync> {

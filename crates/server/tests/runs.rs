@@ -419,6 +419,22 @@ impl Fixture {
         }
     }
 
+    /// The same files under a second fixture: the same repository,
+    /// threads directory, config directory and bundled workflows, and a
+    /// fresh scratch directory for its socket. Two daemons over one
+    /// project need two fixtures, because a fixture owns the directory it
+    /// made (#58 fix 2's cross-process case, in one test process).
+    fn twin(&self) -> Self {
+        Self {
+            dir: tempfile::tempdir().unwrap(),
+            repo: self.repo.clone(),
+            remote: self.remote.clone(),
+            threads: self.threads.clone(),
+            cfg_dir: self.cfg_dir.clone(),
+            bundled: self.bundled.clone(),
+        }
+    }
+
     /// A daemon over these files: `scripts` hand out one thread's acts
     /// each, and with `resume` the start-up scan claims unfinished runs.
     async fn daemon(self, scripts: Scripts, resume: bool) -> Daemon {
@@ -511,6 +527,9 @@ impl Daemon {
     /// the files are handed back, so a second daemon can be started over
     /// the same logs, repository and threads directory.
     async fn stop(self) -> Fixture {
+        // A killed process takes its advisory locks with it: ending the
+        // run tasks drops the futures that hold them (#58 fix 2).
+        self.server.threads.runs().stop_tasks().await;
         self._task.abort();
         // The task stops at its next await point. A moment later the run
         // is parked on the child's turn — the provider's script is spent,
@@ -1908,5 +1927,410 @@ async fn t12_an_answer_written_before_the_crash_is_acted_on_once() {
         events.len(),
         before + 2,
         "one answer (written before) plus one run_finished: nothing repeated"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The fix round: #58 items 1, 2 and 3
+// ---------------------------------------------------------------------------
+
+/// A keep-awake guard that records what a run asks of it, so a test can
+/// watch the hold follow the work (issue #58 fix 1). `peak` is the most
+/// holds it ever saw outstanding at once.
+#[derive(Default)]
+struct Counting {
+    inner: Mutex<(usize, usize)>,
+}
+
+impl Counting {
+    fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Holds outstanding right now.
+    fn holds(&self) -> usize {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).0
+    }
+
+    /// The most holds outstanding at any time.
+    fn peak(&self) -> usize {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).1
+    }
+}
+
+impl aigentic_server::awake::KeepAwake for Counting {
+    fn hold(&self) {
+        let mut rec = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        rec.0 += 1;
+        rec.1 = rec.1.max(rec.0);
+    }
+
+    fn release(&self) {
+        let mut rec = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        rec.0 = rec.0.saturating_sub(1);
+    }
+
+    fn status(&self) -> String {
+        "on".to_owned()
+    }
+}
+
+/// T14 — a run holds the keep-awake guard while it advances and gives it
+/// back at a gate and on every way out: mid-step a hold is outstanding,
+/// a run waiting at a checkpoint holds none, and `Finished` and a
+/// `RunnerError` both leave the count at zero (issue #58 fix 1).
+#[tokio::test]
+async fn t14_a_run_holds_keep_awake_only_while_it_advances() {
+    // A `full` brief parks the run at its `route` gate: the script is one
+    // reply, so the step after the answer does nothing and the run ends
+    // `Stopped` when it is answered.
+    let daemon = Daemon::new(
+        Scripts::of([vec![report("r1", brief_report_full())]]),
+        false,
+    )
+    .await;
+    let guard = Counting::new();
+    daemon.server.threads.with_keep_awake(guard.clone());
+    let (client, _) = daemon.connect("steve").await;
+    let lead = daemon.build(&client, "steve", 58).await.lead;
+
+    // While the run advances — the brief's provider call — a hold is
+    // outstanding.
+    assert!(
+        daemon.wait_until(|| guard.peak() > 0).await,
+        "a step holds the machine awake while it works"
+    );
+    // At the gate nobody is working: #47's design releases it, and the
+    // run must follow it, or a laptop stays up however long a gate waits.
+    assert!(
+        daemon
+            .wait_until(
+                || gate_of(&daemon.lead_events(lead)).as_deref() == Some("route")
+                    && guard.holds() == 0
+            )
+            .await,
+        "a run waiting at a gate holds nothing; holds are {}",
+        guard.holds()
+    );
+    // A second look: it stays released while it waits.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(guard.holds(), 0, "still waiting, still holding nothing");
+
+    // The answer resumes it, and it ends: nothing is left held.
+    let answered = client
+        .request(Request::AnswerCheckpoint {
+            lead,
+            gate: "route".into(),
+            answer: CheckpointAnswer::Stop,
+            amendment: None,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(answered, Response::Ok), "{answered:?}");
+    assert_eq!(daemon.wait_finished(lead).await, RunOutcome::Stopped);
+    assert!(
+        daemon.wait_until(|| guard.holds() == 0).await,
+        "`Finished` leaves nothing held"
+    );
+    assert_eq!(
+        guard.holds(),
+        0,
+        "the hold went back on the way out of `Finished`"
+    );
+}
+
+/// T14b — a run that ends in a `RunnerError` leaves no hold behind
+/// (issue #58 fix 1).
+#[tokio::test]
+async fn t14b_a_runner_error_leaves_no_hold() {
+    let fixture = Fixture::new(Vec::new());
+    let daemon = fixture
+        .daemon(
+            Scripts::of([vec![report("r1", brief_report_full())]]),
+            false,
+        )
+        .await;
+    let guard = Counting::new();
+    daemon.server.threads.with_keep_awake(guard.clone());
+    let (client, _) = daemon.connect("steve").await;
+    let lead = daemon.build(&client, "steve", 58).await.lead;
+
+    assert!(
+        daemon.wait_until(|| guard.peak() > 0).await,
+        "the run held the machine awake while it worked"
+    );
+    assert!(
+        daemon
+            .wait_until(|| gate_of(&daemon.lead_events(lead)).as_deref() == Some("route"))
+            .await,
+        "the run waits at the route gate"
+    );
+    assert_eq!(guard.holds(), 0, "a run waiting at a gate holds nothing");
+    let files = daemon.stop().await;
+
+    // The workflow the lead recorded is gone: a daemon that claims the
+    // run cannot build it, so the run stops with an error. Nothing ran,
+    // so nothing appends and the count must be zero again.
+    std::fs::remove_dir_all(files.bundled.join("workflows").join("build")).unwrap();
+    let daemon = files.daemon(Scripts::of(Vec::new()), false).await;
+    daemon.server.threads.with_keep_awake(guard.clone());
+    let (client, _) = daemon.connect("steve").await;
+    let mut notices = client.take_notices().expect("the notice stream");
+    // Subscribing first is what makes the lead's notes reach this client:
+    // the error is broadcast the moment the claim builds the run.
+    assert!(matches!(
+        client
+            .request(Request::Open {
+                thread: lead,
+                from_seq: 0
+            })
+            .await
+            .unwrap(),
+        Response::Opened { .. }
+    ));
+    let resumed = daemon.build(&client, "steve", 58).await;
+    assert_eq!(resumed.lead, lead, "the same run");
+
+    let stopped = daemon
+        .wait_until(|| !Daemon::notes(&mut notices, lead).is_empty())
+        .await;
+    assert!(stopped, "the run reported the error as a note");
+    assert_eq!(guard.holds(), 0, "an error leaves nothing held");
+}
+
+/// T15 — two daemons over one project: the lead's OS lock lets one drive
+/// it and refuses the other, so one log has one writer and its seqs are
+/// gapless (issue #58 fix 2). Two `Server`s in one test process, each
+/// with its own registry, are exactly the cross-process case the
+/// in-process slot cannot see.
+#[tokio::test]
+async fn t15_one_writer_per_lead_across_processes() {
+    let fixture = Fixture::new(Vec::new());
+    // The second daemon's files, taken before the first takes the
+    // fixture: same repository, threads and config, its own scratch.
+    let twin = fixture.twin();
+    // The first daemon: one `full` brief, so the run parks at its gate
+    // and holds the lead open while the second daemon tries to claim it.
+    let scripts = Scripts::of([vec![report("r1", brief_report_full())]]);
+    let first = fixture.daemon(scripts.clone(), false).await;
+    let (client, _) = first.connect("steve").await;
+    let lead = first.build(&client, "steve", 58).await.lead;
+    assert!(
+        first
+            .wait_until(|| gate_of(&first.lead_events(lead)).as_deref() == Some("route"))
+            .await,
+        "the first daemon's run waits at its gate"
+    );
+    assert!(
+        first
+            .fixture
+            .threads
+            .join("p")
+            .join(format!("{lead}.lock"))
+            .exists(),
+        "the lead's lock file sits beside its log"
+    );
+
+    // A second daemon over the same files: same project, same threads
+    // directory, its own registry and its own server. Nothing holds the
+    // lead for it, in process — that is what the OS lock is for.
+    let other = twin.daemon(Scripts::default(), false).await;
+
+    let (client2, _) = other.connect("magnus").await;
+    let refused = match client2
+        .request(Request::Build {
+            project: "p".into(),
+            issue: 58,
+            workflow: None,
+        })
+        .await
+        .unwrap()
+    {
+        Response::Refused { reason } => reason,
+        other => panic!("the second daemon is refused the lead: {other:?}"),
+    };
+    assert_eq!(
+        refused,
+        format!("run {lead} is being driven by another aigentic process"),
+        "the refusal says who holds it"
+    );
+
+    // The second daemon wrote nothing: one answer, from the first, and
+    // the log's seqs are still gapless.
+    let events = first.lead_events(lead);
+    let seqs: Vec<u64> = events.iter().map(|e| e.seq).collect();
+    assert_eq!(
+        seqs,
+        (0..seqs.len() as u64).collect::<Vec<_>>(),
+        "one writer, gapless seqs"
+    );
+
+    // The first daemon's own re-claim is an attach, not a refusal: the
+    // run is its.
+    let again = first.build(&client, "steve", 58).await;
+    assert_eq!(again.lead, lead, "the same lead");
+    assert!(again.resumed, "the unfinished run is resumed");
+
+    let _ = other.stop().await;
+    let _ = first.stop().await;
+}
+
+/// T16 — `Report` on a run-owned thread is served from its log, with no
+/// actor started: a running child and its lead both answer (issue #58
+/// fix 3).
+#[tokio::test]
+async fn t16_report_on_a_run_owned_thread_answers_without_an_actor() {
+    let daemon = Daemon::new(happy_scripts(), false).await;
+    let (client, _) = daemon.connect("steve").await;
+    let lead = daemon.build(&client, "steve", 58).await.lead;
+    assert_eq!(daemon.wait_finished(lead).await, RunOutcome::Closed);
+    let child = daemon
+        .child_of(lead, "implement-alone", 1)
+        .expect("the step started a child");
+
+    for thread in [lead, child] {
+        let answered = client
+            .request(Request::Report {
+                thread,
+                report: aigentic_api::ReportKind::Project,
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(answered, Response::Text { .. }),
+            "a report on a run-owned thread is answered from its log: {answered:?}"
+        );
+        assert!(
+            daemon.server.threads.mailbox(thread).is_none(),
+            "no actor was started for it"
+        );
+    }
+
+    // A run-owned thread's other writes stay refused: the run's task is
+    // its only writer.
+    let refused = client
+        .request(Request::Post {
+            thread: child,
+            blocks: vec![aigentic_runtime::aigentic_core::ContentBlock::Text(
+                "hello".into(),
+            )],
+            interrupt: false,
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(refused, Response::Refused { .. }),
+        "a post to a run's child is refused: {refused:?}"
+    );
+}
+
+/// T15b — a log that cannot be read is not "no unfinished run" (issue
+/// #58 fix 2): the lookup reports it — a note naming the file — and
+/// refuses to start a new lead for the project, rather than writing a
+/// second one over a run that is still there.
+#[tokio::test]
+async fn t15b_a_corrupt_lead_log_refuses_a_new_run() {
+    let fx = Fixture::new(Vec::new());
+    // The project's own threads directory: `threads_dir/<project>`.
+    let threads = fx.threads.join("p");
+    let repo = fx.repo.clone();
+
+    // A lead whose log was damaged: a good `thread_started`, then a line
+    // no event can parse, then a `run_started` — the shape a partial
+    // write or a copy that lost a byte leaves. Repair cuts a torn *tail*;
+    // it must not silently read this as nothing.
+    let lead = Ulid::generate();
+    std::fs::create_dir_all(&threads).unwrap();
+    let (mut log, _cut) = ThreadLog::open_with(&threads, lead, Repair::Refuse).unwrap();
+    for (kind, payload) in [
+        (
+            EventKind::ThreadStarted,
+            serde_json::to_value(ThreadStartedPayload {
+                project: Some("p".into()),
+                root: repo.clone(),
+                created_by: Author::User(aigentic_runtime::aigentic_core::UserId("steve".into())),
+                parent_thread: None,
+                step: None,
+            })
+            .unwrap(),
+        ),
+        (
+            EventKind::RunStarted,
+            json!({
+                "issue": 58,
+                "workflow": "build",
+                "version": 1,
+                "content_hash": "abc",
+                "budget_usd": 3.0,
+            }),
+        ),
+    ] {
+        log.append(aigentic_runtime::aigentic_log::NewEvent {
+            kind,
+            author: Author::User(aigentic_runtime::aigentic_core::UserId("steve".into())),
+            payload,
+            parent_event: None,
+        })
+        .unwrap();
+    }
+    drop(log);
+    // Keep the two good lines, replace the middle one with noise.
+    let path = threads.join(format!("{lead}.jsonl"));
+    let text = std::fs::read_to_string(&path).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 2, "the header and the run_started");
+    std::fs::write(
+        &path,
+        format!("{}\nthis is not an event\n{}\n", lines[0], lines[1]),
+    )
+    .unwrap();
+
+    let daemon = fx.daemon(Scripts::of(Vec::new()), false).await;
+    // The note goes to the corrupt lead's watchers, so watch before the
+    // lookup runs.
+    let (tx, mut notes) = mpsc::unbounded_channel();
+    daemon.server.threads.runs().watch(lead, tx);
+
+    let refused = daemon
+        .server
+        .threads
+        .build_run(
+            "p",
+            59,
+            None,
+            Author::User(aigentic_runtime::aigentic_core::UserId("steve".into())),
+        )
+        .await;
+    let Err(error) = refused else {
+        panic!("a new run must not start while a lead log cannot be read");
+    };
+    let text = error.to_string();
+    assert!(
+        text.contains(&format!("{lead}.jsonl")),
+        "the refusal names the file: {text}"
+    );
+    assert!(
+        text.contains("cannot read"),
+        "the refusal says what went wrong: {text}"
+    );
+
+    let note = tokio::time::timeout(Duration::from_secs(5), notes.recv())
+        .await
+        .expect("a note reaches the watcher")
+        .expect("the lane is open");
+    let Notice::Note { thread, text } = note else {
+        panic!("expected a note, got {note:?}");
+    };
+    assert_eq!(thread, lead);
+    assert!(
+        text.contains(&format!("{lead}.jsonl")),
+        "the note names the file: {text}"
+    );
+
+    // The corrupt lead is not driven: a daemon does not drive what it
+    // cannot read.
+    assert!(
+        !daemon.server.threads.runs().held(lead),
+        "nothing claims it"
     );
 }

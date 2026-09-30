@@ -29,7 +29,7 @@ use aigentic_runtime::{Mode, Runtime};
 use tokio::sync::{mpsc, oneshot};
 use ulid::Ulid;
 
-use crate::awake::KeepAwake;
+use crate::awake::{Held, KeepAwake};
 use crate::build::{ProviderFactory, Root, build_thread};
 use crate::config::Config;
 use crate::workspaces::Workspace;
@@ -253,15 +253,85 @@ pub struct Answer {
 
 /// What [`Runs::claim`] decided for a lead.
 pub enum Claim {
-    /// Nobody held the lead: the caller starts the task, and sends
-    /// answers on this sender.
+    /// Nobody held the lead, here or in any other process: the caller
+    /// starts the task, keeps the lock alive for the task's whole life,
+    /// and sends answers on this sender.
     Claimed(
+        LeadLock,
         mpsc::UnboundedReceiver<Answer>,
         mpsc::UnboundedSender<Answer>,
     ),
-    /// Someone already drives the lead. Never build a second `Runner`
-    /// over it: send the answer on this sender and attach.
+    /// Somebody already drives the lead in this process. Never build a
+    /// second `Runner` over it: send the answer on this sender and
+    /// attach.
     Attached(mpsc::UnboundedSender<Answer>),
+    /// Another `aigentic` process drives the lead (issue #58 fix 2).
+    /// Nothing may be written: the holder is the lead log's one writer.
+    Elsewhere {
+        /// Why, ready to show a person.
+        reason: String,
+    },
+}
+
+/// The OS claim on one lead's log (issue #58 fix 2).
+///
+/// The in-process slot cannot see another daemon: two `aigentic build
+/// <n>`, or a build beside `aigentic serve`, would both claim a lead
+/// and both append to its log — duplicate seqs, then an unreadable log
+/// and a second lead. An advisory lock on `<threads_dir>/<lead>.lock`,
+/// taken inside the claim before any `Runner` is built and held for the
+/// task's whole life, is what tells them apart. The file is left in
+/// place when the lock is dropped, so the next claim locks the same
+/// inode instead of racing a fresh path.
+pub struct LeadLock {
+    /// The locked file. Dropping it — the task ending, on any path,
+    /// including an error — releases the lock.
+    file: std::fs::File,
+    /// Where it is, for the refusal's message and for a test.
+    path: PathBuf,
+}
+
+impl LeadLock {
+    /// Take `lead`'s lock under `threads_dir`, or say who holds it.
+    fn take(threads_dir: &std::path::Path, lead: Ulid) -> Result<Self, String> {
+        let path = threads_dir.join(format!("{lead}.lock"));
+        if let Err(e) = std::fs::create_dir_all(threads_dir) {
+            return Err(format!("cannot make {}: {e}", threads_dir.display()));
+        }
+        let file = match std::fs::File::options()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(e) => return Err(format!("cannot open {}: {e}", path.display())),
+        };
+        match file.try_lock() {
+            Ok(()) => Ok(Self { file, path }),
+            // Someone else — another daemon — holds it. `unlock` says
+            // nothing here: the lock was never taken.
+            Err(std::fs::TryLockError::WouldBlock) => Err(format!(
+                "run {lead} is being driven by another aigentic process"
+            )),
+            Err(std::fs::TryLockError::Error(e)) => {
+                Err(format!("cannot lock {}: {e}", path.display()))
+            }
+        }
+    }
+
+    /// Where the lock lives: `<threads_dir>/<lead>.lock`.
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for LeadLock {
+    fn drop(&mut self) {
+        // Closing the file would release it anyway; unlocking says so.
+        let _ = self.file.unlock();
+    }
 }
 
 /// Which leads a task owns, and who watches each of them.
@@ -274,6 +344,11 @@ pub enum Claim {
 pub struct Runs {
     slots: Mutex<HashMap<Ulid, mpsc::UnboundedSender<Answer>>>,
     watchers: Mutex<HashMap<Ulid, Vec<mpsc::UnboundedSender<Notice>>>>,
+    /// The task that drives each lead, so a daemon going away can end
+    /// them (issue #58 fix 2). Each task's OS lock lives inside its
+    /// future, so ending the tasks is what a process dying does to its
+    /// advisory locks.
+    tasks: Mutex<HashMap<Ulid, tokio::task::JoinHandle<()>>>,
 }
 
 impl Runs {
@@ -285,15 +360,48 @@ impl Runs {
     /// Take `lead` for this caller, or find it taken — inserting and
     /// testing under one lock, before any `Runner` is built. Exactly one
     /// caller ever sees `Claimed` for a lead, so exactly one task drives
-    /// it and one `ThreadLog` writes it.
-    pub fn claim(&self, lead: Ulid) -> Claim {
+    /// it and one `ThreadLog` writes it. The in-process slot is checked
+    /// first; a fresh claim then takes the lead's OS lock, so a lead
+    /// another daemon drives is refused rather than driven twice (issue
+    /// #58 fix 2).
+    pub fn claim(&self, lead: Ulid, world: &RunWorld) -> Claim {
         let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(tx) = slots.get(&lead) {
             return Claim::Attached(tx.clone());
         }
+        let lock = match LeadLock::take(&world.root.threads_dir, lead) {
+            Ok(lock) => lock,
+            Err(reason) => return Claim::Elsewhere { reason },
+        };
         let (tx, rx) = mpsc::unbounded_channel();
         slots.insert(lead, tx.clone());
-        Claim::Claimed(rx, tx)
+        Claim::Claimed(lock, rx, tx)
+    }
+
+    /// Remember the task that drives `lead`, so [`Runs::stop_tasks`] can
+    /// end it. Called by whoever spawned it, in the same claim.
+    pub fn remember(&self, lead: Ulid, task: tokio::task::JoinHandle<()>) {
+        self.tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(lead, task);
+    }
+
+    /// End every task this registry drives and free every slot: a daemon
+    /// going away, or a test standing in for one a `kill -9` took (issue
+    /// #58 fix 2). Aborting a task drops its future, and with it the
+    /// lead's OS lock — exactly what the dying process did.
+    pub async fn stop_tasks(&self) {
+        let tasks: Vec<tokio::task::JoinHandle<()>> = {
+            let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+            tasks.drain().map(|(_, task)| task).collect()
+        };
+        for task in tasks {
+            task.abort();
+            // Draining the handle is what makes the drop final.
+            let _ = task.await;
+        }
+        self.slots.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 
     /// Give up `lead`, so a later claim may drive it again: the task
@@ -359,7 +467,12 @@ pub async fn drive(
     world: RunWorld,
     lead: Ulid,
     mut answers: mpsc::UnboundedReceiver<Answer>,
+    lock: LeadLock,
 ) {
+    // Held for this task's whole life, on every way out: `_lock` is
+    // dropped when the task returns, finished, stopped or panicked, so
+    // no path leaves the lead locked by a task that ended.
+    let _lock = lock;
     let outcome = run(runs.clone(), &world, lead, &mut answers).await;
     if let Err(e) = &outcome {
         runs.broadcast(
@@ -396,16 +509,25 @@ async fn run(
         );
     }
     let mut seen = runner.log().len();
-    // Held for the whole run: the machine stays awake while a step works.
-    let _guard = world.guard.clone();
-    loop {
+    // The hold follows the advancing (#58 fix): taken while the run
+    // works — a child waiting on a provider is why #47 exists — and
+    // given back at a gate, where nobody is working, and on every way
+    // out of this loop. `Held` releases on drop, so no path leaks one.
+    let mut held: Option<Held> = None;
+    let outcome = loop {
+        if held.is_none() {
+            held = Some(Held::take(world.guard.clone()));
+        }
         match runner.advance().await {
             Ok(Advanced::Moved) => {}
             Ok(Advanced::WaitingHuman { .. }) => {
+                // Nothing is working while the run waits for an answer:
+                // the hold goes back until one arrives.
+                drop(held.take());
                 let Some(answer) = answers.recv().await else {
                     // Nobody can answer any more: the task ends, and the
                     // run stays resumable.
-                    return Ok(());
+                    break Ok(());
                 };
                 let verdict = runner.answer(
                     &answer.gate,
@@ -419,19 +541,26 @@ async fn run(
                     .send(verdict.map(|_| ()).map_err(|e| e.to_string()));
                 if !wrote {
                     // A refused answer (the wrong gate, a second answer to
-                    // one already answered) changes nothing: keep waiting.
+                    // one already answered) changes nothing, and the run
+                    // still waits: hold nothing and loop back to the gate.
                     seen = broadcast_new(&runs, lead, &runner, seen);
                     continue;
                 }
             }
+            // Finished, whichever outcome: the log says which, the events
+            // it wrote reach the watchers, and the caller only needs to
+            // know the task ended.
             Ok(Advanced::Finished { .. }) => {
                 broadcast_new(&runs, lead, &runner, seen);
-                return Ok(());
+                break Ok(());
             }
-            Err(e) => return Err(e),
+            Err(e) => break Err(e),
         }
         seen = broadcast_new(&runs, lead, &runner, seen);
-    }
+    };
+    // Released on every exit, `Finished` and an error alike.
+    drop(held.take());
+    outcome
 }
 
 /// The log's answer, from the wire's mirror of it.

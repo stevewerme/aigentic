@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use aigentic_api::{CheckpointAnswer, ThreadInfo, ThreadState};
+use aigentic_api::{CheckpointAnswer, Notice, ReportKind, ThreadInfo, ThreadState};
 use aigentic_runtime::aigentic_core::{Author, ContentBlock, Event, EventKind};
 use aigentic_runtime::aigentic_log::{
     NewEvent, Repair, RunStartedPayload, ThreadLog, ThreadStartedPayload, UserMessagePayload,
@@ -61,8 +61,10 @@ pub struct ThreadTable {
     /// The daemon's one keep-awake guard (issue #47). Every thread's
     /// actor gets a clone of it, so one program holds the machine awake
     /// for the whole daemon however many threads work at once. A run's
-    /// task holds it too, while it advances.
-    guard: Arc<dyn KeepAwake>,
+    /// task holds it too, while it advances. Swapped under a lock so a
+    /// test can install a recording guard, as `with_run_deps` swaps the
+    /// world's seams.
+    guard: Mutex<Arc<dyn KeepAwake>>,
     /// Which runs a task drives, and who watches them (issue #58). It
     /// hangs off the table because a session sees nothing but the table
     /// and the config.
@@ -119,7 +121,7 @@ impl ThreadTable {
             providers,
             reports,
             threads_base,
-            guard,
+            guard: Mutex::new(guard),
             runs: Arc::new(Runs::new()),
             run_deps: Mutex::new(Arc::new(ProdDeps)),
             build_lock: AsyncMutex::new(()),
@@ -132,7 +134,15 @@ impl ThreadTable {
     /// The guard every actor is built with: a test installs a recording
     /// one here, so a thread built from the table can be watched.
     pub fn guard(&self) -> Arc<dyn KeepAwake> {
-        self.guard.clone()
+        self.guard.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Install the keep-awake guard every actor and run task gets from
+    /// now on: a test's recording one, so it can watch what a run holds,
+    /// step by step (#58 fix 1). A thread built before the swap keeps
+    /// the guard it was built with.
+    pub fn with_keep_awake(&self, guard: Arc<dyn KeepAwake>) {
+        *self.guard.lock().unwrap_or_else(|e| e.into_inner()) = guard;
     }
 
     /// The run registry: which lead a task drives, and who watches it.
@@ -361,7 +371,7 @@ impl ThreadTable {
         )
         .await?;
         let (actor, mailbox) = ThreadActor::new(built.runtime, built.torn, self.reports.clone())?;
-        let actor = actor.with_keep_awake(self.guard.clone());
+        let actor = actor.with_keep_awake(self.guard());
         tokio::spawn(actor.run());
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         // Two sessions may have raced to build it; the first in wins and
@@ -449,7 +459,7 @@ impl ThreadTable {
             config_dir: self.config_dir.clone(),
             providers: self.providers.clone(),
             deps: self.run_deps(),
-            guard: self.guard.clone(),
+            guard: self.guard(),
             root,
             project: project.to_owned(),
             workspaces: self.workspaces.clone(),
@@ -460,22 +470,41 @@ impl ThreadTable {
     /// The lead of the unfinished run for `(project, issue)`: a thread
     /// whose log holds `run_started { issue }` and no `run_finished`.
     /// Read with repair, because a `kill -9` leaves a torn tail.
-    pub fn unfinished_run(&self, project: &str, issue: u64) -> Option<Ulid> {
-        let root = self.root_of(project).ok()?;
+    ///
+    /// A lead log that cannot be read is **not** "no unfinished run"
+    /// (issue #58 fix 2): a corrupt log read as nothing would start a
+    /// second lead over a run that is still there, so this reports it —
+    /// a note naming the file and the error — and refuses, which stops
+    /// the project's next `Build` until a person has looked.
+    pub fn unfinished_run(&self, project: &str, issue: u64) -> Result<Option<Ulid>, ThreadError> {
+        let root = self.root_of(project)?;
         let ids = thread_ids(&root.threads_dir);
         // Newest first: a run that was restarted has one lead per issue,
         // and the newest is the one the last `Build` made.
         for id in ids {
-            let Ok((log, _cut)) =
-                ThreadLog::open_with(&root.threads_dir, id, Repair::TruncateTornTail)
-            else {
-                continue;
+            let opened = ThreadLog::open_with(&root.threads_dir, id, Repair::TruncateTornTail);
+            let (log, _cut) = match opened {
+                Ok(opened) => opened,
+                Err(e) => {
+                    let path = root.threads_dir.join(format!("{id}.jsonl"));
+                    self.runs.broadcast(
+                        id,
+                        Notice::Note {
+                            thread: id,
+                            text: format!("cannot read {}: {e}", path.display()),
+                        },
+                    );
+                    return Err(ThreadError::Refused(format!(
+                        "cannot read {}: {e} — fix or remove it before starting a run in {project}",
+                        path.display()
+                    )));
+                }
             };
             if crate::runs::unfinished(&log, issue).is_some() {
-                return Some(id);
+                return Ok(Some(id));
             }
         }
-        None
+        Ok(None)
     }
 
     /// Which kind of run-owned thread `thread` is, from its own log.
@@ -539,11 +568,39 @@ impl ThreadTable {
             .collect())
     }
 
+    /// A report for a run-owned thread (issue #58, rule 5c). A run's
+    /// thread has no actor, so `Report`, which only reads, is served from
+    /// its log here: `build_thread` opens the log and assembles the
+    /// runtime, nothing is appended and no turn runs. The log is the
+    /// source of truth and the renderer projects it.
+    pub async fn report_of(&self, thread: Ulid, kind: ReportKind) -> Result<String, ThreadError> {
+        let project = self
+            .project_of(thread)
+            .ok_or(ThreadError::NoThread(thread))?;
+        let root = self.root_of(&project)?;
+        let events = self.events_from(thread, 0)?;
+        // The same lock a build takes: assembling a runtime touches the
+        // log and the project, and never happens beside a `Build`.
+        let _serial = self.build_lock.lock().await;
+        let built = build_thread(
+            &self.config,
+            &self.config_dir,
+            &*self.providers,
+            &root,
+            &self.workspaces,
+            thread,
+            self.profile_override.as_deref(),
+        )
+        .await?;
+        Ok(self.reports.render(&built.runtime, &events, kind))
+    }
+
     /// The start-up scan (issue #58, rule 8): every unfinished run in
     /// every project is claimed, so a daemon killed mid-run picks the runs
     /// up again. A served daemon does this; an embedded one
-    /// (`resume_runs: false`) does not — opening the REPL must not
-    /// silently resume someone's build and push.
+    /// (`resume_runs: false`) does not - opening the REPL must not
+    /// silently resume someone's build and push. It is the one scan: a
+    /// session no longer repeats it per connection (#58 fix 5).
     ///
     /// A lead waiting at a checkpoint gets a task that waits; one left
     /// mid-child continues it. A finished lead is ignored, and so is a
@@ -579,7 +636,9 @@ impl ThreadTable {
                 if crate::runs::unfinished(&log, started.issue).is_none() {
                     continue;
                 }
-                self.claim_or_attach(id, &world);
+                // A lead another aigentic process drives is left to it:
+                // this daemon must not write the same log.
+                let _ = self.claim_or_attach(id, &world);
             }
         }
     }
@@ -600,8 +659,8 @@ impl ThreadTable {
     ) -> Result<(Ulid, bool), ThreadError> {
         let _serial = self.build_lock.lock().await;
         let world = self.run_world(project)?;
-        if let Some(lead) = self.unfinished_run(project, issue) {
-            self.claim_or_attach(lead, &world);
+        if let Some(lead) = self.unfinished_run(project, issue)? {
+            self.claim_or_attach(lead, &world)?;
             return Ok((lead, true));
         }
         // The workflow defaults to `build`, the name the acceptance uses
@@ -634,7 +693,7 @@ impl ThreadTable {
                 parent_event: None,
             })?;
         }
-        self.claim_or_attach(lead, &world);
+        self.claim_or_attach(lead, &world)?;
         Ok((lead, false))
     }
 
@@ -680,7 +739,7 @@ impl ThreadTable {
         }
         drop(log);
         let world = self.run_world(&project)?;
-        let tx = self.claim_or_attach(lead, &world);
+        let tx = self.claim_or_attach(lead, &world)?;
         let (reply, rx) = oneshot::channel();
         tx.send(Answer {
             gate,
@@ -699,60 +758,27 @@ impl ThreadTable {
 
     /// Claim `lead` for this caller, starting a task over it when nobody
     /// holds it, and return where to send its answers. An [`Claim::Attached`]
-    /// lead gets no second runner.
-    fn claim_or_attach(&self, lead: Ulid, world: &RunWorld) -> mpsc::UnboundedSender<Answer> {
-        match self.runs.claim(lead) {
-            Claim::Attached(tx) => tx,
-            Claim::Claimed(rx, tx) => {
+    /// lead gets no second runner, and a lead another process drives is
+    /// refused (issue #58 fix 2) rather than written a second time.
+    fn claim_or_attach(
+        &self,
+        lead: Ulid,
+        world: &RunWorld,
+    ) -> Result<mpsc::UnboundedSender<Answer>, ThreadError> {
+        match self.runs.claim(lead, world) {
+            Claim::Attached(tx) => Ok(tx),
+            Claim::Claimed(lock, rx, tx) => {
                 let runs = self.runs.clone();
                 let world = world.clone();
-                tokio::spawn(async move { drive(runs, world, lead, rx).await });
-                tx
+                // The lock travels into the task, which holds it until it
+                // ends: no path leaves a claimed lead unlocked or a
+                // released lead locked.
+                let task = tokio::spawn(async move { drive(runs, world, lead, rx, lock).await });
+                self.runs.remember(lead, task);
+                Ok(tx)
             }
+            Claim::Elsewhere { reason } => Err(ThreadError::Refused(reason)),
         }
-    }
-
-    /// Claim every unfinished run of every project, as a restarting
-    /// daemon does: a run left mid-step resumes, a run waiting at a
-    /// checkpoint gets a task that waits for an answer. Finished leads
-    /// are left alone. Returns how many runs a task was started over.
-    ///
-    /// An embedded daemon never calls this: opening the terminal must not
-    /// silently resume someone's build and push.
-    pub fn resume_runs(&self) -> usize {
-        let mut started = 0;
-        for (project, _root, _count) in self.projects() {
-            let lead_world = self.run_world(&project).ok();
-            let Some(world) = lead_world else { continue };
-            let ids = thread_ids(&world.root.threads_dir);
-            for id in ids {
-                let Ok((log, _cut)) =
-                    ThreadLog::open_with(&world.root.threads_dir, id, Repair::TruncateTornTail)
-                else {
-                    continue;
-                };
-                if crate::runs::run_started_of(&log).is_err() {
-                    continue;
-                }
-                if log
-                    .events()
-                    .iter()
-                    .any(|event| event.kind == EventKind::RunFinished)
-                {
-                    continue;
-                }
-                match self.runs.claim(id) {
-                    Claim::Attached(_) => {}
-                    Claim::Claimed(rx, _tx) => {
-                        let runs = self.runs.clone();
-                        let world = world.clone();
-                        tokio::spawn(async move { drive(runs, world, id, rx).await });
-                        started += 1;
-                    }
-                }
-            }
-        }
-        started
     }
 }
 
