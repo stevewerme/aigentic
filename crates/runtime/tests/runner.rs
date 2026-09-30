@@ -297,7 +297,7 @@ impl RunnerHost for FakeHost {
             .with_step(step, deny)?;
         // A test that wants a real `usage.cost_usd` on the child's lines
         // prices this child's endpoint; an unpriced host behaves as before.
-        if let Some(prices) = self.prices.clone() {
+        if let Some(prices) = self.prices {
             runtime.set_pricing(profile, Some(prices));
         }
         Ok(runtime)
@@ -402,7 +402,7 @@ impl Fixture {
             self.lead,
             &self.children,
             self.caps.clone(),
-            self.prices.clone(),
+            self.prices,
         );
         Runner::new(
             log,
