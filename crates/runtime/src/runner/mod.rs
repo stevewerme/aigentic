@@ -380,7 +380,7 @@ impl<F: Forge, H: RunnerHost> Runner<F, H> {
             if prompt_count(self.host.child_log(child)?.events()) != posted + 1 {
                 return Err(RunnerError::MessageNotPosted);
             }
-        } else {
+        } else if !self.attempt_reported(child, attempt)? {
             let mut runtime = self
                 .host
                 .build_child(child, &step.profile, &step.id, &step.deny)?;
@@ -391,6 +391,20 @@ impl<F: Forge, H: RunnerHost> Runner<F, H> {
         }
         self.apply_end(&step, attempt)?;
         Ok(Advanced::Moved)
+    }
+
+    /// Whether this attempt's report is already in the child's log: a
+    /// `step_reported` written after the attempt's own runner message.
+    /// Such a report is the attempt's outcome, so the turn must not be
+    /// resumed or continued to make it report again — the crash may have
+    /// landed between the report and the child's `turn_ended`.
+    fn attempt_reported(&self, child: Ulid, attempt: u32) -> Result<bool, RunnerError> {
+        let log = self.host.child_log(child)?;
+        let events = log.events();
+        let from = prompt_at(events, attempt).unwrap_or(0);
+        Ok(events[from..]
+            .iter()
+            .any(|event| event.kind == EventKind::StepReported))
     }
 
     /// Whether a child's log has been started at all: the crash can
@@ -677,13 +691,6 @@ impl<F: Forge, H: RunnerHost> Runner<F, H> {
         let events = log.events();
         let from = prompt_at(events, attempt).unwrap_or(0);
         let tail = &events[from..];
-        let Some(end) = tail.iter().rev().find(|e| e.kind == EventKind::TurnEnded) else {
-            return Err(RunnerError::Host(format!(
-                "child {child} never ended its turn"
-            )));
-        };
-        let end: TurnEndedPayload = serde_json::from_value(end.payload.clone())
-            .map_err(|_| RunnerError::Host(format!("child {child}: unreadable turn_ended")))?;
         // The price the child's runtime stamped on each call, inside its
         // `usage`: `payload["cost_usd"]` at the top level is always absent,
         // which is why this used to sum to an empty `-0.0`. A `fold` from a
@@ -711,39 +718,48 @@ impl<F: Forge, H: RunnerHost> Runner<F, H> {
                 reported_event,
             }
         };
-        match end.reason.as_str() {
-            STEP_REPORTED => {
-                let Some(report_event) = reported else {
-                    return Err(RunnerError::Host(format!("child {child} reported nothing")));
-                };
-                let report: StepReport = serde_json::from_value(report_event.payload.clone())
-                    .map_err(|_| {
-                        RunnerError::Host(format!("child {child}: unreadable step_reported"))
-                    })?;
-                if report.body.clone().unwrap_or_default().trim().is_empty() {
-                    // No `step_finished`: the child did end its turn, but a
-                    // report with no body is not a step's outcome the log
-                    // may record as one.
-                    self.escalate(
-                        "step_stop",
-                        vec![
-                            step.id.clone(),
-                            attempt.to_string(),
-                            "the report has no body".into(),
-                        ],
-                    )?;
-                    return Ok(());
-                }
-                let status = match report.status {
-                    Some(ReportStatus::Done) => StepStatus::Done,
-                    _ => StepStatus::Partial,
-                };
-                let finished = finish(status, STEP_REPORTED.into(), Some(report_event.id));
-                self.append(EventKind::StepFinished, &finished)?;
-                Ok(())
+        // A report this attempt wrote is its outcome, whatever the latest
+        // `turn_ended` says: the crash may have landed between the report
+        // and the turn's end, and the report is in the log either way. This
+        // is reached only when `re_await` left the turn alone for the same
+        // reason, so the turn is never run again to produce a second one.
+        if let Some(report_event) = reported {
+            let report: StepReport =
+                serde_json::from_value(report_event.payload.clone()).map_err(|_| {
+                    RunnerError::Host(format!("child {child}: unreadable step_reported"))
+                })?;
+            if report.body.clone().unwrap_or_default().trim().is_empty() {
+                // No `step_finished`: a report with no body is not a step's
+                // outcome the log may record as one.
+                self.escalate(
+                    "step_stop",
+                    vec![
+                        step.id.clone(),
+                        attempt.to_string(),
+                        "the report has no body".into(),
+                    ],
+                )?;
+                return Ok(());
             }
+            let status = match report.status {
+                Some(ReportStatus::Done) => StepStatus::Done,
+                _ => StepStatus::Partial,
+            };
+            let finished = finish(status, STEP_REPORTED.into(), Some(report_event.id));
+            self.append(EventKind::StepFinished, &finished)?;
+            return Ok(());
+        }
+        let Some(end) = tail.iter().rev().find(|e| e.kind == EventKind::TurnEnded) else {
+            return Err(RunnerError::Host(format!(
+                "child {child} never ended its turn"
+            )));
+        };
+        let end: TurnEndedPayload = serde_json::from_value(end.payload.clone())
+            .map_err(|_| RunnerError::Host(format!("child {child}: unreadable turn_ended")))?;
+        match end.reason.as_str() {
+            STEP_REPORTED => Err(RunnerError::Host(format!("child {child} reported nothing"))),
             "done" | "resumed" | "max_iterations" | "max_tokens" | "max_wall_time" => {
-                let finished = finish(StepStatus::Partial, end.reason, reported.map(|e| e.id));
+                let finished = finish(StepStatus::Partial, end.reason, None);
                 self.append(EventKind::StepFinished, &finished)?;
                 Ok(())
             }

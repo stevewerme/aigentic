@@ -1238,6 +1238,63 @@ async fn t14_a_report_without_a_body_escalates_and_posts_nothing() {
     );
 }
 
+/// T16: a report already in the log is the attempt's outcome, whatever
+/// the latest `turn_ended` says — the review's J9 world, where the daemon
+/// died between a child's `step_reported` and its `turn_ended`.
+#[tokio::test]
+async fn t16_a_written_report_is_the_attempts_outcome() {
+    let h = happy_path();
+    let fx = &h.fx;
+    let run = trace(fx).await;
+    // The crash landed inside the brief's turn, after its report.
+    fx.restore_child_prefix(
+        run.after_where(EventKind::StepStarted, 1),
+        h.brief_child,
+        |events| {
+            !events
+                .iter()
+                .any(|event| event.kind == EventKind::TurnEnded)
+        },
+    );
+    let events = fx.child_events_of(h.brief_child);
+    let report_id = events
+        .iter()
+        .find(|event| event.kind == EventKind::StepReported)
+        .expect("the report was written")
+        .id;
+    assert_eq!(turn_ends(&events), 0, "the turn never ended");
+
+    let mut runner = fx.runner();
+    assert_eq!(
+        pause_step(&drive(&mut runner).await),
+        "implement-alone",
+        "the run continues past the repaired step"
+    );
+    let lead = fx.lead_events();
+    let finished = step_finished(&lead);
+    assert_eq!(finished[0].end_reason, STEP_REPORTED);
+    assert_eq!(finished[0].status, StepStatus::Done);
+    assert_eq!(
+        finished[0].reported_event,
+        Some(report_id),
+        "the report in the log is the attempt's outcome"
+    );
+    assert_eq!(
+        prompts(&events).len(),
+        1,
+        "no second attempt: the turn is not made to run again"
+    );
+    assert_eq!(
+        fx.forge.posted().len(),
+        2,
+        "the written report is posted once, then the implementer's"
+    );
+    assert!(
+        fx.forge.posted()[0].contains("## Brief"),
+        "the brief's own report is the one posted"
+    );
+}
+
 /// T17: a step's cost is the price its children's `usage` lines carry,
 /// summed, and `-0.0` never appears.
 #[tokio::test]
