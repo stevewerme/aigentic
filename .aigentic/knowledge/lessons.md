@@ -97,6 +97,15 @@ so the rule can be judged, not just obeyed. The `brief`, `plan-check` and
   round-2 Flash judge reproduced the fixer's mutation check itself. One
   ticket is not proof: keep shadowing roles before moving them.
 
+- **Two independent judges beat one stronger judge.** On #65 a Flash judge
+  at `medium` and one at `high` (shadow, blind) both approved, and each
+  proved a finding the other missed: a failing git read escalates, and a
+  refused push errors out with no gate. `high` did not reason more per
+  call (270 tokens against 355), so on TensorX it is no stronger tier. The
+  diversity came from two samples, not from effort. On a critical ticket,
+  run two Flash judges in parallel (about $6, less than one capped Kimi
+  judge on #57).
+
 ## Plans and tests
 
 - **Check the design against the issue's purpose, not only its words.**
