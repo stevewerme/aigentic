@@ -8,11 +8,15 @@
 //! Nothing here knows about `core`'s types beyond what a log line holds.
 
 pub mod forge;
+pub mod git;
 pub mod host;
+pub mod install;
 pub mod slots;
 
 pub use forge::{FakeForge, Forge, ForgeError, GhForge, IssueView};
+pub use git::{GitRepo, Repo, RepoError};
 pub use host::RunnerHost;
+pub use install::{CargoInstaller, FakeInstaller, Installer};
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -20,13 +24,17 @@ use std::sync::Mutex;
 
 use aigentic_core::{AgentId, Author, ContentBlock, Event, EventKind};
 use aigentic_log::{
-    CheckpointAskedPayload, LogError, NewEvent, NextMove, ReportStatus, RouteTakenPayload,
-    RunFinishedPayload, RunOutcome, RunStartedPayload, RunState, StepFinishedPayload, StepReport,
-    StepStartedPayload, StepStatus, ThreadLog, TurnEndedPayload, run_state,
+    CheckOutcome, CheckResult, CheckpointAnswer, CheckpointAskedPayload, ChecksOutcome,
+    ChecksRunPayload, CommitRef, LogError, NewEvent, NextMove, PushedPayload, ReleaseImpact,
+    ReportStatus, RouteTakenPayload, RunFinishedPayload, RunOutcome, RunStartedPayload, RunState,
+    StepFinishedPayload, StepReport, StepStartedPayload, StepStatus, ThreadLog, TurnEndedPayload,
+    run_state,
 };
 use serde_json::Value;
 use ulid::Ulid;
 
+use crate::checks::git::{read_commits_between, read_uncommitted};
+use crate::checks::{CheckInput, run_checks};
 use crate::workflow::{LoadedWorkflow, Step, WorkflowError};
 use crate::{Runtime, RuntimeError, STEP_REPORTED, Signal};
 
@@ -63,6 +71,9 @@ pub enum RunnerError {
     /// The host refused to do something, or has nothing to do it with.
     #[error("host: {0}")]
     Host(String),
+    /// A git read or push failed.
+    #[error("repo: {0}")]
+    Repo(#[from] RepoError),
     /// The thread is not a run: the daemon writes `run_started` first.
     #[error("this thread is not a run: the daemon writes `run_started` first")]
     NotARun,
@@ -74,11 +85,16 @@ pub enum RunnerError {
         /// The id the caller passed.
         lead: Ulid,
     },
-    /// A move that belongs to the checks, push and close step.
-    #[error("`{what}` is owned by #65")]
-    OwnedBy65 {
-        /// The move's name, for the message.
-        what: &'static str,
+    /// Installing the binary failed, or the installed binary could not be
+    /// asked its version.
+    #[error("install: {0}")]
+    Install(String),
+    /// A gate was answered `go` or `amend`: acting on that is a later
+    /// slice's work, so the runner stops rather than guessing.
+    #[error("gate `{gate}` was answered go or amend, and acting on that is a later slice")]
+    SliceTwo {
+        /// The gate that was answered.
+        gate: String,
     },
     /// A message was posted into the child and the child's log does not
     /// hold it, so the turn never started.
@@ -142,9 +158,6 @@ impl Drop for WriteGuard {
 // ---------------------------------------------------------------------------
 
 /// What one `advance` did.
-// `PausedAtChecks` carries the whole report: the caller needs it, and the
-// other variants are zero-sized, so the difference is not worth a box.
-#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum Advanced {
     /// A move was made; call `advance` again.
@@ -154,14 +167,6 @@ pub enum Advanced {
         /// The gate that was asked.
         gate: String,
     },
-    /// The step's checks are #65's: the report is where the runner hands
-    /// over, and the checks have not run.
-    PausedAtChecks {
-        /// The step whose checks are due.
-        step: String,
-        /// Its report.
-        report: StepReport,
-    },
     /// The run ended.
     Finished {
         /// How it ended.
@@ -169,27 +174,64 @@ pub enum Advanced {
     },
 }
 
+/// Where a writing step started, as its first attempt recorded it: the
+/// head its commits are read from and the remote ref its push is judged
+/// against.
+struct Start {
+    head: String,
+    remote: String,
+}
+
+/// The first attempt's start record, or the field it lacks.
+enum StartRecord {
+    /// The first attempt's `head_at_start` and `remote_at_start`.
+    Ready { head: String, remote: String },
+    /// The record is missing this field, named as the gate names it.
+    Missing(&'static str),
+}
+
+/// One check that failed, as a send-back and a gate name it.
+struct FailedCheck {
+    id: String,
+    detail: String,
+}
+
+impl FailedCheck {
+    /// `- <id>: <detail>`, the line a send-back's message carries.
+    fn line(&self) -> String {
+        format!("- {}: {}", self.id, self.detail)
+    }
+
+    /// `Id: detail`, the shape a gate's `shown` carries: no list marker a
+    /// gate reader would mistake for the list itself.
+    fn named(&self) -> String {
+        format!("{}: {}", self.id, self.detail)
+    }
+}
+
 /// One run's lead thread: the log it appends to, and the seams it drives
 /// children and the forge through.
-pub struct Runner<F: Forge, H: RunnerHost> {
+pub struct Runner<F: Forge, H: RunnerHost, R: Repo> {
     lead: ThreadLog,
     lead_id: Ulid,
     forge: F,
     host: H,
+    installer: Box<dyn Installer>,
     workflow: LoadedWorkflow,
-    repo: PathBuf,
+    repo: R,
     lock: Option<WriteGuard>,
 }
 
-impl<F: Forge, H: RunnerHost> Runner<F, H> {
+impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
     /// A runner over a log the daemon already wrote `run_started` to.
     pub fn new(
         lead: ThreadLog,
         lead_id: Ulid,
         forge: F,
         host: H,
+        installer: Box<dyn Installer>,
         workflow: LoadedWorkflow,
-        repo: PathBuf,
+        repo: R,
     ) -> Result<Self, RunnerError> {
         if lead.thread_id() != lead_id {
             return Err(RunnerError::ThreadMismatch {
@@ -202,6 +244,7 @@ impl<F: Forge, H: RunnerHost> Runner<F, H> {
             lead_id,
             forge,
             host,
+            installer,
             workflow,
             repo,
             lock: None,
@@ -266,11 +309,13 @@ impl<F: Forge, H: RunnerHost> Runner<F, H> {
             NextMove::FollowRoute { taken, .. } => self.follow_route(&taken).await,
             NextMove::AwaitingCheckpoint { gate } => Ok(Advanced::WaitingHuman { gate }),
             NextMove::Done { outcome } => Ok(Advanced::Finished { outcome }),
-            NextMove::ChecksDone { .. } | NextMove::Pushed { .. } | NextMove::Answered { .. } => {
-                Err(RunnerError::OwnedBy65 {
-                    what: "checks, push, install",
-                })
-            }
+            NextMove::ChecksDone {
+                step,
+                attempt,
+                outcome,
+            } => self.checks_done(&step, attempt, outcome).await,
+            NextMove::Pushed { step, .. } => self.after_pushed(&step),
+            NextMove::Answered { gate, answer, .. } => self.answered(&gate, answer),
         }
     }
 
@@ -330,6 +375,16 @@ impl<F: Forge, H: RunnerHost> Runner<F, H> {
         }
         let fresh = child.is_none();
         let child = child.unwrap_or_else(|| self.host.new_child_id());
+        // Where a writing step started is read on the first attempt only:
+        // the checks and the push want the base the step's commits sit on,
+        // and a send-back must not move it.
+        let (head_at_start, remote_at_start) = if step.writes && attempt == 1 {
+            let head = self.repo.head()?;
+            let remote = self.repo.remote_head(&self.repo.branch()?)?;
+            (Some(head), remote)
+        } else {
+            (None, None)
+        };
         self.append(
             EventKind::StepStarted,
             &StepStartedPayload {
@@ -339,6 +394,8 @@ impl<F: Forge, H: RunnerHost> Runner<F, H> {
                 child_thread: child,
                 attempt,
                 budget_usd: step.budget.unwrap_or(0.0),
+                head_at_start,
+                remote_at_start,
             },
         )?;
         if fresh {
@@ -507,11 +564,13 @@ impl<F: Forge, H: RunnerHost> Runner<F, H> {
         report: &StepReport,
     ) -> Result<Advanced, RunnerError> {
         let Some(branch) = step.route_by.clone() else {
-            if !step.checks.is_empty() {
-                return Ok(Advanced::PausedAtChecks {
-                    step: step.id.clone(),
-                    report: report.clone(),
-                });
+            // A writing step's report is not the end: its checks and its
+            // push come next, and both are decided from the log's state,
+            // never from git read twice. A `push` step with no checks
+            // still goes there, so a plan that names no check is not a
+            // plan that silently skips the push.
+            if step.push || !step.checks.is_empty() {
+                return self.handover(step, attempt);
             }
             if step.next.as_deref() == Some("done") {
                 return self.finish(RunOutcome::Closed);
@@ -569,21 +628,408 @@ impl<F: Forge, H: RunnerHost> Runner<F, H> {
         Ok(Advanced::Moved)
     }
 
+    // -- the writing step's handover: checks, push, install, close ---------
+
+    /// After a writing step reported: run its checks, or go straight to the
+    /// push when it names none. The first attempt's start record is read
+    /// first — a step that began without one is not judged and not pushed.
+    fn handover(&mut self, step: &Step, attempt: u32) -> Result<Advanced, RunnerError> {
+        let start = match self.start_record(&step.id)? {
+            StartRecord::Ready { head, remote } => Start { head, remote },
+            StartRecord::Missing(field) => {
+                return self.escalate("no_start_record", vec![step.id.clone(), field.into()]);
+            }
+        };
+        if step.checks.is_empty() {
+            return self.push_and_install(step, attempt, &start);
+        }
+        let Some((report, _)) = self.report_of(&step.id, attempt)? else {
+            return self.escalate(
+                "step_stop",
+                vec![
+                    step.id.clone(),
+                    attempt.to_string(),
+                    "done without a report".into(),
+                ],
+            );
+        };
+        let child = self.child_of(&step.id, attempt)?;
+        let log = self.host.child_log(child)?;
+        // Every failing read is the `checks_error` gate with git's own
+        // words: a check that could not run is never a substituted value.
+        let commits = match read_commits_between(self.repo.root(), &start.head, "HEAD") {
+            Ok(commits) => commits,
+            Err(err) => {
+                return self.escalate(
+                    "checks_error",
+                    vec![step.id.clone(), attempt.to_string(), err.to_string()],
+                );
+            }
+        };
+        let uncommitted = match read_uncommitted(self.repo.root()) {
+            Ok(paths) => paths,
+            Err(err) => {
+                return self.escalate(
+                    "checks_error",
+                    vec![step.id.clone(), attempt.to_string(), err.to_string()],
+                );
+            }
+        };
+        let named = self.named_subjects(step)?;
+        let model = self.host.model_of(&step.profile)?;
+        let input = CheckInput {
+            commits: &commits,
+            events: log.events(),
+            report: &report,
+            named_subjects: &named,
+            model: &model,
+            uncommitted: &uncommitted,
+        };
+        let checks = match run_checks(&step.checks, &input) {
+            Ok(checks) => checks,
+            Err(err) => {
+                return self.escalate(
+                    "checks_error",
+                    vec![step.id.clone(), attempt.to_string(), err.to_string()],
+                );
+            }
+        };
+        self.append(
+            EventKind::ChecksRun,
+            &ChecksRunPayload {
+                step: step.id.clone(),
+                checks,
+            },
+        )?;
+        Ok(Advanced::Moved)
+    }
+
+    /// A `checks_run` was written: a `fail` sends the step back once, a
+    /// second hands it to the human; a pass or a flag pushes.
+    async fn checks_done(
+        &mut self,
+        step_id: &str,
+        attempt: u32,
+        outcome: ChecksOutcome,
+    ) -> Result<Advanced, RunnerError> {
+        let step = self.step(step_id)?.clone();
+        // A rebuilt runner takes the write lock again here: the run is
+        // still the writing step's until `run_finished` (rule 9).
+        if step.writes
+            && self.lock.is_none()
+            && let Some(waiting) = self.take_write_lock()?
+        {
+            return Ok(waiting);
+        }
+        match outcome {
+            ChecksOutcome::Pass | ChecksOutcome::Flagged => {
+                if !step.push {
+                    return self.escalate(
+                        "no_push",
+                        vec![
+                            step.id.clone(),
+                            attempt.to_string(),
+                            "the step's checks did not block the push, and it does not push".into(),
+                        ],
+                    );
+                }
+                let start = match self.start_record(&step.id)? {
+                    StartRecord::Ready { head, remote } => Start { head, remote },
+                    StartRecord::Missing(field) => {
+                        return self
+                            .escalate("no_start_record", vec![step.id.clone(), field.into()]);
+                    }
+                };
+                self.push_and_install(&step, attempt, &start)
+            }
+            ChecksOutcome::Fail => {
+                let failing = self.failing_checks(&step.id);
+                if self.failed_runs(&step.id) <= 1 {
+                    let child = self.child_of(&step.id, attempt)?;
+                    return self.start_step(&step.id, attempt + 1, Some(child)).await;
+                }
+                let mut shown = vec![step.id.clone(), attempt.to_string()];
+                shown.extend(failing.iter().map(|check| check.named()));
+                self.escalate("checks_failed", shown)
+            }
+        }
+    }
+
+    /// Push the step's commits once, install the binary, and record both.
+    /// The remote is read first: a remote that moved during the step is
+    /// never pushed over, never forced.
+    fn push_and_install(
+        &mut self,
+        step: &Step,
+        attempt: u32,
+        start: &Start,
+    ) -> Result<Advanced, RunnerError> {
+        let branch = self.repo.branch()?;
+        let head = self.repo.head()?;
+        let remote = self.repo.remote_head(&branch)?;
+        if remote.as_deref() != Some(head.as_str()) {
+            if remote.as_deref() != Some(start.remote.as_str()) {
+                let moved = remote.unwrap_or_else(|| "(the remote has no such branch)".into());
+                return self.escalate(
+                    "remote_moved",
+                    vec![
+                        step.id.clone(),
+                        format!("remote moved during the step: {}..{moved}", start.remote),
+                    ],
+                );
+            }
+            self.repo.push(&branch)?;
+        }
+        let installed = self.installer.install(&self.repo)?;
+        let short = &head[..head.len().min(12)];
+        if !installed.contains(short) {
+            return self.escalate(
+                "install_mismatch",
+                vec![step.id.clone(), installed, head.clone()],
+            );
+        }
+        let commits = match read_commits_between(self.repo.root(), &start.head, "HEAD") {
+            Ok(commits) => commits
+                .into_iter()
+                .map(|commit| CommitRef {
+                    sha: commit.sha,
+                    subject: commit.subject,
+                })
+                .collect(),
+            Err(err) => {
+                return self.escalate(
+                    "checks_error",
+                    vec![step.id.clone(), attempt.to_string(), err.to_string()],
+                );
+            }
+        };
+        self.append(
+            EventKind::Pushed,
+            &PushedPayload {
+                commits,
+                ref_before: start.remote.clone(),
+                ref_after: head,
+                installed: Some(installed),
+            },
+        )?;
+        Ok(Advanced::Moved)
+    }
+
+    /// After the push is written: close the issue when this step is the
+    /// last, and end the run. Both are safe to repeat — a rebuild re-reads
+    /// the issue's comments and never posts the closing comment twice.
+    fn after_pushed(&mut self, step_id: &str) -> Result<Advanced, RunnerError> {
+        let step = self.step(step_id)?.clone();
+        // A rebuilt runner takes the write lock again: the closing comment
+        // and the close are this run's, and nothing here repeats them
+        // anyway, but the lock outlives every move up to `run_finished`.
+        if step.writes
+            && self.lock.is_none()
+            && let Some(waiting) = self.take_write_lock()?
+        {
+            return Ok(waiting);
+        }
+        if step.next.as_deref() != Some("done") {
+            return self.escalate(
+                "no_next_step",
+                vec![
+                    step.id.clone(),
+                    format!("`{}` is the last step and names no `next`", step.id),
+                ],
+            );
+        }
+        let issue = self.issue()?;
+        let (report, _) = self.latest_report(&step.id)?;
+        let impact = report.release_impact;
+        let tag = self.close_tag();
+        if !self
+            .forge
+            .comments(issue)?
+            .iter()
+            .any(|comment| comment.contains(&tag))
+        {
+            let stated = match impact {
+                Some(impact) => impact_word(impact).to_owned(),
+                None => "unstated".to_owned(),
+            };
+            let text = format!(
+                "## Closing\n\n{}\n\nRelease impact: {stated}\n\n{tag}",
+                report.body.clone().unwrap_or_default()
+            );
+            self.forge.comment(issue, &text)?;
+        }
+        self.forge.close(issue)?;
+        self.finish_with(RunOutcome::Closed, impact)
+    }
+
+    /// Where a step's first attempt started: the head its commits are read
+    /// from and the remote ref its push is judged against. A later attempt
+    /// records nothing, so the first attempt is the only source.
+    fn start_record(&self, step_id: &str) -> Result<StartRecord, RunnerError> {
+        let event = self.lead.events().iter().find(|event| {
+            event.kind == EventKind::StepStarted
+                && serde_json::from_value::<StepStartedPayload>(event.payload.clone())
+                    .is_ok_and(|payload| payload.step == step_id && payload.attempt == 1)
+        });
+        let Some(event) = event else {
+            return Ok(StartRecord::Missing("head_at_start"));
+        };
+        let payload: StepStartedPayload = serde_json::from_value(event.payload.clone())
+            .map_err(|_| RunnerError::Host(format!("unreadable step_started for {step_id}")))?;
+        match (payload.head_at_start, payload.remote_at_start) {
+            (Some(head), Some(remote)) => Ok(StartRecord::Ready { head, remote }),
+            (None, _) => Ok(StartRecord::Missing("head_at_start")),
+            (_, None) => Ok(StartRecord::Missing("remote_at_start")),
+        }
+    }
+
+    /// The subjects the brief named, in its own order: the `commits` slot
+    /// of the last step before this one that reported. Absent, or not a
+    /// list of strings, is an empty list — never a guess.
+    fn named_subjects(&self, step: &Step) -> Result<Vec<String>, RunnerError> {
+        let Some(report) = self.earlier_reports(step)?.pop() else {
+            return Ok(Vec::new());
+        };
+        let Some(Value::Array(items)) =
+            report.slots.and_then(|slots| slots.get("commits").cloned())
+        else {
+            return Ok(Vec::new());
+        };
+        Ok(items
+            .iter()
+            .map(|item| item.as_str().map(str::to_owned))
+            .collect::<Option<Vec<_>>>()
+            .unwrap_or_default())
+    }
+
+    /// This step's latest `checks_run`, and the checks it failed.
+    fn failing_checks(&self, step_id: &str) -> Vec<FailedCheck> {
+        self.last_checks(step_id)
+            .into_iter()
+            .flatten()
+            .filter(|check| check.result == CheckResult::Fail)
+            .map(|check| FailedCheck {
+                id: check.id,
+                detail: check.detail.unwrap_or_else(|| "no detail".into()),
+            })
+            .collect()
+    }
+
+    /// The checks of a step's latest `checks_run`.
+    fn last_checks(&self, step_id: &str) -> Option<Vec<CheckOutcome>> {
+        self.lead
+            .events()
+            .iter()
+            .rev()
+            .filter(|event| event.kind == EventKind::ChecksRun)
+            .filter_map(|event| {
+                serde_json::from_value::<ChecksRunPayload>(event.payload.clone()).ok()
+            })
+            .find(|payload| payload.step == step_id)
+            .map(|payload| payload.checks)
+    }
+
+    /// How many `checks_run` events of this step hold a `fail`: the first
+    /// sends the step back, so a second means the send-back did not help.
+    fn failed_runs(&self, step_id: &str) -> usize {
+        self.lead
+            .events()
+            .iter()
+            .filter(|event| event.kind == EventKind::ChecksRun)
+            .filter_map(|event| {
+                serde_json::from_value::<ChecksRunPayload>(event.payload.clone()).ok()
+            })
+            .filter(|payload| {
+                payload.step == step_id
+                    && payload.checks.iter().any(|c| c.result == CheckResult::Fail)
+            })
+            .count()
+    }
+
+    /// Whether this step's latest state event is a `checks_run` holding a
+    /// `fail`: that is what a send-back answers. Any other event in
+    /// between — a budget warning, say — does not change it.
+    fn send_back_due(&self, step_id: &str) -> bool {
+        self.lead
+            .events()
+            .iter()
+            .rev()
+            .find(|event| {
+                matches!(
+                    event.kind,
+                    EventKind::StepStarted | EventKind::StepFinished | EventKind::ChecksRun
+                )
+            })
+            .filter(|event| event.kind == EventKind::ChecksRun)
+            .and_then(|event| {
+                serde_json::from_value::<ChecksRunPayload>(event.payload.clone()).ok()
+            })
+            .is_some_and(|payload| {
+                payload.step == step_id
+                    && payload.checks.iter().any(|c| c.result == CheckResult::Fail)
+            })
+    }
+
+    /// The tag a run's closing comment carries, so a rebuild never posts a
+    /// second one.
+    fn close_tag(&self) -> String {
+        format!("<!-- aigentic run={} step=close -->", self.lead_id)
+    }
+
+    /// A step's latest attempt that reported, and its report.
+    fn latest_report(&self, step_id: &str) -> Result<(StepReport, u32), RunnerError> {
+        let state = self.state()?;
+        let record = state
+            .steps
+            .iter()
+            .rev()
+            .find(|record| record.step == step_id && record.reported_event.is_some())
+            .ok_or_else(|| RunnerError::Host(format!("no report for `{step_id}`")))?;
+        let attempt = record.attempt;
+        let Some((report, _)) = self.report_of(step_id, attempt)? else {
+            return Err(RunnerError::Host(format!(
+                "no report for `{step_id}` attempt {attempt}"
+            )));
+        };
+        Ok((report, attempt))
+    }
+
     // -- pieces -------------------------------------------------------------
 
     /// Write `run_finished` and end the run.
     fn finish(&mut self, outcome: RunOutcome) -> Result<Advanced, RunnerError> {
+        self.finish_with(outcome, None)
+    }
+
+    /// Write `run_finished` with the closing comment's release impact, and
+    /// end the run.
+    fn finish_with(
+        &mut self,
+        outcome: RunOutcome,
+        release_impact: Option<ReleaseImpact>,
+    ) -> Result<Advanced, RunnerError> {
         let cost_usd = self.cost();
         self.append(
             EventKind::RunFinished,
             &RunFinishedPayload {
                 outcome,
                 cost_usd,
-                release_impact: None,
+                release_impact,
             },
         )?;
         self.lock = None;
         Ok(Advanced::Finished { outcome })
+    }
+
+    /// A human answered a gate: `stop` ends the run, and acting on `go` or
+    /// `amend` belongs to a later slice, so it is an error, not a guess.
+    fn answered(&mut self, gate: &str, answer: CheckpointAnswer) -> Result<Advanced, RunnerError> {
+        match answer {
+            CheckpointAnswer::Stop => self.finish(RunOutcome::Stopped),
+            CheckpointAnswer::Go | CheckpointAnswer::Amend => Err(RunnerError::SliceTwo {
+                gate: gate.to_owned(),
+            }),
+        }
     }
 
     /// Write `checkpoint_asked` and hand the run to the human. This is the
@@ -609,14 +1055,14 @@ impl<F: Forge, H: RunnerHost> Runner<F, H> {
     /// runner escalates, finishes or drops, so a second writing step in
     /// this run never takes it again.
     fn take_write_lock(&mut self) -> Result<Option<Advanced>, RunnerError> {
-        match WriteGuard::take(self.repo.clone(), self.lead_id) {
+        match WriteGuard::take(self.repo.root().to_path_buf(), self.lead_id) {
             Ok(guard) => {
                 self.lock = Some(guard);
                 Ok(None)
             }
             Err(holder) => {
                 let shown = vec![
-                    self.repo.display().to_string(),
+                    self.repo.root().display().to_string(),
                     format!("lead {holder} holds it"),
                     format!("lead {} waits", self.lead_id),
                 ];
@@ -673,9 +1119,23 @@ impl<F: Forge, H: RunnerHost> Runner<F, H> {
     }
 
     /// The prompt an attempt gets: the step's template rendered for the
-    /// first, a short instruction afterwards. The render can fail, and a
-    /// failed render is a `render_failed` escalation.
+    /// first, a short instruction afterwards, and the template again with
+    /// the failing checks when a send-back brings the step back. The render
+    /// can fail, and a failed render is a `render_failed` escalation.
     fn attempt_message(&self, step: &Step, attempt: u32) -> Result<String, RunnerError> {
+        // A send-back reads as a first attempt with the failures handed to
+        // it: the same template, plus the failing checks, so the step is
+        // told exactly which lines to fix (#57's `check_failures` slot).
+        if self.send_back_due(&step.id) {
+            let mut slots = self.slot_map(step)?;
+            let lines: Vec<String> = self
+                .failing_checks(&step.id)
+                .iter()
+                .map(FailedCheck::line)
+                .collect();
+            slots.insert("check_failures".to_string(), Value::from(lines.join("\n")));
+            return Ok(self.workflow.render(&step.id, &slots)?);
+        }
         if attempt <= 1 {
             let slots = self.slot_map(step)?;
             return Ok(self.workflow.render(&step.id, &slots)?);
@@ -923,4 +1383,14 @@ fn prompt_at(events: &[Event], attempt: u32) -> Option<usize> {
         .filter(|(_, event)| is_prompt(event))
         .nth(attempt.saturating_sub(1) as usize)
         .map(|(index, _)| index)
+}
+
+/// A release impact as its serde name (`none`, `patch`, `minor`,
+/// `breaking`): the word a closing comment writes, read from the one place
+/// that decides it, so a rename cannot drift.
+fn impact_word(impact: ReleaseImpact) -> String {
+    serde_json::to_value(impact)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "unstated".to_owned())
 }

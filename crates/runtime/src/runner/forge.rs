@@ -6,6 +6,7 @@
 
 use std::io::Write as _;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use ulid::Ulid;
@@ -46,6 +47,9 @@ pub trait Forge {
     fn comments(&self, n: u64) -> Result<Vec<String>, ForgeError>;
     /// Post one comment.
     fn comment(&self, n: u64, body: &str) -> Result<(), ForgeError>;
+    /// Close the issue. An issue that is already closed is success, not a
+    /// failure: a rebuilt runner closes what the crash left open.
+    fn close(&self, n: u64) -> Result<(), ForgeError>;
 }
 
 impl<T: Forge + ?Sized> Forge for Arc<T> {
@@ -59,6 +63,10 @@ impl<T: Forge + ?Sized> Forge for Arc<T> {
 
     fn comment(&self, n: u64, body: &str) -> Result<(), ForgeError> {
         (**self).comment(n, body)
+    }
+
+    fn close(&self, n: u64) -> Result<(), ForgeError> {
+        (**self).close(n)
     }
 }
 
@@ -128,6 +136,35 @@ impl Forge for GhForge {
         let _ = std::fs::remove_file(&path);
         result.map(|_| ())
     }
+
+    fn close(&self, n: u64) -> Result<(), ForgeError> {
+        let number = n.to_string();
+        let Err(failure) = gh(&["issue", "close", &number]) else {
+            return Ok(());
+        };
+        // Closing what is already closed is success, not a failure: a
+        // rebuilt runner finishes what the crash left open. `gh`'s exit
+        // status alone cannot tell the two apart, so ask for the state.
+        if self.state(&number)? == "CLOSED" {
+            return Ok(());
+        }
+        Err(failure)
+    }
+}
+
+impl GhForge {
+    /// The issue's state, as `gh` reports it.
+    fn state(&self, n: &str) -> Result<String, ForgeError> {
+        #[derive(serde::Deserialize)]
+        struct Wire {
+            #[serde(default)]
+            state: Option<String>,
+        }
+        let text = gh(&["issue", "view", n, "--json", "state"])?;
+        Ok(serde_json::from_str::<Wire>(&text)?
+            .state
+            .unwrap_or_default())
+    }
 }
 
 /// Run one `gh` command and return its stdout.
@@ -153,6 +190,10 @@ pub struct FakeForge {
     pub issue: IssueView,
     /// Every comment posted, oldest first.
     pub comments: Mutex<Vec<String>>,
+    /// Whether `close` has succeeded yet.
+    closed: AtomicBool,
+    /// How many more `close` calls fail before one goes through.
+    close_failures: Mutex<usize>,
 }
 
 impl FakeForge {
@@ -161,15 +202,41 @@ impl FakeForge {
         Self {
             issue,
             comments: Mutex::new(Vec::new()),
+            closed: AtomicBool::new(false),
+            close_failures: Mutex::new(0),
         }
     }
 
     /// A forge that starts with `comments` already on the issue.
     pub fn with_comments(issue: IssueView, comments: Vec<String>) -> Self {
         Self {
-            issue,
             comments: Mutex::new(comments),
+            ..Self::new(issue)
         }
+    }
+
+    /// A forge whose issue is already closed, as a crash before the
+    /// closing comment leaves it.
+    pub fn closed_at_start(mut self) -> Self {
+        self.closed = AtomicBool::new(true);
+        self
+    }
+
+    /// Make the next `times` `close` calls fail, as a forge that is down
+    /// for a moment does.
+    pub fn fail_close(&self, times: usize) {
+        *self.close_failures.lock().expect("close mutex") = times;
+    }
+
+    /// Close the issue behind the runner's back, as a crash after the
+    /// `gh issue close` landed leaves it.
+    pub fn set_closed(&self, closed: bool) {
+        self.closed.store(closed, Ordering::SeqCst);
+    }
+
+    /// Whether `close` has succeeded.
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
     }
 
     /// What has been posted, oldest first.
@@ -192,6 +259,24 @@ impl Forge for FakeForge {
             .lock()
             .expect("comments mutex")
             .push(body.to_string());
+        Ok(())
+    }
+
+    fn close(&self, _n: u64) -> Result<(), ForgeError> {
+        if self.is_closed() {
+            return Ok(());
+        }
+        {
+            let mut left = self.close_failures.lock().expect("close mutex");
+            if *left > 0 {
+                *left -= 1;
+                return Err(ForgeError::Command {
+                    args: "issue close".to_string(),
+                    message: "the forge is down".to_string(),
+                });
+            }
+        }
+        self.closed.store(true, Ordering::SeqCst);
         Ok(())
     }
 }

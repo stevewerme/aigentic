@@ -642,6 +642,79 @@ fn e4_edit_table_row_by_row() {
     }
 }
 
+/// T10: E4's edit table over `edit_file` and `write_file` (issue #65's
+/// rule 12): a write to a temp path is not an edit, so the gate's own
+/// `/tmp` log survives, and anything else — a repo path, a `..` that
+/// leaves the temp directory, a path the call never names — stays one.
+#[test]
+fn t10_e4_a_temp_path_write_is_not_an_edit() {
+    use aigentic_runtime::checks::is_an_edit;
+
+    // The bash rows the temp rule touches.
+    for (command, wanted) in [
+        ("cargo test > /tmp/65-gate.log 2>&1", false),
+        ("cat > /tmp/65-msg.txt <<'MSG'\nhi\nMSG", false),
+        (
+            "echo x > /tmp/../Users/steve/Projects/aigentic/src/lib.rs",
+            true,
+        ),
+        ("cp /tmp/x.rs crates/runtime/src/lib.rs > /tmp/d", true),
+    ] {
+        assert_eq!(is_an_edit(command), wanted, "{command}");
+    }
+
+    // And through E4, the tool calls: a gate whose child writes to a temp
+    // path passes, and one that touches a repo file between the steps
+    // fails. The paths are the rows `to_temp` turns on: temp itself, a
+    // temp path that climbs out with `..`, and a call that names none.
+    for (name, args, is_edit) in [
+        (
+            "write_file",
+            json!({"path": "/tmp/65-gate.log", "content": "x"}),
+            false,
+        ),
+        (
+            "edit_file",
+            json!({"path": "/tmp/65/msg.txt", "content": "x"}),
+            false,
+        ),
+        (
+            "write_file",
+            json!({"path": "/var/folders/ab/T/65-gate.log", "content": "x"}),
+            false,
+        ),
+        (
+            "edit_file",
+            json!({"path": "crates/runtime/src/lib.rs", "content": "x"}),
+            true,
+        ),
+        (
+            "write_file",
+            json!({"path": "/tmp/../Users/steve/Projects/aigentic/src/lib.rs", "content": "x"}),
+            true,
+        ),
+        ("edit_file", json!({"content": "x"}), true),
+    ] {
+        let mut log = Log::new();
+        let format = log.bash(1, "cargo fmt");
+        log.ok(2, &format, "");
+        let candidate = log.call(3, name, args);
+        log.ok(4, &candidate, "");
+        let clippy = log.bash(5, "cargo clippy --all-targets -- -D warnings");
+        log.ok(6, &clippy, "");
+        let suite = log.bash(7, "cargo test > /tmp/65-gate.log 2>&1");
+        log.ok(8, &suite, "test result: ok. 12 passed; 0 failed");
+
+        let got = verdict_of(&log.take(), "E4");
+        if is_edit {
+            let detail = got.expect_err("an edit between the steps");
+            assert!(detail.contains("edit between"), "{name}: {detail}");
+        } else {
+            assert_eq!(got, Ok(()), "{name} writes outside the repo");
+        }
+    }
+}
+
 /// T9: E4 passes a healthy synthetic gate (`## Plan amendment` item 3:
 /// no weekend log holds one in template form).
 #[test]

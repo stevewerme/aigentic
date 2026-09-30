@@ -14,7 +14,8 @@ use aigentic_log::{
 };
 use aigentic_policy::Policy;
 use aigentic_runtime::runner::{
-    Advanced, FakeForge, Forge, GhForge, IssueView, Runner, RunnerError, RunnerHost, WriteGuard,
+    Advanced, FakeForge, FakeInstaller, Forge, GhForge, GitRepo, IssueView, Runner, RunnerError,
+    RunnerHost, WriteGuard,
 };
 use aigentic_runtime::workflow::{LoadedWorkflow, WorkflowFile, WorkflowOrigin};
 use aigentic_runtime::{Answer, Approver, Prices, Runtime};
@@ -129,11 +130,14 @@ fn brief_report() -> Value {
 }
 
 /// The implementer's report: what the last step of the happy path reports.
+/// It states a release impact, as a real implementer's does, so the
+/// closing comment has something to carry.
 fn implementer_report() -> Value {
     json!({
         "status": "done",
         "body": "## Implementation\n\nall landed",
         "slots": {"size": "trivial"},
+        "release_impact": "patch",
     })
 }
 
@@ -146,6 +150,38 @@ fn run_started(workflow: &LoadedWorkflow) -> RunStartedPayload {
         content_hash: workflow.content_hash.clone(),
         budget_usd: workflow.workflow.budget.trivial,
     }
+}
+
+/// The trailer a passing commit carries: the E1 check reads the model the
+/// step's profile resolved to, and `flash` is `tensorx/deepseek-v4.1-flash`.
+const TRAILER: &str = "Co-Authored-By: aigentic (deepseek-v4.1-flash) <332865255+aigentic-bot@users.noreply.github.com>";
+
+/// A work repo on `main` with one commit, pushed to a bare remote: what a
+/// writing step's `head_at_start` and `remote_at_start` are read from, and
+/// where its push lands.
+fn init_git(repo: &Path, remote: &Path) {
+    let run = |args: &[&str], cwd: &Path| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    };
+    run(&["init", "-b", "main"], repo);
+    run(&["config", "user.name", "aigentic test"], repo);
+    run(&["config", "user.email", "test@example.invalid"], repo);
+    std::fs::write(repo.join("README.md"), "the repo\n").unwrap();
+    run(&["add", "README.md"], repo);
+    run(&["commit", "-m", "initial commit"], repo);
+    run(&["init", "--bare", "-b", "main"], remote);
+    run(&["remote", "add", "origin", remote.to_str().unwrap()], repo);
+    run(&["push", "-u", "origin", "main"], repo);
 }
 
 // ---------------------------------------------------------------------------
@@ -331,12 +367,19 @@ struct Fixture {
     dir: tempfile::TempDir,
     lead: Ulid,
     repo: PathBuf,
+    remote: PathBuf,
+    installer: FakeInstaller,
+    initial_head: String,
     children: Vec<(Ulid, Vec<Vec<ProviderEvent>>)>,
     forge: Arc<FakeForge>,
     workflow: LoadedWorkflow,
     caps: BTreeMap<Ulid, u32>,
     prices: Option<Prices>,
 }
+
+/// The runner a fixture builds, named once so a helper's signature stays
+/// short.
+type TestRunner = Runner<Arc<FakeForge>, FakeHost, GitRepo>;
 
 impl Fixture {
     /// A fixture whose children are scripted in the order they start. The
@@ -353,12 +396,39 @@ impl Fixture {
     ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().join("repo");
+        let remote = dir.path().join("remote.git");
+        // A real repository with a real bare remote: a writing step's
+        // checks, its push and the closing comment all read git, so the
+        // fixture gives them one to read. See `init_git`.
         std::fs::create_dir_all(&repo).unwrap();
-        let workflow = WorkflowFile::load_dir(
+        std::fs::create_dir_all(&remote).unwrap();
+        let mut workflow = WorkflowFile::load_dir(
             &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../workflows/build"),
             WorkflowOrigin::Bundled,
         )
         .expect("the build workflow loads");
+        // The runner's own tests drive the commit checks. E4 (the gate),
+        // E5 and E7 (the report) read a child's tool calls, and the
+        // fixture's children are scripted replies, not real work: those
+        // three have their tests in `tests/checks.rs`. Everything else is
+        // the bundled workflow, so a test can still assert on its real
+        // ids, markers and templates.
+        let implementer = workflow
+            .workflow
+            .steps
+            .iter_mut()
+            .find(|step| step.id == "implement-alone")
+            .expect("the bundled workflow has the implementer step");
+        implementer.checks = vec!["E1".to_owned(), "E2".to_owned(), "E3".to_owned()];
+        init_git(&repo, &remote);
+        let initial_head = {
+            let out = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&repo)
+                .output()
+                .expect("git runs");
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        };
         let lead = Ulid::generate();
         let mut log = ThreadLog::open(dir.path(), lead).unwrap();
         log.append(aigentic_log::NewEvent {
@@ -373,12 +443,24 @@ impl Fixture {
             dir,
             lead,
             repo,
+            remote,
+            installer: FakeInstaller::echoing_head(),
+            initial_head,
             children,
             forge,
             workflow,
             caps: BTreeMap::new(),
             prices: None,
         }
+    }
+
+    /// The child the run gave the implementer step, from the lead log:
+    /// `trace` commits the brief's work through it.
+    fn implementer_child(&self) -> Option<Ulid> {
+        step_started(&self.lead_events())
+            .into_iter()
+            .find(|started| started.step == "implement-alone" && started.attempt == 1)
+            .map(|started| started.child_thread)
     }
 
     /// Give a child a turn cap, so a scripted turn can end on it.
@@ -395,7 +477,7 @@ impl Fixture {
     }
 
     /// A runner over the log as it stands, with the fixture's forge.
-    fn runner(&self) -> Runner<Arc<FakeForge>, FakeHost> {
+    fn runner(&self) -> TestRunner {
         let log = ThreadLog::open(self.dir.path(), self.lead).unwrap();
         let host = FakeHost::new(
             self.dir.path().to_path_buf(),
@@ -409,10 +491,169 @@ impl Fixture {
             self.lead,
             self.forge.clone(),
             host,
+            Box::new(self.installer.clone()),
             self.workflow.clone(),
-            self.repo.clone(),
+            GitRepo::new(self.repo.clone()),
         )
         .expect("the log is the lead's")
+    }
+
+    /// A fixture whose writes land in a repository the checks pass.
+    fn with_installer(mut self, installer: FakeInstaller) -> Self {
+        self.installer = installer;
+        self
+    }
+
+    /// The checks a named step runs, replacing the workflow's.
+    fn with_checks_for(mut self, step: &str, ids: &[&str]) -> Self {
+        let step = self
+            .workflow
+            .workflow
+            .steps
+            .iter_mut()
+            .find(|candidate| candidate.id == step)
+            .expect("the fixture names a step the workflow has");
+        step.checks = ids.iter().map(|id| (*id).to_owned()).collect();
+        self
+    }
+
+    /// The checks the implementer runs.
+    fn with_checks(self, ids: &[&str]) -> Self {
+        self.with_checks_for("implement-alone", ids)
+    }
+
+    /// A step that pushes nothing: the run stops after its checks instead.
+    fn without_push(mut self) -> Self {
+        let step = self
+            .workflow
+            .workflow
+            .steps
+            .iter_mut()
+            .find(|candidate| candidate.id == "implement-alone")
+            .expect("the bundled workflow has the implementer step");
+        step.push = false;
+        self
+    }
+
+    /// Someone else pushes to the remote while a step runs. Returns the
+    /// commit they pushed, so a test can tell it from the step's own head.
+    fn push_a_stranger(&self) -> String {
+        let other = self.dir.path().join("stranger");
+        let _ = std::fs::remove_dir_all(&other);
+        self.git_in(
+            self.dir.path(),
+            &[
+                "clone",
+                "--branch",
+                "main",
+                self.remote.to_str().unwrap(),
+                "stranger",
+            ],
+        );
+        std::fs::write(other.join("stranger.txt"), "someone else\n").unwrap();
+        self.git_in(&other, &["add", "stranger.txt"]);
+        self.git_in(
+            &other,
+            &[
+                "-c",
+                "user.name=stranger",
+                "-c",
+                "user.email=stranger@example.invalid",
+                "commit",
+                "-m",
+                "stranger: a commit the step never made",
+            ],
+        );
+        let head = self.git_in(&other, &["rev-parse", "HEAD"]);
+        self.git_in(&other, &["push", "origin", "HEAD:main"]);
+        head
+    }
+
+    /// The work repo's head before the fixture made any work commit.
+    fn initial_head(&self) -> String {
+        self.initial_head.clone()
+    }
+
+    /// Run `git` in the work repo, panicking on failure.
+    fn git(&self, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&self.repo)
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    }
+
+    /// Run `git` somewhere else, panicking on failure.
+    fn git_in(&self, dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {args:?} in {} failed: {}",
+            dir.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    }
+
+    /// Commit one file change with the trailer the E1 check wants, so a
+    /// step's writes pass the checks the fixture's workflow runs.
+    fn commit_named(&self, subject: &str) {
+        let path = self.repo.join("work.txt");
+        let mut text = std::fs::read_to_string(&path).unwrap_or_default();
+        text.push_str(subject);
+        text.push('\n');
+        std::fs::write(&path, text).unwrap();
+        self.git(&["add", "work.txt"]);
+        self.git(&["commit", "-m", &format!("{subject}\n\n{TRAILER}")]);
+    }
+
+    /// Rewrite the last commit's subject, keeping its trailer: what an
+    /// implementer does when the checks say the subject is wrong.
+    fn amend_named(&self, subject: &str) {
+        self.git(&[
+            "commit",
+            "--amend",
+            "-m",
+            &format!("{subject}\n\n{TRAILER}"),
+        ]);
+    }
+
+    /// The work repo's HEAD.
+    fn head(&self) -> String {
+        self.git(&["rev-parse", "HEAD"])
+    }
+
+    /// The subject of the work repo's HEAD.
+    fn head_subject(&self) -> String {
+        self.git(&["log", "-1", "--format=%s"])
+    }
+
+    /// The bare remote's `main`, read with `ls-remote` so nothing has to
+    /// be fetched into the work repo to see it.
+    fn remote_head(&self) -> String {
+        let out = std::process::Command::new("git")
+            .args([
+                "ls-remote",
+                self.remote.to_str().unwrap(),
+                "refs/heads/main",
+            ])
+            .output()
+            .expect("git runs");
+        String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_owned()
     }
 
     /// The issue the run is for, as `run_started` says.
@@ -464,6 +705,18 @@ impl Fixture {
     /// Put the world back to what it was after `snapshot`: the lead log,
     /// every child's log, and the children that did not exist yet.
     fn restore(&self, snapshot: &Snapshot) {
+        self.restore_logs(snapshot);
+        // The repository and the remote are rewound with the logs: the
+        // world a rebuild starts from is the world of that moment.
+        self.git(&["checkout", "--force", "-B", "main", &snapshot.head]);
+        self.git_in(
+            &self.remote,
+            &["update-ref", "refs/heads/main", &snapshot.remote_head],
+        );
+    }
+
+    /// Rewind only the logs, leaving the repository alone.
+    fn restore_logs(&self, snapshot: &Snapshot) {
         write_events(
             &self.dir.path().join(format!("{}.jsonl", self.lead)),
             &snapshot.lead,
@@ -508,6 +761,14 @@ impl Fixture {
         }
     }
 
+    /// Put the forge back where `snapshot` found it: the comments it held
+    /// and an open issue. A rebuild from a prefix needs this, because the
+    /// full run that made the snapshot closed the issue on the way.
+    fn rewind_forge(&self, snapshot: &Snapshot) {
+        self.set_comments(snapshot.comments.clone());
+        self.forge.set_closed(false);
+    }
+
     /// What the issue holds, as a rebuild after a crash would find it.
     fn set_comments(&self, comments: Vec<String>) {
         *self.forge.comments.lock().unwrap() = comments;
@@ -527,6 +788,13 @@ struct Snapshot {
     lead: Vec<Event>,
     children: BTreeMap<Ulid, Vec<Event>>,
     comments: Vec<String>,
+    /// Where the work repo stood when the snapshot was taken. A rebuild
+    /// starts from the tree of that moment, not from the commits a later
+    /// move made, and a step's checks judge the commits between them.
+    head: String,
+    /// Where the bare remote stood, so a rebuilt push sees the remote the
+    /// crash left behind rather than one a later move moved.
+    remote_head: String,
 }
 
 /// A full run, kept so a test can rebuild from any point of it.
@@ -567,22 +835,67 @@ impl Trace {
     }
 }
 
-/// Drive a fixture to its pause, recording the world after every move.
+/// Drive a fixture to its end, recording the world after every move.
+///
+/// A run that reaches a writing step's end reads the repository back: the
+/// checks compare the commits between where the step started and HEAD. So
+/// the driver makes the commits the brief named as soon as the
+/// implementer's report is in its log, exactly where a real implementer
+/// would have made them (#65).
 async fn trace(fx: &Fixture) -> Trace {
+    let mut committed = false;
+    trace_between(fx, |_| {
+        if let Some(child) = fx.implementer_child() {
+            commit_what_the_brief_named(fx, child, &mut committed);
+        }
+    })
+    .await
+}
+
+/// Drive a fixture move by move, letting the test do git work between
+/// moves: `between(moves)` runs after the `moves`-th move. A writing
+/// step's checks read the repository, so the commits its report claims
+/// have to be made in the middle of the run.
+async fn trace_between(fx: &Fixture, mut between: impl FnMut(usize)) -> Trace {
     let mut runner = fx.runner();
     let mut snapshots = vec![snapshot(fx)];
+    let mut moves = 0;
     let terminal = loop {
         match runner.advance().await.expect("the run advances") {
-            Advanced::Moved => snapshots.push(snapshot(fx)),
+            Advanced::Moved => {
+                moves += 1;
+                between(moves);
+                snapshots.push(snapshot(fx));
+            }
             other => break other,
         }
     };
-    // A pause writes its gate, so the world moved once more without a
-    // `Moved`: record it, or a rebuild's last event would look missing.
     snapshots.push(snapshot(fx));
     Trace {
         snapshots,
         terminal,
+    }
+}
+
+/// The commits the fixture's brief names, made as soon as the implementer
+/// has reported and not before, with the trailer the E1 check wants. The
+/// report is where a real implementer's commits exist; the run reads the
+/// repo at the checks, which come after it.
+fn commit_what_the_brief_named(fx: &Fixture, implementer: Ulid, done: &mut bool) {
+    if *done {
+        return;
+    }
+    let reported = fx
+        .child_events_of(implementer)
+        .iter()
+        .any(|event| event.kind == EventKind::StepReported);
+    // Only from the state before any of them: a rebuild from a point after
+    // the report finds the commits already in the tree.
+    if reported && fx.head() == fx.initial_head() {
+        for subject in ["runtime: one", "runtime: two"] {
+            fx.commit_named(subject);
+        }
+        *done = true;
     }
 }
 
@@ -591,23 +904,89 @@ fn snapshot(fx: &Fixture) -> Snapshot {
         lead: fx.lead_events(),
         children: fx.child_events(),
         comments: fx.forge.posted(),
+        head: fx.head(),
+        remote_head: fx.remote_head(),
     }
 }
 
 /// Rebuild from `snapshot` and do one move.
-async fn replay(fx: &Fixture, snapshot: &Snapshot) -> (Advanced, Runner<Arc<FakeForge>, FakeHost>) {
+async fn replay(fx: &Fixture, snapshot: &Snapshot) -> (Advanced, TestRunner) {
     fx.restore(snapshot);
     let mut runner = fx.runner();
     let advanced = runner.advance().await.expect("the rebuilt runner advances");
     (advanced, runner)
 }
 
-/// Drive a runner to its pause.
-async fn drive(runner: &mut Runner<Arc<FakeForge>, FakeHost>) -> Advanced {
-    runner
-        .run_to_pause()
-        .await
-        .expect("the run reaches a pause")
+/// Drive a runner to its pause, doing the git work a run's middle needs:
+/// once the implementer has reported, the commits its brief named land, so
+/// a rebuilt run's checks read them and not an empty range.
+async fn drive(fx: &Fixture, runner: &mut TestRunner) -> Advanced {
+    let mut committed = false;
+    drive_with(fx, runner, || {
+        if let Some(child) = fx.implementer_child() {
+            commit_what_the_brief_named(fx, child, &mut committed);
+        }
+    })
+    .await
+}
+
+/// The same, with `between` called after each move: a run whose middle
+/// needs other git work (a wrong subject, an amend) drives itself this
+/// way, so a rebuilt run is caught up the same way the full one was.
+async fn drive_with(_fx: &Fixture, runner: &mut TestRunner, mut between: impl FnMut()) -> Advanced {
+    loop {
+        match runner.advance().await.expect("the run advances") {
+            Advanced::Moved => between(),
+            other => return other,
+        }
+    }
+}
+
+/// The git work a wrong-subject run needs between its moves: commit a
+/// subject the brief never named, then amend it once a check has failed.
+struct WrongSubject {
+    implementer: Ulid,
+    committed: bool,
+    amended: bool,
+}
+
+impl WrongSubject {
+    fn new(implementer: Ulid) -> Self {
+        Self {
+            implementer,
+            committed: false,
+            amended: false,
+        }
+    }
+
+    /// `fix` is whether the run is meant to pass: without it the subject
+    /// stays wrong and the second check fails too.
+    fn between(&mut self, fx: &Fixture, fix: bool) {
+        let reported = fx
+            .child_events_of(self.implementer)
+            .iter()
+            .any(|event| event.kind == EventKind::StepReported);
+        if reported && !self.committed && fx.head() == fx.initial_head() {
+            // "runtime: one" is named; "runtime: wrong" is not, so E2
+            // fails on the commits the step made.
+            fx.commit_named("runtime: one");
+            fx.commit_named("runtime: wrong");
+            self.committed = true;
+        }
+        // The amend is keyed on the log, not on this driver's own state:
+        // a rebuild from a tree the full run already committed finds the
+        // failing check in the log and must still fix the subject. It
+        // never amends twice, so every prefix ends at the same commit the
+        // full run ended at — the pushed sha is compared below.
+        if fix
+            && !self.amended
+            && checks_failed(&fx.lead_events(), "implement-alone")
+            && fx.head_subject() != "runtime: two"
+        {
+            fx.amend_named("runtime: two");
+            self.amended = true;
+        }
+    }
 }
 
 /// Rewrite a JSONL log so it holds exactly `events`, as a prefix.
@@ -630,6 +1009,43 @@ fn step_finished(events: &[Event]) -> Vec<aigentic_log::StepFinishedPayload> {
     events
         .iter()
         .filter(|event| event.kind == EventKind::StepFinished)
+        .map(|event| serde_json::from_value(event.payload.clone()).unwrap())
+        .collect()
+}
+
+/// Every `checks_run` payload, oldest first.
+fn checks_run(events: &[Event]) -> Vec<aigentic_log::ChecksRunPayload> {
+    events
+        .iter()
+        .filter(|event| event.kind == EventKind::ChecksRun)
+        .map(|event| serde_json::from_value(event.payload.clone()).unwrap())
+        .collect()
+}
+
+/// Every `pushed` payload, oldest first.
+fn pushed_events(events: &[Event]) -> Vec<aigentic_log::PushedPayload> {
+    events
+        .iter()
+        .filter(|event| event.kind == EventKind::Pushed)
+        .map(|event| serde_json::from_value(event.payload.clone()).unwrap())
+        .collect()
+}
+
+/// The `run_finished` payload, if the run ended.
+fn run_finished(events: &[Event]) -> aigentic_log::RunFinishedPayload {
+    let event = events
+        .iter()
+        .find(|event| event.kind == EventKind::RunFinished)
+        .expect("the run finished");
+    serde_json::from_value(event.payload.clone()).unwrap()
+}
+
+/// The `run_finished` payloads, oldest first: a rebuilt runner must not
+/// write a second one.
+fn run_finished_all(events: &[Event]) -> Vec<aigentic_log::RunFinishedPayload> {
+    events
+        .iter()
+        .filter(|event| event.kind == EventKind::RunFinished)
         .map(|event| serde_json::from_value(event.payload.clone()).unwrap())
         .collect()
 }
@@ -717,17 +1133,6 @@ fn gate_shown(events: &[Event]) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// A pause, as the step (or gate) it names, so a test can read a terminal
-/// without matching the whole report.
-fn pause_step(advanced: &Advanced) -> String {
-    match advanced {
-        Advanced::Moved => "moved".into(),
-        Advanced::WaitingHuman { gate } => format!("gate:{gate}"),
-        Advanced::PausedAtChecks { step, .. } => step.clone(),
-        Advanced::Finished { outcome } => format!("finished:{outcome:?}"),
-    }
-}
-
 /// How many times a child's log ends a turn.
 fn turn_ends(events: &[Event]) -> usize {
     events
@@ -774,21 +1179,28 @@ fn happy_path() -> Happy {
 /// `route_taken.budget_usd == brief budget slot`; `reported_event`
 /// resolves in the child's log.
 #[tokio::test]
-async fn t1_the_happy_path_pauses_on_the_implementer() {
+async fn t1_the_happy_path_checks_pushes_installs_and_closes() {
     let h = happy_path();
     let fx = &h.fx;
-    let run = trace(fx).await;
+    // The commits land while the implementer's turn is over and before the
+    // handover, as a real implementer's would.
+    let mut committed = false;
+    let run = trace_between(fx, |_| {
+        commit_what_the_brief_named(fx, h.implementer_child, &mut committed)
+    })
+    .await;
     let events = run.lead();
 
+    let head = fx.head();
+    let terminal = run.terminal.clone();
     assert_eq!(
-        run.terminal,
-        Advanced::PausedAtChecks {
-            step: "implement-alone".to_owned(),
-            report: child_report(fx, h.implementer_child),
+        terminal,
+        Advanced::Finished {
+            outcome: aigentic_log::RunOutcome::Closed,
         },
-        "the run hands the implementer's report to the checks"
+        "the run passes its checks, pushes and closes"
     );
-    assert_eq!(gate(events), None, "implement-alone pauses at its checks");
+    assert_eq!(gate(events), None, "no gate is asked: the checks pass");
 
     let started = step_started(events);
     assert_eq!(started.len(), 2, "one child per step, no retry");
@@ -863,13 +1275,120 @@ async fn t1_the_happy_path_pauses_on_the_implementer() {
 
     // One comment per report, carrying the step's marker and the report.
     let posted = fx.forge.posted();
-    assert_eq!(posted.len(), 2, "one comment per reporting step");
+    assert_eq!(
+        posted.len(),
+        3,
+        "one comment per reporting step, one closing"
+    );
     let brief_marker = &fx.workflow.workflow.steps[0].marker;
     let implementer_marker = &fx.workflow.workflow.steps[1].marker;
     assert!(posted[0].contains(brief_marker.as_str()));
     assert!(posted[0].contains("the brief"));
     assert!(posted[1].contains(implementer_marker.as_str()));
     assert!(posted[1].contains("all landed"));
+
+    // The checks ran on the step that wrote, and they passed.
+    let checks = checks_run(events);
+    assert_eq!(checks.len(), 1, "one checks_run for the writing step");
+    assert_eq!(checks[0].step, "implement-alone");
+    assert_eq!(
+        checks[0]
+            .checks
+            .iter()
+            .map(|c| c.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["E1", "E2", "E3"],
+        "the step's checks, in the workflow's order"
+    );
+    assert!(
+        checks[0]
+            .checks
+            .iter()
+            .all(|check| check.result == aigentic_log::CheckResult::Pass),
+        "the fixture's commits pass every check: {:?}",
+        checks[0].checks
+    );
+
+    // The push landed on the bare remote, and `pushed` says what it moved:
+    // from the remote head the step started at, to its own head.
+    let pushed = pushed_events(events);
+    assert_eq!(pushed.len(), 1, "one push");
+    assert_eq!(
+        pushed[0].ref_after, head,
+        "the pushed ref is the step's head"
+    );
+    assert_eq!(
+        pushed[0]
+            .commits
+            .iter()
+            .map(|commit| commit.subject.as_str())
+            .collect::<Vec<_>>(),
+        vec!["runtime: two", "runtime: one"],
+        "the commits the push carried, as `git log` lists them (newest first)"
+    );
+    assert_eq!(
+        pushed[0].commits.first().map(|commit| commit.sha.as_str()),
+        Some(head.as_str()),
+        "the newest entry is the step's head"
+    );
+    assert_eq!(
+        pushed[0].commits.last().map(|commit| commit.sha.as_str()),
+        Some(fx.git(&["rev-parse", "HEAD~1"]).as_str()),
+        "the oldest entry is the commit the step started from"
+    );
+    assert_eq!(fx.remote_head(), head, "the bare remote has the head");
+
+    // The install is recorded, and names the commit just pushed.
+    assert_eq!(fx.installer.calls(), 1, "the binary is installed once");
+    let installed = pushed[0]
+        .installed
+        .as_deref()
+        .expect("the push records the install");
+    assert!(
+        installed.contains(&head[..12]),
+        "the installed binary names the pushed commit: {installed}"
+    );
+
+    // The closing comment is last, states the report's release impact, and
+    // the issue is closed.
+    let closing = fx.forge.posted().pop().expect("a closing comment");
+    assert!(
+        closing.contains("## Closing"),
+        "the closing comment: {closing}"
+    );
+    assert!(
+        closing.contains("all landed"),
+        "with the implementer's report"
+    );
+    assert!(
+        closing.contains("Release impact: patch"),
+        "the closing states the report's impact: {closing}"
+    );
+    assert_eq!(
+        implementer_report()["release_impact"],
+        json!("patch"),
+        "and the fixture's report is where that came from"
+    );
+    assert!(fx.forge.is_closed(), "the issue is closed");
+
+    let finished = run_finished(events);
+    assert_eq!(
+        finished.outcome,
+        aigentic_log::RunOutcome::Closed,
+        "the run says how it ended"
+    );
+    assert_eq!(
+        finished.release_impact,
+        Some(aigentic_log::ReleaseImpact::Patch),
+        "the closing comment's impact, as the event records it"
+    );
+
+    // The writing step held the write lock; the close released it.
+    assert_eq!(
+        WriteGuard::holder(&fx.repo),
+        None,
+        "the lock is free when the run is over"
+    );
 }
 
 /// T2: `full` → `WaitingHuman{route}`, `budget_usd` set.
@@ -922,13 +1441,15 @@ async fn t2_the_full_route_asks_before_any_child_starts() {
     );
 }
 
-/// T3: rebuild the `Runner` after **every** lead event of T1's run; each
-/// next `advance()` does the move once.
-#[tokio::test]
-async fn t3_a_rebuild_after_every_lead_event_does_each_move_once() {
-    let h = happy_path();
-    let fx = &h.fx;
-    let run = trace(fx).await;
+/// T9: rebuild the `Runner` after **every** lead event of `run`; each
+/// next `advance()` does the move once, and the rebuilt runner never
+/// repeats a move or stops somewhere else.
+async fn sweep_every_prefix(
+    fx: &Fixture,
+    run: &Trace,
+    implementer: Ulid,
+    mut catch_up: impl FnMut() -> bool,
+) {
     let n = run.lead().len();
     assert!(n >= 5, "the happy path is several moves long");
 
@@ -937,7 +1458,11 @@ async fn t3_a_rebuild_after_every_lead_event_does_each_move_once() {
         let (advanced, mut runner) = replay(fx, snapshot).await;
         let after = fx.lead_events();
         if k < n {
-            assert_eq!(advanced, Advanced::Moved, "prefix {k}: a move was due");
+            // A move was due. The last of them ends the run, so the
+            // rebuilt runner's one move finishes it rather than moving on.
+            if run.lead()[k].kind != EventKind::RunFinished {
+                assert_eq!(advanced, Advanced::Moved, "prefix {k}: a move was due");
+            }
             assert_eq!(
                 after.len(),
                 k + 1,
@@ -964,7 +1489,12 @@ async fn t3_a_rebuild_after_every_lead_event_does_each_move_once() {
         }
 
         // Catching up from the rebuilt state changes nothing either.
-        let done = drive(&mut runner).await;
+        let done = if catch_up() {
+            let mut subject = WrongSubject::new(implementer);
+            drive_with(fx, &mut runner, || subject.between(fx, true)).await
+        } else {
+            drive(fx, &mut runner).await
+        };
         assert_eq!(done, run.terminal, "prefix {k}: the same pause");
         assert_eq!(
             kinds(&fx.lead_events()),
@@ -972,6 +1502,19 @@ async fn t3_a_rebuild_after_every_lead_event_does_each_move_once() {
             "prefix {k}: the same moves, once each"
         );
     }
+}
+
+/// T3: rebuild the `Runner` after **every** lead event of T1's run; each
+/// next `advance()` does the move once.
+#[tokio::test]
+async fn t3_a_rebuild_after_every_lead_event_does_each_move_once() {
+    let h = happy_path();
+    let run = trace(&h.fx).await;
+    assert!(
+        run.lead().len() >= 5,
+        "the happy path is several moves long"
+    );
+    sweep_every_prefix(&h.fx, &run, h.implementer_child, || false).await;
 }
 
 /// T4: a cap then a report — `step_finished(1, Partial, "max_iterations")`,
@@ -990,14 +1533,18 @@ async fn t4_a_cap_is_retried_in_the_same_child_with_continue() {
     ])
     .capped(implementer_child, 1);
 
-    let run = trace(&fx).await;
+    let mut committed = false;
+    let run = trace_between(&fx, |_| {
+        commit_what_the_brief_named(&fx, implementer_child, &mut committed)
+    })
+    .await;
     let events = run.lead();
     assert_eq!(
         run.terminal,
-        Advanced::PausedAtChecks {
-            step: "implement-alone".to_owned(),
-            report: child_report(&fx, implementer_child),
-        }
+        Advanced::Finished {
+            outcome: aigentic_log::RunOutcome::Closed,
+        },
+        "the retry passes its checks and closes"
     );
 
     let started = step_started(events);
@@ -1038,13 +1585,17 @@ async fn t4_a_cap_is_retried_in_the_same_child_with_continue() {
     );
     assert!(!messages[0].contains("{{"), "rendered, not raw");
 
-    // Attempt 1 reported nothing, so only the implementer's report is a
-    // comment; the brief's is the other.
+    // Attempt 1 reported nothing, so the comments are the brief's report,
+    // the implementer's, and the run's closing one.
     let posted = fx.forge.posted();
-    assert_eq!(posted.len(), 2);
+    assert_eq!(posted.len(), 3, "two reports and the closing comment");
     assert!(
         posted[1].contains("attempt=2"),
         "the report says which attempt"
+    );
+    assert!(
+        posted[2].contains("## Closing"),
+        "and the last comment closes the run"
     );
 }
 
@@ -1060,7 +1611,7 @@ async fn t5_a_second_cap_escalates() {
     .capped(implementer_child, 1);
 
     let mut runner = fx.runner();
-    let paused = drive(&mut runner).await;
+    let paused = drive(&fx, &mut runner).await;
     assert_eq!(
         paused,
         Advanced::WaitingHuman {
@@ -1097,13 +1648,17 @@ async fn t6_a_turn_that_stops_without_reporting_is_told_to_finish() {
         ),
     ]);
 
-    let run = trace(&fx).await;
+    let mut committed = false;
+    let run = trace_between(&fx, |_| {
+        commit_what_the_brief_named(&fx, implementer_child, &mut committed)
+    })
+    .await;
     assert_eq!(
         run.terminal,
-        Advanced::PausedAtChecks {
-            step: "implement-alone".to_owned(),
-            report: child_report(&fx, implementer_child),
-        }
+        Advanced::Finished {
+            outcome: aigentic_log::RunOutcome::Closed,
+        },
+        "the report arrives and the run closes"
     );
     let messages = prompts(&fx.child_events_of(implementer_child));
     assert_eq!(messages.len(), 2);
@@ -1128,7 +1683,7 @@ async fn t7_a_second_missing_report_escalates() {
 
     let mut runner = fx.runner();
     assert_eq!(
-        drive(&mut runner).await,
+        drive(&fx, &mut runner).await,
         Advanced::WaitingHuman {
             gate: "step_stop".to_owned()
         }
@@ -1155,7 +1710,13 @@ async fn t13_resumed_is_treated_as_done() {
         ),
     ]);
     let run = trace(&fx).await;
-    assert_eq!(pause_step(&run.terminal), "implement-alone");
+    assert_eq!(
+        run.terminal,
+        Advanced::Finished {
+            outcome: aigentic_log::RunOutcome::Closed
+        },
+        "the run goes on to close"
+    );
     // The child is created; nothing else of the attempt exists: the prompt
     // below is the one the run posted, the answer the one it got back.
     fx.restore_child_prefix(
@@ -1186,9 +1747,9 @@ async fn t13_resumed_is_treated_as_done() {
 
     let mut runner = fx.runner();
     assert_eq!(
-        pause_step(&drive(&mut runner).await),
-        "implement-alone",
-        "the repaired turn ends the attempt, not the run"
+        drive(&fx, &mut runner).await,
+        run.terminal,
+        "the repaired turn ends the attempt; the run goes on to close"
     );
     let events = fx.lead_events();
     let finished = step_finished(&events);
@@ -1214,7 +1775,7 @@ async fn t14_a_report_without_a_body_escalates_and_posts_nothing() {
 
     let mut runner = fx.runner();
     assert_eq!(
-        drive(&mut runner).await,
+        drive(&fx, &mut runner).await,
         Advanced::WaitingHuman {
             gate: "step_stop".to_owned()
         }
@@ -1266,9 +1827,9 @@ async fn t16_a_written_report_is_the_attempts_outcome() {
 
     let mut runner = fx.runner();
     assert_eq!(
-        pause_step(&drive(&mut runner).await),
-        "implement-alone",
-        "the run continues past the repaired step"
+        drive(fx, &mut runner).await,
+        run.terminal,
+        "the run continues past the repaired step to its end"
     );
     let lead = fx.lead_events();
     let finished = step_finished(&lead);
@@ -1284,10 +1845,24 @@ async fn t16_a_written_report_is_the_attempts_outcome() {
         1,
         "no second attempt: the turn is not made to run again"
     );
+    let posted = fx.forge.posted();
+    let reports: Vec<&String> = posted
+        .iter()
+        .filter(|body| !body.contains("step=close"))
+        .collect();
     assert_eq!(
-        fx.forge.posted().len(),
+        reports.len(),
         2,
         "the written report is posted once, then the implementer's"
+    );
+    assert_eq!(
+        fx.forge
+            .posted()
+            .iter()
+            .filter(|body| body.contains("step=close"))
+            .count(),
+        1,
+        "and the run closes the issue with its own comment"
     );
     assert!(
         fx.forge.posted()[0].contains("## Brief"),
@@ -1323,7 +1898,13 @@ async fn t17_a_steps_cost_is_the_childrens_usage() {
     assert!(expected > 0.0, "the fixture prices a real cost");
 
     let mut runner = fx.runner();
-    assert_eq!(pause_step(&drive(&mut runner).await), "implement-alone");
+    assert_eq!(
+        drive(&fx, &mut runner).await,
+        Advanced::Finished {
+            outcome: aigentic_log::RunOutcome::Closed
+        },
+        "the priced run closes"
+    );
 
     let events = fx.lead_events();
     let finished = step_finished(&events);
@@ -1370,7 +1951,7 @@ async fn t8_a_rebuild_without_the_child_creates_and_prompts_once() {
         1,
         "one prompt, not two"
     );
-    drive(&mut runner).await;
+    drive(fx, &mut runner).await;
     assert_eq!(
         prompts(&fx.child_events_of(h.brief_child)).len(),
         1,
@@ -1407,7 +1988,7 @@ async fn t8b_a_child_without_the_prompt_gets_exactly_one() {
         1,
         "the existing child is not created again"
     );
-    drive(&mut runner).await;
+    drive(fx, &mut runner).await;
     assert_eq!(prompts(&fx.child_events_of(h.brief_child)).len(), 1);
 }
 
@@ -1426,7 +2007,13 @@ async fn t8c_a_rebuild_before_the_continue_posts_it_once() {
     ])
     .capped(implementer_child, 1);
     let run = trace(&fx).await;
-    assert_eq!(pause_step(&run.terminal), "implement-alone");
+    assert_eq!(
+        run.terminal,
+        Advanced::Finished {
+            outcome: aigentic_log::RunOutcome::Closed
+        },
+        "the run closes"
+    );
 
     // The lead has `step_started(2)`; the child's log holds attempt 1's
     // prompt and its end, but not the `continue`.
@@ -1453,10 +2040,9 @@ async fn t8c_a_rebuild_before_the_continue_posts_it_once() {
         "the `continue` is posted once, after the rendered prompt"
     );
     assert_eq!(messages.iter().filter(|m| *m == CONTINUE_PROMPT).count(), 1);
-    let terminal = drive(&mut runner).await;
+    let terminal = drive(&fx, &mut runner).await;
     assert_eq!(
-        pause_step(&terminal),
-        "implement-alone",
+        terminal, run.terminal,
         "and the run carries on rather than escalating"
     );
 }
@@ -1496,7 +2082,7 @@ async fn t8d_a_rebuild_before_the_retry_starts_it_once() {
     assert_eq!(attempts, vec![1, 1, 2]);
     // The second cap still escalates, exactly as in the full run.
     assert_eq!(
-        drive(&mut runner).await,
+        drive(&fx, &mut runner).await,
         Advanced::WaitingHuman {
             gate: "step_stop".to_owned()
         }
@@ -1517,7 +2103,7 @@ async fn t9_a_rebuild_around_a_post_never_posts_twice() {
     let run = trace(fx).await;
     let full = run.lead();
     let posted = fx.forge.posted();
-    assert_eq!(posted.len(), 2);
+    assert_eq!(posted.len(), 3, "two reports and the closing comment");
 
     // Every lead event boundary of the happy path: rebuild there, catch
     // up, and see the same comments once each. A rebuild *after* a post
@@ -1525,7 +2111,7 @@ async fn t9_a_rebuild_around_a_post_never_posts_twice() {
     for k in 1..=full.len() {
         let snapshot = run.after(k);
         let (_, mut runner) = replay(fx, snapshot).await;
-        drive(&mut runner).await;
+        drive(fx, &mut runner).await;
         let now = fx.forge.posted();
         assert_eq!(
             now, posted,
@@ -1552,7 +2138,7 @@ async fn t9_a_rebuild_around_a_post_never_posts_twice() {
         1,
         "the report is not posted a second time"
     );
-    drive(&mut runner).await;
+    drive(fx, &mut runner).await;
     assert_eq!(
         fx.forge.posted(),
         run.comments(),
@@ -1582,8 +2168,22 @@ async fn t9_a_rebuild_around_a_post_never_posts_twice() {
     let seeded = attempt_two.replace("attempt=2", "attempt=1");
     assert_ne!(seeded, attempt_two, "the tag names the attempt");
     fx.set_comments(vec![seeded]);
-    let run = trace(fx).await;
-    assert_eq!(pause_step(&run.terminal), "implement-alone");
+    // Rebuild from just before the post: the run's last attempt posts its
+    // report again, and the earlier attempt's tag must not suppress it.
+    let before_the_post = first
+        .lead()
+        .iter()
+        .rposition(|event| event.kind == EventKind::StepFinished)
+        .expect("the implementer's step finished");
+    let snapshot = first.after(before_the_post);
+    let (_, mut runner) = replay(fx, snapshot).await;
+    assert_eq!(
+        drive(fx, &mut runner).await,
+        Advanced::Finished {
+            outcome: aigentic_log::RunOutcome::Closed
+        },
+        "the run closes"
+    );
     let now = fx.forge.posted();
     assert_eq!(
         now.iter().filter(|body| body.contains("attempt=1")).count(),
@@ -1604,11 +2204,20 @@ async fn t15_the_second_run_over_a_held_repo_waits() {
     let a = happy_path();
     // The paused run is kept: a dropped runner drops the write lock.
     let mut first = a.fx.runner();
-    assert_eq!(pause_step(&drive(&mut first).await), "implement-alone");
+    // Advance the first run until its writing step starts, which is where
+    // it takes the write lock. Driving it to its end would release the
+    // lock, and the wait below would never be seen.
+    while step_started(&a.fx.lead_events()).len() < 2 {
+        assert_eq!(
+            first.advance().await.expect("the first run advances"),
+            Advanced::Moved,
+            "the first run is still going"
+        );
+    }
     assert_eq!(
         WriteGuard::holder(&a.fx.repo),
         Some(a.fx.lead),
-        "the paused run holds the repo"
+        "the running run holds the repo"
     );
 
     let brief_child = Ulid::generate();
@@ -1620,7 +2229,7 @@ async fn t15_the_second_run_over_a_held_repo_waits() {
     b.repo = a.fx.repo.clone();
     let mut runner = b.runner();
     assert_eq!(
-        drive(&mut runner).await,
+        drive(&b, &mut runner).await,
         Advanced::WaitingHuman {
             gate: "write_lock".to_owned()
         },
@@ -1704,7 +2313,13 @@ async fn t10_slots_reach_the_template_verbatim() {
         (implementer_child, vec![report("r2", implementer_report())]),
     ]);
     let run = trace(&fx).await;
-    assert_eq!(pause_step(&run.terminal), "implement-alone");
+    assert_eq!(
+        run.terminal,
+        Advanced::Finished {
+            outcome: aigentic_log::RunOutcome::Closed
+        },
+        "the run closes"
+    );
 
     let prompt = prompts(&fx.child_events_of(implementer_child))
         .into_iter()
@@ -1895,6 +2510,15 @@ case "$1 $2" in
   "issue view")
     case "$*" in
       *comments*) printf '%s' '{"comments":[{"body":"first"},{"body":"second"}]}' ;;
+      # `close` asks for the state after a failed close: the file the
+      # `issue close` row below leaves behind says which answer to give.
+      *state*)
+        if [ -f "$here/closed" ]; then
+          printf '%s' '{"state":"CLOSED"}'
+        else
+          printf '%s' '{"state":"OPEN"}'
+        fi
+        ;;
       *) printf '%s' '{"title":"A title","body":"A body"}' ;;
     esac
     ;;
@@ -1903,6 +2527,17 @@ case "$1 $2" in
       if [ "$1" = "--body-file" ]; then shift; cp "$1" "$here/body.txt"; fi
       shift
     done
+    ;;
+  "issue close")
+    # `gh` refuses a close when the issue is already closed. A file the
+    # test drops decides whether this attempt is the one that fails.
+    if [ -f "$here/close_fails" ]; then
+      rm -f "$here/close_fails"
+      if [ -f "$here/already_closed" ]; then touch "$here/closed"; fi
+      echo "gh: issue is already closed" >&2
+      exit 1
+    fi
+    touch "$here/closed"
     ;;
   *) echo "fake gh: unexpected args: $*" >&2; exit 1 ;;
 esac
@@ -1914,6 +2549,97 @@ fn write_fake_gh(dir: &std::path::Path) {
     let mut perms = std::fs::metadata(&path).unwrap().permissions();
     std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
     std::fs::set_permissions(&path, perms).unwrap();
+}
+
+/// A `PATH` that finds `dir`'s fake `gh` first, restored when the guard
+/// drops. One test reads or writes `PATH` at a time.
+struct FakeGh {
+    dir: tempfile::TempDir,
+    old: Option<std::ffi::OsString>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl FakeGh {
+    fn new() -> Self {
+        let lock = PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        write_fake_gh(dir.path());
+        let old = std::env::var_os("PATH");
+        let mut path = dir.path().as_os_str().to_os_string();
+        if let Some(old) = &old {
+            path.push(":");
+            path.push(old);
+        }
+        // SAFETY: every test that reads or writes `PATH` holds `PATH_LOCK`.
+        unsafe { std::env::set_var("PATH", &path) };
+        Self {
+            dir,
+            old,
+            _lock: lock,
+        }
+    }
+
+    /// Leave a file the script reads, e.g. `close_fails`.
+    fn touch(&self, name: &str) {
+        std::fs::write(self.dir.path().join(name), "").unwrap();
+    }
+
+    /// A file the script wrote, if it did.
+    fn read(&self, name: &str) -> Option<String> {
+        std::fs::read_to_string(self.dir.path().join(name)).ok()
+    }
+}
+
+impl Drop for FakeGh {
+    fn drop(&mut self) {
+        match &self.old {
+            // SAFETY: as above.
+            Some(previous) => unsafe { std::env::set_var("PATH", previous) },
+            None => unsafe { std::env::remove_var("PATH") },
+        }
+    }
+}
+
+/// T13: `GhForge::close` asks `gh` to close the issue, and an issue that
+/// is already closed is success — a rebuilt runner finishing what a crash
+/// left open. The fake `gh` refuses the close and then reports the state,
+/// which is the pair of calls the real one makes.
+#[test]
+fn t13_gh_forge_closes_an_issue_and_accepts_already_closed() {
+    let gh = FakeGh::new();
+    let forge = GhForge::new();
+
+    // Already closed: `close` fails, the state is CLOSED, so it is done.
+    gh.touch("close_fails");
+    gh.touch("already_closed");
+    assert!(
+        forge.close(65).is_ok(),
+        "an issue that is already closed is success"
+    );
+    assert!(
+        gh.read("closed").is_some(),
+        "the state the fake reported was CLOSED"
+    );
+
+    // Open: `close` fails and the state is OPEN, which is a real failure
+    // and carries the message `gh` gave.
+    drop(gh);
+    let gh = FakeGh::new();
+    gh.touch("close_fails");
+    let err = GhForge::new()
+        .close(65)
+        .expect_err("an open issue that refuses to close is an error");
+    assert!(
+        format!("{err}").contains("already closed"),
+        "the error carries gh's own message: {err}"
+    );
+    assert!(gh.read("closed").is_none(), "nothing was closed");
+
+    // The plain path: `gh issue close` succeeds on the first call.
+    drop(gh);
+    let gh = FakeGh::new();
+    assert!(GhForge::new().close(65).is_ok(), "a clean close");
+    assert!(gh.read("closed").is_some(), "the fake recorded the close");
 }
 
 /// T12: `GhForge` reads the issue's title and body and posts a comment as a
@@ -1954,4 +2680,781 @@ fn t12_gh_forge_reads_the_issue_and_posts_a_comment() {
         Some(previous) => unsafe { std::env::set_var("PATH", previous) },
         None => unsafe { std::env::remove_var("PATH") },
     }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #65: the checks, the send-back, the push, the install, the close
+// ---------------------------------------------------------------------------
+
+/// The happy path with a second scripted reply for the implementer, so a
+/// send-back's attempt 2 has a report to post.
+fn retryable() -> Happy {
+    let brief_child = Ulid::generate();
+    let implementer_child = Ulid::generate();
+    Happy {
+        fx: Fixture::new(vec![
+            (brief_child, vec![report("r1", brief_report())]),
+            (
+                implementer_child,
+                vec![
+                    report("r2", implementer_report()),
+                    report("r3", implementer_report()),
+                ],
+            ),
+        ]),
+        brief_child,
+        implementer_child,
+    }
+}
+
+/// The happy path with the installer a test wants.
+fn happy_path_installed(installer: FakeInstaller) -> Happy {
+    let brief_child = Ulid::generate();
+    let implementer_child = Ulid::generate();
+    Happy {
+        fx: Fixture::new(vec![
+            (brief_child, vec![report("r1", brief_report())]),
+            (implementer_child, vec![report("r2", implementer_report())]),
+        ])
+        .with_installer(installer),
+        brief_child,
+        implementer_child,
+    }
+}
+
+/// The prompts a child was given, in order.
+fn child_prompts(fx: &Fixture, id: Ulid) -> Vec<String> {
+    prompts(&fx.child_events_of(id))
+}
+
+/// Whether a `checks_run` for `step` holds a `fail`.
+fn checks_failed(events: &[Event], step: &str) -> bool {
+    checks_run(events).iter().any(|run| {
+        run.step == step
+            && run
+                .checks
+                .iter()
+                .any(|check| check.result == aigentic_log::CheckResult::Fail)
+    })
+}
+
+/// Drive a run whose implementer commits a subject the brief never named
+/// before the first check reads the repository, and — when `fix` is set —
+/// amends it to the named one as soon as a check has failed.
+async fn drive_a_wrong_subject(fx: &Fixture, implementer: Ulid, fix: bool) -> Trace {
+    let mut runner = fx.runner();
+    let mut snapshots = vec![snapshot(fx)];
+    let mut subject = WrongSubject::new(implementer);
+    let terminal = loop {
+        match runner.advance().await.expect("the run advances") {
+            Advanced::Moved => {
+                subject.between(fx, fix);
+                snapshots.push(snapshot(fx));
+            }
+            other => break other,
+        }
+    };
+    snapshots.push(snapshot(fx));
+    Trace {
+        snapshots,
+        terminal,
+    }
+}
+
+/// T2: a failing check sends the step back once; the fixed attempt passes,
+/// pushes, installs and closes the issue.
+#[tokio::test]
+async fn t2_a_failed_check_sends_the_step_back_and_a_pass_pushes() {
+    let h = retryable();
+    let fx = &h.fx;
+    let run = drive_a_wrong_subject(fx, h.implementer_child, true).await;
+
+    assert_eq!(
+        run.terminal,
+        Advanced::Finished {
+            outcome: aigentic_log::RunOutcome::Closed
+        },
+        "the send-back's attempt passes and the run closes"
+    );
+    let events = run.lead();
+    assert_eq!(gate(events), None, "no gate is asked");
+
+    // The step was started twice, on the same child.
+    let started: Vec<_> = step_started(events)
+        .into_iter()
+        .filter(|started| started.step == "implement-alone")
+        .collect();
+    assert_eq!(started.len(), 2, "one start per attempt");
+    assert_eq!(started[0].attempt, 1);
+    assert_eq!(started[1].attempt, 2);
+    assert_eq!(
+        started[1].child_thread, h.implementer_child,
+        "the send-back continues in the step's own child"
+    );
+
+    // The send-back reads as a first attempt with the failures in it.
+    let prompts = child_prompts(fx, h.implementer_child);
+    assert_eq!(prompts.len(), 2, "one prompt per attempt");
+    assert!(
+        prompts[1].contains("Sent back by the runner"),
+        "the second prompt is the send-back: {}",
+        prompts[1]
+    );
+    assert!(
+        prompts[1].contains("- E2:"),
+        "and it names the failing check: {}",
+        prompts[1]
+    );
+    assert!(
+        prompts[1].contains(&issue_view().title),
+        "the send-back is the same brief, not a bare message"
+    );
+
+    // Two check runs: the first fails, the amender's passes.
+    let checks = checks_run(events);
+    assert_eq!(checks.len(), 2, "one run per attempt");
+    assert!(
+        checks_failed(events, "implement-alone"),
+        "the first run failed on the wrong subject"
+    );
+    assert!(
+        checks[1]
+            .checks
+            .iter()
+            .all(|check| check.result == aigentic_log::CheckResult::Pass),
+        "the amended commits pass: {:?}",
+        checks[1].checks
+    );
+
+    // The push carried the amended commit, and the run closed.
+    let head = fx.head();
+    let pushed = pushed_events(events);
+    assert_eq!(pushed.len(), 1, "one push, after the checks passed");
+    assert_eq!(pushed[0].ref_after, head);
+    assert_eq!(
+        pushed[0]
+            .commits
+            .iter()
+            .map(|commit| commit.subject.as_str())
+            .collect::<Vec<_>>(),
+        vec!["runtime: two", "runtime: one"],
+        "the amended subject, newest first"
+    );
+    assert_eq!(fx.remote_head(), head, "the remote has the amended head");
+    assert!(fx.forge.is_closed(), "the issue is closed");
+    assert_eq!(
+        run_finished(events).outcome,
+        aigentic_log::RunOutcome::Closed
+    );
+}
+
+/// T3: a second failing run of the checks escalates instead of pushing.
+#[tokio::test]
+async fn t3_a_second_failed_check_escalates_without_pushing() {
+    let h = retryable();
+    let fx = &h.fx;
+    let run = drive_a_wrong_subject(fx, h.implementer_child, false).await;
+
+    assert_eq!(
+        run.terminal,
+        Advanced::WaitingHuman {
+            gate: "checks_failed".to_owned()
+        },
+        "twice failed is the human's problem"
+    );
+    let events = run.lead();
+    let checks = checks_run(events);
+    assert_eq!(checks.len(), 2, "one failing run per attempt");
+    assert!(
+        checks.iter().all(|run| run
+            .checks
+            .iter()
+            .any(|c| c.result == aigentic_log::CheckResult::Fail)),
+        "both runs failed"
+    );
+    assert_eq!(
+        step_started(events)
+            .into_iter()
+            .filter(|started| started.step == "implement-alone")
+            .count(),
+        2,
+        "a second failure starts no third attempt"
+    );
+    assert!(
+        pushed_events(events).is_empty(),
+        "nothing is pushed after a second failure"
+    );
+    assert_eq!(
+        fx.remote_head(),
+        fx.initial_head(),
+        "the remote never moved"
+    );
+    assert_eq!(fx.installer.calls(), 0, "and nothing is installed");
+    assert!(!fx.forge.is_closed());
+    let shown = gate_shown(events);
+    assert!(
+        shown.iter().any(|line| line.contains("E2")),
+        "the gate names the failing check: {shown:?}"
+    );
+}
+
+/// T4: a remote that moved while the step ran is never pushed over.
+#[tokio::test]
+async fn t4_a_remote_that_moved_is_never_pushed_over() {
+    let h = happy_path();
+    let fx = &h.fx;
+    let mut runner = fx.runner();
+    let mut committed = false;
+    let mut stranger = None;
+    let advanced = loop {
+        let advanced = runner.advance().await.expect("the run advances");
+        let reported = fx
+            .child_events_of(h.implementer_child)
+            .iter()
+            .any(|event| event.kind == EventKind::StepReported);
+        if reported && !committed && fx.head() == fx.initial_head() {
+            commit_what_the_brief_named(fx, h.implementer_child, &mut committed);
+        }
+        if committed && stranger.is_none() {
+            // Someone else pushes while the step is still running.
+            stranger = Some(fx.push_a_stranger());
+        }
+        if !matches!(advanced, Advanced::Moved) {
+            break advanced;
+        }
+    };
+
+    assert_eq!(
+        advanced,
+        Advanced::WaitingHuman {
+            gate: "remote_moved".to_owned()
+        },
+        "the moved remote stops the run"
+    );
+    let events = fx.lead_events();
+    assert!(
+        pushed_events(&events).is_empty(),
+        "the step's commits are not pushed over the stranger's"
+    );
+    assert_eq!(
+        fx.remote_head(),
+        stranger.unwrap(),
+        "the remote holds the stranger's commit, not the step's"
+    );
+    let shown = gate_shown(&events);
+    assert!(
+        shown
+            .iter()
+            .any(|line| line.contains("remote moved during the step")),
+        "the gate says what happened: {shown:?}"
+    );
+    assert_eq!(fx.installer.calls(), 0, "nothing is installed");
+}
+
+/// T5: the push landed but the process died before `pushed`; a rebuild
+/// pushes nothing again and records the push once.
+#[tokio::test]
+async fn t5_a_crash_between_push_and_pushed_does_not_push_twice() {
+    let h = happy_path();
+    let fx = &h.fx;
+    let run = trace(fx).await;
+    let head = fx.head();
+
+    // Back to the moment the checks passed, then the push happens and the
+    // process dies with `pushed` unwritten.
+    let snapshot = run.after_where(EventKind::ChecksRun, 1);
+    fx.restore(snapshot);
+    fx.rewind_forge(snapshot);
+    fx.git(&["push", "origin", "main"]);
+    assert_eq!(fx.remote_head(), head, "the push landed before the crash");
+    assert!(
+        pushed_events(&fx.lead_events()).is_empty(),
+        "and the lead log never heard of it"
+    );
+
+    let mut runner = fx.runner();
+    let advanced = drive(fx, &mut runner).await;
+    assert_eq!(
+        advanced,
+        Advanced::Finished {
+            outcome: aigentic_log::RunOutcome::Closed
+        },
+        "the rebuilt run closes"
+    );
+    let events = fx.lead_events();
+    let pushed = pushed_events(&events);
+    assert_eq!(pushed.len(), 1, "the push is recorded once");
+    assert_eq!(pushed[0].ref_after, head);
+    assert_eq!(
+        pushed[0].ref_before,
+        fx.initial_head(),
+        "from the base the step started at"
+    );
+    assert_eq!(
+        fx.remote_head(),
+        head,
+        "the remote is where the step left it"
+    );
+    // The rebuild installed again: the crash left no `pushed` event, and
+    // an install of the same commit is a no-op that `--force` repeats
+    // safely. Only the push is guarded, because only a push can be lost.
+    assert!(fx.installer.calls() >= 1, "the step's commit was installed");
+    assert_eq!(run_finished_all(&events).len(), 1, "and one run_finished");
+}
+
+/// T6a: the push is recorded but the process died before the close; a
+/// rebuild posts the closing comment once and finishes once.
+#[tokio::test]
+async fn t6a_a_crash_after_pushed_posts_the_closing_comment_once() {
+    let h = happy_path();
+    let fx = &h.fx;
+    let run = trace(fx).await;
+
+    let snapshot = run.after_where(EventKind::Pushed, 1);
+    assert_eq!(
+        snapshot.comments.len(),
+        2,
+        "the two reports, not yet the closing one"
+    );
+    fx.restore(snapshot);
+    fx.rewind_forge(snapshot);
+
+    let mut runner = fx.runner();
+    let advanced = drive(fx, &mut runner).await;
+    assert_eq!(
+        advanced,
+        Advanced::Finished {
+            outcome: aigentic_log::RunOutcome::Closed
+        }
+    );
+    let posted = fx.forge.posted();
+    assert_eq!(posted.len(), 3, "one closing comment, not two");
+    assert_eq!(
+        posted
+            .iter()
+            .filter(|comment| comment.contains("## Closing"))
+            .count(),
+        1
+    );
+    assert!(fx.forge.is_closed());
+    assert_eq!(
+        run_finished_all(&fx.lead_events()).len(),
+        1,
+        "run_finished once"
+    );
+}
+
+/// T6b: a close that fails once is retried by the rebuild, which posts no
+/// second closing comment.
+#[tokio::test]
+async fn t6b_a_close_that_fails_is_retried_without_a_second_comment() {
+    let h = happy_path();
+    let fx = &h.fx;
+    let run = trace(fx).await;
+    let snapshot = run.after_where(EventKind::Pushed, 1);
+    fx.restore(snapshot);
+    fx.rewind_forge(snapshot);
+
+    fx.forge.fail_close(1);
+    let mut runner = fx.runner();
+    let err = runner
+        .advance()
+        .await
+        .expect_err("the forge is down for a moment");
+    assert!(
+        matches!(err, RunnerError::Forge(_)),
+        "the close failure is a forge error: {err}"
+    );
+    assert!(
+        fx.forge
+            .posted()
+            .iter()
+            .any(|comment| comment.contains("## Closing")),
+        "the closing comment landed before the close failed"
+    );
+    assert!(!fx.forge.is_closed());
+
+    // The rebuild finds the comment already posted and closes.
+    let mut runner = fx.runner();
+    let advanced = drive(fx, &mut runner).await;
+    assert_eq!(
+        advanced,
+        Advanced::Finished {
+            outcome: aigentic_log::RunOutcome::Closed
+        }
+    );
+    let posted = fx.forge.posted();
+    assert_eq!(posted.len(), 3, "the rebuild posts nothing again");
+    assert_eq!(
+        posted
+            .iter()
+            .filter(|comment| comment.contains("## Closing"))
+            .count(),
+        1
+    );
+    assert!(fx.forge.is_closed());
+    assert_eq!(run_finished_all(&fx.lead_events()).len(), 1);
+}
+
+/// T6c: the closing comment and the close both landed, and the process
+/// died before `run_finished`; the rebuild repeats neither.
+#[tokio::test]
+async fn t6c_a_closing_comment_already_posted_is_not_posted_again() {
+    let h = happy_path();
+    let fx = &h.fx;
+    let run = trace(fx).await;
+    let snapshot = run.after_where(EventKind::Pushed, 1);
+    fx.restore(snapshot);
+
+    // The forge holds the closing comment and the closed issue; the lead
+    // log's last event is still `pushed`.
+    let tag = format!("<!-- aigentic run={} step=close -->", fx.lead);
+    let mut comments = snapshot.comments.clone();
+    comments.push(format!(
+        "## Closing\n\nall landed\n\nRelease impact: patch\n\n{tag}"
+    ));
+    fx.set_comments(comments);
+    fx.forge.set_closed(true);
+
+    let mut runner = fx.runner();
+    let advanced = drive(fx, &mut runner).await;
+    assert_eq!(
+        advanced,
+        Advanced::Finished {
+            outcome: aigentic_log::RunOutcome::Closed
+        },
+        "an already closed issue is a success"
+    );
+    let posted = fx.forge.posted();
+    assert_eq!(posted.len(), 3, "no second closing comment");
+    assert_eq!(
+        posted
+            .iter()
+            .filter(|comment| comment.contains("## Closing"))
+            .count(),
+        1
+    );
+    let events = fx.lead_events();
+    assert_eq!(run_finished_all(&events).len(), 1, "run_finished once");
+    assert_eq!(
+        run_finished(&events).outcome,
+        aigentic_log::RunOutcome::Closed
+    );
+}
+
+/// T7: a binary that does not name the pushed commit stops the run.
+#[tokio::test]
+async fn t7_an_install_that_does_not_name_the_head_escalates() {
+    let h = happy_path_installed(FakeInstaller::new("aigentic 0.0.0 (000000000000)"));
+    let fx = &h.fx;
+    let run = trace(fx).await;
+
+    assert_eq!(
+        run.terminal,
+        Advanced::WaitingHuman {
+            gate: "install_mismatch".to_owned()
+        },
+        "an install of something else is not the step's head"
+    );
+    let events = run.lead();
+    let head = fx.head();
+    assert_eq!(
+        fx.remote_head(),
+        head,
+        "the push had already landed when the install was judged"
+    );
+    assert!(
+        pushed_events(events).is_empty(),
+        "and `pushed` was not written, so a rebuild retries from the push"
+    );
+    assert_eq!(fx.installer.calls(), 1, "the install was asked once");
+    let shown = gate_shown(events);
+    assert!(
+        shown.iter().any(|line| line.contains("000000000000")),
+        "the gate says what the binary answered: {shown:?}"
+    );
+    assert!(
+        shown.iter().any(|line| line.contains(&head)),
+        "and which commit it should have named: {shown:?}"
+    );
+}
+
+/// T8: a gate answered `stop` finishes the run and gives the write lock
+/// back.
+#[tokio::test]
+async fn t8_a_stop_answer_finishes_the_run_and_releases_the_lock() {
+    let brief_child = Ulid::generate();
+    let mut full = brief_report();
+    full["slots"]["size"] = json!("full");
+    full["slots"]["budget"] = json!(4);
+    let fx = Fixture::new(vec![(brief_child, vec![report("r1", full)])]);
+
+    // The `full` route asks the human before it starts a step.
+    let mut runner = fx.runner();
+    let paused = loop {
+        match runner.advance().await.expect("the run advances") {
+            Advanced::Moved => {}
+            other => break other,
+        }
+    };
+    assert_eq!(
+        paused,
+        Advanced::WaitingHuman {
+            gate: "route".to_owned()
+        }
+    );
+
+    // The human says stop.
+    let mut log = ThreadLog::open(fx.dir.path(), fx.lead).unwrap();
+    log.append(aigentic_log::NewEvent {
+        kind: EventKind::CheckpointAnswered,
+        author: Author::User(UserId("steve".into())),
+        payload: json!({"answer": "stop", "marks": []}),
+        parent_event: None,
+    })
+    .unwrap();
+
+    let mut runner = fx.runner();
+    let advanced = runner.advance().await.expect("the answer is read");
+    assert_eq!(
+        advanced,
+        Advanced::Finished {
+            outcome: aigentic_log::RunOutcome::Stopped
+        },
+        "a stop ends the run"
+    );
+    let events = fx.lead_events();
+    let finished = run_finished(&events);
+    assert_eq!(finished.outcome, aigentic_log::RunOutcome::Stopped);
+    assert_eq!(run_finished_all(&events).len(), 1, "run_finished once");
+    // The lock is free: nobody holds it any more.
+    assert_eq!(
+        WriteGuard::holder(&fx.repo),
+        None,
+        "the write lock was released"
+    );
+}
+
+/// T9: T2's run, rebuilt after every one of its lead events, does each
+/// move once — the send-back and the amend included.
+#[tokio::test]
+async fn t9_a_rebuild_around_every_lead_event_does_each_move_once() {
+    let h = retryable();
+    let fx = &h.fx;
+    let run = drive_a_wrong_subject(fx, h.implementer_child, true).await;
+    assert_eq!(
+        run.terminal,
+        Advanced::Finished {
+            outcome: aigentic_log::RunOutcome::Closed
+        },
+        "the send-back's run closes"
+    );
+    sweep_every_prefix(fx, &run, h.implementer_child, || true).await;
+}
+
+/// T14: a check id the workflow does not have stops the run before
+/// anything is pushed.
+#[tokio::test]
+async fn t14_an_unknown_check_id_escalates_without_pushing() {
+    let brief_child = Ulid::generate();
+    let implementer_child = Ulid::generate();
+    let fx = Fixture::new(vec![
+        (brief_child, vec![report("r1", brief_report())]),
+        (implementer_child, vec![report("r2", implementer_report())]),
+    ])
+    .with_checks(&["E9"]);
+
+    let mut runner = fx.runner();
+    let advanced = drive(&fx, &mut runner).await;
+    assert_eq!(
+        advanced,
+        Advanced::WaitingHuman {
+            gate: "checks_error".to_owned()
+        },
+        "an unknown check is an error, not a pass"
+    );
+    let events = fx.lead_events();
+    assert!(
+        checks_run(&events).is_empty(),
+        "no checks_run is written for a run that could not check"
+    );
+    assert!(pushed_events(&events).is_empty(), "nothing is pushed");
+    assert_eq!(fx.remote_head(), fx.initial_head());
+    assert_eq!(fx.installer.calls(), 0);
+    let shown = gate_shown(&events);
+    assert!(
+        shown.iter().any(|line| line.contains("implement-alone")),
+        "the gate names the step: {shown:?}"
+    );
+}
+
+/// T15: a `step_started` written before the start fields existed leaves
+/// the run without a base, so it stops rather than guessing one.
+#[tokio::test]
+async fn t15_a_step_started_without_the_start_fields_escalates() {
+    let h = happy_path();
+    let fx = &h.fx;
+    let run = trace(fx).await;
+
+    // Back to the implementer's `step_started`, with the start fields
+    // taken out of it: a log from before #65 reads like this.
+    let snapshot = run.after_where(EventKind::StepStarted, 2);
+    fx.restore(snapshot);
+    let mut events = fx.lead_events();
+    for event in &mut events {
+        if event.kind == EventKind::StepStarted {
+            let payload = event.payload.as_object_mut().expect("a payload object");
+            payload.remove("head_at_start");
+            payload.remove("remote_at_start");
+        }
+    }
+    write_events(&fx.dir.path().join(format!("{}.jsonl", fx.lead)), &events);
+
+    let mut runner = fx.runner();
+    let advanced = drive(fx, &mut runner).await;
+    assert_eq!(
+        advanced,
+        Advanced::WaitingHuman {
+            gate: "no_start_record".to_owned()
+        },
+        "without a base the run cannot judge the step's commits"
+    );
+    let events = fx.lead_events();
+    let shown = gate_shown(&events);
+    assert!(
+        shown.iter().any(|line| line == "implement-alone"),
+        "the gate names the step: {shown:?}"
+    );
+    assert!(
+        shown.iter().any(|line| line == "head_at_start"),
+        "and the field it is missing: {shown:?}"
+    );
+    assert!(
+        checks_run(&events).is_empty(),
+        "no check ran against a guessed base"
+    );
+    assert!(pushed_events(&events).is_empty());
+    assert_eq!(fx.remote_head(), fx.initial_head());
+}
+
+/// T16: a writing step that does not push stops after its checks.
+#[tokio::test]
+async fn t16_a_step_that_does_not_push_escalates() {
+    let brief_child = Ulid::generate();
+    let implementer_child = Ulid::generate();
+    let fx = Fixture::new(vec![
+        (brief_child, vec![report("r1", brief_report())]),
+        (implementer_child, vec![report("r2", implementer_report())]),
+    ])
+    .without_push();
+
+    let mut runner = fx.runner();
+    let advanced = drive(&fx, &mut runner).await;
+    assert_eq!(
+        advanced,
+        Advanced::WaitingHuman {
+            gate: "no_push".to_owned()
+        },
+        "a writing step that pushes nothing is the human's to judge"
+    );
+    let events = fx.lead_events();
+    assert_eq!(
+        checks_run(&events).len(),
+        1,
+        "the checks still ran before the push was due"
+    );
+    assert!(pushed_events(&events).is_empty());
+    assert_eq!(fx.remote_head(), fx.initial_head());
+    assert_eq!(fx.installer.calls(), 0, "and nothing is installed");
+}
+
+/// T17: a routed step's checks do not swallow its route.
+#[tokio::test]
+async fn t17_a_routed_step_with_checks_still_takes_its_route() {
+    let brief_child = Ulid::generate();
+    let implementer_child = Ulid::generate();
+    // The brief decides the route; give it a check id that would stop the
+    // run if a routed step ever ran the checks it was given.
+    let fx = &Fixture::new(vec![
+        (brief_child, vec![report("r1", brief_report())]),
+        (implementer_child, vec![report("r2", implementer_report())]),
+    ])
+    .with_checks_for("brief", &["E9"]);
+    let run = trace(fx).await;
+
+    assert_eq!(
+        run.terminal,
+        Advanced::Finished {
+            outcome: aigentic_log::RunOutcome::Closed
+        },
+        "the routed run still closes"
+    );
+    let events = run.lead();
+    let taken = route_taken(events).expect("the route is still written down");
+    assert_eq!(taken.proposed, "trivial");
+    let checks = checks_run(events);
+    assert_eq!(checks.len(), 1, "one checks_run for the run");
+    assert_eq!(
+        checks[0].step, "implement-alone",
+        "a routed step runs no checks of its own"
+    );
+}
+
+/// T18: a `budget_warned` between the failing checks and the send-back
+/// does not hide the failure from attempt 2's prompt.
+#[tokio::test]
+async fn t18_a_budget_warning_between_the_failure_and_the_send_back_keeps_it() {
+    let h = retryable();
+    let fx = &h.fx;
+    let mut runner = fx.runner();
+    let mut committed = false;
+    loop {
+        let advanced = runner.advance().await.expect("the run advances");
+        let reported = fx
+            .child_events_of(h.implementer_child)
+            .iter()
+            .any(|event| event.kind == EventKind::StepReported);
+        if reported && !committed && fx.head() == fx.initial_head() {
+            fx.commit_named("runtime: one");
+            fx.commit_named("runtime: wrong");
+            committed = true;
+        }
+        if checks_failed(&fx.lead_events(), "implement-alone") {
+            break;
+        }
+        assert!(
+            matches!(advanced, Advanced::Moved),
+            "the run reaches its failing checks"
+        );
+    }
+
+    // A budget warning lands between the failure and the send-back.
+    let mut log = ThreadLog::open(fx.dir.path(), fx.lead).unwrap();
+    log.append(aigentic_log::NewEvent {
+        kind: EventKind::BudgetWarned,
+        author: Author::Agent(AgentId("runner".into())),
+        payload: serde_json::to_value(aigentic_log::BudgetWarnedPayload {
+            scope: aigentic_log::BudgetScope::Issue,
+            spent_usd: 2.6,
+            limit_usd: 3.0,
+        })
+        .unwrap(),
+        parent_event: None,
+    })
+    .unwrap();
+
+    // The rebuilt runner still sends the step back with the failure in it.
+    let mut runner = fx.runner();
+    assert_eq!(
+        runner.advance().await.expect("the run advances"),
+        Advanced::Moved,
+        "the send-back starts attempt 2"
+    );
+    let prompts = child_prompts(fx, h.implementer_child);
+    assert_eq!(prompts.len(), 2, "one prompt per attempt");
+    assert!(
+        prompts[1].contains("- E2:"),
+        "the warning between the two moves changed nothing: {}",
+        prompts[1]
+    );
 }

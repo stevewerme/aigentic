@@ -30,10 +30,20 @@ use crate::config::Config;
 use crate::project_cmd::ProjectCommand;
 use crate::skills_cmd::{SkillPaths, SkillsCommand};
 
+/// The version `aigentic --version` prints: the package version, and the
+/// commit the binary was built from. The commit is put in the environment
+/// by `build.rs`, which reads it out of the repository's git directory.
+const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("AIGENTIC_GIT_SHA"),
+    ")"
+);
+
 #[derive(Debug, Parser)]
 #[command(
     name = "aigentic",
-    version,
+    version = VERSION,
     about = "Aigentic agent harness, streaming REPL"
 )]
 struct Cli {
@@ -695,6 +705,34 @@ mod tests {
     use super::*;
     use clap::Parser;
     use ulid::Ulid;
+
+    /// Issue #65: `aigentic --version` shows the package version and the
+    /// commit the binary was built from, so a run can say which binary a
+    /// thread actually used. The sha may be `unknown` off a checkout.
+    #[test]
+    fn version_names_the_package_and_the_commit() {
+        let sha = VERSION
+            .strip_prefix(env!("CARGO_PKG_VERSION"))
+            .and_then(|rest| rest.strip_prefix(" ("))
+            .and_then(|rest| rest.strip_suffix(')'))
+            .unwrap_or_else(|| panic!("not `version (sha)`: {VERSION}"));
+        assert_eq!(sha.len(), 12, "a short sha is twelve characters: {sha}");
+        assert!(
+            sha == "unknown"
+                || sha
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
+            "neither a short sha nor `unknown`: {sha}"
+        );
+
+        let cli = Cli::try_parse_from(["aigentic", "--version"]).unwrap_err();
+        assert_eq!(
+            cli.kind(),
+            clap::error::ErrorKind::DisplayVersion,
+            "--version is clap's, not an argument error"
+        );
+        assert!(cli.to_string().contains(VERSION), "{}", cli);
+    }
 
     /// Issue #31: `stats` takes its own `--since` and `--json`, and the
     /// global `--project` still reaches it.

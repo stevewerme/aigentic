@@ -226,24 +226,29 @@ impl Call {
     }
 
     /// The E4 edit table: `edit_file` and `write_file` write, a bash call
-    /// writes when any of its segments does.
+    /// writes when any of its segments does. A file write to a temp path
+    /// is not an edit: the gate writes its log to `/tmp` (#65), and a
+    /// scratch file outside the repo changes nothing the gate checked.
+    /// A missing path stays an edit: it names nothing that is provably
+    /// outside the repo.
     fn is_edit(&self) -> bool {
         match self.name.as_str() {
-            "edit_file" | "write_file" => true,
+            "edit_file" | "write_file" => !self.path().is_some_and(to_temp),
             "bash" => self.command().is_some_and(is_an_edit),
             _ => false,
         }
+    }
+
+    /// The path an `edit_file` or `write_file` names.
+    fn path(&self) -> Option<&str> {
+        self.args.get("path").and_then(|value| value.as_str())
     }
 
     /// What the call touched, for a detail that names the edit.
     fn what(&self) -> String {
         match self.name.as_str() {
             "edit_file" | "write_file" => {
-                let path = self
-                    .args
-                    .get("path")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("?");
+                let path = self.path().unwrap_or("?");
                 format!("{} {path}", self.name)
             }
             "bash" => format!("bash {:?}", elide(self.command().unwrap_or(""), 120)),

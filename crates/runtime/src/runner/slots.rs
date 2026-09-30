@@ -17,6 +17,7 @@ use crate::workflow::Step;
 use crate::workflow::render::trailer_model;
 
 use super::forge::Forge;
+use super::git::Repo;
 use super::host::RunnerHost;
 use super::{Runner, RunnerError};
 
@@ -45,7 +46,7 @@ fn commits_text(items: &[Value]) -> Option<String> {
 // template line)
 // ---------------------------------------------------------------------------
 
-impl<F: Forge, H: RunnerHost> Runner<F, H> {
+impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
     /// The slot map one step's template is rendered with: every earlier
     /// step's report, then the runner's own slots, which win.
     pub fn slot_map(&self, step: &Step) -> Result<BTreeMap<String, Value>, RunnerError> {
