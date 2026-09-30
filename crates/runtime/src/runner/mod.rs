@@ -684,11 +684,20 @@ impl<F: Forge, H: RunnerHost> Runner<F, H> {
         };
         let end: TurnEndedPayload = serde_json::from_value(end.payload.clone())
             .map_err(|_| RunnerError::Host(format!("child {child}: unreadable turn_ended")))?;
+        // The price the child's runtime stamped on each call, inside its
+        // `usage`: `payload["cost_usd"]` at the top level is always absent,
+        // which is why this used to sum to an empty `-0.0`. A `fold` from a
+        // positive zero keeps a run with no prices from writing `-0.0`.
         let cost_usd: f64 = tail
             .iter()
             .filter(|e| e.kind == EventKind::AssistantMessage)
-            .filter_map(|e| e.payload.get("cost_usd").and_then(Value::as_f64))
-            .sum();
+            .filter_map(|e| {
+                e.payload
+                    .get("usage")
+                    .and_then(|usage| usage.get("cost_usd"))
+                    .and_then(Value::as_f64)
+            })
+            .fold(0.0_f64, |total, cost| total + cost);
         let reported = tail
             .iter()
             .rev()

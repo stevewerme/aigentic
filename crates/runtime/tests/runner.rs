@@ -17,7 +17,7 @@ use aigentic_runtime::runner::{
     Advanced, FakeForge, Forge, GhForge, IssueView, Runner, RunnerError, RunnerHost, WriteGuard,
 };
 use aigentic_runtime::workflow::{LoadedWorkflow, WorkflowFile, WorkflowOrigin};
-use aigentic_runtime::{Answer, Approver, Runtime};
+use aigentic_runtime::{Answer, Approver, Prices, Runtime};
 use aigentic_runtime::{
     STEP_REPORTED,
     runner::{CALL_FINISH_STEP, CONTINUE_PROMPT},
@@ -182,6 +182,9 @@ struct FakeHost {
     planned: Mutex<VecDeque<(Ulid, Vec<Vec<ProviderEvent>>)>>,
     scripts: Mutex<BTreeMap<Ulid, Vec<Vec<ProviderEvent>>>>,
     models: BTreeMap<String, String>,
+    /// The price table a child's runtime is built with, so a test can see
+    /// a real `usage.cost_usd` on its lines.
+    prices: Option<Prices>,
 }
 
 impl FakeHost {
@@ -190,6 +193,7 @@ impl FakeHost {
         lead: Ulid,
         children: &[(Ulid, Vec<Vec<ProviderEvent>>)],
         caps: BTreeMap<Ulid, u32>,
+        prices: Option<Prices>,
     ) -> Self {
         Self {
             dir,
@@ -201,6 +205,7 @@ impl FakeHost {
                 ("kimi".to_owned(), "tensorx/kimi-k2".to_owned()),
                 ("flash".to_owned(), "tensorx/deepseek-v4.1-flash".to_owned()),
             ]),
+            prices,
         }
     }
 }
@@ -258,7 +263,7 @@ impl RunnerHost for FakeHost {
     fn build_child(
         &mut self,
         id: Ulid,
-        _profile: &str,
+        profile: &str,
         step: &str,
         deny: &[String],
     ) -> Result<Runtime, RunnerError> {
@@ -280,7 +285,7 @@ impl RunnerHost for FakeHost {
         let (provider, _seen) = scripted(script.into_iter().skip(answered).collect());
         let registry: ToolRegistry = vec![Box::new(Noop) as Box<dyn aigentic_core::Tool>].into();
         let cap = self.caps.get(&id).copied().unwrap_or(50);
-        let runtime = Runtime::new(provider, registry, log, AgentId("child".into()))
+        let mut runtime = Runtime::new(provider, registry, log, AgentId("child".into()))
             .with_policy(Policy::defaults())
             .with_approver(Box::new(Yes))
             .with_budget(Budget {
@@ -290,6 +295,11 @@ impl RunnerHost for FakeHost {
                 cache_read_price_ratio: 0.25,
             })
             .with_step(step, deny)?;
+        // A test that wants a real `usage.cost_usd` on the child's lines
+        // prices this child's endpoint; an unpriced host behaves as before.
+        if let Some(prices) = self.prices.clone() {
+            runtime.set_pricing(profile, Some(prices));
+        }
         Ok(runtime)
     }
 
@@ -325,6 +335,7 @@ struct Fixture {
     forge: Arc<FakeForge>,
     workflow: LoadedWorkflow,
     caps: BTreeMap<Ulid, u32>,
+    prices: Option<Prices>,
 }
 
 impl Fixture {
@@ -366,12 +377,20 @@ impl Fixture {
             forge,
             workflow,
             caps: BTreeMap::new(),
+            prices: None,
         }
     }
 
     /// Give a child a turn cap, so a scripted turn can end on it.
     fn capped(mut self, id: Ulid, max_iterations: u32) -> Self {
         self.caps.insert(id, max_iterations);
+        self
+    }
+
+    /// Price the children's endpoint, so their `usage` lines carry a real
+    /// `cost_usd` for the runner to sum.
+    fn priced(mut self, prices: Prices) -> Self {
+        self.prices = Some(prices);
         self
     }
 
@@ -383,6 +402,7 @@ impl Fixture {
             self.lead,
             &self.children,
             self.caps.clone(),
+            self.prices.clone(),
         );
         Runner::new(
             log,
@@ -1218,6 +1238,62 @@ async fn t14_a_report_without_a_body_escalates_and_posts_nothing() {
     );
 }
 
+/// T17: a step's cost is the price its children's `usage` lines carry,
+/// summed, and `-0.0` never appears.
+#[tokio::test]
+async fn t17_a_steps_cost_is_the_childrens_usage() {
+    // The same two-report world as `happy_path`, priced.
+    let brief_child = Ulid::generate();
+    let implementer_child = Ulid::generate();
+    let prices = Prices {
+        input: 3.0,
+        cache_read: 0.5,
+        cache_write: 4.0,
+        output: 15.0,
+    };
+    let fx = Fixture::new(vec![
+        (brief_child, vec![report("r1", brief_report())]),
+        (implementer_child, vec![report("r2", implementer_report())]),
+    ])
+    .priced(prices);
+    // The expected cost comes from the fixture's own price table and the
+    // tokens the scripts report (`usage(10, 5)`).
+    let expected = prices.cost_usd(&aigentic_log::Usage::reported(aigentic_core::Usage {
+        input_tokens: 10,
+        output_tokens: 5,
+        ..Default::default()
+    }));
+    assert!(expected > 0.0, "the fixture prices a real cost");
+
+    let mut runner = fx.runner();
+    assert_eq!(pause_step(&drive(&mut runner).await), "implement-alone");
+
+    let events = fx.lead_events();
+    let finished = step_finished(&events);
+    assert_eq!(
+        finished[0].cost_usd, expected,
+        "the brief's step cost is its child's usage"
+    );
+    assert_eq!(
+        finished[1].cost_usd, expected,
+        "the implementer's step cost is its child's usage"
+    );
+    for step in &finished {
+        assert_ne!(
+            step.cost_usd.to_bits(),
+            (-0.0_f64).to_bits(),
+            "`-0.0` never appears"
+        );
+    }
+    let state = run_state(&events).unwrap();
+    assert_eq!(state.cost_usd, expected * 2.0, "the run sums its steps");
+    assert_eq!(
+        runner.state().unwrap().cost_usd,
+        expected * 2.0,
+        "the runner's own state agrees"
+    );
+}
+
 /// T8: rebuild after `step_started`, no child log → one child, one prompt.
 #[tokio::test]
 async fn t8_a_rebuild_without_the_child_creates_and_prompts_once() {
@@ -1620,7 +1696,13 @@ async fn t10_slots_reach_the_template_verbatim() {
         );
     }
     let budget = &fx.workflow.workflow.budget;
-    let host = FakeHost::new(fx.dir.path().to_path_buf(), fx.lead, &[], BTreeMap::new());
+    let host = FakeHost::new(
+        fx.dir.path().to_path_buf(),
+        fx.lead,
+        &[],
+        BTreeMap::new(),
+        None,
+    );
     for (name, expected) in [
         ("issue", fx.issue().to_string()),
         (
