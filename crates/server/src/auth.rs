@@ -101,6 +101,7 @@ mod tests {
                 },
             ],
             projects: vec![],
+            resume_runs: false,
         };
         assert_eq!(user_for_token(&config, "s3").as_deref(), Some("steve"));
         assert_eq!(user_for_token(&config, "s"), None);

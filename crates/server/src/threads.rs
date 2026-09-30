@@ -7,25 +7,32 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use aigentic_api::{ThreadInfo, ThreadState};
-use aigentic_runtime::aigentic_core::{Author, ContentBlock, EventKind};
+use aigentic_api::{CheckpointAnswer, ThreadInfo, ThreadState};
+use aigentic_runtime::aigentic_core::{Author, ContentBlock, Event, EventKind};
 use aigentic_runtime::aigentic_log::{
-    NewEvent, ThreadLog, ThreadStartedPayload, UserMessagePayload,
+    NewEvent, Repair, RunStartedPayload, ThreadLog, ThreadStartedPayload, UserMessagePayload,
 };
 use aigentic_runtime::aigentic_policy::Participants;
+use aigentic_runtime::workflow::WorkflowFile;
 use aigentic_runtime::{Project, ProjectFile};
 use time::format_description::well_known::Rfc3339;
-use tokio::sync::oneshot;
+use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
 use ulid::Ulid;
 
 use crate::actor::{Mail, Mailbox, Reports, ThreadActor};
 use crate::awake::KeepAwake;
 use crate::build::{BuildError, ProviderFactory, Root, build_thread, project_context};
 use crate::config::{Config, ServerConfig};
+use crate::runs::{Answer, Claim, ProdDeps, RunDeps, RunWorld, Runs, drive};
+use crate::skills::SkillPaths;
 use crate::workspaces::Workspace;
 
 /// Threads of a root without a project file.
 pub const NO_PROJECT_DIR: &str = "_none";
+
+/// The workflow a `Build` runs when the request names none (issue #58):
+/// the bundled build workflow, the one the acceptance uses.
+pub const DEFAULT_WORKFLOW: &str = "build";
 
 struct Entry {
     mailbox: Mailbox,
@@ -53,8 +60,23 @@ pub struct ThreadTable {
     workspaces: Vec<Workspace>,
     /// The daemon's one keep-awake guard (issue #47). Every thread's
     /// actor gets a clone of it, so one program holds the machine awake
-    /// for the whole daemon however many threads work at once.
+    /// for the whole daemon however many threads work at once. A run's
+    /// task holds it too, while it advances.
     guard: Arc<dyn KeepAwake>,
+    /// Which runs a task drives, and who watches them (issue #58). It
+    /// hangs off the table because a session sees nothing but the table
+    /// and the config.
+    runs: Arc<Runs>,
+    /// The forge, installer and repo a run drives. Production's are the
+    /// real ones; the tests install their own through `with_run_deps`,
+    /// which is why this is swapped under a lock rather than at build
+    /// time: a test drives a daemon the way a client does, through
+    /// `Server::new`.
+    run_deps: Mutex<Arc<dyn RunDeps>>,
+    /// Serialises the "is there an unfinished run for this issue?" check
+    /// and the lead it creates under it, so two concurrent `Build`s for
+    /// one issue cannot both find nothing and both start a run.
+    build_lock: AsyncMutex<()>,
     entries: Mutex<HashMap<Ulid, Entry>>,
 }
 
@@ -72,6 +94,10 @@ pub enum ThreadError {
     Runtime(#[from] aigentic_runtime::RuntimeError),
     #[error("the thread's actor is gone")]
     Gone,
+    #[error("no run in thread {0}: its log holds no `run_started`")]
+    NotARun(Ulid),
+    #[error("workflow: {0}")]
+    Workflow(#[from] aigentic_runtime::workflow::WorkflowError),
     #[error("{0}")]
     Refused(String),
 }
@@ -94,6 +120,9 @@ impl ThreadTable {
             reports,
             threads_base,
             guard,
+            runs: Arc::new(Runs::new()),
+            run_deps: Mutex::new(Arc::new(ProdDeps)),
+            build_lock: AsyncMutex::new(()),
             profile_override: None,
             workspaces: Vec::new(),
             entries: Mutex::new(HashMap::new()),
@@ -104,6 +133,25 @@ impl ThreadTable {
     /// one here, so a thread built from the table can be watched.
     pub fn guard(&self) -> Arc<dyn KeepAwake> {
         self.guard.clone()
+    }
+
+    /// The run registry: which lead a task drives, and who watches it.
+    pub fn runs(&self) -> Arc<Runs> {
+        self.runs.clone()
+    }
+
+    /// Replace the seams a run drives the world through. `ProdDeps`
+    /// unless a test installed its own; see [`crate::runs::RunDeps`].
+    pub fn with_run_deps(&self, deps: Arc<dyn RunDeps>) {
+        *self.run_deps.lock().unwrap_or_else(|e| e.into_inner()) = deps;
+    }
+
+    /// The seams a run drives the world through, as they stand now.
+    pub fn run_deps(&self) -> Arc<dyn RunDeps> {
+        self.run_deps
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Build every thread from `profile` instead of its project's
@@ -382,6 +430,378 @@ impl ThreadTable {
     pub fn open_count(&self) -> usize {
         self.entries.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
+
+    // -- runs (issue #58) ----------------------------------------------------
+
+    /// What a run's task needs of the daemon for `project`: the config,
+    /// the providers, the seams, the guard, and the project's root. No
+    /// handle on this table comes with it.
+    pub fn run_world(&self, project: &str) -> Result<RunWorld, ThreadError> {
+        let root = self.root_of(project)?;
+        let bundled = SkillPaths::new(
+            &root.root,
+            &self.config_dir,
+            self.config.bundled_dir.as_deref(),
+        )
+        .bundled;
+        Ok(RunWorld {
+            config: self.config.clone(),
+            config_dir: self.config_dir.clone(),
+            providers: self.providers.clone(),
+            deps: self.run_deps(),
+            guard: self.guard.clone(),
+            root,
+            project: project.to_owned(),
+            workspaces: self.workspaces.clone(),
+            bundled,
+        })
+    }
+
+    /// The lead of the unfinished run for `(project, issue)`: a thread
+    /// whose log holds `run_started { issue }` and no `run_finished`.
+    /// Read with repair, because a `kill -9` leaves a torn tail.
+    pub fn unfinished_run(&self, project: &str, issue: u64) -> Option<Ulid> {
+        let root = self.root_of(project).ok()?;
+        let ids = thread_ids(&root.threads_dir);
+        // Newest first: a run that was restarted has one lead per issue,
+        // and the newest is the one the last `Build` made.
+        for id in ids {
+            let Ok((log, _cut)) =
+                ThreadLog::open_with(&root.threads_dir, id, Repair::TruncateTornTail)
+            else {
+                continue;
+            };
+            if crate::runs::unfinished(&log, issue).is_some() {
+                return Some(id);
+            }
+        }
+        None
+    }
+
+    /// Which kind of run-owned thread `thread` is, from its own log.
+    pub fn run_thread(&self, thread: Ulid) -> RunThread {
+        let Some(project) = self.project_of(thread) else {
+            return RunThread::No;
+        };
+        let Ok(root) = self.root_of(&project) else {
+            return RunThread::No;
+        };
+        // Repair: a torn tail is not a reason to start an actor over a
+        // run-owned thread.
+        let Ok((log, _cut)) =
+            ThreadLog::open_with(&root.threads_dir, thread, Repair::TruncateTornTail)
+        else {
+            return RunThread::No;
+        };
+        if let Ok(started) = crate::runs::run_started_of(&log) {
+            return RunThread::Lead {
+                issue: started.issue,
+            };
+        }
+        let child = log
+            .events()
+            .iter()
+            .filter(|event| event.kind == EventKind::ThreadStarted)
+            .filter_map(|event| {
+                serde_json::from_value::<ThreadStartedPayload>(event.payload.clone()).ok()
+            })
+            .find_map(|p| p.parent_thread);
+        match child {
+            Some(lead) => {
+                let step = log
+                    .events()
+                    .iter()
+                    .filter(|event| event.kind == EventKind::ThreadStarted)
+                    .filter_map(|event| {
+                        serde_json::from_value::<ThreadStartedPayload>(event.payload.clone()).ok()
+                    })
+                    .find_map(|p| p.step);
+                RunThread::Child { lead, step }
+            }
+            None => RunThread::No,
+        }
+    }
+
+    /// The events of `thread` from `from_seq`, oldest first, read with
+    /// repair. No actor is started and nothing is written.
+    pub fn events_from(&self, thread: Ulid, from_seq: u64) -> Result<Vec<Event>, ThreadError> {
+        let project = self
+            .project_of(thread)
+            .ok_or(ThreadError::NoThread(thread))?;
+        let root = self.root_of(&project)?;
+        let (log, _cut) =
+            ThreadLog::open_with(&root.threads_dir, thread, Repair::TruncateTornTail)?;
+        Ok(log
+            .events()
+            .iter()
+            .filter(|event| event.seq >= from_seq)
+            .cloned()
+            .collect())
+    }
+
+    /// The start-up scan (issue #58, rule 8): every unfinished run in
+    /// every project is claimed, so a daemon killed mid-run picks the runs
+    /// up again. A served daemon does this; an embedded one
+    /// (`resume_runs: false`) does not — opening the REPL must not
+    /// silently resume someone's build and push.
+    ///
+    /// A lead waiting at a checkpoint gets a task that waits; one left
+    /// mid-child continues it. A finished lead is ignored, and so is a
+    /// lead holding only `thread_started`.
+    pub fn resume_unfinished_runs(&self) {
+        if !self.server.resume_runs {
+            return;
+        }
+        let projects: Vec<String> = self
+            .server
+            .projects
+            .iter()
+            .map(|p| p.name.clone())
+            .collect();
+        for project in projects {
+            let Ok(root) = self.root_of(&project) else {
+                continue;
+            };
+            let Ok(world) = self.run_world(&project) else {
+                continue;
+            };
+            for id in thread_ids(&root.threads_dir) {
+                // Repair, like every other read here: a `kill -9` mid-write
+                // leaves a half line that was never an event.
+                let Ok((log, _cut)) =
+                    ThreadLog::open_with(&root.threads_dir, id, Repair::TruncateTornTail)
+                else {
+                    continue;
+                };
+                let Some(started) = crate::runs::run_started_of(&log).ok() else {
+                    continue;
+                };
+                if crate::runs::unfinished(&log, started.issue).is_none() {
+                    continue;
+                }
+                self.claim_or_attach(id, &world);
+            }
+        }
+    }
+
+    /// Start a run for `(project, issue)`, or resume the one already
+    /// there, and answer with its lead. `resumed` says which happened.
+    ///
+    /// The whole check-and-create runs under one lock per table, so two
+    /// concurrent `Build`s for one issue cannot both find no run and both
+    /// create one. Exactly one task ever drives a lead: [`Runs::claim`]
+    /// decides it.
+    pub async fn build_run(
+        &self,
+        project: &str,
+        issue: u64,
+        workflow: Option<String>,
+        by: Author,
+    ) -> Result<(Ulid, bool), ThreadError> {
+        let _serial = self.build_lock.lock().await;
+        let world = self.run_world(project)?;
+        if let Some(lead) = self.unfinished_run(project, issue) {
+            self.claim_or_attach(lead, &world);
+            return Ok((lead, true));
+        }
+        // The workflow defaults to `build`, the name the acceptance uses
+        // (issue #58, rule 4).
+        let name = workflow.unwrap_or_else(|| DEFAULT_WORKFLOW.to_owned());
+        let loaded = WorkflowFile::load(&name, &world.workflow_roots())?;
+        let info = self.create(project, by.clone()).await?;
+        let lead = info.id;
+        // The lead's log starts `thread_started`, then `run_started`: the
+        // runner insists on it, and this is the last write before a task
+        // owns the log.
+        let (mut log, _cut) =
+            ThreadLog::open_with(&world.root.threads_dir, lead, Repair::TruncateTornTail)?;
+        if !log
+            .events()
+            .iter()
+            .any(|event| event.kind == EventKind::RunStarted)
+        {
+            log.append(NewEvent {
+                kind: EventKind::RunStarted,
+                author: by,
+                payload: serde_json::to_value(RunStartedPayload {
+                    issue,
+                    workflow: name,
+                    version: loaded.workflow.version,
+                    content_hash: loaded.content_hash,
+                    budget_usd: loaded.workflow.budget.full,
+                })
+                .expect("run_started serialises"),
+                parent_event: None,
+            })?;
+        }
+        self.claim_or_attach(lead, &world);
+        Ok((lead, false))
+    }
+
+    /// Send one answer to the task that drives `lead`, starting that task
+    /// when nobody holds the lead — the start-up scan may not have
+    /// reached it, or its task may have ended. Blocks until the task has
+    /// appended the answer or refused it.
+    ///
+    /// Nothing is written here: the task owns the lead log and checks the
+    /// gate immediately before appending, so a second answer to one gate
+    /// and an answer to a gate the run is not asking at are both refused.
+    pub async fn answer_checkpoint(
+        &self,
+        lead: Ulid,
+        gate: String,
+        answer: CheckpointAnswer,
+        amendment: Option<String>,
+        by: Author,
+    ) -> Result<(), ThreadError> {
+        let RunThread::Lead { .. } = self.run_thread(lead) else {
+            return Err(ThreadError::NotARun(lead));
+        };
+        let project = self.project_of(lead).ok_or(ThreadError::NoThread(lead))?;
+        // The open gate is the run's, not the answerer's: check it here,
+        // so a wrong gate, a run that is not waiting and a run that has
+        // already finished are refused before a task is started over it.
+        // The runner checks again, immediately before it appends.
+        let root = self.root_of(&project)?;
+        let (log, _cut) = ThreadLog::open_with(&root.threads_dir, lead, Repair::TruncateTornTail)?;
+        match aigentic_runtime::aigentic_log::run_state(log.events())?.next_move() {
+            aigentic_runtime::aigentic_log::NextMove::AwaitingCheckpoint { gate: asked }
+                if asked == gate => {}
+            aigentic_runtime::aigentic_log::NextMove::AwaitingCheckpoint { gate: asked } => {
+                return Err(ThreadError::Refused(format!(
+                    "the run waits at `{asked}`, not `{gate}`"
+                )));
+            }
+            _ => {
+                return Err(ThreadError::Refused(format!(
+                    "the run is not waiting at a gate, so `{gate}` cannot be answered"
+                )));
+            }
+        }
+        drop(log);
+        let world = self.run_world(&project)?;
+        let tx = self.claim_or_attach(lead, &world);
+        let (reply, rx) = oneshot::channel();
+        tx.send(Answer {
+            gate,
+            answer,
+            amendment,
+            by,
+            reply,
+        })
+        .map_err(|_| ThreadError::Gone)?;
+        match rx.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(reason)) => Err(ThreadError::Refused(reason)),
+            Err(_) => Err(ThreadError::Gone),
+        }
+    }
+
+    /// Claim `lead` for this caller, starting a task over it when nobody
+    /// holds it, and return where to send its answers. An [`Claim::Attached`]
+    /// lead gets no second runner.
+    fn claim_or_attach(&self, lead: Ulid, world: &RunWorld) -> mpsc::UnboundedSender<Answer> {
+        match self.runs.claim(lead) {
+            Claim::Attached(tx) => tx,
+            Claim::Claimed(rx, tx) => {
+                let runs = self.runs.clone();
+                let world = world.clone();
+                tokio::spawn(async move { drive(runs, world, lead, rx).await });
+                tx
+            }
+        }
+    }
+
+    /// Claim every unfinished run of every project, as a restarting
+    /// daemon does: a run left mid-step resumes, a run waiting at a
+    /// checkpoint gets a task that waits for an answer. Finished leads
+    /// are left alone. Returns how many runs a task was started over.
+    ///
+    /// An embedded daemon never calls this: opening the terminal must not
+    /// silently resume someone's build and push.
+    pub fn resume_runs(&self) -> usize {
+        let mut started = 0;
+        for (project, _root, _count) in self.projects() {
+            let lead_world = self.run_world(&project).ok();
+            let Some(world) = lead_world else { continue };
+            let ids = thread_ids(&world.root.threads_dir);
+            for id in ids {
+                let Ok((log, _cut)) =
+                    ThreadLog::open_with(&world.root.threads_dir, id, Repair::TruncateTornTail)
+                else {
+                    continue;
+                };
+                if crate::runs::run_started_of(&log).is_err() {
+                    continue;
+                }
+                if log
+                    .events()
+                    .iter()
+                    .any(|event| event.kind == EventKind::RunFinished)
+                {
+                    continue;
+                }
+                match self.runs.claim(id) {
+                    Claim::Attached(_) => {}
+                    Claim::Claimed(rx, _tx) => {
+                        let runs = self.runs.clone();
+                        let world = world.clone();
+                        tokio::spawn(async move { drive(runs, world, id, rx).await });
+                        started += 1;
+                    }
+                }
+            }
+        }
+        started
+    }
+}
+
+/// What a thread is to a run (issue #58, rule 5): a lead, a step child,
+/// or an ordinary thread the daemon may run an actor for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunThread {
+    /// Not part of a run: an ordinary thread.
+    No,
+    /// A run's lead; the run is for `issue`.
+    Lead {
+        /// The issue the run was started for.
+        issue: u64,
+    },
+    /// A step's child thread, written by a run's runner: `lead` is the
+    /// run it belongs to, `step` the step it works when the header names
+    /// one.
+    Child { lead: Ulid, step: Option<String> },
+}
+
+impl RunThread {
+    /// This thread on the wire (issue #58): `None` for a thread no run
+    /// owns.
+    pub fn wire(&self) -> Option<aigentic_api::RunThread> {
+        match self {
+            RunThread::No => None,
+            RunThread::Lead { issue } => Some(aigentic_api::RunThread::Lead { issue: *issue }),
+            RunThread::Child { lead, step } => Some(aigentic_api::RunThread::Child {
+                lead: *lead,
+                step: step.clone(),
+            }),
+        }
+    }
+}
+
+/// Every thread id in `dir`, newest first. An unreadable directory is
+/// empty, not an error: a project that never ran anything has none.
+fn thread_ids(dir: &Path) -> Vec<Ulid> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut ids: Vec<Ulid> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("jsonl"))
+        .filter_map(|path| path.file_stem()?.to_str()?.parse().ok())
+        .collect();
+    ids.sort_unstable_by(|a, b| b.cmp(a));
+    ids
 }
 
 /// A listing row from the log alone.

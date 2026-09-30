@@ -302,41 +302,58 @@ impl RunnerHost for FakeHost {
         profile: &str,
         step: &str,
         deny: &[String],
-    ) -> Result<Runtime, RunnerError> {
-        let log = ThreadLog::open(&self.dir, id)?;
-        let script = self
-            .scripts
-            .lock()
-            .unwrap()
-            .get(&id)
-            .cloned()
-            .unwrap_or_default();
-        // What the child's log has already answered, so a rebuild gets
-        // the replies that are still to come.
-        let answered = log
-            .events()
-            .iter()
-            .filter(|event| event.kind == EventKind::AssistantMessage)
-            .count();
-        let (provider, _seen) = scripted(script.into_iter().skip(answered).collect());
-        let registry: ToolRegistry = vec![Box::new(Noop) as Box<dyn aigentic_core::Tool>].into();
-        let cap = self.caps.get(&id).copied().unwrap_or(50);
-        let mut runtime = Runtime::new(provider, registry, log, AgentId("child".into()))
-            .with_policy(Policy::defaults())
-            .with_approver(Box::new(Yes))
-            .with_budget(Budget {
-                max_iterations: cap,
-                max_tokens: u64::MAX,
-                max_wall_time: std::time::Duration::from_secs(60),
-                cache_read_price_ratio: 0.25,
-            })
-            .with_step(step, deny)?;
-        // A test that wants a real `usage.cost_usd` on the child's lines
-        // prices this child's endpoint; an unpriced host behaves as before.
-        if let Some(prices) = self.prices {
-            runtime.set_pricing(profile, Some(prices));
+    ) -> impl std::future::Future<Output = Result<Runtime, RunnerError>> + Send {
+        // A scripted child needs nothing async; the trait is async for the
+        // daemon's host, which connects MCP servers on the way (#58).
+        let prepared = (|| -> Result<_, RunnerError> {
+            let log = ThreadLog::open(&self.dir, id)?;
+            // What the child's log has already answered, so a rebuild
+            // gets the replies that are still to come.
+            let answered = log
+                .events()
+                .iter()
+                .filter(|event| event.kind == EventKind::AssistantMessage)
+                .count();
+            let script = self
+                .scripts
+                .lock()
+                .unwrap()
+                .get(&id)
+                .cloned()
+                .unwrap_or_default();
+            let (provider, _seen) = scripted(script.into_iter().skip(answered).collect());
+            let registry: ToolRegistry =
+                vec![Box::new(Noop) as Box<dyn aigentic_core::Tool>].into();
+            Ok((
+                provider,
+                registry,
+                log,
+                self.caps.get(&id).copied().unwrap_or(50),
+                self.prices,
+            ))
+        })();
+        let profile = profile.to_owned();
+        let step = step.to_owned();
+        let deny = deny.to_vec();
+        async move {
+            let (provider, registry, log, cap, prices) = prepared?;
+            let mut runtime = Runtime::new(provider, registry, log, AgentId("child".into()))
+                .with_policy(Policy::defaults())
+                .with_approver(Box::new(Yes))
+                .with_budget(Budget {
+                    max_iterations: cap,
+                    max_tokens: u64::MAX,
+                    max_wall_time: std::time::Duration::from_secs(60),
+                    cache_read_price_ratio: 0.25,
+                })
+                .with_step(&step, &deny)?;
+            // A test that wants a real `usage.cost_usd` on the child's lines
+            // prices this child's endpoint; an unpriced host behaves as before.
+            if let Some(prices) = prices {
+                runtime.set_pricing(&profile, Some(prices));
+            }
+            Ok(runtime)
         }
-        Ok(runtime)
     }
 
     fn child_exists(&self, id: Ulid) -> bool {

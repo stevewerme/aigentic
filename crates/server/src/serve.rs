@@ -112,6 +112,10 @@ impl Bound {
     /// Accept forever, sweeping idle threads on the side.
     pub async fn serve(self) -> Result<(), ServerError> {
         let server = self.server;
+        // A killed daemon's unfinished runs are picked up here, before any
+        // client can ask (issue #58, rule 8). An embedded daemon's
+        // `resume_runs` is false, so it claims nothing on its own.
+        server.threads.resume_unfinished_runs();
         let sweeper = {
             let server = server.clone();
             tokio::spawn(async move {
@@ -231,7 +235,10 @@ impl Server {
 
     /// Production wiring: providers from the config's profiles, every
     /// report rendered.
-    pub fn from_configs(config: Config, config_dir: PathBuf, server: ServerConfig) -> Self {
+    pub fn from_configs(config: Config, config_dir: PathBuf, mut server: ServerConfig) -> Self {
+        // The served daemon is the one that picks up the runs a killed
+        // daemon left behind (issue #58). An embedded daemon does not.
+        server.resume_runs = true;
         let providers: Arc<dyn ProviderFactory> = Arc::new(Profiles(Arc::new(config.clone())));
         let reports = Arc::new(DefaultReports {
             global_instructions: config
@@ -343,6 +350,8 @@ impl Server {
                 name: project.clone(),
                 root,
             }],
+            // An embedded daemon resumes nothing on its own (issue #58).
+            resume_runs: false,
         };
         let server = Arc::new(Self::build(
             config,

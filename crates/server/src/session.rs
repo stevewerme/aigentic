@@ -6,10 +6,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use aigentic_api::{
-    Body, Frame, Notice, PROTOCOL_VERSION, ProjectInfo, Request, Response, Welcome, decode, encode,
+    Body, CheckpointAnswer, Frame, Notice, PROTOCOL_VERSION, ProjectInfo, Request, Response,
+    ThreadState, Welcome, decode, encode,
 };
 use aigentic_runtime::Mode;
-use aigentic_runtime::aigentic_core::{Author, UserId};
+use aigentic_runtime::aigentic_core::{AgentId, Author, UserId};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot};
 use ulid::Ulid;
@@ -17,7 +18,7 @@ use ulid::Ulid;
 use crate::actor::Mail;
 use crate::auth;
 use crate::config::ServerConfig;
-use crate::threads::{ThreadError, ThreadTable};
+use crate::threads::{RunThread, ThreadError, ThreadTable};
 
 /// The longest line a session may send; longer closes it. A post can
 /// carry a large block, so this is generous, but not unbounded.
@@ -162,10 +163,19 @@ pub async fn serve(
     };
     let author = Author::User(UserId(user.clone()));
 
-    // Open threads: mailbox per thread, and the task forwarding its
-    // notices to the writer.
-    let mut open: HashMap<Ulid, (crate::actor::Mailbox, tokio::task::JoinHandle<()>)> =
-        HashMap::new();
+    // A served daemon picks up the runs the last one left behind, right
+    // here: a run at a checkpoint gets a task that waits for an answer,
+    // one mid-step resumes. `claim` makes it idempotent, so the second
+    // session does nothing. An embedded daemon never does this: opening
+    // the terminal must not silently resume someone's build and push.
+    if config.resume_runs {
+        threads.resume_runs();
+    }
+
+    // Open threads: the mailbox of the thread's actor when it has one
+    // (a run-owned thread has none, issue #58), and the task forwarding
+    // its notices to the writer.
+    let mut open: HashMap<Ulid, OpenThread> = HashMap::new();
 
     while let Some(line) = next_line(&mut reader, &mut buf).await? {
         let Ok(frame) = decode(&line) else {
@@ -181,9 +191,11 @@ pub async fn serve(
         .await;
         send(Frame::response(id, response));
     }
-    for (thread, (_, forward)) in open.drain() {
-        forward.abort();
-        threads.close(thread);
+    for (thread, entry) in open.drain() {
+        entry.forward.abort();
+        if entry.mailbox.is_some() {
+            threads.close(thread);
+        }
     }
     drop(out_tx);
     let _ = writer_task.await;
@@ -210,9 +222,11 @@ fn project_infos(config: &ServerConfig, threads: &ThreadTable, user: &str) -> Ve
 /// The project a request is about, for the role check.
 fn project_for(threads: &ThreadTable, request: &Request) -> Option<String> {
     match request {
-        Request::ListThreads { project } | Request::CreateThread { project } => {
-            Some(project.clone())
-        }
+        Request::ListThreads { project }
+        | Request::CreateThread { project }
+        | Request::Build { project, .. } => Some(project.clone()),
+        // A checkpoint is answered in the project its run works in.
+        Request::AnswerCheckpoint { lead, .. } => threads.project_of(*lead),
         Request::Open { thread, .. }
         | Request::Close { thread }
         | Request::Post { thread, .. }
@@ -236,10 +250,20 @@ async fn handle(
     threads: &Arc<ThreadTable>,
     user: &str,
     author: &Author,
-    open: &mut HashMap<Ulid, (crate::actor::Mailbox, tokio::task::JoinHandle<()>)>,
+    open: &mut HashMap<Ulid, OpenThread>,
     out: &mpsc::UnboundedSender<String>,
     request: Request,
 ) -> Response {
+    // A run-owned thread belongs to its run (issue #58, rule 5): its
+    // step child or its lead is written by the run's task alone, so
+    // nothing here may post into it, and no actor is started for it.
+    if let Some(thread) = mutates_run(&request)
+        && threads.run_thread(thread) != RunThread::No
+    {
+        return Response::Refused {
+            reason: "this thread belongs to a run".into(),
+        };
+    }
     // Roles first: a refused request never reaches a mailbox.
     if aigentic_runtime::aigentic_policy::needs(&request).is_some() {
         let Some(project) = project_for(threads, &request) else {
@@ -286,7 +310,11 @@ async fn handle(
             Err(e) => thread_error(e),
         },
         Request::Open { thread, from_seq } => {
-            if let Some(mailbox) = open.get(&thread).map(|(m, _)| m.clone()) {
+            let run = threads.run_thread(thread);
+            if run != RunThread::No {
+                return open_run(threads, run, thread, from_seq, out, open);
+            }
+            if let Some(mailbox) = open.get(&thread).and_then(|entry| entry.mailbox.clone()) {
                 // Already open here: answer from the actor again.
                 return subscribe(&mailbox, thread, from_seq, out, open).await;
             }
@@ -296,9 +324,11 @@ async fn handle(
             }
         }
         Request::Close { thread } => {
-            if let Some((_, forward)) = open.remove(&thread) {
-                forward.abort();
-                threads.close(thread);
+            if let Some(entry) = open.remove(&thread) {
+                entry.forward.abort();
+                if entry.mailbox.is_some() {
+                    threads.close(thread);
+                }
             }
             Response::Ok
         }
@@ -411,6 +441,43 @@ async fn handle(
             }
             Err(e) => Response::Refused { reason: e },
         },
+        Request::Build {
+            project,
+            issue,
+            workflow,
+        } => match threads
+            .build_run(&project, issue, workflow, author.clone())
+            .await
+        {
+            Ok((lead, resumed)) => {
+                // Watch the run's lead from here on: its events arrive as
+                // notices, and the log holds what happened before.
+                watch_run(threads, lead, out, open);
+                Response::Run { lead, resumed }
+            }
+            Err(e) => run_error(e),
+        },
+        Request::AnswerCheckpoint {
+            lead,
+            gate,
+            answer,
+            amendment,
+        } => {
+            // Slice 1 answers `stop` only: acting on `go` or `amend` is
+            // the next slice's work, and nothing is written for them.
+            if !matches!(answer, CheckpointAnswer::Stop) {
+                return Response::Refused {
+                    reason: "answering go or amend comes in slice 2".into(),
+                };
+            }
+            match threads
+                .answer_checkpoint(lead, gate, answer, amendment, author.clone())
+                .await
+            {
+                Ok(()) => Response::Ok,
+                Err(e) => run_error(e),
+            }
+        }
         Request::Report { thread, report } => {
             ask_actor(threads, open, thread, |reply| Mail::Report {
                 kind: report,
@@ -418,6 +485,121 @@ async fn handle(
             })
             .await
         }
+    }
+}
+
+/// One thread a session has opened. A run-owned thread (issue #58) has
+/// no actor, so `mailbox` is `None` and only the notice forward is real.
+struct OpenThread {
+    mailbox: Option<crate::actor::Mailbox>,
+    forward: tokio::task::JoinHandle<()>,
+}
+
+/// The thread a request would write into, when the request is one of
+/// rule 5c's: those are refused on a run-owned thread.
+fn mutates_run(request: &Request) -> Option<Ulid> {
+    match request {
+        Request::Post { thread, .. }
+        | Request::InvokeSkill { thread, .. }
+        | Request::Interrupt { thread }
+        | Request::Decide { thread, .. }
+        | Request::AnswerHuman { thread, .. }
+        | Request::SetMode { thread, .. }
+        | Request::Compact { thread }
+        | Request::Pin { thread, .. }
+        | Request::Remember { thread, .. }
+        | Request::Rename { thread, .. }
+        | Request::SwitchProject { thread, .. } => Some(*thread),
+        _ => None,
+    }
+}
+
+/// A run's own failures: the run's task refused the answer for a reason
+/// the caller can act on. Those are refusals, not errors, so a client
+/// can tell "no such lead" from "the daemon broke".
+fn run_error(e: ThreadError) -> Response {
+    match &e {
+        ThreadError::Refused(_)
+        | ThreadError::NoThread(_)
+        | ThreadError::NoProject(_)
+        | ThreadError::NotARun(_) => Response::Refused {
+            reason: e.to_string(),
+        },
+        _ => Response::Error {
+            message: e.to_string(),
+        },
+    }
+}
+
+/// `Open` on a run-owned thread: the log from `from_seq`, and the run's
+/// live events from here on. No actor is started — the run's task is the
+/// thread's only writer — and nothing is resumed.
+fn open_run(
+    threads: &Arc<ThreadTable>,
+    run: RunThread,
+    thread: Ulid,
+    from_seq: u64,
+    out: &mpsc::UnboundedSender<String>,
+    open: &mut HashMap<Ulid, OpenThread>,
+) -> Response {
+    let events = match threads.events_from(thread, from_seq) {
+        Ok(events) => events,
+        Err(e) => return thread_error(e),
+    };
+    // A run-owned thread's state says the run drives it: no actor is
+    // started for it, and only the run's task is running it. A lead whose
+    // task has ended reads `idle`, which is what it is — the log holds
+    // everything either way, and `run_finished` says how it ended.
+    let state = if threads.runs().held(thread) {
+        ThreadState::Running {
+            by: Author::Agent(AgentId(aigentic_runtime::workflow::RUNNER.into())),
+            queued: 0,
+        }
+    } else {
+        ThreadState::Idle
+    };
+    if !open.contains_key(&thread) {
+        watch_run(threads, thread, out, open);
+    }
+    Response::Opened {
+        state,
+        events,
+        run: run.wire(),
+        // A run's child works in `auto` with no approver; there is no
+        // mode to read from the log, and this is what it runs as.
+        mode: Mode::Auto.name().to_owned(),
+        profile: None,
+        model: "runner".into(),
+        effort: None,
+    }
+}
+
+/// Watch a run's lead: every notice the run broadcasts goes to this
+/// session from now on. Nothing is written and no actor is started.
+fn watch_run(
+    threads: &Arc<ThreadTable>,
+    lead: Ulid,
+    out: &mpsc::UnboundedSender<String>,
+    open: &mut HashMap<Ulid, OpenThread>,
+) {
+    let (notices, mut notice_rx) = mpsc::unbounded_channel::<Notice>();
+    threads.runs().watch(lead, notices);
+    let out = out.clone();
+    let forward = tokio::spawn(async move {
+        while let Some(notice) = notice_rx.recv().await {
+            if out.send(encode(&Frame::notice(notice))).is_err() {
+                break;
+            }
+        }
+    });
+    if let Some(old) = open.insert(
+        lead,
+        OpenThread {
+            mailbox: None,
+            forward,
+        },
+    ) {
+        old.forward.abort();
     }
 }
 
@@ -439,7 +621,7 @@ async fn subscribe(
     thread: Ulid,
     from_seq: u64,
     out: &mpsc::UnboundedSender<String>,
-    open: &mut HashMap<Ulid, (crate::actor::Mailbox, tokio::task::JoinHandle<()>)>,
+    open: &mut HashMap<Ulid, OpenThread>,
 ) -> Response {
     let (notices, mut notice_rx) = mpsc::unbounded_channel::<Notice>();
     let (reply, rx) = oneshot::channel();
@@ -468,12 +650,19 @@ async fn subscribe(
             }
         }
     });
-    if let Some((_, old)) = open.insert(thread, (mailbox.clone(), forward)) {
-        old.abort();
+    if let Some(old) = open.insert(
+        thread,
+        OpenThread {
+            mailbox: Some(mailbox.clone()),
+            forward,
+        },
+    ) {
+        old.forward.abort();
     }
     Response::Opened {
         state,
         events,
+        run: None,
         mode,
         profile,
         model,
@@ -485,14 +674,21 @@ async fn subscribe(
 /// for a request without an `Open` first) and wait for the reply.
 async fn ask_actor(
     threads: &Arc<ThreadTable>,
-    open: &mut HashMap<Ulid, (crate::actor::Mailbox, tokio::task::JoinHandle<()>)>,
+    open: &mut HashMap<Ulid, OpenThread>,
     thread: Ulid,
     mail: impl FnOnce(oneshot::Sender<Response>) -> Mail,
 ) -> Response {
-    let mailbox = match open.get(&thread) {
-        Some((m, _)) => m.clone(),
+    let mailbox = match open.get(&thread).and_then(|entry| entry.mailbox.clone()) {
+        Some(m) => m,
         None => match threads.mailbox(thread) {
             Some(m) => m,
+            // A run-owned thread never gets an actor: starting one would
+            // be a second writer over the run's log (issue #58, rule 5).
+            None if threads.run_thread(thread) != RunThread::No => {
+                return Response::Refused {
+                    reason: "this thread belongs to a run".into(),
+                };
+            }
             None => match threads.open(thread).await {
                 Ok((m, _)) => {
                     // Opened for this request only; not a subscription.

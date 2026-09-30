@@ -6,91 +6,21 @@
 //! `CreateThread` writes `thread_started` first; idle unload never
 //! while awaiting approval. A scripted provider stands in for the model.
 
-use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use aigentic_api::client::{Addr, Client, ClientError};
 use aigentic_api::{Notice, Request, Response, ThreadState};
-use aigentic_runtime::aigentic_core::{
-    Capabilities, CompletionRequest, ContentBlock, EventKind, Message, Provider, ProviderEvent,
-    ToolCall,
-};
+use aigentic_runtime::aigentic_core::{ContentBlock, EventKind, ProviderEvent};
 use aigentic_runtime::aigentic_log::{ThreadLog, ThreadStartedPayload};
-use aigentic_server::build::{BuildError, ProviderFactory};
 use aigentic_server::config::{Config, ProjectConfig, ServerConfig, UserConfig};
 use aigentic_server::{Listener, NoReports, Server};
-use futures_core::Stream;
-use serde_json::json;
 use tokio::sync::mpsc;
 
-/// Every thread gets the same script, in order; `None` pends.
-struct Scripted(Mutex<VecDeque<Option<Vec<ProviderEvent>>>>);
+mod common;
 
-impl Provider for Scripted {
-    fn complete(
-        &self,
-        _: &CompletionRequest<'_>,
-    ) -> Pin<Box<dyn Stream<Item = ProviderEvent> + Send + '_>> {
-        match self.0.lock().unwrap().pop_front().flatten() {
-            Some(events) => Box::pin(futures_util::stream::iter(events)),
-            None => Box::pin(futures_util::stream::pending()),
-        }
-    }
-    fn count_tokens(&self, _: &[Message]) -> u64 {
-        7
-    }
-    fn capabilities(&self) -> Capabilities {
-        Capabilities {
-            supports_tools: true,
-            supports_images: false,
-            supports_caching: false,
-            supports_structured_output: false,
-            max_context_tokens: 1000,
-        }
-    }
-}
-
-/// One script per thread built, in order.
-type Scripts = VecDeque<Vec<Option<Vec<ProviderEvent>>>>;
-
-struct Factory(Arc<Mutex<Scripts>>);
-
-impl ProviderFactory for Factory {
-    fn build(
-        &self,
-        _: &str,
-    ) -> Result<(Box<dyn aigentic_runtime::aigentic_core::Provider>, String), BuildError> {
-        let script = self.0.lock().unwrap().pop_front().unwrap_or_default();
-        Ok((
-            Box::new(Scripted(Mutex::new(script.into()))),
-            "scripted".into(),
-        ))
-    }
-}
-
-fn text(t: &str) -> ProviderEvent {
-    ProviderEvent::TextDelta(t.into())
-}
-fn done() -> ProviderEvent {
-    ProviderEvent::Done {
-        finish_reason: "stop".into(),
-    }
-}
-fn bash(id: &str, command: &str) -> ProviderEvent {
-    ProviderEvent::ToolCall(ToolCall {
-        id: id.into(),
-        name: "bash".into(),
-        args: json!({"command": command}),
-    })
-}
-fn tool_use() -> ProviderEvent {
-    ProviderEvent::Done {
-        finish_reason: "tool_use".into(),
-    }
-}
+use common::{Factory, bash, done, text, tool_use};
 
 struct Daemon {
     socket: PathBuf,
@@ -151,12 +81,13 @@ async fn daemon(scripts: Vec<Vec<Option<Vec<ProviderEvent>>>>, idle_secs: u64) -
                 root: q,
             },
         ],
+        resume_runs: false,
     };
     let server = Arc::new(Server::new(
         config,
         cfg_dir,
         server,
-        Arc::new(Factory(Arc::new(Mutex::new(scripts.into())))),
+        Arc::new(Factory::new(scripts.into())),
         Arc::new(NoReports),
     ));
     let socket = dir.path().join("d.sock");

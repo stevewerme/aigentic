@@ -190,6 +190,7 @@ async fn a_thread_moves_to_another_project_and_stays_there_across_a_reload() {
             name: "q".into(),
             root: q.clone(),
         }],
+        resume_runs: false,
     };
     let script = Arc::new(Mutex::new(VecDeque::from(vec![
         vec![text("hello from p"), done()],

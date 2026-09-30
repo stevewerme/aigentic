@@ -238,6 +238,11 @@ pub enum Response {
     Opened {
         state: ThreadState,
         events: Vec<Event>,
+        /// Set when the thread belongs to a run (issue #58): a lead, or
+        /// one of its steps' children. Such a thread is served read-only,
+        /// because the run alone writes its log.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run: Option<RunThread>,
         #[serde(default)]
         mode: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -332,6 +337,26 @@ pub enum Notice {
     Note {
         thread: Ulid,
         text: String,
+    },
+}
+
+/// A thread a run owns (issue #58). The daemon serves it read-only:
+/// the run is its only writer, whichever client asks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunThread {
+    /// A run's lead thread: the issue it builds.
+    Lead {
+        /// The issue the run was asked for.
+        issue: u64,
+    },
+    /// A step's child thread, under its run's lead.
+    Child {
+        /// The run's lead.
+        lead: Ulid,
+        /// The workflow step the child works.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        step: Option<String>,
     },
 }
 
@@ -585,6 +610,7 @@ mod tests {
                     queued: 1,
                 },
                 events: vec![event()],
+                run: Some(RunThread::Lead { issue: 58 }),
                 mode: "manual".into(),
                 profile: Some("flash".into()),
                 model: "deepseek-v4.1-flash".into(),
@@ -719,6 +745,7 @@ mod tests {
             Response::Opened {
                 state: ThreadState::Idle,
                 events: vec![],
+                run: None,
                 mode: "auto".into(),
                 profile: Some("flash".into()),
                 model: "deepseek-v4.1-flash".into(),
@@ -737,11 +764,13 @@ mod tests {
                 profile,
                 model,
                 effort,
+                run,
                 ..
             }) => {
                 assert!(profile.is_none());
                 assert_eq!(model, "unknown", "a daemon that sends no model");
                 assert!(effort.is_none());
+                assert!(run.is_none(), "a daemon that sends no run");
             }
             other => panic!("wrong body: {other:?}"),
         }
@@ -751,6 +780,7 @@ mod tests {
             Response::Opened {
                 state: ThreadState::Idle,
                 events: vec![],
+                run: None,
                 mode: "auto".into(),
                 profile: None,
                 model: "unknown".into(),

@@ -24,11 +24,11 @@ use std::sync::Mutex;
 
 use aigentic_core::{AgentId, Author, ContentBlock, Event, EventKind};
 use aigentic_log::{
-    CheckOutcome, CheckResult, CheckpointAnswer, CheckpointAskedPayload, ChecksOutcome,
-    ChecksRunPayload, CommitRef, LogError, NewEvent, NextMove, PushedPayload, ReleaseImpact,
-    ReportStatus, RouteTakenPayload, RunFinishedPayload, RunOutcome, RunStartedPayload, RunState,
-    StepFinishedPayload, StepReport, StepStartedPayload, StepStatus, ThreadLog, TurnEndedPayload,
-    run_state,
+    CheckOutcome, CheckResult, CheckpointAnswer, CheckpointAnsweredPayload, CheckpointAskedPayload,
+    ChecksOutcome, ChecksRunPayload, CommitRef, LogError, NewEvent, NextMove, PushedPayload,
+    ReleaseImpact, ReportStatus, RouteTakenPayload, RunFinishedPayload, RunOutcome,
+    RunStartedPayload, RunState, StepFinishedPayload, StepReport, StepStartedPayload, StepStatus,
+    ThreadLog, TurnEndedPayload, run_state,
 };
 use serde_json::Value;
 use ulid::Ulid;
@@ -100,6 +100,21 @@ pub enum RunnerError {
     /// hold it, so the turn never started.
     #[error("the child's log does not hold the message just posted")]
     MessageNotPosted,
+    /// An answer named a gate the run is not asking at. Nothing is
+    /// written: the open gate is the run's, not the answerer's.
+    #[error("the run waits at `{asked}`, not `{answered}`")]
+    WrongGate {
+        /// The gate the run is waiting at.
+        asked: String,
+        /// The gate the answer named.
+        answered: String,
+    },
+    /// An answer arrived while the run waits at no gate (issue #58).
+    #[error("the run is not waiting at a gate, so `{gate}` cannot be answered")]
+    NotWaiting {
+        /// The gate the answer named.
+        gate: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -319,6 +334,51 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
         }
     }
 
+    /// Answer the run's open checkpoint, then let the caller advance it.
+    ///
+    /// `gate` must be the gate the run is waiting at, checked here,
+    /// immediately before the append: the lead log has one writer, so
+    /// this is where "a second answer to the same gate is refused"
+    /// (issue #58) holds. A run that is not waiting, or waits elsewhere,
+    /// writes nothing. `by` is the answering user; the amendment, when
+    /// there is one, is the answer's text.
+    pub fn answer(
+        &mut self,
+        gate: &str,
+        answer: CheckpointAnswer,
+        amendment: Option<String>,
+        by: Author,
+    ) -> Result<Ulid, RunnerError> {
+        match self.waiting_gate()? {
+            Some(asked) if asked == gate => {}
+            Some(asked) => {
+                return Err(RunnerError::WrongGate {
+                    asked,
+                    answered: gate.to_owned(),
+                });
+            }
+            None => {
+                return Err(RunnerError::NotWaiting {
+                    gate: gate.to_owned(),
+                });
+            }
+        }
+        let payload = CheckpointAnsweredPayload {
+            answer,
+            amendment,
+            marks: Vec::new(),
+        };
+        self.append_as(by, EventKind::CheckpointAnswered, &payload)
+    }
+
+    /// The gate the run waits at, or `None` when it is not waiting.
+    fn waiting_gate(&self) -> Result<Option<String>, RunnerError> {
+        Ok(match self.state()?.next_move() {
+            NextMove::AwaitingCheckpoint { gate } => Some(gate),
+            _ => None,
+        })
+    }
+
     /// `advance` until the run pauses, waits or ends.
     pub async fn run_to_pause(&mut self) -> Result<Advanced, RunnerError> {
         loop {
@@ -432,7 +492,8 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
             let message = self.attempt_message(&step, attempt)?;
             let mut runtime = self
                 .host
-                .build_child(child, &step.profile, &step.id, &step.deny)?;
+                .build_child(child, &step.profile, &step.id, &step.deny)
+                .await?;
             self.run_turn(&mut runtime, &message).await?;
             if prompt_count(self.host.child_log(child)?.events()) != posted + 1 {
                 return Err(RunnerError::MessageNotPosted);
@@ -440,7 +501,8 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
         } else if !self.attempt_reported(child, attempt)? {
             let mut runtime = self
                 .host
-                .build_child(child, &step.profile, &step.id, &step.deny)?;
+                .build_child(child, &step.profile, &step.id, &step.deny)
+                .await?;
             let mut observe = |_: Signal<'_>| {};
             if let crate::Resumed::Interrupted { .. } = runtime.resume(None, &mut observe)? {
                 runtime.continue_turn(&mut observe).await?;
@@ -1077,10 +1139,21 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
         kind: EventKind,
         payload: &impl serde::Serialize,
     ) -> Result<Ulid, RunnerError> {
+        self.append_as(Author::Agent(AgentId(RUNNER.into())), kind, payload)
+    }
+
+    /// `append`, authored by `by` rather than the runner: a human's
+    /// answer at a gate carries their name.
+    fn append_as(
+        &mut self,
+        by: Author,
+        kind: EventKind,
+        payload: &impl serde::Serialize,
+    ) -> Result<Ulid, RunnerError> {
         let payload = serde_json::to_value(payload).expect("payloads are serialisable");
         let event = self.lead.append(NewEvent {
             kind,
-            author: Author::Agent(AgentId(RUNNER.into())),
+            author: by,
             payload,
             parent_event: None,
         })?;
@@ -1110,7 +1183,8 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
         let before = prompt_count(self.host.child_log(child)?.events());
         let mut runtime = self
             .host
-            .build_child(child, &step.profile, &step.id, &step.deny)?;
+            .build_child(child, &step.profile, &step.id, &step.deny)
+            .await?;
         self.run_turn(&mut runtime, text).await?;
         if prompt_count(self.host.child_log(child)?.events()) != before + 1 {
             return Err(RunnerError::MessageNotPosted);

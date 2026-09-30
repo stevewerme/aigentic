@@ -74,6 +74,7 @@ pub struct Built {
 
 /// The daemon's view of one project root: the checkout and where its
 /// threads live.
+#[derive(Debug, Clone)]
 pub struct Root {
     pub name: String,
     pub root: PathBuf,

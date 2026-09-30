@@ -6,6 +6,8 @@
 //! [`RunnerHost::build_child`] reopens one that exists, so a rebuilt runner
 //! continues in the child's own file.
 
+use std::future::Future;
+
 use aigentic_log::ThreadLog;
 use ulid::Ulid;
 
@@ -24,13 +26,17 @@ pub trait RunnerHost {
 
     /// Builds the child's Runtime for `profile`, reopening its log if it
     /// exists, with `with_step(step, deny)` applied.
+    ///
+    /// Async because building one is: the daemon's host connects the
+    /// project's MCP servers on the way, and the runner must not block
+    /// its executor's thread to wait for that (#58).
     fn build_child(
         &mut self,
         id: Ulid,
         profile: &str,
         step: &str,
         deny: &[String],
-    ) -> Result<Runtime, RunnerError>;
+    ) -> impl Future<Output = Result<Runtime, RunnerError>> + Send;
 
     /// Whether the child's log is already on disk.
     fn child_exists(&self, id: Ulid) -> bool;

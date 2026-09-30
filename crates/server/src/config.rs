@@ -1168,6 +1168,12 @@ pub struct ServerConfig {
     pub users: Vec<UserConfig>,
     #[serde(default)]
     pub projects: Vec<ProjectConfig>,
+    /// Whether the daemon picks up the runs the last one left behind
+    /// when a session opens (issue #58). Not a file key: `aigentic serve`
+    /// sets it, an embedded daemon leaves it off, so opening the
+    /// terminal never resumes someone else's build on its own.
+    #[serde(skip)]
+    pub resume_runs: bool,
 }
 
 fn default_listen() -> String {

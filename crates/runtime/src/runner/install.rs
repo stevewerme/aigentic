@@ -31,7 +31,7 @@ pub enum InstallError {
 }
 
 /// Build and install the binary a run's next thread will use.
-pub trait Installer {
+pub trait Installer: Send + Sync {
     /// Install the binary from `repo` and return what the installed binary
     /// prints for `--version`.
     fn install(&self, repo: &dyn Repo) -> Result<String, RunnerError>;
