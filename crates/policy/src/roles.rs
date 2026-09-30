@@ -123,6 +123,9 @@ pub fn needs(request: &Request) -> Option<Role> {
         Request::Decide { .. } | Request::SetMode { .. } | Request::Compact { .. } => {
             Some(Role::Approve)
         }
+        // A build pushes to the main branch and answers its own gates
+        // (issue #58): both are the approver's.
+        Request::Build { .. } | Request::AnswerCheckpoint { .. } => Some(Role::Approve),
     }
 }
 
@@ -263,6 +266,23 @@ mod tests {
             ),
             (Request::Compact { thread: t }, Some(Role::Approve)),
             (Request::Interrupt { thread: t }, Some(Role::Write)),
+            (
+                Request::Build {
+                    project: "p".into(),
+                    issue: 58,
+                    workflow: None,
+                },
+                Some(Role::Approve),
+            ),
+            (
+                Request::AnswerCheckpoint {
+                    lead: t,
+                    gate: "brief".into(),
+                    answer: aigentic_api::CheckpointAnswer::Stop,
+                    amendment: None,
+                },
+                Some(Role::Approve),
+            ),
         ];
         for (request, role) in rows {
             assert_eq!(needs(&request), role, "{request:?}");

@@ -14,8 +14,9 @@ use aigentic_core::{Author, ContentBlock, Event, RiskClass, ToolCall};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-/// Sent in `Hello`; a mismatch is refused with both numbers.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// Sent in `Hello`; a mismatch is refused with both numbers. Version 2
+/// adds `Build`/`AnswerCheckpoint` and `Response::Run` (issue #58).
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// One line on the wire.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -156,6 +157,36 @@ pub enum Request {
         thread: Ulid,
         report: ReportKind,
     },
+    /// Start a run for `issue` in `project`, or resume the unfinished one
+    /// (issue #58). Refused unless the user has `approve`: a build pushes
+    /// to the main branch. `workflow` defaults to the bundled `build`.
+    Build {
+        project: String,
+        issue: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workflow: Option<String>,
+    },
+    /// Answer the open checkpoint of a run's lead (issue #58). In slice 1
+    /// only `stop` is accepted; `go` and `amend` are refused. The lead is
+    /// the run's own thread, not a project thread.
+    AnswerCheckpoint {
+        lead: Ulid,
+        gate: String,
+        answer: CheckpointAnswer,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        amendment: Option<String>,
+    },
+}
+
+/// A human's answer at a run's checkpoint (issue #58). Mirrors the log's
+/// `CheckpointAnswer` rather than take an edge to `log` (AGENTS.md); the
+/// serde shape is identical, so the same word crosses the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointAnswer {
+    Go,
+    Amend,
+    Stop,
 }
 
 /// The text reports the REPL prints, rendered by the daemon so every
@@ -192,6 +223,13 @@ pub enum Response {
     },
     Thread {
         thread: ThreadInfo,
+    },
+    /// The reply to `Build` (issue #58): the run's lead thread.
+    /// `resumed` says an unfinished run was picked up rather than a new
+    /// one started. The session subscribes this client to the lead.
+    Run {
+        lead: Ulid,
+        resumed: bool,
     },
     /// The reply to `Open`: the state now, the events since `from_seq`,
     /// and the thread's permission mode, with the identity the footer
@@ -492,6 +530,17 @@ mod tests {
                 thread: thread(),
                 report: ReportKind::Policy,
             },
+            Request::Build {
+                project: "p".into(),
+                issue: 58,
+                workflow: Some("build".into()),
+            },
+            Request::AnswerCheckpoint {
+                lead: thread(),
+                gate: "brief".into(),
+                answer: CheckpointAnswer::Stop,
+                amendment: None,
+            },
         ]
     }
 
@@ -525,6 +574,10 @@ mod tests {
             },
             Response::Thread {
                 thread: thread_info,
+            },
+            Response::Run {
+                lead: thread(),
+                resumed: true,
             },
             Response::Opened {
                 state: ThreadState::Running {
@@ -756,7 +809,12 @@ mod tests {
     fn an_unknown_kind_fails_naming_the_protocol() {
         let err = decode(r#"{"id":1,"request":{"kind":"teleport","thread":"x"}}"#).unwrap_err();
         let text = err.to_string();
-        assert!(text.contains("protocol 1"), "{text}");
+        // The message names the version this side speaks, so the literal
+        // follows the constant rather than the bump.
+        assert!(
+            text.contains(&format!("protocol {PROTOCOL_VERSION}")),
+            "{text}"
+        );
         assert!(text.contains("teleport"), "{text}");
         assert!(decode("not json").is_err());
         assert!(decode("").is_err());
