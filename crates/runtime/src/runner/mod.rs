@@ -324,7 +324,7 @@ impl<F: Forge, H: RunnerHost> Runner<F, H> {
         };
         if step.writes
             && self.lock.is_none()
-            && let Some(waiting) = self.take_write_lock(&step)?
+            && let Some(waiting) = self.take_write_lock()?
         {
             return Ok(waiting);
         }
@@ -359,7 +359,7 @@ impl<F: Forge, H: RunnerHost> Runner<F, H> {
         let step = self.step(step_id)?.clone();
         if step.writes
             && self.lock.is_none()
-            && let Some(waiting) = self.take_write_lock(&step)?
+            && let Some(waiting) = self.take_write_lock()?
         {
             return Ok(waiting);
         }
@@ -601,9 +601,14 @@ impl<F: Forge, H: RunnerHost> Runner<F, H> {
         Ok(Advanced::WaitingHuman { gate: gate.into() })
     }
 
-    /// Take the repository's write lock, or escalate `write_lock`.
-    fn take_write_lock(&mut self, step: &Step) -> Result<Option<Advanced>, RunnerError> {
-        let _ = step;
+    /// Take this repository's write lock for this lead, keyed by the
+    /// repository root in the process-wide map. A rebuild over the same
+    /// run finds its own lead there and keeps working; another lead gets
+    /// the `write_lock` gate — the pause is returned as `Some` — naming
+    /// the holder. On success the guard is held in `self.lock` until the
+    /// runner escalates, finishes or drops, so a second writing step in
+    /// this run never takes it again.
+    fn take_write_lock(&mut self) -> Result<Option<Advanced>, RunnerError> {
         match WriteGuard::take(self.repo.clone(), self.lead_id) {
             Ok(guard) => {
                 self.lock = Some(guard);
