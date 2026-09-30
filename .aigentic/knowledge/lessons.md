@@ -76,6 +76,24 @@ so the rule can be judged, not just obeyed. The `brief`, `plan-check` and
   the exit status `tail`'s, so a failing clippy reads green. The template
   says one command per call and E4 now enforces it.
 
+- **Consolidate the spec before a big implementation.** #57's first
+  implementer read a plan, two amendments and a rescoped issue, spent 400
+  calls and 18 context sweeps re-reading them in 15-line slices, and wrote
+  no code. A fresh implementer given one consolidated spec (conflicts
+  resolved, types copied in, work listed by commit) finished for $5.16.
+  When a plan has more than one amendment, merge them into one spec before
+  the implementer starts.
+- **Spell out the gate's exact form.** Every builder until #57's fix round
+  wrapped a gate command (`cd …;`, `&&`, `| tail`, `; echo "exit=$?"`). The
+  fix prompt said "no `cd`, no `;`, no `&&`, no pipe" and got three bare
+  calls. Say what not to add, not only what to run.
+- **Flash judges well when asked to prove.** On #57 a Flash judge ($1.49)
+  finished a probing review, proved a cost bug by running it and found a
+  crash case (J9), while the Kimi judge capped twice ($8.67, no verdict;
+  `max_iterations = 80` is too low for a judge that builds a probe). The
+  round-2 Flash judge reproduced the fixer's mutation check itself. One
+  ticket is not proof: keep shadowing roles before moving them.
+
 ## Plans and tests
 
 - **Check the design against the issue's purpose, not only its words.**
