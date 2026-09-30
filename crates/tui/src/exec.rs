@@ -401,6 +401,7 @@ mod tests {
         let server = ServerConfig {
             listen: "unix".into(),
             idle_unload_secs: 60,
+            resume_runs: false,
             users: vec![UserConfig {
                 name: "steve".into(),
                 token_env: None,

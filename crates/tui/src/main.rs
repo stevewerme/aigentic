@@ -2,6 +2,7 @@
 //! subcommands. No full-screen mode; the terminal keeps its scrollback.
 
 mod app;
+mod build_cmd;
 mod checks;
 mod config;
 mod doctor;
@@ -26,6 +27,7 @@ use clap::{Parser, Subcommand};
 use ulid::Ulid;
 
 use crate::app::engine::{ClientRepl, Identity};
+use crate::build_cmd::BuildArgs;
 use crate::config::Config;
 use crate::project_cmd::ProjectCommand;
 use crate::skills_cmd::{SkillPaths, SkillsCommand};
@@ -132,6 +134,20 @@ enum Command {
         /// `AIGENTIC_TOKEN` on their machine. Nothing is stored.
         #[arg(long, value_name = "USER")]
         new_token: Option<String>,
+    },
+    /// Build one issue to the end: start (or resume) the build workflow
+    /// for `n` and follow it, answering a checkpoint `stop`. Progress on
+    /// stderr. Exit 0 closed, 3 stopped (a human is needed), 1 a run
+    /// stopped by an error. Ctrl-C detaches; the run stays resumable.
+    Build {
+        /// The issue number.
+        n: u64,
+        /// The workflow to run (default: the daemon's, `build`).
+        #[arg(long, value_name = "NAME")]
+        workflow: Option<String>,
+        /// Every notice as a JSON line on stdout.
+        #[arg(long)]
+        json: bool,
     },
     /// Run one prompt to the end with no prompt shown: progress on
     /// stderr, the final message on stdout. Exit 0 done, 1 failed, 3 done
@@ -437,22 +453,35 @@ async fn main() -> anyhow::Result<()> {
             std::process::exit(0);
         }
         Some(
-            Command::Doctor { .. } | Command::Init | Command::Serve { .. } | Command::Exec { .. },
+            Command::Doctor { .. }
+            | Command::Init
+            | Command::Serve { .. }
+            | Command::Exec { .. }
+            | Command::Build { .. },
         )
         | None => {}
     }
 
     // `exec` reads its prompt before anything connects, so a missing
     // prompt fails fast.
-    let exec_args = match cli.command {
+    let exec_args = match &cli.command {
         Some(Command::Exec {
             prompt,
             json,
             output_last,
         }) => Some(exec::ExecArgs {
-            prompt: exec::prompt_from(prompt)?,
-            json,
-            output_last,
+            prompt: exec::prompt_from(prompt.clone())?,
+            json: *json,
+            output_last: output_last.clone(),
+        }),
+        _ => None,
+    };
+    // `build` names its issue before anything connects, like `exec`.
+    let build_args = match &cli.command {
+        Some(Command::Build { n, workflow, json }) => Some(BuildArgs {
+            issue: *n,
+            workflow: workflow.clone(),
+            json: *json,
         }),
         _ => None,
     };
@@ -515,6 +544,23 @@ async fn main() -> anyhow::Result<()> {
             welcome.server
         );
     };
+    // `build` asks the daemon to run the issue and follows the run: it
+    // never opens a thread of its own, so a run's lead is its one log.
+    if let Some(args) = build_args {
+        let notices = client.take_notices().context("notice stream")?;
+        let outcome = build_cmd::run(
+            &client,
+            notices,
+            &project_name,
+            &welcome.user,
+            &args,
+            &mut std::io::stdout(),
+            &mut std::io::stderr(),
+        )
+        .await?;
+        drop(embedded);
+        std::process::exit(outcome.code);
+    }
     let role = welcome
         .projects
         .iter()
@@ -549,6 +595,7 @@ async fn main() -> anyhow::Result<()> {
             profile,
             model,
             effort,
+            ..
         } => (
             state,
             events,

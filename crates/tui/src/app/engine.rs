@@ -2394,6 +2394,8 @@ mod tests {
         let server_config = aigentic_server::ServerConfig {
             listen: "unix".into(),
             idle_unload_secs: 600,
+            // An embedded daemon resumes nothing on its own (#58, rule 8).
+            resume_runs: false,
             users: ["steve", "magnus"]
                 .iter()
                 .map(|n| UserConfig {
@@ -2570,6 +2572,8 @@ mod tests {
         let server_config = aigentic_server::ServerConfig {
             listen: "unix".into(),
             idle_unload_secs: 600,
+            // An embedded daemon resumes nothing on its own (#58, rule 8).
+            resume_runs: false,
             users: ["steve", "magnus", "reviewer"]
                 .iter()
                 .map(|n| UserConfig {
