@@ -83,6 +83,9 @@ so the rule can be judged, not just obeyed. The `brief`, `plan-check` and
   resolved, types copied in, work listed by commit) finished for $5.16.
   When a plan has more than one amendment, merge them into one spec before
   the implementer starts.
+  It happened again on #65 when the supervisor put two amendments on top
+  of a spec it had written up front: 400 calls, 17 sweeps, no commit. The
+  rule covers amendments to a spec too: merge before implementing, always.
 - **Spell out the gate's exact form.** Every builder until #57's fix round
   wrapped a gate command (`cd …;`, `&&`, `| tail`, `; echo "exit=$?"`). The
   fix prompt said "no `cd`, no `;`, no `&&`, no pipe" and got three bare
