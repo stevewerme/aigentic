@@ -439,8 +439,11 @@ impl ClientRepl {
         // A followed run's checkpoint takes a typed line first (issue #68):
         // plain mode has no keys, so `1`/`stop` and `2`/`wait` are the
         // prompt's answers there. A `/` line still reaches the parser,
-        // so `/build` and `/help` keep working with the prompt up.
-        if !line.trim_start().starts_with('/')
+        // so `/build` and `/help` keep working with the prompt up. Only
+        // while it is the prompt on screen, though: with the chat's
+        // prompt up, a typed `1` is the chat's answer (#68's review).
+        if self.prompted.is_none()
+            && !line.trim_start().starts_with('/')
             && let Some(keyed) = self.checkpoint.as_ref().and_then(|(_, _, m)| m.line(line))
         {
             self.apply_checkpoint(keyed, out).await;
@@ -939,6 +942,20 @@ impl ClientRepl {
             return self.menu.as_ref();
         }
         self.checkpoint()
+    }
+
+    /// Which prompt `menu()` draws: the chat's call or the run's gate.
+    /// The shell restarts the answering keys' grace when it changes, so
+    /// a key in flight from answering one prompt cannot land on the
+    /// prompt that replaces it (#68's review: `1` allowed a command, and
+    /// the Enter after it stopped the run).
+    pub fn menu_id(&self) -> Option<String> {
+        if let Some(call_id) = self.prompted.as_ref() {
+            return self.menu.as_ref().map(|_| format!("chat:{call_id}"));
+        }
+        self.checkpoint
+            .as_ref()
+            .map(|(lead, gate, _)| format!("gate:{lead}:{gate}"))
     }
 
     /// A key while the menu is up: the selection, the digits, the hidden
@@ -4422,6 +4439,53 @@ mod tests {
             .title
             .clone();
         assert_eq!(title, "checkpoint second");
+        daemon.stop();
+    }
+
+    /// T15b (#68's review): with the chat's permission prompt and the
+    /// gate both up, a typed `1` is the chat's answer and never the
+    /// gate's; the two prompts have different ids, so the shell's grace
+    /// restarts when the gate's prompt takes the chat's place.
+    #[tokio::test]
+    async fn a_typed_line_answers_the_prompt_on_screen_not_the_gate() {
+        let lead_id = Ulid::generate();
+        let backlog = vec![run_event(
+            lead_id,
+            1,
+            EventKind::CheckpointAsked,
+            checkpoint_asked("second"),
+        )];
+        let (mut repl, mut out, daemon) = repl_for(lead_id, backlog).await;
+        repl.handle_line("/build 58", &mut out).await;
+        let gate_id = repl.menu_id().expect("the gate's prompt is up");
+        assert!(gate_id.starts_with("gate:"), "{gate_id}");
+
+        let call_id = "c1";
+        repl.render(
+            Notice::State {
+                thread: repl.thread,
+                state: approval_state(call_id),
+            },
+            &mut out,
+        );
+        let chat_id = repl.menu_id().expect("the chat's prompt is up");
+        assert_eq!(chat_id, format!("chat:{call_id}"));
+        assert_ne!(chat_id, gate_id, "a change of prompt is a change of id");
+
+        repl.handle_line("1", &mut out).await;
+        let requests = daemon.requests();
+        assert!(
+            requests
+                .iter()
+                .any(|r| matches!(r, Request::Decide { allow: true, .. })),
+            "the `1` allowed the chat's call: {requests:?}"
+        );
+        assert!(
+            !requests
+                .iter()
+                .any(|r| matches!(r, Request::AnswerCheckpoint { .. })),
+            "and never answered the gate: {requests:?}"
+        );
         daemon.stop();
     }
 

@@ -591,6 +591,21 @@ const PROMPT_GRACE: Duration = Duration::from_millis(500);
 /// A second press of Ctrl-C or Esc within this long completes it.
 const ARM_WINDOW: Duration = Duration::from_secs(1);
 
+/// Since when the drawn prompt has been up: kept while the same prompt
+/// stays, restarted when another takes its place (#68's review). The
+/// answering keys wait out the grace from this instant, so a key in
+/// flight from answering one prompt cannot answer the next.
+fn next_grace(
+    drawn: Option<String>,
+    was: Option<(String, Instant)>,
+    now: Instant,
+) -> Option<(String, Instant)> {
+    match (drawn, was) {
+        (None, _) => None,
+        (Some(id), Some((prev, at))) if prev == id => Some((prev, at)),
+        (Some(id), _) => Some((id, now)),
+    }
+}
 async fn run_shell(
     mut engine: ClientRepl,
     mut notices: mpsc::Receiver<Notice>,
@@ -635,7 +650,7 @@ async fn run_shell(
     let mut prompt_draft: Option<String> = None;
     // When the current prompt block first showed: single-key answers wait
     // PROMPT_GRACE so a key meant for the draft does not answer it.
-    let mut block_since: Option<Instant> = None;
+    let mut block_since: Option<(String, Instant)> = None;
 
     // A thread opened while it waits: the prompt is shown at once.
     let state = engine.state().clone();
@@ -671,11 +686,7 @@ async fn run_shell(
         {
             armed = None;
         }
-        block_since = match (engine.menu(), block_since) {
-            (None, _) => None,
-            (Some(_), Some(t)) => Some(t),
-            (Some(_), None) => Some(Instant::now()),
-        };
+        block_since = next_grace(engine.menu_id(), block_since, Instant::now());
         // The prompt went away while its reason input was open: the
         // draft comes back (the reason is moot).
         if prompt_draft.is_some() && engine.menu().is_none() {
@@ -843,7 +854,7 @@ async fn run_shell(
                         // passed.
                         if engine.menu().is_some() {
                             let settled =
-                                block_since.is_some_and(|t| t.elapsed() >= PROMPT_GRACE);
+                                block_since.as_ref().is_some_and(|(_, t)| t.elapsed() >= PROMPT_GRACE);
                             match engine
                                 .menu_key(&key, composer.is_empty(), settled, &mut out)
                                 .await
@@ -1692,5 +1703,30 @@ mod tests {
             );
         }
         assert_eq!(menu.rows.len(), 2, "two picks, no more");
+    }
+
+    /// #68's review: the grace is the drawn prompt's, so it restarts
+    /// when another prompt takes the screen and holds while one stays.
+    #[test]
+    fn the_answering_grace_restarts_with_each_prompt() {
+        let t0 = Instant::now();
+        let later = t0 + std::time::Duration::from_secs(5);
+        let kept = next_grace(Some("chat:c1".into()), Some(("chat:c1".into(), t0)), later);
+        assert_eq!(
+            kept,
+            Some(("chat:c1".to_owned(), t0)),
+            "the same prompt keeps its clock"
+        );
+        let fresh = next_grace(Some("gate:l:g".into()), Some(("chat:c1".into(), t0)), later);
+        assert_eq!(
+            fresh,
+            Some(("gate:l:g".to_owned(), later)),
+            "a new prompt starts its own"
+        );
+        assert_eq!(next_grace(None, Some(("chat:c1".into(), t0)), later), None);
+        assert_eq!(
+            next_grace(Some("chat:c1".into()), None, later),
+            Some(("chat:c1".to_owned(), later))
+        );
     }
 }
