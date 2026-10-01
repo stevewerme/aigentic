@@ -56,6 +56,9 @@ pub enum Cell {
     Summary(String),
     /// A checklist item finished: checked off into the scrollback, dim.
     Done(String),
+    /// A lead's line, from the shared run view (issue #68): dim, each
+    /// line `▸ ` prefixed. The text may hold several lines.
+    Run(String),
 }
 
 /// The checklist's lines: a head with the count, then one line a step.
@@ -275,6 +278,15 @@ impl Cell {
                 text.clone(),
                 Style::default().add_modifier(Modifier::DIM),
             ))],
+            Cell::Run(text) => text
+                .lines()
+                .map(|l| {
+                    Line::from(Span::styled(
+                        format!("▸ {l}"),
+                        Style::default().add_modifier(Modifier::DIM),
+                    ))
+                })
+                .collect(),
             Cell::Note(text) => text
                 .lines()
                 .map(|l| {

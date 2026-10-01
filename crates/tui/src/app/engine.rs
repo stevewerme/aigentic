@@ -16,9 +16,10 @@ use aigentic_api::client::Client;
 use aigentic_api::{Notice, ReportKind, Request, Response, ThreadState};
 use aigentic_runtime::aigentic_core::{Author, ContentBlock, EventKind, ToolCall};
 use aigentic_runtime::aigentic_log::{
-    AssistantMessagePayload, CompactedPayload, CompactionStrategy, DecisionScope,
-    InterruptedPayload, MemoryExtractedPayload, MemoryRememberedPayload, PermissionDecidedPayload,
-    SkillLoadedPayload, ToolResultPayload, TurnEndedPayload, UserMessagePayload,
+    AssistantMessagePayload, CheckpointAnsweredPayload, CheckpointAskedPayload, CompactedPayload,
+    CompactionStrategy, DecisionScope, InterruptedPayload, MemoryExtractedPayload,
+    MemoryRememberedPayload, PermissionDecidedPayload, RunFinishedPayload, SkillLoadedPayload,
+    ToolResultPayload, TurnEndedPayload, UserMessagePayload,
 };
 use aigentic_runtime::{ASKED_HUMAN, INTERRUPTED};
 
@@ -222,6 +223,18 @@ impl Identity {
     }
 }
 
+/// The run this REPL follows (issue #68): its lead, the issue it is for,
+/// and the last `seq` drawn. `printed` is the boundary between the
+/// backlog and the live notices: both sources advance it, and both skip
+/// `seq <= printed`, so a lead event appended between the two is drawn
+/// once (copy of `build_cmd`'s rule).
+#[derive(Debug, Clone)]
+pub struct Followed {
+    pub lead: Ulid,
+    pub issue: u64,
+    pub printed: u64,
+}
+
 pub struct ClientRepl {
     client: Client,
     thread: Ulid,
@@ -261,6 +274,15 @@ pub struct ClientRepl {
     /// The `update_tasks` call ids, whose results draw nothing.
     task_calls: std::collections::HashSet<String>,
     quit: bool,
+    /// The project this REPL started in (issue #68): `/build` names it,
+    /// and its run is opened through it.
+    home_project: String,
+    /// The run this REPL follows (issue #68), if any.
+    following: Option<Followed>,
+    /// The followed run's checkpoint prompt, apart from `menu`: a chat
+    /// state change clearing `menu` never withdraws it, and a chat
+    /// permission prompt comes first when both are up.
+    checkpoint: Option<(Ulid, String, Menu)>,
     /// The last `Notice::Usage`: window fill and the ceiling —
     /// compaction's line — for the status line (phase 6 step 3).
     usage: Option<(u64, u64)>,
@@ -277,6 +299,11 @@ pub struct ClientRepl {
 }
 
 impl ClientRepl {
+    // One argument per thing the REPL needs to know at birth: the wire,
+    // the chat thread, who is talking, what they may do, what to show,
+    // what to remember, how to count money, and the project it started
+    // in (issue #68). Bundling them would only move the same list.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         client: Client,
         thread: Ulid,
@@ -285,6 +312,7 @@ impl ClientRepl {
         state: ThreadState,
         mode: String,
         identity: Identity,
+        project: &str,
     ) -> Self {
         Self {
             client,
@@ -310,6 +338,9 @@ impl ClientRepl {
             last_stop: None,
             awaiting_turn: false,
             quit: false,
+            home_project: project.to_owned(),
+            following: None,
+            checkpoint: None,
         }
     }
 
@@ -405,6 +436,16 @@ impl ClientRepl {
             }
             return;
         }
+        // A followed run's checkpoint takes a typed line first (issue #68):
+        // plain mode has no keys, so `1`/`stop` and `2`/`wait` are the
+        // prompt's answers there. A `/` line still reaches the parser,
+        // so `/build` and `/help` keep working with the prompt up.
+        if !line.trim_start().starts_with('/')
+            && let Some(keyed) = self.checkpoint.as_ref().and_then(|(_, _, m)| m.line(line))
+        {
+            self.apply_checkpoint(keyed, out).await;
+            return;
+        }
         // A pending question or request this client prompted for takes
         // the line first; without the role the line is what it is.
         match &self.state {
@@ -430,7 +471,9 @@ impl ClientRepl {
                         Pick::Deny => {
                             self.decide(false, false, None, reason, out).await;
                         }
-                        Pick::Answer | Pick::Other => {}
+                        // A checkpoint pick never reaches here (its own prompt
+                        // handles it): issue #68.
+                        Pick::Answer | Pick::Other | Pick::StopRun | Pick::LeaveWaiting => {}
                     }
                     return;
                 }
@@ -493,6 +536,7 @@ impl ClientRepl {
                 self.show(r, "", out);
             }
             Command::Cost => self.report(ReportKind::Cost, out).await,
+            Command::Build(arg) => self.build(arg, out).await,
             // The raw stop reason stays off the transcript (issue #22):
             // `/why` fetches it, engine-local, no daemon round-trip.
             Command::Why => out.line(&why_line(self.last_stop.as_deref())),
@@ -645,6 +689,203 @@ impl ClientRepl {
         self.show(r, ok, out);
     }
 
+    /// `/build <n>` (issue #68): start or resume a run of that issue and
+    /// follow its lead's log from here. `Build`'s reply and `Open`'s both
+    /// arrive on this task, which also consumes the notices, so a lead
+    /// event appended in between is processed after the backlog and
+    /// skipped by `printed`.
+    async fn build(&mut self, arg: Option<&str>, out: &mut dyn Printer) {
+        let issue = arg
+            .map(str::trim)
+            .and_then(|a| a.parse::<u64>().ok())
+            .filter(|n| *n > 0);
+        let Some(issue) = issue else {
+            out.line("[usage: /build <issue number>]");
+            return;
+        };
+        if !self.may_approve() {
+            out.line("[/build needs the approve role in this project]");
+            return;
+        }
+        // One run at a time: following m leaves n, which keeps running
+        // in the daemon.
+        if self.following.is_some() {
+            self.detach(out);
+        }
+        let project = self
+            .project
+            .clone()
+            .unwrap_or_else(|| self.home_project.clone());
+        let r = self
+            .request(Request::Build {
+                project,
+                issue,
+                workflow: None,
+            })
+            .await;
+        match r {
+            Response::Run { lead, resumed } => {
+                let how = if resumed { "resumed" } else { "started" };
+                out.cell(
+                    Cell::Run(format!("run {lead} for issue #{issue} ({how})")),
+                    true,
+                );
+                self.following = Some(Followed {
+                    lead,
+                    issue,
+                    printed: 0,
+                });
+                self.follow_backlog(lead, out).await;
+            }
+            Response::Refused { reason } => out.line(&format!("[build refused: {reason}]")),
+            other => self.show(other, "", out),
+        }
+    }
+
+    /// The lead's log from its first event, drawn in order (issue #68).
+    /// Nothing is answered here: a gate the backlog ends at is shown and
+    /// left waiting for a person.
+    async fn follow_backlog(&mut self, lead: Ulid, out: &mut dyn Printer) {
+        let events = match crate::run_view::fetch_backlog(&self.client, lead).await {
+            Ok(events) => events,
+            Err(e) if e.downcast_ref::<crate::run_view::Refused>().is_some() => {
+                out.line(&format!("[build refused: {e}]"));
+                return;
+            }
+            Err(e) => {
+                out.line(&format!("[error: {e}]"));
+                return;
+            }
+        };
+        for event in &events {
+            self.render_run_event(event, out);
+        }
+    }
+
+    /// One event from the followed lead (issue #68): skip what `printed`
+    /// already covers, then draw the line, show the prompt a gate asks
+    /// for, and end the follow at the outcome. The same rule serves the
+    /// backlog and the live notices.
+    fn render_run_event(
+        &mut self,
+        event: &aigentic_runtime::aigentic_core::Event,
+        out: &mut dyn Printer,
+    ) {
+        let Some(followed) = self.following.as_mut() else {
+            return;
+        };
+        if event.seq <= followed.printed {
+            return;
+        }
+        followed.printed = event.seq;
+        let lead = followed.lead;
+        if let Some(text) = crate::run_view::render(event) {
+            out.cell(Cell::Run(text), true);
+        }
+        match event.kind {
+            EventKind::CheckpointAsked => {
+                if let Ok(p) =
+                    serde_json::from_value::<CheckpointAskedPayload>(event.payload.clone())
+                {
+                    let menu = Menu::checkpoint(&p.gate, &p.shown);
+                    out.prompt(&menu);
+                    self.checkpoint = Some((lead, p.gate, menu));
+                }
+            }
+            // Answered from another connection: the prompt goes without
+            // this client sending anything. The answer event names no
+            // gate (the payload has no such field), and a lead has one
+            // gate up at a time, so any answer withdraws the prompt.
+            EventKind::CheckpointAnswered => {
+                if serde_json::from_value::<CheckpointAnsweredPayload>(event.payload.clone())
+                    .is_ok()
+                {
+                    self.checkpoint = None;
+                }
+            }
+            EventKind::RunFinished => {
+                if let Ok(p) = serde_json::from_value::<RunFinishedPayload>(event.payload.clone()) {
+                    out.cell(
+                        Cell::Run(format!(
+                            "run {lead} finished: {}",
+                            crate::run_view::outcome_line(&p.outcome)
+                        )),
+                        true,
+                    );
+                    self.following = None;
+                    self.checkpoint = None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Stop following the run (issue #68): its prompt goes, and it keeps
+    /// running in the daemon — paused until the next `/build n` without
+    /// `--server`.
+    pub fn detach(&mut self, out: &mut dyn Printer) {
+        let Some(followed) = self.following.take() else {
+            return;
+        };
+        self.checkpoint = None;
+        out.line(&format!(
+            "[detached from run {}: it keeps running in the daemon; without --server, \
+             closing this REPL pauses it until /build {}]",
+            followed.lead, followed.issue
+        ));
+    }
+
+    /// Whether a run is followed, for the keys (issue #68).
+    pub fn following(&self) -> bool {
+        self.following.is_some()
+    }
+
+    /// The followed run's checkpoint prompt, while it is up.
+    pub fn checkpoint(&self) -> Option<&Menu> {
+        self.checkpoint.as_ref().map(|(_, _, menu)| menu)
+    }
+
+    /// A keyed answer to the checkpoint prompt: stop the run, or leave it
+    /// waiting and send nothing (issue #68).
+    async fn apply_checkpoint(&mut self, keyed: Keyed, out: &mut dyn Printer) {
+        let Some((lead, gate)) = self
+            .checkpoint
+            .as_ref()
+            .map(|(lead, gate, _)| (*lead, gate.clone()))
+        else {
+            return;
+        };
+        let Keyed::Decide { pick, echo, .. } = keyed else {
+            return;
+        };
+        out.line(&echo);
+        match pick {
+            Pick::StopRun => {
+                let r = self
+                    .request(Request::AnswerCheckpoint {
+                        lead,
+                        gate: gate.clone(),
+                        answer: aigentic_api::CheckpointAnswer::Stop,
+                        amendment: None,
+                    })
+                    .await;
+                match r {
+                    Response::Ok => {
+                        self.checkpoint = None;
+                        out.line(&format!("[answered {gate}: stop]"));
+                    }
+                    // A refusal answers nothing: the prompt stays.
+                    other => self.show(other, "", out),
+                }
+            }
+            Pick::LeaveWaiting => {
+                self.checkpoint = None;
+                out.line(&format!("[left {gate} waiting: /build <n> asks again]"));
+            }
+            Pick::Answer | Pick::Other | Pick::Allow { .. } | Pick::Deny => {}
+        }
+    }
+
     /// Answer the permission request this client prompted for. `p` sends
     /// a prefix (allow from now on), `Esc` a reason with the deny.
     pub async fn decide(
@@ -690,9 +931,14 @@ impl ClientRepl {
         self.turn.as_ref()
     }
 
-    /// The menu the shell draws while this client is prompted.
+    /// The menu the shell draws while this client is prompted: the chat
+    /// prompt when there is one, else the followed run's checkpoint
+    /// prompt (issue #68).
     pub fn menu(&self) -> Option<&Menu> {
-        self.prompted.as_ref().and(self.menu.as_ref())
+        if self.prompted.is_some() {
+            return self.menu.as_ref();
+        }
+        self.checkpoint()
     }
 
     /// A key while the menu is up: the selection, the digits, the hidden
@@ -708,7 +954,25 @@ impl ClientRepl {
         out: &mut dyn Printer,
     ) -> MenuKey {
         if self.prompted.is_none() {
-            return MenuKey::Passed;
+            // With no chat prompt the keys belong to the followed run's
+            // checkpoint menu (issue #68), if one is up.
+            let keyed = {
+                let Some((_, _, menu)) = self.checkpoint.as_mut() else {
+                    return MenuKey::Passed;
+                };
+                menu.key(key, composer_empty, settled)
+            };
+            return match keyed {
+                Keyed::Passed => MenuKey::Passed,
+                Keyed::Used => MenuKey::Used,
+                // A checkpoint has no text input: there is nothing for
+                // the composer to take.
+                Keyed::Text => MenuKey::Passed,
+                keyed @ (Keyed::Decide { .. } | Keyed::Answer { .. }) => {
+                    self.apply_checkpoint(keyed, out).await;
+                    MenuKey::Used
+                }
+            };
         }
         let Some(menu) = self.menu.as_mut() else {
             return MenuKey::Passed;
@@ -737,7 +1001,7 @@ impl ClientRepl {
                     Pick::Deny => {
                         self.decide(false, false, None, reason, out).await;
                     }
-                    Pick::Answer | Pick::Other => {}
+                    Pick::Answer | Pick::Other | Pick::StopRun | Pick::LeaveWaiting => {}
                 }
             }
             Keyed::Answer { text, echo } => {
@@ -807,6 +1071,8 @@ impl ClientRepl {
                     self.answer_menu(&contribution, out).await;
                 }
             }
+            // A checkpoint has no text input: nothing to send.
+            Some(Kind::Checkpoint) => {}
             None => {}
         }
     }
@@ -929,6 +1195,58 @@ impl ClientRepl {
     /// One notice to lines. Streamed text is printed as its lines
     /// complete; the rest at the message's end.
     pub fn render(&mut self, notice: Notice, out: &mut dyn Printer) {
+        // A followed run's notices go to the run view (issue #68), and
+        // everything else for its lead is dropped: a lead's `State` must
+        // never reach `self.state`, which drives the footer and what
+        // Ctrl-C and Esc mean. Notices for a thread that is neither the
+        // chat nor the followed lead are dropped too — an old lead after
+        // a detach still pushes them.
+        if self.route(&notice, out) {
+            return;
+        }
+        self.render_chat(notice, out)
+    }
+
+    /// Draw a notice as the run view, or answer whether it was one
+    /// (issue #68). `false` hands the notice to the chat.
+    fn route(&mut self, notice: &Notice, out: &mut dyn Printer) -> bool {
+        let some_lead = self.following.as_ref().map(|f| f.lead);
+        let thread = match notice {
+            Notice::Event { thread, .. }
+            | Notice::TextDelta { thread, .. }
+            | Notice::ToolCallStarted { thread, .. }
+            | Notice::State { thread, .. }
+            | Notice::Mode { thread, .. }
+            | Notice::Model { thread, .. }
+            | Notice::Usage { thread, .. }
+            | Notice::Note { thread, .. } => *thread,
+        };
+        if thread == self.thread {
+            return false;
+        }
+        match notice {
+            Notice::Event { event, .. } if some_lead == Some(thread) => {
+                self.render_run_event(event, out);
+                true
+            }
+            Notice::Note { text, .. } if some_lead == Some(thread) => {
+                out.cell(Cell::Run(format!("note: {text}")), true);
+                // The runner says the run is over before its last
+                // events land; the follow ends here so nothing after
+                // it is drawn as live.
+                if text.starts_with("run stopped") {
+                    self.following = None;
+                    self.checkpoint = None;
+                }
+                true
+            }
+            // Every other notice for the lead, and every notice for a
+            // thread we are not on: nothing to draw.
+            _ => true,
+        }
+    }
+
+    fn render_chat(&mut self, notice: Notice, out: &mut dyn Printer) {
         match notice {
             Notice::Model {
                 profile,
@@ -1600,7 +1918,8 @@ mod tests {
     use crate::config::Config;
     use aigentic_api::client::Addr;
     use aigentic_runtime::aigentic_core::{
-        Capabilities, CompletionRequest, Message, Provider, ProviderError, ProviderEvent, Usage,
+        Capabilities, CompletionRequest, Event, Message, Provider, ProviderError, ProviderEvent,
+        RiskClass, ToolCall as CoreToolCall, Usage,
     };
     use aigentic_server::build::{BuildError, ProviderFactory};
     use aigentic_server::{DefaultReports, Server};
@@ -1672,6 +1991,20 @@ mod tests {
     fn tool_use() -> ProviderEvent {
         ProviderEvent::Done {
             finish_reason: "tool_use".into(),
+        }
+    }
+
+    /// The chat thread waiting on a permission decision.
+    fn approval_state(call_id: &str) -> ThreadState {
+        ThreadState::AwaitingApproval {
+            call_id: call_id.into(),
+            call: CoreToolCall {
+                id: call_id.into(),
+                name: "bash".into(),
+                args: serde_json::json!({ "command": "rm -rf /" }),
+            },
+            class: RiskClass::Exec,
+            reason: "class exec: ask".into(),
         }
     }
 
@@ -1787,6 +2120,7 @@ mod tests {
             state,
             mode,
             Identity::default(),
+            "proj",
         );
         let (tx, rx) = mpsc::unbounded_channel();
         // Lines arrive as a person would type them, with a pause for the
@@ -1887,6 +2221,7 @@ mod tests {
             state,
             mode,
             Identity::default(),
+            "proj",
         );
         let (tx, rx) = mpsc::unbounded_channel();
         let (pacer, _) = Client::connect(&Addr::Unix(embedded.socket.clone()), &embedded.token)
@@ -1977,6 +2312,7 @@ mod tests {
             state,
             mode,
             Identity::default(),
+            "proj",
         );
         let (pacer, _) = Client::connect(&addr, &embedded.token).await.unwrap();
         open(&pacer, "proj", Some(thread)).await;
@@ -2079,6 +2415,7 @@ mod tests {
             state,
             mode,
             Identity::default(),
+            "proj",
         );
         let (pacer, _) = Client::connect(&addr, &embedded.token).await.unwrap();
         open(&pacer, "proj", Some(thread)).await;
@@ -2167,6 +2504,7 @@ mod tests {
             state,
             mode,
             Identity::default(),
+            "proj",
         );
         let (pacer, _) = Client::connect(&addr, &embedded.token).await.unwrap();
         open(&pacer, "proj", Some(thread)).await;
@@ -2255,6 +2593,7 @@ mod tests {
             state,
             mode,
             Identity::default(),
+            "proj",
         );
         // The pacer: a second session on the same thread.
         let (pacer, _) = Client::connect(&addr, &embedded.token).await.unwrap();
@@ -2439,6 +2778,7 @@ mod tests {
             state,
             mode,
             Identity::default(),
+            "proj",
         );
         let (magnus, _) = Client::connect(&addr, "tok-magnus").await.unwrap();
         open(&magnus, "p", Some(thread)).await;
@@ -2626,6 +2966,7 @@ mod tests {
             state,
             mode,
             Identity::default(),
+            "proj",
         );
 
         let (reviewer, welcome) = connect("reviewer").await;
@@ -2641,6 +2982,7 @@ mod tests {
             state,
             mode,
             Identity::default(),
+            "proj",
         );
 
         let (magnus, _) = connect("magnus").await;
@@ -2777,6 +3119,7 @@ mod tests {
             state,
             mode,
             Identity::default(),
+            "proj",
         );
         let (tx, rx) = mpsc::unbounded_channel();
         let feeder = async move {
@@ -2912,6 +3255,7 @@ mod tests {
             state,
             mode,
             Identity::default(),
+            "proj",
         );
         let (tx, rx) = mpsc::unbounded_channel();
         let feeder = async move {
@@ -3161,5 +3505,1008 @@ mod tests {
         assert_eq!(lines.len(), 2, "{lines:#?}");
         assert!(lines[0].starts_with("the machine slept"), "{lines:#?}");
         assert!(lines[1].starts_with("[turn ended: "), "{lines:#?}");
+    }
+
+    // ---- /build in the REPL (issue #68) ------------------------------
+
+    /// A followed run's tests drive a scripted daemon
+    /// (`run_view::fake_daemon`): a socket that answers `Build` and
+    /// `Open` and pushes the notices a test asks for. `Lead` bundles
+    /// what they share, so each test reads as the REPL's own steps.
+    struct Lead {
+        _dir: tempfile::TempDir,
+        daemon: crate::run_view::fake_daemon::FakeDaemon,
+        repl: ClientRepl,
+        notices: mpsc::Receiver<Notice>,
+        out: Copies,
+    }
+
+    impl Lead {
+        /// A daemon whose `Build` names `lead` and whose `Open` hands
+        /// back `backlog`, with a REPL attached to a chat thread.
+        async fn start(lead: Ulid, backlog: Vec<Event>) -> Self {
+            Self::with(lead, backlog, "admin", None, false).await
+        }
+
+        /// The same, with the role, the refusal and the `resumed` flag
+        /// a test needs.
+        async fn with(
+            lead: Ulid,
+            backlog: Vec<Event>,
+            role: &'static str,
+            refuse_build: Option<String>,
+            resumed: bool,
+        ) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let script = crate::run_view::fake_daemon::Script {
+                lead,
+                backlog,
+                resumed,
+                role,
+                refuse_build,
+                refuse_open: None,
+            };
+            let daemon = crate::run_view::fake_daemon::FakeDaemon::start(dir.path(), script).await;
+            let (client, welcome) = Client::connect(&daemon.addr(), "tok").await.unwrap();
+            let role = welcome.projects[0].role.clone();
+            let (thread, state, mode) = open(&client, "proj", Some(Ulid::generate())).await;
+            let notices = client.take_notices().unwrap();
+            let repl = ClientRepl::new(
+                client,
+                thread,
+                "steve",
+                role,
+                state,
+                mode,
+                Identity::default(),
+                "proj",
+            );
+            Self {
+                _dir: dir,
+                daemon,
+                repl,
+                notices,
+                out: Copies::default(),
+            }
+        }
+
+        /// The lines drawn so far.
+        fn lines(&self) -> Vec<String> {
+            self.out.0.0.clone()
+        }
+
+        /// A typed line, as the shell would hand it over.
+        async fn line(&mut self, line: &str) {
+            self.repl.handle_line(line, &mut self.out).await;
+        }
+
+        /// Every notice that has arrived, drawn. A pause for the
+        /// daemon's writes, then whatever is there.
+        async fn pump(&mut self) {
+            while let Ok(Some(notice)) =
+                tokio::time::timeout(std::time::Duration::from_millis(200), self.notices.recv())
+                    .await
+            {
+                self.repl.render(notice, &mut self.out);
+            }
+        }
+
+        /// Push a notice as a live one.
+        fn push(&self, notice: Notice) {
+            self.daemon.push(notice);
+        }
+    }
+
+    /// An event for a lead, at `seq`.
+    fn run_event(lead: Ulid, seq: u64, kind: EventKind, payload: serde_json::Value) -> Event {
+        Event {
+            id: Ulid::generate(),
+            thread_id: lead,
+            seq,
+            kind,
+            author: Author::User(aigentic_runtime::aigentic_core::UserId("steve".into())),
+            payload,
+            parent_event: None,
+            created_at: time::OffsetDateTime::now_utc(),
+        }
+    }
+
+    /// A `step_started` payload, as the runner writes it.
+    fn step_started(step: &str, attempt: u32, child: Ulid) -> serde_json::Value {
+        serde_json::json!({
+            "step": step,
+            "role": "implementer",
+            "profile": "flash",
+            "child_thread": child,
+            "attempt": attempt,
+            "budget_usd": 3.0,
+        })
+    }
+
+    /// A `checkpoint_asked` payload with one shown line.
+    fn checkpoint_asked(gate: &str) -> serde_json::Value {
+        serde_json::json!({
+            "gate": gate,
+            "shown": ["plan ready"],
+            "options": ["go", "amend", "stop"],
+        })
+    }
+
+    /// A `run_finished` payload.
+    fn run_finished(outcome: aigentic_runtime::aigentic_log::RunOutcome) -> serde_json::Value {
+        serde_json::json!({ "outcome": outcome, "cost_usd": 1.5 })
+    }
+
+    /// T1: the parser and the help text. `/build 73` is the number,
+    /// `/build` alone is no argument, and `/build x` is neither.
+    #[test]
+    fn build_parses_its_argument_and_is_in_the_help() {
+        assert_eq!(
+            parse_line("/build 73", &[]),
+            Command::Build(Some("73")),
+            "the number is the argument"
+        );
+        assert_eq!(
+            parse_line("/build", &[]),
+            Command::Build(None),
+            "no argument is not an argument"
+        );
+        assert!(
+            crate::app::commands::COMMANDS
+                .iter()
+                .any(|(name, _)| *name == "build"),
+            "/build is offered: {:?}",
+            crate::app::commands::COMMANDS
+        );
+        assert!(HELP.contains("/build <n>"), "the help names it: {HELP}");
+    }
+
+    /// T1: `/build x` prints the usage line and sends nothing.
+    #[tokio::test]
+    async fn a_bad_build_argument_prints_the_usage_line_and_sends_nothing() {
+        let mut lead = Lead::start(Ulid::generate(), Vec::new()).await;
+        lead.line("/build x").await;
+        assert_eq!(
+            lead.lines(),
+            vec!["[usage: /build <issue number>]".to_owned()],
+            "the usage line, and nothing sent"
+        );
+        assert!(
+            !lead
+                .daemon
+                .requests()
+                .iter()
+                .any(|r| matches!(r, Request::Build { .. })),
+            "no Build was sent: {:?}",
+            lead.daemon.requests()
+        );
+    }
+
+    /// T3: `/build 58` sends the project and the issue, then opens the
+    /// lead at seq 0, and the backlog becomes run cells in order — the
+    /// first of them saying `started` or `resumed` as the reply did.
+    #[tokio::test]
+    async fn build_sends_the_project_the_issue_and_opens_the_lead() {
+        let lead_id = Ulid::generate();
+        let backlog = vec![
+            run_event(
+                lead_id,
+                1,
+                EventKind::StepStarted,
+                step_started("implement", 1, Ulid::generate()),
+            ),
+            run_event(
+                lead_id,
+                2,
+                EventKind::CheckpointAsked,
+                checkpoint_asked("route"),
+            ),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let script = crate::run_view::fake_daemon::Script {
+            lead: lead_id,
+            backlog: backlog.clone(),
+            resumed: true,
+            role: "admin",
+            refuse_build: None,
+            refuse_open: None,
+        };
+        let daemon = crate::run_view::fake_daemon::FakeDaemon::start(dir.path(), script).await;
+        let (client, welcome) = Client::connect(&daemon.addr(), "tok").await.unwrap();
+        let role = welcome.projects[0].role.clone();
+        let (thread, state, mode) = open(&client, "proj", Some(Ulid::generate())).await;
+        let notices = client.take_notices().unwrap();
+        let mut repl = ClientRepl::new(
+            client,
+            thread,
+            "steve",
+            role,
+            state,
+            mode,
+            Identity::default(),
+            "proj",
+        );
+        let mut out = Copies::default();
+        repl.handle_line("/build 58", &mut out).await;
+
+        let requests = daemon.requests();
+        // Hello, the chat thread's own open, then the build and the
+        // lead's open, in that order (the spec keeps them in one call).
+        match &requests[2] {
+            Request::Build {
+                project,
+                issue,
+                workflow,
+            } => {
+                assert_eq!(project, "proj", "the project the REPL started in");
+                assert_eq!(*issue, 58);
+                assert!(workflow.is_none());
+            }
+            other => panic!("the build follows the chat's open: {other:?}"),
+        }
+        assert_eq!(
+            requests[3],
+            Request::Open {
+                thread: lead_id,
+                from_seq: 0
+            },
+            "the lead's log, from its first event"
+        );
+
+        let lines = out.0.0.clone();
+        let expected_step = crate::run_view::render(&backlog[0]).unwrap();
+        let expected_gate = crate::run_view::render(&backlog[1]).unwrap();
+        // The prompt prints through `Menu::plain()`, so its lines come
+        // from the menu the engine built, not from here.
+        let prompt =
+            crate::app::menu::Menu::checkpoint("route", &["plan ready".to_owned()]).plain();
+        assert_eq!(
+            prompt[prompt.len() - 2..],
+            [
+                "  1. Stop the run".to_owned(),
+                "  2. Leave it waiting".to_owned()
+            ],
+            "the prompt's last two lines are its rows: {prompt:?}"
+        );
+        assert!(
+            prompt[1] == "  plan ready",
+            "the prompt's body is the gate's shown lines: {prompt:?}"
+        );
+        assert!(
+            prompt[0].ends_with("checkpoint route"),
+            "the prompt's title is the gate: {prompt:?}"
+        );
+        let mut expected = vec![
+            format!("▸ run {lead_id} for issue #58 (resumed)"),
+            format!("▸ {expected_step}"),
+            format!("▸ {expected_gate}"),
+        ];
+        expected.extend(prompt);
+        assert_eq!(
+            lines, expected,
+            "the run cell first, then the backlog in order, then the gate's prompt"
+        );
+        assert!(
+            repl.menu().is_some(),
+            "the backlog ended at a gate, so the prompt is up"
+        );
+        drop(notices);
+        daemon.stop();
+    }
+
+    /// T6: a backlog that ends at an unanswered gate shows the prompt
+    /// and sends no answer until a pick. A backlog that ends at the
+    /// outcome commits it and leaves nothing followed.
+    #[tokio::test]
+    async fn a_backlog_gate_is_shown_and_never_answered_on_its_own() {
+        let lead_id = Ulid::generate();
+        let backlog = vec![run_event(
+            lead_id,
+            1,
+            EventKind::CheckpointAsked,
+            checkpoint_asked("gate-1"),
+        )];
+        let mut lead = Lead::start(lead_id, backlog).await;
+        lead.line("/build 58").await;
+        lead.pump().await;
+        assert!(
+            !lead
+                .daemon
+                .requests()
+                .iter()
+                .any(|r| matches!(r, Request::AnswerCheckpoint { .. })),
+            "nothing was answered: {:?}",
+            lead.daemon.requests()
+        );
+        assert!(lead.repl.menu().is_some(), "the gate's prompt is up");
+        assert!(lead.repl.following(), "the run is followed");
+
+        // A backlog that ends at the outcome: the line, and no follow.
+        let lead_id = Ulid::generate();
+        let backlog = vec![run_event(
+            lead_id,
+            1,
+            EventKind::RunFinished,
+            run_finished(aigentic_runtime::aigentic_log::RunOutcome::Closed),
+        )];
+        let (mut repl, mut out, daemon) = repl_for(lead_id, backlog).await;
+        repl.handle_line("/build 58", &mut out).await;
+        let lines = out.0.0.clone();
+        assert_eq!(
+            lines.last().unwrap(),
+            &format!(
+                "▸ run {lead_id} finished: {}",
+                crate::run_view::outcome_line(&aigentic_runtime::aigentic_log::RunOutcome::Closed)
+            ),
+            "{lines:#?}"
+        );
+        assert!(!repl.following(), "a finished run is not followed");
+        daemon.stop();
+    }
+
+    /// T5: a live gate shows the prompt; `Stop the run` sends the
+    /// answer and `Ok` withdraws it; the outcome line ends the follow,
+    /// so a later event draws nothing.
+    #[tokio::test]
+    async fn a_live_gate_is_answered_stop_and_the_outcome_ends_the_follow() {
+        let lead_id = Ulid::generate();
+        let mut lead = Lead::start(lead_id, Vec::new()).await;
+        lead.line("/build 58").await;
+        lead.pump().await;
+
+        lead.push(Notice::Event {
+            thread: lead_id,
+            event: run_event(
+                lead_id,
+                1,
+                EventKind::StepStarted,
+                step_started("s", 1, Ulid::generate()),
+            ),
+        });
+        lead.pump().await;
+        assert!(
+            lead.lines().iter().any(|l| l.contains("step s attempt 1")),
+            "the live event drew a cell: {:?}",
+            lead.lines()
+        );
+
+        lead.push(Notice::Event {
+            thread: lead_id,
+            event: run_event(
+                lead_id,
+                2,
+                EventKind::CheckpointAsked,
+                checkpoint_asked("g2"),
+            ),
+        });
+        lead.pump().await;
+        let menu = lead.repl.menu().expect("the prompt is up");
+        assert_eq!(menu.title, "checkpoint g2", "the gate is the title");
+
+        // Picking `Stop the run` sends the answer; `Ok` withdraws it.
+        let before = lead.daemon.requests().len();
+        lead.repl
+            .menu_key(&key_for('1'), true, true, &mut lead.out)
+            .await;
+        let sent = lead.daemon.requests()[before..].to_vec();
+        match &sent[0] {
+            Request::AnswerCheckpoint {
+                lead: answered,
+                gate,
+                answer,
+                amendment,
+            } => {
+                assert_eq!(*answered, lead_id);
+                assert_eq!(gate, "g2");
+                assert_eq!(*answer, aigentic_api::CheckpointAnswer::Stop);
+                assert!(amendment.is_none());
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(lead.repl.menu().is_none(), "the prompt went on `Ok`");
+
+        lead.push(Notice::Event {
+            thread: lead_id,
+            event: run_event(
+                lead_id,
+                3,
+                EventKind::RunFinished,
+                run_finished(aigentic_runtime::aigentic_log::RunOutcome::Stopped),
+            ),
+        });
+        lead.pump().await;
+        let expected = format!(
+            "▸ run {lead_id} finished: {}",
+            crate::run_view::outcome_line(&aigentic_runtime::aigentic_log::RunOutcome::Stopped)
+        );
+        assert!(
+            lead.lines().contains(&expected),
+            "the outcome line: {:?}",
+            lead.lines()
+        );
+        assert!(!lead.repl.following(), "the follow ended");
+
+        lead.push(Notice::Event {
+            thread: lead_id,
+            event: run_event(
+                lead_id,
+                4,
+                EventKind::StepStarted,
+                step_started("late", 1, Ulid::generate()),
+            ),
+        });
+        lead.pump().await;
+        assert!(
+            !lead.lines().iter().any(|l| l.contains("step late")),
+            "nothing after the outcome draws: {:?}",
+            lead.lines()
+        );
+    }
+
+    /// T4 and T17r: a notice for a third thread draws nothing; a lead's
+    /// `State` never reaches this client's state; a chat-thread notice
+    /// still draws; and a `seq` already printed is not drawn again.
+    #[tokio::test]
+    async fn only_the_chat_and_the_followed_lead_draw_and_a_leads_state_is_ignored() {
+        let lead_id = Ulid::generate();
+        let mut lead = Lead::start(lead_id, Vec::new()).await;
+        lead.line("/build 58").await;
+        lead.pump().await;
+        let state_before = lead.repl.state().clone();
+        let after_build = lead.lines();
+
+        // The lead goes Running; this client must not follow it.
+        lead.push(Notice::State {
+            thread: lead_id,
+            state: ThreadState::Running {
+                by: Author::User(aigentic_runtime::aigentic_core::UserId("steve".into())),
+                queued: 0,
+            },
+        });
+        lead.pump().await;
+        assert_eq!(
+            lead.repl.state(),
+            &state_before,
+            "a lead's state never reaches the chat's"
+        );
+        assert_eq!(
+            lead.lines(),
+            after_build,
+            "a state is not a run cell: {:?}",
+            lead.lines()
+        );
+
+        // A third thread: nothing.
+        lead.push(Notice::Event {
+            thread: Ulid::generate(),
+            event: run_event(
+                Ulid::generate(),
+                9,
+                EventKind::StepStarted,
+                step_started("other", 1, Ulid::generate()),
+            ),
+        });
+        lead.pump().await;
+        assert_eq!(lead.lines(), after_build, "a stranger draws nothing");
+
+        // The chat thread's own notice still draws, exactly as before.
+        let chat = lead.repl.thread;
+        let mut someone_else = run_event(
+            chat,
+            1,
+            EventKind::UserMessage,
+            serde_json::json!({
+                "blocks": [{ "type": "text", "text": "hello" }],
+            }),
+        );
+        someone_else.author =
+            Author::User(aigentic_runtime::aigentic_core::UserId("magnus".into()));
+        // The chat's and the lead's seq counters are separate.
+        let chat_seq = someone_else.seq;
+        lead.push(Notice::Event {
+            thread: chat,
+            event: someone_else,
+        });
+        lead.pump().await;
+        assert!(
+            lead.lines().iter().any(|l| l.contains("magnus: hello")),
+            "the chat still draws (seq {chat_seq}): {:?}",
+            lead.lines()
+        );
+
+        // A seq already printed is not drawn twice: two notices for the
+        // same event make one cell.
+        let printed = lead.lines().len();
+        let event = run_event(
+            lead_id,
+            7,
+            EventKind::StepStarted,
+            step_started("once", 1, Ulid::generate()),
+        );
+        lead.push(Notice::Event {
+            thread: lead_id,
+            event: event.clone(),
+        });
+        lead.pump().await;
+        lead.push(Notice::Event {
+            thread: lead_id,
+            event: event.clone(),
+        });
+        lead.pump().await;
+        assert_eq!(
+            lead.lines().len(),
+            printed + 1,
+            "one cell for the seq, not two: {:?}",
+            lead.lines()
+        );
+    }
+
+    /// T5/T6: the boundary between backlog and live — an event the
+    /// backlog already drew arrives live and is skipped.
+    #[tokio::test]
+    async fn a_live_event_the_backlog_already_drew_is_skipped() {
+        let lead_id = Ulid::generate();
+        let backlog = vec![run_event(
+            lead_id,
+            1,
+            EventKind::StepStarted,
+            step_started("backlog", 1, Ulid::generate()),
+        )];
+        let (mut repl, mut out, daemon) = repl_for(lead_id, backlog.clone()).await;
+        repl.handle_line("/build 58", &mut out).await;
+        let drawn = out.0.0.clone();
+        repl.render(
+            Notice::Event {
+                thread: lead_id,
+                event: backlog[0].clone(),
+            },
+            &mut out,
+        );
+        assert_eq!(
+            out.0.0, drawn,
+            "the same seq, from the backlog and live, is one cell"
+        );
+        daemon.stop();
+    }
+
+    /// T7: `Leave it waiting` and Esc withdraw the prompt and send
+    /// nothing.
+    #[tokio::test]
+    async fn leaving_the_gate_waiting_sends_nothing() {
+        let lead_id = Ulid::generate();
+        let backlog = vec![run_event(
+            lead_id,
+            1,
+            EventKind::CheckpointAsked,
+            checkpoint_asked("wait-here"),
+        )];
+        let (mut repl, mut out, daemon) = repl_for(lead_id, backlog).await;
+        repl.handle_line("/build 58", &mut out).await;
+        let before = daemon.requests().len();
+        repl.handle_line("2", &mut out).await;
+        assert_eq!(
+            out.0.0.last().unwrap(),
+            "[left wait-here waiting: /build <n> asks again]",
+            "{:#?}",
+            out.0.0
+        );
+        assert!(repl.menu().is_none(), "the prompt went without an answer");
+        assert_eq!(daemon.requests().len(), before, "nothing was sent");
+
+        // Esc is the same choice, on the prompt itself.
+        let lead_id = Ulid::generate();
+        let backlog = vec![run_event(
+            lead_id,
+            1,
+            EventKind::CheckpointAsked,
+            checkpoint_asked("esc-gate"),
+        )];
+        let (mut repl, mut out, daemon) = repl_for(lead_id, backlog).await;
+        repl.handle_line("/build 58", &mut out).await;
+        let before = daemon.requests().len();
+        let used = repl.menu_key(&key_for_esc(), true, true, &mut out).await;
+        assert_eq!(used, MenuKey::Used, "Esc is the prompt's");
+        assert!(repl.menu().is_none(), "the prompt went");
+        assert_eq!(daemon.requests().len(), before, "nothing was sent");
+        daemon.stop();
+    }
+
+    /// T8: a chat-thread state change leaves the gate's prompt up, and
+    /// it can still be answered.
+    #[tokio::test]
+    async fn the_gate_survives_a_chat_state_change_and_is_still_answerable() {
+        let lead_id = Ulid::generate();
+        let backlog = vec![run_event(
+            lead_id,
+            1,
+            EventKind::CheckpointAsked,
+            checkpoint_asked("survivor"),
+        )];
+        let (mut repl, mut out, daemon) = repl_for(lead_id, backlog).await;
+        repl.handle_line("/build 58", &mut out).await;
+        assert!(repl.menu().is_some());
+
+        let chat = repl.thread;
+        repl.render(
+            Notice::State {
+                thread: chat,
+                state: ThreadState::Running {
+                    by: Author::User(aigentic_runtime::aigentic_core::UserId("steve".into())),
+                    queued: 0,
+                },
+            },
+            &mut out,
+        );
+        repl.render(
+            Notice::State {
+                thread: chat,
+                state: ThreadState::Idle,
+            },
+            &mut out,
+        );
+        assert!(
+            repl.menu().is_some(),
+            "the prompt is drawn apart from the chat's own"
+        );
+
+        let before = daemon.requests().len();
+        repl.menu_key(&key_for('1'), true, true, &mut out).await;
+        let sent = daemon.requests()[before..].to_vec();
+        assert!(
+            matches!(
+                sent[0],
+                Request::AnswerCheckpoint {
+                    answer: aigentic_api::CheckpointAnswer::Stop,
+                    ..
+                }
+            ),
+            "still answerable: {sent:?}"
+        );
+        daemon.stop();
+    }
+
+    /// T9: while a run is followed and the chat is idle with an empty
+    /// composer, the first Ctrl-C detaches; the prompt goes with it, and
+    /// later lead notices draw nothing.
+    #[tokio::test]
+    async fn the_first_ctrl_c_detaches_from_the_followed_run() {
+        let lead_id = Ulid::generate();
+        let backlog = vec![run_event(
+            lead_id,
+            1,
+            EventKind::CheckpointAsked,
+            checkpoint_asked("d-gate"),
+        )];
+        let mut lead = Lead::start(lead_id, backlog).await;
+        lead.line("/build 58").await;
+        lead.pump().await;
+
+        let ctx = crate::app::keymap::KeyContext {
+            running: false,
+            composer_empty: true,
+            following: true,
+        };
+        let action = crate::app::keymap::action_for(&key_for_ctrl_c(), ctx);
+        assert_eq!(
+            action,
+            crate::app::keymap::Action::DetachRun,
+            "Ctrl-C detaches while a run is followed"
+        );
+        lead.repl.detach(&mut lead.out);
+        let expected = format!(
+            "[detached from run {lead_id}: it keeps running in the daemon; without --server, \
+             closing this REPL pauses it until /build 58]"
+        );
+        assert_eq!(lead.out.0.0.last().unwrap(), &expected);
+        assert!(!lead.repl.following(), "the follow ended");
+        assert!(lead.repl.menu().is_none(), "its prompt went too");
+
+        // The daemon keeps pushing: nothing is drawn.
+        let drawn = lead.lines().len();
+        lead.push(Notice::Event {
+            thread: lead_id,
+            event: run_event(
+                lead_id,
+                2,
+                EventKind::StepStarted,
+                step_started("after", 1, Ulid::generate()),
+            ),
+        });
+        lead.pump().await;
+        assert_eq!(lead.lines().len(), drawn, "a detached lead is not drawn");
+
+        // The next Ctrl-C is the ordinary one: with the composer empty
+        // it arms quit, and Esc arms recall.
+        let ctx = crate::app::keymap::KeyContext {
+            running: false,
+            composer_empty: true,
+            following: false,
+        };
+        assert_eq!(
+            crate::app::keymap::action_for(&key_for_ctrl_c(), ctx),
+            crate::app::keymap::Action::QuitArm
+        );
+        assert_eq!(
+            crate::app::keymap::action_for(&key_for_esc(), ctx),
+            crate::app::keymap::Action::RecallArm
+        );
+    }
+
+    /// T10: without the approve role, `/build` says so and sends
+    /// nothing.
+    #[tokio::test]
+    async fn build_without_the_approve_role_sends_nothing() {
+        let mut lead = Lead::with(Ulid::generate(), Vec::new(), "read", None, false).await;
+        lead.line("/build 58").await;
+        assert_eq!(
+            lead.lines(),
+            vec!["[/build needs the approve role in this project]".to_owned()]
+        );
+        assert!(
+            !lead
+                .daemon
+                .requests()
+                .iter()
+                .any(|request| matches!(request, Request::Build { .. })),
+            "no build went out: {:?}",
+            lead.daemon.requests()
+        );
+    }
+
+    /// T11: a refused `Build` prints the reason. A lead's `Note`
+    /// starting `run stopped` becomes a cell and ends the follow.
+    #[tokio::test]
+    async fn a_refused_build_and_a_run_stopped_note() {
+        let mut lead = Lead::with(
+            Ulid::generate(),
+            Vec::new(),
+            "admin",
+            Some("the issue is not open".into()),
+            false,
+        )
+        .await;
+        lead.line("/build 58").await;
+        assert_eq!(
+            lead.lines(),
+            vec!["[build refused: the issue is not open]".to_owned()]
+        );
+        assert!(!lead.repl.following(), "nothing is followed");
+
+        let lead_id = Ulid::generate();
+        let mut lead = Lead::start(lead_id, Vec::new()).await;
+        lead.line("/build 58").await;
+        lead.pump().await;
+        assert!(lead.repl.following());
+        lead.push(Notice::Note {
+            thread: lead_id,
+            text: "run stopped: the budget went".into(),
+        });
+        lead.pump().await;
+        assert_eq!(
+            lead.lines().last().unwrap(),
+            "▸ note: run stopped: the budget went"
+        );
+        assert!(!lead.repl.following(), "the note ended the follow");
+    }
+
+    /// T14: an answer from another session withdraws the prompt without
+    /// this client sending anything.
+    #[tokio::test]
+    async fn an_answer_from_elsewhere_withdraws_the_prompt() {
+        let lead_id = Ulid::generate();
+        let backlog = vec![run_event(
+            lead_id,
+            1,
+            EventKind::CheckpointAsked,
+            checkpoint_asked("elsewhere"),
+        )];
+        let (mut repl, mut out, daemon) = repl_for(lead_id, backlog).await;
+        repl.handle_line("/build 58", &mut out).await;
+        assert!(repl.menu().is_some());
+        let before = daemon.requests().len();
+        repl.render(
+            Notice::Event {
+                thread: lead_id,
+                event: run_event(
+                    lead_id,
+                    2,
+                    EventKind::CheckpointAnswered,
+                    serde_json::json!({ "answer": "stop" }),
+                ),
+            },
+            &mut out,
+        );
+        assert!(repl.menu().is_none(), "the prompt went");
+        assert_eq!(daemon.requests().len(), before, "this client sent nothing");
+    }
+
+    /// T13: with the prompt up in plain mode, `/help` still runs the
+    /// command and an unrelated line goes to the chat.
+    #[tokio::test]
+    async fn a_slash_line_still_runs_and_another_line_goes_to_the_chat() {
+        let lead_id = Ulid::generate();
+        let backlog = vec![run_event(
+            lead_id,
+            1,
+            EventKind::CheckpointAsked,
+            checkpoint_asked("plain"),
+        )];
+        let (mut repl, mut out, daemon) = repl_for(lead_id, backlog).await;
+        repl.handle_line("/build 58", &mut out).await;
+        let before = daemon.requests().len();
+        repl.handle_line("/help", &mut out).await;
+        assert!(
+            out.0.0.iter().any(|l| l.starts_with("/build <n>")),
+            "the command still ran: {:?}",
+            out.0.0
+        );
+        assert!(repl.menu().is_some(), "and left the prompt alone");
+        assert_eq!(daemon.requests().len(), before, "and sent nothing");
+
+        repl.handle_line("just a thought", &mut out).await;
+        let sent = daemon.requests()[before..].to_vec();
+        assert!(
+            matches!(sent[0], Request::Post { .. }),
+            "an unrelated line is the chat's: {sent:?}"
+        );
+    }
+
+    /// T15: a chat permission prompt and a checkpoint at once: the
+    /// chat's comes first, and the checkpoint is shown once it ends.
+    #[tokio::test]
+    async fn the_chat_prompt_comes_first_and_the_gate_after_it() {
+        let lead_id = Ulid::generate();
+        let backlog = vec![run_event(
+            lead_id,
+            1,
+            EventKind::CheckpointAsked,
+            checkpoint_asked("second"),
+        )];
+        let (mut repl, mut out, daemon) = repl_for(lead_id, backlog).await;
+        repl.handle_line("/build 58", &mut out).await;
+
+        let call_id = "c1";
+        repl.render(
+            Notice::State {
+                thread: repl.thread,
+                state: approval_state(call_id),
+            },
+            &mut out,
+        );
+        assert!(repl.prompted.is_some(), "the chat's prompt was set up");
+        let title = repl.menu().expect("a menu").title.clone();
+        assert!(
+            !title.starts_with("checkpoint"),
+            "the permission prompt comes first, not the gate's: {title}"
+        );
+
+        // The chat prompt ends: the checkpoint prompt is what is left.
+        repl.render(
+            Notice::State {
+                thread: repl.thread,
+                state: ThreadState::Idle,
+            },
+            &mut out,
+        );
+        let title = repl
+            .menu()
+            .expect("the checkpoint prompt is still there")
+            .title
+            .clone();
+        assert_eq!(title, "checkpoint second");
+        daemon.stop();
+    }
+
+    /// T16: `/build 59` while following 58 detaches from 58 — prompt
+    /// withdrawn, its later notices undrawn — then follows 59.
+    #[tokio::test]
+    async fn a_second_build_detaches_from_the_first_run() {
+        let first = Ulid::generate();
+        let mut lead = Lead::start(
+            first,
+            vec![run_event(
+                first,
+                1,
+                EventKind::CheckpointAsked,
+                checkpoint_asked("first-gate"),
+            )],
+        )
+        .await;
+        lead.line("/build 58").await;
+        lead.pump().await;
+        assert!(lead.repl.following());
+
+        // The second run: the daemon answers `Build` with the same lead
+        // (it has one), so the detach is what the log shows.
+        lead.line("/build 59").await;
+        lead.pump().await;
+        assert!(
+            lead.lines()
+                .iter()
+                .any(|l| l.starts_with("[detached from run ")),
+            "the detach line: {:?}",
+            lead.lines()
+        );
+        assert!(lead.repl.following(), "and then 59 is followed");
+        assert!(
+            lead.lines()
+                .iter()
+                .filter(|l| l.starts_with("▸ run "))
+                .count()
+                >= 2,
+            "both runs have their cell: {:?}",
+            lead.lines()
+        );
+    }
+
+    /// A REPL over a scripted daemon with one lead, for the tests that
+    /// need the parts rather than the bundle.
+    async fn repl_for(lead: Ulid, backlog: Vec<Event>) -> (ClientRepl, Copies, GuardedLead) {
+        let dir = tempfile::tempdir().unwrap();
+        let script = crate::run_view::fake_daemon::Script {
+            lead,
+            backlog,
+            resumed: false,
+            role: "admin",
+            refuse_build: None,
+            refuse_open: None,
+        };
+        let daemon = crate::run_view::fake_daemon::FakeDaemon::start(dir.path(), script).await;
+        let (client, welcome) = Client::connect(&daemon.addr(), "tok").await.unwrap();
+        let role = welcome.projects[0].role.clone();
+        let (thread, state, mode) = open(&client, "proj", Some(Ulid::generate())).await;
+        let repl = ClientRepl::new(
+            client,
+            thread,
+            "steve",
+            role,
+            state,
+            mode,
+            Identity::default(),
+            "proj",
+        );
+        let (daemon, _dir) = (daemon, dir);
+        (repl, Copies::default(), GuardedLead { daemon, _dir })
+    }
+
+    /// A daemon with the directory its socket lives in, so the two
+    /// outlive each other.
+    struct GuardedLead {
+        daemon: crate::run_view::fake_daemon::FakeDaemon,
+        _dir: tempfile::TempDir,
+    }
+
+    impl GuardedLead {
+        /// Every request the daemon has answered, in order.
+        fn requests(&self) -> Vec<Request> {
+            self.daemon.requests()
+        }
+
+        /// Stop the daemon's task.
+        fn stop(self) {
+            self.daemon.stop();
+        }
+    }
+
+    /// A key by its code, for the menu and the keymap.
+    fn key_for(c: char) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char(c),
+            crossterm::event::KeyModifiers::NONE,
+        )
+    }
+
+    fn key_for_esc() -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        )
+    }
+
+    fn key_for_ctrl_c() -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('c'),
+            crossterm::event::KeyModifiers::CONTROL,
+        )
     }
 }

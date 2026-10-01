@@ -24,6 +24,10 @@ pub enum Pick {
     Answer,
     /// Free text for the current question: the composer takes it.
     Other,
+    /// Stop the followed run (issue #68), at its checkpoint prompt.
+    StopRun,
+    /// Leave the followed run waiting: the prompt goes, nothing is sent.
+    LeaveWaiting,
 }
 
 /// One row of the menu.
@@ -40,6 +44,9 @@ pub struct Row {
 pub enum Kind {
     Permission,
     Question,
+    /// A followed build's checkpoint (issue #68): stop the run, or
+    /// leave it waiting.
+    Checkpoint,
 }
 
 /// What a key or a line came to.
@@ -212,6 +219,35 @@ impl Menu {
         }
     }
 
+    /// The checkpoint prompt for a followed build (issue #68): what the
+    /// lead is waiting at, and the two things a client can do about it
+    /// today. `Stop the run` is the one answer the server takes; #59
+    /// adds `go` and `amend`.
+    pub fn checkpoint(gate: &str, shown: &[String]) -> Self {
+        Self {
+            kind: Kind::Checkpoint,
+            title: format!("checkpoint {gate}"),
+            body: shown.join("\n"),
+            note: None,
+            rows: vec![
+                Row {
+                    label: "Stop the run".into(),
+                    desc: None,
+                    pick: Pick::StopRun,
+                },
+                Row {
+                    label: "Leave it waiting".into(),
+                    desc: None,
+                    pick: Pick::LeaveWaiting,
+                },
+            ],
+            selected: 0,
+            multi: false,
+            picked: Vec::new(),
+            questions: None,
+        }
+    }
+
     /// A question from `ask_human`: the first of the call's questions
     /// on the widget, the rest one after another as each is answered.
     /// A question without options has no rows: the composer takes the
@@ -340,6 +376,8 @@ impl Menu {
             }
             // Esc opens the reason input on the deny row, at once.
             KeyCode::Esc if self.kind == Kind::Permission => Keyed::Text,
+            // Esc on a checkpoint leaves the run waiting, at once.
+            KeyCode::Esc if self.kind == Kind::Checkpoint => self.pick(1),
             _ if !settled => Keyed::Passed,
             KeyCode::Char(' ') if plain && self.multi && typing_safe => {
                 self.toggle(self.selected);
@@ -444,6 +482,16 @@ impl Menu {
                 }
             }
             Pick::Other => Keyed::Text,
+            Pick::StopRun => Keyed::Decide {
+                pick: Pick::StopRun,
+                reason: None,
+                echo: format!("↳ {}", row.label),
+            },
+            Pick::LeaveWaiting => Keyed::Decide {
+                pick: Pick::LeaveWaiting,
+                reason: None,
+                echo: format!("↳ {}", row.label),
+            },
         }
     }
 
@@ -454,6 +502,13 @@ impl Menu {
     pub fn line(&self, text: &str) -> Option<Keyed> {
         if self.kind == Kind::Question {
             return Some(self.question_line(text.trim()));
+        }
+        if self.kind == Kind::Checkpoint {
+            return match text.trim().to_ascii_lowercase().as_str() {
+                "1" | "stop" => Some(self.pick(0)),
+                "2" | "wait" | "leave" => Some(self.pick(1)),
+                _ => None,
+            };
         }
         if self.rows.is_empty() {
             return None;
@@ -531,6 +586,7 @@ impl Menu {
         let tag = match self.kind {
             Kind::Permission => "permission",
             Kind::Question => "question",
+            Kind::Checkpoint => "checkpoint",
         };
         let mut lines = vec![format!("[{tag}] {}", self.title)];
         if !self.body.is_empty() {

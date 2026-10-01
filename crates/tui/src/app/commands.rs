@@ -32,6 +32,8 @@ pub enum Command<'a> {
     Policy,
     /// The memory files as the prefix carries them.
     Memory,
+    /// Follow a build of an issue here: `/build <n>` (issue #68).
+    Build(Option<&'a str>),
     /// A user-invoked skill: its name and the rest of the line.
     Skill(&'a str, &'a str),
     /// The key table.
@@ -84,6 +86,8 @@ pub fn parse_line<'a>(line: &'a str, skills: &[String]) -> Command<'a> {
         ("policy", _) => Command::Policy,
         ("memory", _) => Command::Memory,
         ("pin", text) if !text.is_empty() => Command::Pin(text),
+        ("build", "") => Command::Build(None),
+        ("build", arg) => Command::Build(Some(arg)),
         ("remember", text) if !text.is_empty() => Command::Remember(text),
         (name, args) if skills.iter().any(|s| s == name) => Command::Skill(name, args),
         _ => Command::Unknown(trimmed),
@@ -127,6 +131,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "the layers, the knowledge mode and every tool's fate",
     ),
     ("threads", "this project's threads, newest first"),
+    ("build", "follow a build of issue n here: /build <n>"),
     ("diff", "the project's working-tree diff, in the pager"),
     ("copy", "copy a code block of the last reply: /copy [n|all]"),
     ("rename", "set the thread's title: /rename <title>"),
@@ -151,6 +156,7 @@ pub const HELP: &str = "\
 /project         the layers, the knowledge mode and every tool's fate
 /project use <n> move this thread to project <n>, keeping the conversation
 /threads         this project's threads, newest first
+/build <n>       follow a build of issue n here, and answer its checkpoints
 /<skill> [args]  run a user-invoked skill
 /diff            the project's working-tree diff, untracked files included
 /rename <title>  set the thread's title (one is proposed after the first turn)

@@ -37,6 +37,9 @@ pub enum Group {
     User,
     Assistant,
     Tools,
+    /// A followed build's lines (issue #68): consecutive run cells sit
+    /// together, with a blank line between them and any other group.
+    Run,
     Summary,
     Note,
 }
@@ -46,6 +49,7 @@ pub fn group(cell: &Cell) -> Group {
         Cell::User(_) => Group::User,
         Cell::Assistant { .. } => Group::Assistant,
         Cell::Tool { .. } | Cell::Explored(_) | Cell::Edit(_) | Cell::Done(_) => Group::Tools,
+        Cell::Run(_) => Group::Run,
         Cell::Summary(_) => Group::Summary,
         Cell::Note(_) => Group::Note,
     }
@@ -255,6 +259,10 @@ pub fn render(cell: &Cell, first: bool, width: usize) -> Vec<Line<'static>> {
             format!("  {}", text.trim_start_matches("─ ")),
             dim(),
         ))],
+        Cell::Run(text) => text
+            .lines()
+            .map(|l| Line::from(Span::styled(format!("▸ {l}"), dim())))
+            .collect(),
         Cell::Note(text) => {
             let bracketed = text.starts_with('[') && text.ends_with(']');
             let (shown, style) = if bracketed {

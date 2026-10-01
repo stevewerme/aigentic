@@ -209,3 +209,180 @@ pub(crate) fn check_result(result: &CheckResult) -> String {
 pub(crate) fn short(sha: &str) -> String {
     sha.chars().take(8).collect()
 }
+
+/// A scripted daemon over a socket, for the REPL's `/build` tests
+/// (issue #68): it answers the requests a followed run makes, records
+/// them, and pushes the notices a test asks it to.
+///
+/// After `build_cmd`'s T17: a `UnixListener`, one connection, requests
+/// matched to responses. Its own addition is the notice side — a test
+/// pushes a lead's live events through `push`, and they arrive on the
+/// client's notice stream as `Notice::Event`.
+#[cfg(test)]
+pub(crate) mod fake_daemon {
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+
+    use aigentic_api::client::Addr;
+    use aigentic_api::{
+        Body, Frame, Notice, ProjectInfo, Request, Response, ThreadState, Welcome, encode,
+    };
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixListener;
+    use tokio::sync::mpsc;
+    use ulid::Ulid;
+
+    use super::Event;
+
+    /// What the daemon answers, and what it holds.
+    pub(crate) struct Script {
+        /// The lead a `Build` is answered with.
+        pub(crate) lead: Ulid,
+        /// What `Open` on the lead hands back.
+        pub(crate) backlog: Vec<Event>,
+        /// Whether `Build` says `resumed`.
+        pub(crate) resumed: bool,
+        /// The user's role in the project, as `Hello`'s welcome says it.
+        pub(crate) role: &'static str,
+        /// Refuse `Build` with this reason instead of running.
+        pub(crate) refuse_build: Option<String>,
+        /// Refuse `Open` on the lead with this reason.
+        pub(crate) refuse_open: Option<String>,
+    }
+
+    /// A running scripted daemon. Drop it (or let the test end) to stop
+    /// its task.
+    pub(crate) struct FakeDaemon {
+        pub(crate) socket: PathBuf,
+        seen: Arc<Mutex<Vec<Request>>>,
+        notices: mpsc::UnboundedSender<Notice>,
+        handle: tokio::task::JoinHandle<()>,
+    }
+
+    impl FakeDaemon {
+        /// Listen under `dir`, in a task, and answer per `script`.
+        pub(crate) async fn start(dir: &std::path::Path, script: Script) -> Self {
+            let socket = dir.join("daemon.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let lead = script.lead;
+            let seen: Arc<Mutex<Vec<Request>>> = Arc::new(Mutex::new(Vec::new()));
+            let (notices, mut pushed) = mpsc::unbounded_channel::<Notice>();
+            let handle = {
+                let seen = Arc::clone(&seen);
+                tokio::spawn(async move {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let (read, mut write) = stream.into_split();
+                    let mut lines = BufReader::new(read).lines();
+                    loop {
+                        let line = tokio::select! {
+                            line = lines.next_line() => line.unwrap(),
+                            Some(notice) = pushed.recv() => {
+                                let frame = Frame::notice(notice);
+                                write
+                                    .write_all(format!("{}\n", encode(&frame)).as_bytes())
+                                    .await
+                                    .unwrap();
+                                continue;
+                            }
+                        };
+                        let Some(line) = line else { break };
+                        let Ok(frame) = aigentic_api::decode(&line) else {
+                            break;
+                        };
+                        let id = frame.id.unwrap_or(0);
+                        let request = match frame.body {
+                            Body::Request(request) => request,
+                            _ => break,
+                        };
+                        seen.lock().unwrap().push(request.clone());
+                        let response = match &request {
+                            Request::Hello { .. } => Response::Welcome(Welcome {
+                                user: "steve".into(),
+                                projects: vec![ProjectInfo {
+                                    name: "proj".into(),
+                                    root: PathBuf::from("/tmp/proj"),
+                                    role: Some(script.role.into()),
+                                    threads: 0,
+                                }],
+                                server: "fake".into(),
+                            }),
+                            Request::Build { .. } => match &script.refuse_build {
+                                Some(reason) => Response::Refused {
+                                    reason: reason.clone(),
+                                },
+                                None => Response::Run {
+                                    lead,
+                                    resumed: script.resumed,
+                                },
+                            },
+                            Request::Open { thread, from_seq } => {
+                                if *thread == lead && from_seq == &0 {
+                                    match &script.refuse_open {
+                                        Some(reason) => Response::Refused {
+                                            reason: reason.clone(),
+                                        },
+                                        None => Response::Opened {
+                                            state: ThreadState::Idle,
+                                            events: script.backlog.clone(),
+                                            run: None,
+                                            mode: "manual".into(),
+                                            profile: None,
+                                            model: "unknown".into(),
+                                            effort: None,
+                                        },
+                                    }
+                                } else {
+                                    // The chat thread: open, and empty.
+                                    Response::Opened {
+                                        state: ThreadState::Idle,
+                                        events: Vec::new(),
+                                        run: None,
+                                        mode: "manual".into(),
+                                        profile: None,
+                                        model: "unknown".into(),
+                                        effort: None,
+                                    }
+                                }
+                            }
+                            // Every answer the REPL sends is accepted.
+                            Request::AnswerCheckpoint { .. } => Response::Ok,
+                            other => panic!("the tests sent an unscripted request: {other:?}"),
+                        };
+                        write
+                            .write_all(
+                                format!("{}\n", encode(&Frame::response(id, response))).as_bytes(),
+                            )
+                            .await
+                            .unwrap();
+                    }
+                })
+            };
+            Self {
+                socket,
+                seen,
+                notices,
+                handle,
+            }
+        }
+
+        /// Where the daemon listens.
+        pub(crate) fn addr(&self) -> Addr {
+            Addr::Unix(self.socket.clone())
+        }
+
+        /// Every request the daemon has answered, in order.
+        pub(crate) fn requests(&self) -> Vec<Request> {
+            self.seen.lock().unwrap().clone()
+        }
+
+        /// Push a notice to the client, as a live event would arrive.
+        pub(crate) fn push(&self, notice: Notice) {
+            self.notices.send(notice).unwrap();
+        }
+
+        /// Stop the daemon's task.
+        pub(crate) fn stop(self) {
+            self.handle.abort();
+        }
+    }
+}

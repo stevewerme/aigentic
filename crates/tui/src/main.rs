@@ -741,6 +741,7 @@ async fn main() -> anyhow::Result<()> {
         state,
         mode,
         identity,
+        &project_name,
     )
     .with_skills(skills);
     app::run(repl, notices, history, project_name, project_root).await?;

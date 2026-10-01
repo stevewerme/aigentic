@@ -82,6 +82,17 @@ impl Printer for Stdout {
     fn line(&mut self, text: &str) {
         println!("{text}");
     }
+
+    fn prompt(&mut self, menu: &Menu) {
+        // No keys out here, so the prompt is printed once: a followed
+        // run's checkpoint (issue #68) must be visible, and the other
+        // prompts already spoke their lines where they were asked for.
+        if menu.kind == crate::app::menu::Kind::Checkpoint {
+            for line in menu.plain() {
+                println!("{line}");
+            }
+        }
+    }
 }
 
 /// How many cells the pager keeps.
@@ -849,6 +860,7 @@ async fn run_shell(
                         let ctx = KeyContext {
                             running: !matches!(engine.state(), ThreadState::Idle),
                             composer_empty: composer.is_empty(),
+                            following: engine.following(),
                         };
                         let action = action_for(&key, ctx);
                         // An armed key completes on its second press.
@@ -878,6 +890,10 @@ async fn run_shell(
                             Action::End => composer.end(),
                             Action::ClearDraft => composer.clear(),
                             Action::Interrupt => engine.interrupt(&mut out).await,
+                            // The first Ctrl-C or Esc while a run is
+                            // followed detaches from it; the second
+                            // behaves as it always did (issue #68).
+                            Action::DetachRun => engine.detach(&mut out),
                             Action::QuitArm => {
                                 if was_armed == Some(Action::QuitArm) {
                                     break;
@@ -1610,5 +1626,71 @@ mod tests {
         assert!(menu.note.is_some());
         let menu = approval("rm -rf build");
         assert_eq!(menu.note, None, "the class reason adds nothing");
+    }
+
+    /// T12 (issue #68): a run cell is dim with `▸ ` on every line, run
+    /// cells sit together, and a blank line separates them from the
+    /// next group; the checkpoint prompt's block draws its title, body
+    /// and two rows.
+    #[test]
+    fn run_cells_are_dim_and_sit_together_and_the_prompt_draws_its_rows() {
+        let reply = Cell::Assistant {
+            text: "done".into(),
+            fenced: false,
+        };
+        let transcript = vec![
+            Cell::User("build 58".into()),
+            Cell::Run("run 01ABC for issue #58 (started)".into()),
+            Cell::Run("checks 1: 1/2 passed\n  check T1: failed — 0 passed".into()),
+            reply,
+        ];
+        let lines = transcript_lines(&transcript, &[]);
+        // The tail is the cell's own text, not a spelling repeated here.
+        let mut expected = vec![
+            "> build 58".to_owned(),
+            String::new(),
+            "▸ run 01ABC for issue #58 (started)".to_owned(),
+            "▸ checks 1: 1/2 passed".to_owned(),
+            "▸   check T1: failed — 0 passed".to_owned(),
+            String::new(),
+        ];
+        expected.extend(text(
+            &Cell::Assistant {
+                text: "done".into(),
+                fenced: false,
+            }
+            .full(),
+        ));
+        assert_eq!(
+            text(&lines),
+            expected,
+            "a run cell's lines are marked, and the groups are spaced"
+        );
+        for line in &lines[2..5] {
+            assert!(
+                line.spans
+                    .iter()
+                    .all(|s| s.style.add_modifier.contains(Modifier::DIM)),
+                "every run span is dim: {line:?}"
+            );
+        }
+
+        let menu = Menu::checkpoint("route", &["plan ready".to_owned()]);
+        let drawn = text(&block_lines(&menu, 40));
+        // The first row carries the selection marker; the labels are the
+        // picks, and the title and body are the gate's.
+        let labels: Vec<&str> = menu.rows.iter().map(|row| row.label.as_str()).collect();
+        assert_eq!(labels, ["Stop the run", "Leave it waiting"]);
+        assert!(drawn[0].contains("checkpoint route"), "{drawn:?}");
+        assert_eq!(drawn[1], "   plan ready", "{drawn:?}");
+        for (i, label) in labels.iter().enumerate() {
+            assert!(
+                drawn[2 + i]
+                    .trim_start_matches([' ', '❯'])
+                    .starts_with(&format!("{}. {label}", i + 1)),
+                "row {i} draws its number and label: {drawn:?}"
+            );
+        }
+        assert_eq!(menu.rows.len(), 2, "two picks, no more");
     }
 }
