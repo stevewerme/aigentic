@@ -940,6 +940,58 @@ async fn t3_build_makes_a_lead_and_streams_it() {
     );
 }
 
+/// T18 — a gate that opens while a client watches reaches it as a
+/// notice, before the run waits for the answer: a client answers only a
+/// `checkpoint_asked` it has received, so the daemon must not wait first
+/// (found by slice 1's acceptance run: `aigentic build` hung at a live
+/// gate). The answer is then acted on and the run finishes, streamed.
+#[tokio::test]
+async fn t18_a_live_gate_is_streamed_before_the_run_waits() {
+    let scripts = Scripts::of([vec![report("r1", brief_report_full())]]);
+    let daemon = Daemon::new(scripts, false).await;
+    let (client, _welcome) = daemon.connect("steve").await;
+    let mut notices = client.take_notices().expect("the notice stream");
+
+    let built = daemon.build(&client, "steve", 58).await;
+    let streamed = Daemon::collect(&mut notices, built.lead, |seen| {
+        seen.iter()
+            .any(|event| event.kind == EventKind::CheckpointAsked)
+    })
+    .await;
+    assert!(
+        streamed
+            .iter()
+            .any(|event| event.kind == EventKind::CheckpointAsked),
+        "the gate arrives as a notice while the run waits at it: {:?}",
+        streamed.iter().map(|e| e.kind).collect::<Vec<_>>()
+    );
+
+    let answered = client
+        .request(Request::AnswerCheckpoint {
+            lead: built.lead,
+            gate: "route".to_owned(),
+            answer: CheckpointAnswer::Stop,
+            amendment: None,
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(answered, Response::Ok),
+        "the answer is taken: {answered:?}"
+    );
+    let rest = Daemon::collect(&mut notices, built.lead, |seen| {
+        seen.iter()
+            .any(|event| event.kind == EventKind::RunFinished)
+    })
+    .await;
+    assert!(
+        rest.iter()
+            .any(|event| event.kind == EventKind::RunFinished),
+        "the run finishes after the answer, streamed"
+    );
+    assert_eq!(daemon.wait_finished(built.lead).await, RunOutcome::Stopped);
+}
+
 /// T4 — the full trivial path over the server, with the daemon resolving
 /// the **bundled** `build` workflow: `Build` → brief → implement → checks
 /// → push (the bare remote advances) → close → `run_finished { Closed }`,

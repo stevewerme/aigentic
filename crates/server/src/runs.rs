@@ -577,6 +577,10 @@ async fn run(
         match runner.advance().await {
             Ok(Advanced::Moved) => {}
             Ok(Advanced::WaitingHuman { .. }) => {
+                // The watchers see the gate before anyone is asked to
+                // answer it: a client answers only a `checkpoint_asked`
+                // it has received, so waiting first would wait forever.
+                seen = broadcast_new(&runs, lead, &runner, seen);
                 // Nothing is working while the run waits for an answer:
                 // the hold goes back until one arrives.
                 drop(held.take());
