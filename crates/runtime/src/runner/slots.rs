@@ -13,8 +13,8 @@ use std::collections::BTreeMap;
 use aigentic_log::{PlannedTest, StepReport};
 use serde_json::Value;
 
-use crate::workflow::Step;
 use crate::workflow::render::trailer_model;
+use crate::workflow::{SlotDecl, SlotKind, Step};
 
 use super::forge::Forge;
 use super::git::Repo;
@@ -39,6 +39,36 @@ fn commits_text(items: &[Value]) -> Option<String> {
         .map(|item| item.as_str().map(str::to_owned))
         .collect::<Option<Vec<_>>>()
         .map(|subjects| subjects.join("\n"))
+}
+
+/// A report's slots as the workflow declares them. Models write every
+/// slot value as a string, so a `bool` slot arrives as `"false"` — which
+/// a section would read as truthy — and `commits`, which the brief
+/// template asks for as a JSON list, arrives as that list's text, which
+/// E2 would read as no subjects (both found by slice 1's acceptance
+/// run). Anything else, or a string that is neither, is left as written.
+pub(crate) fn normalized(
+    mut slots: BTreeMap<String, Value>,
+    declared: &[SlotDecl],
+) -> BTreeMap<String, Value> {
+    for decl in declared.iter().filter(|decl| decl.kind == SlotKind::Bool) {
+        if let Some(Value::String(text)) = slots.get(&decl.name) {
+            let flag = match text.trim().to_ascii_lowercase().as_str() {
+                "true" => Some(true),
+                "false" => Some(false),
+                _ => None,
+            };
+            if let Some(flag) = flag {
+                slots.insert(decl.name.clone(), Value::Bool(flag));
+            }
+        }
+    }
+    if let Some(Value::String(text)) = slots.get("commits")
+        && let Ok(list @ Value::Array(_)) = serde_json::from_str::<Value>(text.trim())
+    {
+        slots.insert("commits".into(), list);
+    }
+    slots
 }
 
 // ---------------------------------------------------------------------------
@@ -128,10 +158,71 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
             else {
                 continue;
             };
-            if let Some((report, _)) = self.report_of(&id, record.attempt)? {
+            if let Some((mut report, _)) = self.report_of(&id, record.attempt)? {
+                report.slots = report
+                    .slots
+                    .map(|slots| normalized(slots, &self.workflow.workflow.slots));
                 reports.push(report);
             }
         }
         Ok(reports)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn decl(name: &str, kind: SlotKind) -> SlotDecl {
+        SlotDecl {
+            name: name.into(),
+            kind,
+            required: false,
+            filled_by: "brief".into(),
+        }
+    }
+
+    fn slots(pairs: &[(&str, Value)]) -> BTreeMap<String, Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), v.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn a_bool_slot_written_as_text_is_a_bool() {
+        let declared = [decl("ui", SlotKind::Bool), decl("size", SlotKind::String)];
+        let out = normalized(
+            slots(&[("ui", json!("false")), ("size", json!("false"))]),
+            &declared,
+        );
+        assert_eq!(out["ui"], json!(false), "a declared bool is read");
+        assert_eq!(out["size"], json!("false"), "a string slot is left alone");
+        let out = normalized(slots(&[("ui", json!(" True "))]), &declared);
+        assert_eq!(out["ui"], json!(true));
+        let out = normalized(slots(&[("ui", json!(true))]), &declared);
+        assert_eq!(out["ui"], json!(true), "a real bool stays");
+        let out = normalized(slots(&[("ui", json!("maybe"))]), &declared);
+        assert_eq!(out["ui"], json!("maybe"), "neither word: left as written");
+    }
+
+    #[test]
+    fn commits_written_as_json_text_are_a_list() {
+        let out = normalized(
+            slots(&[("commits", json!("[\"gitignore: .scratch/\"]"))]),
+            &[],
+        );
+        assert_eq!(out["commits"], json!(["gitignore: .scratch/"]));
+        let out = normalized(slots(&[("commits", json!(["a: b"]))]), &[]);
+        assert_eq!(out["commits"], json!(["a: b"]), "a real list stays");
+        let out = normalized(slots(&[("commits", json!("a: b"))]), &[]);
+        assert_eq!(out["commits"], json!("a: b"), "not JSON: left as written");
+        let out = normalized(slots(&[("commits", json!("{\"a\": 1}"))]), &[]);
+        assert_eq!(
+            out["commits"],
+            json!("{\"a\": 1}"),
+            "not a list: left as written"
+        );
     }
 }

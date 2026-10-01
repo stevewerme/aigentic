@@ -1191,6 +1191,55 @@ fn happy_path() -> Happy {
     }
 }
 
+/// T1s — a brief that writes its slots as text, as models do: `ui:
+/// "false"` and `commits` as a JSON list's text (slice 1's acceptance
+/// run). The implementer's prompt has no pty section, and E2 reads the
+/// named subjects, so the run checks, pushes and closes.
+#[tokio::test]
+async fn t1s_slots_written_as_text_are_read_as_declared() {
+    let brief_child = Ulid::generate();
+    let implementer_child = Ulid::generate();
+    let mut brief = brief_report();
+    brief["slots"]["ui"] = json!("false");
+    brief["slots"]["commits"] = json!("[\"runtime: one\", \"runtime: two\"]");
+    let fx = &Fixture::new(vec![
+        (brief_child, vec![report("r1", brief)]),
+        (implementer_child, vec![report("r2", implementer_report())]),
+    ]);
+    let mut committed = false;
+    let run = trace_between(fx, |_| {
+        commit_what_the_brief_named(fx, implementer_child, &mut committed)
+    })
+    .await;
+
+    let prompts = child_prompts(fx, implementer_child);
+    assert!(
+        !prompts[0].contains("## Pty check"),
+        "`ui: \"false\"` drops the pty section: {}",
+        prompts[0]
+    );
+    assert!(
+        prompts[0].contains("runtime: one\nruntime: two"),
+        "the commits render one subject per line: {}",
+        prompts[0]
+    );
+    let checks = checks_run(run.lead());
+    assert!(
+        checks.iter().all(|run| run
+            .checks
+            .iter()
+            .all(|check| check.result != aigentic_log::CheckResult::Fail)),
+        "no check fails, E2 among them: {checks:?}"
+    );
+    assert_eq!(
+        run.terminal,
+        Advanced::Finished {
+            outcome: aigentic_log::RunOutcome::Closed
+        },
+        "the run closes"
+    );
+}
+
 /// T1: trivial happy path → `PausedAtChecks` on implement-alone; one
 /// `## Brief` and one `## Implementation` comment;
 /// `route_taken.budget_usd == brief budget slot`; `reported_event`
