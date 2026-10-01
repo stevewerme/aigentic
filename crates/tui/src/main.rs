@@ -11,6 +11,7 @@ mod init_cmd;
 mod pocock;
 mod pocock_templates;
 mod project_cmd;
+mod run_view;
 mod skills_cmd;
 mod stats;
 
