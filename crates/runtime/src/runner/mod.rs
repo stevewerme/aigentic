@@ -666,7 +666,7 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
                 ],
             );
         };
-        let Some(budget) = slot("budget").and_then(|v| v.as_f64()) else {
+        let Some(budget) = slot("budget").as_ref().and_then(budget_usd) else {
             return self.escalate(
                 "route_escalate",
                 vec![
@@ -1467,4 +1467,40 @@ fn impact_word(impact: ReleaseImpact) -> String {
         .ok()
         .and_then(|value| value.as_str().map(str::to_owned))
         .unwrap_or_else(|| "unstated".to_owned())
+}
+
+/// A brief's `budget` slot as USD: a JSON number, or a string that
+/// starts with one (`"3"`, `"3 USD"`, `"$3.50"`). Models write the unit
+/// even when asked for a number, and the wording must not stop a run
+/// (slice 1's acceptance: `"3 USD"` escalated).
+fn budget_usd(value: &serde_json::Value) -> Option<f64> {
+    if let Some(n) = value.as_f64() {
+        return Some(n);
+    }
+    let text = value.as_str()?.trim();
+    let text = text.strip_prefix('$').unwrap_or(text).trim_start();
+    let end = text
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(text.len());
+    text[..end].parse::<f64>().ok().filter(|n| n.is_finite())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::budget_usd;
+    use serde_json::json;
+
+    #[test]
+    fn a_budget_is_a_number_or_starts_with_one() {
+        assert_eq!(budget_usd(&json!(3)), Some(3.0));
+        assert_eq!(budget_usd(&json!(4.5)), Some(4.5));
+        assert_eq!(budget_usd(&json!("3")), Some(3.0));
+        assert_eq!(budget_usd(&json!("3 USD")), Some(3.0));
+        assert_eq!(budget_usd(&json!("$3.50")), Some(3.5));
+        assert_eq!(budget_usd(&json!(" 6usd ")), Some(6.0));
+        assert_eq!(budget_usd(&json!("three")), None);
+        assert_eq!(budget_usd(&json!("USD 3")), None);
+        assert_eq!(budget_usd(&json!("")), None);
+        assert_eq!(budget_usd(&json!(null)), None);
+    }
 }

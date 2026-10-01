@@ -34,7 +34,7 @@ The issue budget is {{budget_trivial}} USD for a trivial issue and {{budget_full
 End by calling `finish_step` once, with:
 
 - `status`: `done`
-- `slots`: `size`, `budget`, `budget_reason` (only when raised), `pointers`, `purpose`, `must_not_undo`, and for a trivial issue `design`, `commits`, `reference_check`, `ui`
+- `slots`: `size`, `budget` (a bare number of USD, such as `3`), `budget_reason` (only when raised), `pointers`, `purpose`, `must_not_undo`, and for a trivial issue `design`, `commits`, `reference_check`, `ui`
 - `planned_tests`: for a trivial issue
 - `body`: a short account a person can read in a minute: the size and why, the purpose, the pointers
 
