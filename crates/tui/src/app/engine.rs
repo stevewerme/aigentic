@@ -4343,10 +4343,38 @@ mod tests {
         assert!(repl.menu().is_some(), "and left the prompt alone");
         assert_eq!(daemon.requests().len(), before, "and sent nothing");
 
+        // The prompt in plain mode is `Menu::plain`'s own text.
+        let prompt = repl.menu().expect("still up").plain();
+        assert_eq!(prompt[0], "[checkpoint] checkpoint plain", "{prompt:?}");
+        assert!(
+            prompt.iter().any(|l| l.starts_with("  1. Stop the run")),
+            "the picks are numbered for a typed answer: {prompt:?}"
+        );
+
+        // And a typed `1` is that pick: it sends the answer and goes.
+        let before = daemon.requests().len();
+        repl.handle_line("1", &mut out).await;
+        let sent = daemon.requests()[before..].to_vec();
+        match &sent[0] {
+            Request::AnswerCheckpoint {
+                lead: answered,
+                gate,
+                answer,
+                amendment,
+            } => {
+                assert_eq!(*answered, lead_id);
+                assert_eq!(gate, "plain");
+                assert_eq!(*answer, aigentic_api::CheckpointAnswer::Stop);
+                assert!(amendment.is_none());
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(repl.menu().is_none(), "the prompt went on `Ok`");
+
         repl.handle_line("just a thought", &mut out).await;
         let sent = daemon.requests()[before..].to_vec();
         assert!(
-            matches!(sent[0], Request::Post { .. }),
+            matches!(sent[1], Request::Post { .. }),
             "an unrelated line is the chat's: {sent:?}"
         );
     }
