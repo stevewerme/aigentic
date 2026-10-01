@@ -105,6 +105,41 @@ so the rule can be judged, not just obeyed. The `brief`, `plan-check` and
   diversity came from two samples, not from effort. On a critical ticket,
   run two Flash judges in parallel (about $6, less than one capped Kimi
   judge on #57).
+- **Size a ticket by cost, and review by risk.** #58 cost about $51 in
+  model spend: 4,939 lines across four crates, two spec checks, a
+  verifier and two judges a round, and a fix round that repeated most of
+  it. Small tickets under the same process cost $1.30 (#53, #54), because
+  calls × context per call grows faster than scope. So:
+  - one crate and one concern per ticket, split *before* the spec (as #57
+    was split into #57 and #65);
+  - one Flash spec check and one Flash judge by default, and a second
+    independent judge only for code that runs unattended, pushes, or is
+    concurrent;
+  - fix rounds get one judge and no verifier, since judges re-run
+    everything anyway;
+  - ask before a ticket passes $10, until #60 enforces budgets.
+
+  Spec quality is cheaper than rework: #58's $7.86 fix round came from gaps
+  in the supervisor's spec.
+- **Close a ticket that changes the run path only after a real run.** Five
+  review rounds approved #58 (keep-awake, cross-process writers, the
+  creation race). Then the first `aigentic build 29` found four bugs none
+  of them had:
+  - a gate that opened while the client watched deadlocked;
+  - the brief's `budget: "3 USD"` escalated;
+  - slots written as text read wrongly (`ui: "false"` truthy, so an
+    11-minute pty check ran on a one-line change);
+  - the template listed the reference check after the gate, against E4.
+
+  Tests drove the code the way the tests were written; models write slots
+  however they like, and a person watches live. The acceptance run on a
+  real trivial issue, `kill -9` included, is part of the review.
+- **Fix from the failing run's evidence, not a similar one.** Fixing #58's
+  `commits` slot, the supervisor read the *first* #29 brief (`'["…"]'`) and
+  not the brief of the run that failed (`'[{"subject": "…"}] (precedent …)'`),
+  so the fix and its test missed the real shape. Judge 5 caught it by
+  replaying the failing run's text. Pin the test on the verbatim value
+  from the log that failed.
 
 ## Plans and tests
 
