@@ -1192,8 +1192,8 @@ fn happy_path() -> Happy {
 }
 
 /// T1s — a brief that writes its slots as text, as models do: `ui:
-/// "false"` and `commits` as a JSON list's text (slice 1's acceptance
-/// run). The implementer's prompt has no pty section, and E2 reads the
+/// "false"`, and `commits` as a JSON list's text with objects for items
+/// and prose after it, the shape slice 1's acceptance brief wrote. The implementer's prompt has no pty section, and E2 reads the
 /// named subjects, so the run checks, pushes and closes.
 #[tokio::test]
 async fn t1s_slots_written_as_text_are_read_as_declared() {
@@ -1201,7 +1201,10 @@ async fn t1s_slots_written_as_text_are_read_as_declared() {
     let implementer_child = Ulid::generate();
     let mut brief = brief_report();
     brief["slots"]["ui"] = json!("false");
-    brief["slots"]["commits"] = json!("[\"runtime: one\", \"runtime: two\"]");
+    // The shape #29's second brief wrote: objects for items, prose after.
+    brief["slots"]["commits"] = json!(
+        "[{\"subject\": \"runtime: one\"}, {\"subject\": \"runtime: two\"}] (precedent: an earlier commit)"
+    );
     let fx = &Fixture::new(vec![
         (brief_child, vec![report("r1", brief)]),
         (implementer_child, vec![report("r2", implementer_report())]),

@@ -44,9 +44,11 @@ fn commits_text(items: &[Value]) -> Option<String> {
 /// A report's slots as the workflow declares them. Models write every
 /// slot value as a string, so a `bool` slot arrives as `"false"` — which
 /// a section would read as truthy — and `commits`, which the brief
-/// template asks for as a JSON list, arrives as that list's text, which
-/// E2 would read as no subjects (both found by slice 1's acceptance
-/// run). Anything else, or a string that is neither, is left as written.
+/// template asks for as a JSON list, arrives as that list's text — once
+/// with objects for items and prose after it — which E2 would read as no
+/// subjects (both found by slice 1's acceptance run). `commits` becomes a
+/// list of subject strings when every item yields one. Anything else is
+/// left as written.
 pub(crate) fn normalized(
     mut slots: BTreeMap<String, Value>,
     declared: &[SlotDecl],
@@ -63,12 +65,44 @@ pub(crate) fn normalized(
             }
         }
     }
-    if let Some(Value::String(text)) = slots.get("commits")
-        && let Ok(list @ Value::Array(_)) = serde_json::from_str::<Value>(text.trim())
-    {
-        slots.insert("commits".into(), list);
+    if let Some(subjects) = slots.get("commits").and_then(commit_subjects) {
+        slots.insert(
+            "commits".into(),
+            Value::Array(subjects.into_iter().map(Value::String).collect()),
+        );
     }
     slots
+}
+
+/// The subjects a `commits` slot names, however a model wrote it: a list,
+/// or the text of one with anything after it (the #29 brief added a
+/// parenthetical), whose items are subjects or `{"subject": …}` objects.
+/// `None` unless every item yields a subject: a slot only partly
+/// understood is left as written rather than half-read.
+fn commit_subjects(value: &Value) -> Option<Vec<String>> {
+    let parsed;
+    let items = match value {
+        Value::Array(items) => items,
+        Value::String(text) => {
+            parsed = serde_json::Deserializer::from_str(text.trim())
+                .into_iter::<Value>()
+                .next()?
+                .ok()?;
+            parsed.as_array()?
+        }
+        _ => return None,
+    };
+    items
+        .iter()
+        .map(|item| match item {
+            Value::String(subject) => Some(subject.clone()),
+            Value::Object(fields) => fields
+                .get("subject")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            _ => None,
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -205,6 +239,41 @@ mod tests {
         assert_eq!(out["ui"], json!(true), "a real bool stays");
         let out = normalized(slots(&[("ui", json!("maybe"))]), &declared);
         assert_eq!(out["ui"], json!("maybe"), "neither word: left as written");
+    }
+
+    #[test]
+    fn commits_as_the_acceptance_briefs_wrote_them_are_subjects() {
+        // The two texts #29's briefs reported, verbatim.
+        let first = normalized(
+            slots(&[("commits", json!("[\"gitignore: .scratch/\"]"))]),
+            &[],
+        );
+        assert_eq!(first["commits"], json!(["gitignore: .scratch/"]));
+        let second = normalized(
+            slots(&[(
+                "commits",
+                json!(
+                    "[{\"subject\": \"gitignore: .scratch/\"}] (precedent for style: `gitignore: .DS_Store` on 5d18e0e)"
+                ),
+            )]),
+            &[],
+        );
+        assert_eq!(second["commits"], json!(["gitignore: .scratch/"]));
+        let objects = normalized(
+            slots(&[("commits", json!([{"subject": "a: b"}, "c: d"]))]),
+            &[],
+        );
+        assert_eq!(
+            objects["commits"],
+            json!(["a: b", "c: d"]),
+            "a real list of objects too"
+        );
+        let numbers = normalized(slots(&[("commits", json!("[1, 2]"))]), &[]);
+        assert_eq!(
+            numbers["commits"],
+            json!("[1, 2]"),
+            "partly understood: left as written"
+        );
     }
 
     #[test]

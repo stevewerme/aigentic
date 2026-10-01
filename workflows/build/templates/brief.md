@@ -25,7 +25,7 @@ The issue budget is {{budget_trivial}} USD for a trivial issue and {{budget_full
 
 - `design`: the change as the implementer should make it: each function or type to change and how.
 - `planned_tests`: numbered T1, T2, …; for each, what it asserts and how its expected value is derived, from the code or from the issue's rule, never computed by hand.
-- `commits`: a JSON list with each commit's subject in this repository's style (`crate: what changed`; see `git log --oneline -15`).
+- `commits`: a JSON list of strings, nothing after it, with each commit's subject in this repository's style (`crate: what changed`; see `git log --oneline -15`).
 - `reference_check`: a command whose output shows the fix working on real data, when the result is measurable. Leave it out otherwise.
 - `ui`: true when the change is visible in the terminal and needs a pty check.
 
