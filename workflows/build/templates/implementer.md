@@ -39,18 +39,6 @@ Run `cargo fmt` before each commit, so formatting lands in the commit it belongs
     Co-Authored-By: aigentic ({{model}}) <332865255+aigentic-bot@users.noreply.github.com>
 
 Do not push and do not install. The runner checks your commits, then pushes them and installs the binary.
-
-## The gate, at the end, once
-
-Run these exactly as written, each in its own bash call:
-
-1. `cargo fmt`
-2. `cargo clippy --all-targets -- -D warnings`
-3. `cargo test > {{gate_log}} 2>&1` with `timeout_secs: 900`
-
-Then search `{{gate_log}}` (`grep -E 'test result:|FAILED|panicked' {{gate_log}}`). Never re-run the suite to read other lines of the same result. If you change code after the gate, run all three again.
-
-A single named test (`cargo test -p <crate> <name>`) must report at least `1 passed`. `0 passed` means the name matched nothing or the test binary is stale: fix the name, or touch the file and rebuild, before concluding anything.
 {{#reference_check}}
 
 ## Reference check
@@ -65,6 +53,18 @@ Run this and put its full output in your report:
 
 This change is visible in the terminal. Check it with `~/.local/share/aigentic/devtools/drive.py` and put the dumps in your report. The session it starts reads the API key from the environment: source the repository's `.env` by its absolute path and start the session from a scratch directory that has no `.env` of its own, in one command: `(set -a; . <repo>/.env; set +a; cd <scratch> && python3 ~/.local/share/aigentic/devtools/drive.py …)`. Never copy `.env` anywhere. When rows appear or vanish, judge from `raw.bin`, not the pyte dump.
 {{/ui}}
+
+## The gate, at the end, once
+
+Run these exactly as written, each in its own bash call:
+
+1. `cargo fmt`
+2. `cargo clippy --all-targets -- -D warnings`
+3. `cargo test > {{gate_log}} 2>&1` with `timeout_secs: 900`
+
+Then search `{{gate_log}}` (`grep -E 'test result:|FAILED|panicked' {{gate_log}}`). Never re-run the suite to read other lines of the same result. If you change code after the gate, run all three again. Nothing runs after the gate but reading its log, so any reference or pty check above runs before it.
+
+A single named test (`cargo test -p <crate> <name>`) must report at least `1 passed`. `0 passed` means the name matched nothing or the test binary is stale: fix the name, or touch the file and rebuild, before concluding anything.
 
 ## Safety
 
