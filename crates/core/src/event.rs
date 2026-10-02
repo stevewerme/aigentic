@@ -125,6 +125,16 @@ pub enum EventKind {
     /// fills a subset. Written by the tool — a later ticket's — and read
     /// by the runner's `step_finished`.
     StepReported,
+    /// The harness proposes a decision of some kind (issue #74). Author:
+    /// the agent or system that proposed it. Appended **before** the turn
+    /// parks (the `CheckpointAsked` rule), so a replay or resume finds the
+    /// open proposal rather than acting on an answer nobody gave.
+    DecisionProposed,
+    /// The answer to a `DecisionProposed` (issue #74), with
+    /// `parent_event = Some(<the proposal's event id>)`. Author: whoever
+    /// answered — a user for a person's answer, `Author::System` for a
+    /// proposal the system closes (`withdrawn`).
+    DecisionAnswered,
 }
 
 /// One line of a thread's append-only log. The log is the source of truth;
@@ -139,7 +149,8 @@ pub struct Event {
     pub author: Author,
     /// Kind-specific JSON.
     pub payload: serde_json::Value,
-    /// Links a `tool_result` to its `assistant_message`.
+    /// Links a `tool_result` to its `assistant_message`, and a
+    /// `decision_answered` to its `decision_proposed` (issue #74).
     pub parent_event: Option<Ulid>,
     /// Serialised as RFC 3339.
     #[serde(with = "time::serde::rfc3339")]
@@ -322,9 +333,26 @@ mod tests {
                 agent_again(),
                 json!({"status": "done", "body": "## Plan", "commits": []}),
             ),
+            // Decisions (issue #74): the harness proposes, a person
+            // answers, and the answer names the proposal.
+            event(
+                23,
+                EventKind::DecisionProposed,
+                Author::System,
+                json!({"kind": "project", "proposal": "switch to getscale/site",
+                       "target": "getscale/site", "reason": "the brief names it",
+                       "stage": "ask"}),
+            ),
+            event(
+                24,
+                EventKind::DecisionAnswered,
+                steve_again(),
+                json!({"answer": "yes"}),
+            ),
         ];
         events[2].parent_event = Some(events[1].id);
         events[9].parent_event = Some(events[8].id);
+        events[24].parent_event = Some(events[23].id);
         events
     }
 
@@ -412,6 +440,30 @@ mod tests {
         unique.sort();
         unique.dedup();
         assert_eq!(unique.len(), names.len(), "wire names are distinct");
+    }
+
+    /// T1 (issue #74): the two decision kinds round-trip and land on the
+    /// wire under the enum's snake_case rule, derived the same way as the
+    /// runner kinds above — never a hand-written name pair.
+    #[test]
+    fn the_decision_kinds_round_trip_under_the_snake_case_rule() {
+        let kinds = [EventKind::DecisionProposed, EventKind::DecisionAnswered];
+        let mut names: Vec<String> = Vec::new();
+        for kind in kinds {
+            let wire = serde_json::to_value(kind).unwrap();
+            let expected = snake_case(&format!("{kind:?}"));
+            assert_eq!(wire, serde_json::Value::String(expected.clone()));
+            let event = event(
+                0,
+                kind,
+                steve_again(),
+                json!({"any": "payload survives whatever the kind"}),
+            );
+            let line = serde_json::to_string(&event).unwrap();
+            assert_eq!(serde_json::from_str::<Event>(&line).unwrap(), event);
+            names.push(expected);
+        }
+        assert_eq!(names, vec!["decision_proposed", "decision_answered"]);
     }
 
     #[test]

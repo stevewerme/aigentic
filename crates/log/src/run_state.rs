@@ -297,7 +297,11 @@ fn runner_kind(kind: EventKind) -> Option<RunnerKind> {
         | EventKind::ContextSaturated
         | EventKind::ProviderRetried
         // A child thread's report, never on the lead thread.
-        | EventKind::StepReported => None,
+        | EventKind::StepReported
+        // Decisions (issue #74) are not runner facts either: a lead
+        // thread's run state reads none of them.
+        | EventKind::DecisionProposed
+        | EventKind::DecisionAnswered => None,
     }
 }
 
@@ -1160,6 +1164,41 @@ mod tests {
                 "{kind:?} is a lead-thread kind"
             );
         }
+    }
+
+    /// T4 (issue #74): the decision events are not runner facts —
+    /// `runner_kind` reads none of them, and a run with proposals and
+    /// answers woven into its log folds to the same `RunState` as the same
+    /// run without them.
+    #[test]
+    fn the_decision_kinds_are_not_runner_facts() {
+        for kind in [EventKind::DecisionProposed, EventKind::DecisionAnswered] {
+            assert_eq!(
+                runner_kind(kind),
+                None,
+                "{kind:?} is not a lead-thread kind"
+            );
+        }
+        let proposal = ev(
+            0,
+            EventKind::DecisionProposed,
+            serde_json::json!({"kind": "project", "proposal": "p", "reason": "r"}),
+        );
+        let mut answer = ev(
+            0,
+            EventKind::DecisionAnswered,
+            serde_json::json!({"answer": "yes"}),
+        );
+        answer.parent_event = Some(proposal.id);
+
+        let plain = numbered(vec![run_started(), step_started(1, child())]);
+        let with = numbered(vec![
+            run_started(),
+            proposal,
+            step_started(1, child()),
+            answer,
+        ]);
+        assert_eq!(run_state(&plain).unwrap(), run_state(&with).unwrap());
     }
 
     /// T20: a `step_finished` before any `step_started` is an ordering

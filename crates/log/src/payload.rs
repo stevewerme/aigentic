@@ -897,10 +897,211 @@ pub struct StepReport {
     pub handoff: Option<Handoff>,
 }
 
+/// What kind of decision a `decision_proposed` event is about (issue
+/// #74). Every kind ADR 0002 names now is a variant from the start, so a
+/// later producer adds no variant an older binary can't read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionKind {
+    /// Which project the thread is in.
+    Project,
+    /// What the build runner should do next with a job.
+    Job,
+    /// Which issue a ticket is, or how it is filed.
+    Ticket,
+    /// What is worth remembering.
+    Knowledge,
+    /// Which profile or model a step runs on.
+    Route,
+    /// Which files or contexts are in play.
+    WorkingSet,
+}
+
+/// How much the harness is trusted to act on a decision kind (issue #74):
+/// `ask` proposes and waits, `tell` proposes and states it, `silent` acts
+/// without a proposal. Only `Ask` is produced in phase 6.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionStage {
+    #[default]
+    Ask,
+    Tell,
+    Silent,
+}
+
+/// Payload of a `decision_proposed` event (issue #74): the harness
+/// proposes a decision of some kind. Written before the turn parks, so a
+/// replay or resume finds the open proposal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecisionProposedPayload {
+    pub kind: DecisionKind,
+    /// What a person reads (`switch to getscale/site`).
+    pub proposal: String,
+    /// The machine-readable object (a project name, a job id) when there
+    /// is one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    pub reason: String,
+    /// The tool call that made the proposal, when one did
+    /// (`suggest_project`, `start_job`), so the runtime's pending entry
+    /// and the log agree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
+    #[serde(default)]
+    pub stage: DecisionStage,
+}
+
+/// A `decision_answered` event's answer (issue #74). The first three are
+/// **a person's** answers; `Withdrawn` closes a proposal nobody answered
+/// — an interrupted turn, a restarted daemon, or `exec` declining
+/// proposals non-interactively — and is written by `Author::System`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionAnswer {
+    Yes,
+    No,
+    Corrected,
+    Withdrawn,
+}
+
+/// Payload of a `decision_answered` event (issue #74); the event's author
+/// is who answered and its `parent_event` is the proposal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecisionAnsweredPayload {
+    pub answer: DecisionAnswer,
+    /// Where the person pointed instead (`no, it's customer X`), present
+    /// only with `Corrected`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correction: Option<String>,
+    /// The answering path's own words (`turn interrupted`, `exec
+    /// declines proposals`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The wire-name rule: `CamelCase` variant names become `snake_case`,
+    /// so the expected name comes from the variant, not a hand-written
+    /// pair (the runner kinds test's rule).
+    fn snake_case(name: &str) -> String {
+        let mut out = String::new();
+        for (i, c) in name.char_indices() {
+            if c.is_uppercase() {
+                if i != 0 {
+                    out.push('_');
+                }
+                out.extend(c.to_lowercase());
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    /// T2 (issue #74): both decision payloads round-trip, every
+    /// `DecisionKind`, `DecisionStage` and `DecisionAnswer` variant
+    /// serialises snake_case, a proposal written without `stage` reads as
+    /// `ask`, and an absent optional key is absent on the wire, not
+    /// `null`.
+    #[test]
+    fn decision_payloads_round_trip_in_snake_case() {
+        for kind in [
+            DecisionKind::Project,
+            DecisionKind::Job,
+            DecisionKind::Ticket,
+            DecisionKind::Knowledge,
+            DecisionKind::Route,
+            DecisionKind::WorkingSet,
+        ] {
+            let wire = serde_json::to_value(kind).unwrap();
+            assert_eq!(wire, json!(snake_case(&format!("{kind:?}"))));
+        }
+        for stage in [
+            DecisionStage::Ask,
+            DecisionStage::Tell,
+            DecisionStage::Silent,
+        ] {
+            let wire = serde_json::to_value(stage).unwrap();
+            assert_eq!(wire, json!(snake_case(&format!("{stage:?}"))));
+        }
+        for answer in [
+            DecisionAnswer::Yes,
+            DecisionAnswer::No,
+            DecisionAnswer::Corrected,
+            DecisionAnswer::Withdrawn,
+        ] {
+            let wire = serde_json::to_value(answer).unwrap();
+            assert_eq!(wire, json!(snake_case(&format!("{answer:?}"))));
+        }
+
+        // A full proposal round-trips, with `target` and `call_id` set.
+        let proposed = DecisionProposedPayload {
+            kind: DecisionKind::Project,
+            proposal: "switch to getscale/site".into(),
+            target: Some("getscale/site".into()),
+            reason: "the brief names it".into(),
+            call_id: Some("c1".into()),
+            stage: DecisionStage::Ask,
+        };
+        let value = serde_json::to_value(&proposed).unwrap();
+        assert_eq!(value["kind"], "project");
+        assert_eq!(value["stage"], "ask");
+        assert_eq!(
+            serde_json::from_value::<DecisionProposedPayload>(value).unwrap(),
+            proposed
+        );
+
+        // A proposal written without `stage` reads as `ask`, and absent
+        // `target`/`call_id` are absent on the wire, not `null`.
+        let bare = serde_json::from_value::<DecisionProposedPayload>(json!({
+            "kind": "job",
+            "proposal": "start the build for #77",
+            "reason": "the issue is ready"
+        }))
+        .unwrap();
+        assert_eq!(bare.stage, DecisionStage::Ask);
+        assert_eq!(bare.target, None);
+        assert_eq!(bare.call_id, None);
+        let back = serde_json::to_value(&bare).unwrap();
+        for absent in ["target", "call_id"] {
+            assert!(back.get(absent).is_none(), "{absent} is absent: {back}");
+        }
+        assert_eq!(back["stage"], "ask");
+
+        // An answer round-trips; a `corrected` carries its correction.
+        let answered = DecisionAnsweredPayload {
+            answer: DecisionAnswer::Corrected,
+            correction: Some("no, it's customer X".into()),
+            note: None,
+        };
+        let value = serde_json::to_value(&answered).unwrap();
+        assert_eq!(
+            value,
+            json!({"answer": "corrected", "correction": "no, it's customer X"})
+        );
+        assert_eq!(
+            serde_json::from_value::<DecisionAnsweredPayload>(value).unwrap(),
+            answered
+        );
+
+        // A withdrawal is written by the system with its own note; the
+        // absent `correction` is absent on the wire, not `null`.
+        let withdrawn = DecisionAnsweredPayload {
+            answer: DecisionAnswer::Withdrawn,
+            correction: None,
+            note: Some("turn interrupted".into()),
+        };
+        let value = serde_json::to_value(&withdrawn).unwrap();
+        assert_eq!(
+            value,
+            json!({"answer": "withdrawn", "note": "turn interrupted"})
+        );
+        assert!(value.get("correction").is_none());
+    }
 
     #[test]
     fn phase5_fields_default_and_stay_off_old_lines() {

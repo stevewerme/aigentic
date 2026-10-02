@@ -78,7 +78,7 @@ latency and cost. Labelled history per site:
 | Site | Question | Label in the log |
 | --- | --- | --- |
 | `memory_gate` | yes/no: worth extracting? | `memory_extracted.written` empty or not |
-| `project_switch` | choice: which project, or none | `project_proposed` + the person's answer |
+| `project_switch` | choice: which project, or none | `decision_proposed` + the person's answer (issue #74; supersedes `project_proposed`) |
 | `skill_select` | choice (multi): which skills | `skill_loaded` in the turns that followed |
 | `route` (later) | choice: which profile | the step's verdict and cost (`stats --issue`) |
 

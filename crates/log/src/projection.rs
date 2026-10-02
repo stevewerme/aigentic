@@ -456,7 +456,13 @@ pub fn project(events: &[Event]) -> Result<Projection, LogError> {
             | EventKind::BudgetWarned
             | EventKind::Pushed
             | EventKind::RunFinished
-            | EventKind::StepReported => {}
+            | EventKind::StepReported
+            // Decisions (issue #74) are bookkeeping kept out of the
+            // model's context: the outcome of a decision reaches the
+            // model through what it caused (a `project_switched`, a job's
+            // summary), not through the record itself.
+            | EventKind::DecisionProposed
+            | EventKind::DecisionAnswered => {}
         }
     }
 
@@ -640,9 +646,10 @@ mod tests {
     use crate::payload::{
         BudgetScope, BudgetWarnedPayload, CheckOutcome, CheckResult, CheckpointAnswer,
         CheckpointAnsweredPayload, CheckpointAskedPayload, ChecksRunPayload, CommitRef,
-        PushedPayload, ReleaseImpact, ReportStatus, RouteTakenPayload, RunFinishedPayload,
-        RunOutcome, RunStartedPayload, StepFinishedPayload, StepReport, StepStartedPayload,
-        StepStatus, Usage,
+        DecisionAnswer, DecisionAnsweredPayload, DecisionKind, DecisionProposedPayload,
+        DecisionStage, PushedPayload, ReleaseImpact, ReportStatus, RouteTakenPayload,
+        RunFinishedPayload, RunOutcome, RunStartedPayload, StepFinishedPayload, StepReport,
+        StepStartedPayload, StepStatus, Usage,
     };
     use aigentic_core::{AgentId, ToolCall, ToolResult, UserId};
     use serde_json::json;
@@ -1586,6 +1593,74 @@ mod tests {
         );
         let rendered = format!("{loud:?}");
         for leaked in ["plan_gate", "ref_after", "content_hash", "budget_usd"] {
+            assert!(
+                !rendered.contains(leaked),
+                "{leaked} never reaches the projection: {rendered}"
+            );
+        }
+    }
+
+    /// T4 (issue #74): the decision events are kept out of the projection —
+    /// a log with a proposal and its answer woven into a real exchange
+    /// projects to exactly the same `Projection` as the same log without
+    /// them, and neither the proposal nor its reason leaks in.
+    #[test]
+    fn the_decision_kinds_are_kept_out_of_the_projection() {
+        let exchange = vec![
+            user(0, "build it"),
+            call(1, "c1", "bash", json!({"command": "cargo test"})),
+            result(2, "c1", "ok"),
+            ended(3),
+        ];
+        let proposed = ev(
+            0,
+            EventKind::DecisionProposed,
+            agent(),
+            serde_json::to_value(&DecisionProposedPayload {
+                kind: DecisionKind::Project,
+                proposal: "switch-to-getscale-site".into(),
+                target: Some("getscale/site".into()),
+                reason: "the-brief-names-it".into(),
+                call_id: None,
+                stage: DecisionStage::Ask,
+            })
+            .unwrap(),
+        );
+        let mut answered = ev(
+            0,
+            EventKind::DecisionAnswered,
+            steve(),
+            serde_json::to_value(&DecisionAnsweredPayload {
+                answer: DecisionAnswer::Yes,
+                correction: None,
+                note: None,
+            })
+            .unwrap(),
+        );
+        answered.parent_event = Some(proposed.id);
+
+        let mut with = vec![
+            exchange[0].clone(),
+            proposed,
+            exchange[1].clone(),
+            answered,
+            exchange[2].clone(),
+            exchange[3].clone(),
+        ];
+        // Gapless sequence numbers: the interleaving is positional only.
+        for (seq, e) in with.iter_mut().enumerate() {
+            e.seq = seq as u64;
+        }
+
+        let quiet = project(&exchange).unwrap();
+        let loud = project(&with).unwrap();
+        assert_eq!(quiet, loud);
+        let rendered = format!("{loud:?}");
+        for leaked in [
+            "switch-to-getscale-site",
+            "the-brief-names-it",
+            "getscale/site",
+        ] {
             assert!(
                 !rendered.contains(leaked),
                 "{leaked} never reaches the projection: {rendered}"

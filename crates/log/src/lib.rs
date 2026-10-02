@@ -8,16 +8,19 @@
 //! `read_all` followed by `project`; a torn tail after a crash can be cut
 //! with [`ThreadLog::open_with`].
 
+mod decision_log;
 mod payload;
 mod projection;
 mod run_state;
 mod store;
 
+pub use decision_log::{DecisionFold, DecisionRecord, RecordedAnswer, decision_records};
 pub use payload::{
     AssistantMessagePayload, BudgetScope, BudgetWarnedPayload, CheckOutcome, CheckResult,
     CheckpointAnswer, CheckpointAnsweredPayload, CheckpointAskedPayload, ChecksRunPayload,
     CommitRef, CompactedPayload, CompactionStrategy, ContextEvictedPayload,
-    ContextSaturatedPayload, DecisionScope, Finding, FindingMark, FixSize, Handoff,
+    ContextSaturatedPayload, DecisionAnswer, DecisionAnsweredPayload, DecisionKind,
+    DecisionProposedPayload, DecisionScope, DecisionStage, Finding, FindingMark, FixSize, Handoff,
     InterruptedPayload, Invoker, LedgerEntry, LedgerStatus, MemoryExtractedPayload, MemoryLine,
     MemoryRememberedPayload, PermissionDecidedPayload, PermissionRequestedPayload, PinnedPayload,
     PlannedTest, PolicyRecord, ProjectSwitchedPayload, ProviderRetriedPayload, PushedPayload,

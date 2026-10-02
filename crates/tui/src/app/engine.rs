@@ -1719,7 +1719,11 @@ impl ClientRepl {
             | EventKind::BudgetWarned
             | EventKind::Pushed
             | EventKind::RunFinished
-            | EventKind::StepReported => {}
+            | EventKind::StepReported
+            // Decisions (issue #74): the REPL draws no line for them;
+            // #7 and #78 draw their own proposal prompts.
+            | EventKind::DecisionProposed
+            | EventKind::DecisionAnswered => {}
         }
     }
 }

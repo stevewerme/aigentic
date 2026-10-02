@@ -136,7 +136,7 @@ crates/tui/Cargo.toml  # + ratatui, crossterm, nucleo, ignore, similar;
 crates/api/src/lib.rs  # Push::Usage, Push::ProjectSwitched, Push::AwaitingSwitch,
                        # Request::SwitchProject, AnswerSwitch, Rename, New;
                        # Decision::DeniedWithReason, Decision::AllowPrefix
-crates/core/src/event.rs        # ProjectProposed, ProjectSwitched, ThreadRenamed
+crates/core/src/event.rs        # ProjectProposed (superseded by #74's decision_proposed), ProjectSwitched, ThreadRenamed
 crates/log/src/payload.rs       # the three payloads
 crates/log/src/projection.rs    # the switch as a one-line system note
 crates/runtime/src/runtime.rs   # set_project, usage(), utility provider
@@ -197,6 +197,8 @@ pub enum EventKind { /* ... */ ProjectProposed, ProjectSwitched, ThreadRenamed }
 pub struct ProjectProposedPayload { pub project: String, pub reason: String, pub accepted: Option<bool> }
 pub struct ProjectSwitchedPayload { pub from: Option<String>, pub to: Option<String>, pub root: PathBuf }
 pub struct ThreadRenamedPayload { pub title: String }
+// Superseded (issue #74): `ProjectProposed` is not built — #74 ships one general pair,
+// `decision_proposed`/`decision_answered`, with `DecisionKind::Project` (§14 Q3, issue #74).
 
 // crates/runtime/src/project.rs
 pub struct ProjectFile { /* ... */ pub related: Vec<String> }
@@ -457,6 +459,11 @@ accepted) is what a later classifier is judged against; it is kept
 from day one. `/project use <name>` and the start-up directory prompt
 do the same switch by hand. A switch while idle only; the request is
 refused during a turn.
+
+> **Superseded (issue #74):** the actor does not append `project_proposed`;
+> #74 ships one general pair, `decision_proposed`/`decision_answered` (the
+> proposal's `target`/`reason` plus its answer replace `(project, reason,
+> accepted)`).
 
 **What a switch does.** The actor builds a `ProjectContext` for the
 target and calls `Runtime::set_project`: layers, knowledge reload,
