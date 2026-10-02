@@ -1,6 +1,6 @@
 # Phase 6 plan
 
-Status: grilled and settled on 2026-09-22 (18 questions, section 11 records the answers); steps 1 to 10 landed the same day · Follows `docs/PRD.md` (the Terminal application and Projects sections) and the phase 0 to 5 plans · Renumbers the PRD's build order: the client is phase 6, sandboxing phase 7, the orchestrator phase 8; multiplayer acceptance (phase 5 step 11) waits behind all three
+Status: grilled and settled on 2026-09-22 (18 questions, section 11 records the answers); steps 1 to 10 landed the same day; revised on 2026-10-02 by the grilling against ADR 0002 (9 questions, section 14 records the answers, and it wins over earlier sections where they differ) · Follows `docs/PRD.md` (the Terminal application and Projects sections) and the phase 0 to 5 plans · Renumbers the PRD's build order: the client is phase 6, sandboxing phase 7, the orchestrator phase 8; multiplayer acceptance (phase 5 step 11) waits behind all three
 
 ## 0. Goal and done-when
 
@@ -29,7 +29,7 @@ the product path.
 
 Done when:
 
-1. **One thread, three projects, one day.** From one thread Steve works
+1. **One front thread, three projects, one day.** From his one front thread (section 14) Steve works
    on the harness (this repository), the marketing site (a second
    repository) and marketing planning (a folder of notes and assets,
    no repository). When a message belongs to another project the model
@@ -47,11 +47,12 @@ Done when:
    and cannot read or write their files. A fact about Steve stated
    anywhere lands in the person-level memory; a fact about the project
    lands in that project's.
-3. **Start is resume.** `aigentic` with no flags resumes the most
-   recent thread wherever it is; the banner names the thread's title
+3. **Start is resume.** `aigentic` with no flags resumes the person's
+   front thread wherever it is; the banner names the thread's title
    and project and, when the directory belongs to another project,
-   asks whether to switch. `--new` starts a thread in the directory's
-   project. Every thread has a title after its first turn.
+   proposes the switch (the `project` decision kind). `/new` starts a
+   fresh front thread, deliberately and rarely. Every thread has a
+   title after its first turn.
 4. **Interrupt is a reflex.** Ctrl-C during a turn cancels the model
    call within a second and the status row says so; Ctrl-C when idle
    with an empty composer quits on the second press within a second.
@@ -85,12 +86,26 @@ Done when:
 9. **Nothing lost.** The phase 3 to 5 acceptance items 1 to 20 in the
    tui README rerun in the new client with the same outcomes, and every
    pre-phase-6 log opens, replays and lists.
+10. **Big work runs in the background.** The model proposes a background
+    job (`start_job`) for work too big for the conversation; on `y` it
+    runs in a child thread in the current project, its permission
+    questions come to the front thread as tagged prompts, and its
+    summary returns as a cell. The status line counts running jobs and
+    `/jobs` lists them, builds included (section 14, Q5 and Q6).
+11. **Length is irrelevant.** The front thread stays near its working-set
+    target (about 120k tokens) however long it gets, and anything evicted
+    comes back through `recall` (section 13, settled in section 14 Q7).
+12. **Every decision is measured.** Each `project` and `job` proposal is
+    logged with its kind and answer, and `aigentic stats --decisions`
+    reports acceptance per kind (section 14, Q3 and Q4).
 
 Not in phase 6: OS sandboxing for bash (phase 7: Seatbelt on macOS,
 bubblewrap or Landlock on Linux, the escalate-and-justify path), the
 orchestrator and any turn that touches two projects (phase 8), a
 classifier that proposes switches without the main model (later, from
-the proposal log; section 12), full markdown and syntax highlighting
+the proposal log; section 12), promoting a decision kind past *ask*
+(after the acceptance week, from its data; ADR 0002), the `ticket` and
+`route` decision kinds, full markdown and syntax highlighting
 inside diffs (light markdown only), image paste, a side pane for pins,
 Vim mode, an external editor key, mouse capture, and multiplayer
 acceptance (phase 5 step 11, after phase 7).
@@ -536,12 +551,17 @@ shared folder); `aigentic workspace new|add <path>|remove
 <project>|list`; or edit the file. Removing a project only drops it
 from the list: its folder, files and threads are untouched.
 
-**Starting.** `aigentic -w vendela` resumes the latest thread whose
-current project is in `vendela`, or starts one there;
-`-w aigentic/site` names a project. Inside a project's folder no flag
-is needed. With nothing to go on (outside any project, no recent
-thread, no flag) the shell shows a picker of workspaces and their
-projects, the same one a bare `/project use` opens.
+**Starting** (revised in section 14, Q8). There are no starting scopes:
+`aigentic` reopens the front thread, and a folder in another project
+proposes the switch. The picker of workspaces and their projects is the
+fallback: on the first run, before a front thread exists, and for a bare
+`/project use`. The `-w` flag is dropped.
+
+**Scale.** A workspace is the boundary for understanding and a project
+the boundary for touching. The front thread's prefix carries the current
+workspace in detail (each project's brief) and every other workspace as
+one line with its project names, so ten workspaces of three projects
+each cost about 30 lines.
 
 ## 10. Steps, one commit each
 
@@ -766,8 +786,8 @@ Settled in the grilling of 2026-09-22 (Q1 to Q18) and in the draft.
 - Whether `exec --json`'s output is the raw `Push` or a simplified
   event schema like Codex's `ThreadItem`. Raw first; a stable schema
   when a second consumer exists.
-- A token ceiling for compaction and inline knowledge (superseded by the
-  working-set target in section 13). Both are fractions
+- A token ceiling for compaction and inline knowledge: settled by the
+  working-set target, about 120k tokens (section 14, Q7). Both are fractions
   of the window, and GLM 5.3 on TensorX has a 1 048 576-token window, so a
   thread compacts only near 734k tokens and knowledge stays inline up to
   about 315k: correct, but every call then carries a very long prompt.
@@ -776,7 +796,7 @@ Settled in the grilling of 2026-09-22 (Q1 to Q18) and in the draft.
 - The PRD's build-order table still lists the orchestrator as phase 6;
   update it when phase 6 closes, with the renumbering in section 0.
 
-## 13. The working set (to be grilled)
+## 13. The working set (settled 2026-10-02; the decisions are in section 14, Q7)
 
 The aim is that a person never manages the context window. Agents hit
 it today because forgetting is lossy and permanent; here the log keeps
@@ -805,3 +825,89 @@ switch, whether the child context is phase 6 or phase 8, and how the
 prompt cache survives eviction (a changed early message invalidates
 everything after it, so eviction should happen in batches at a
 compaction boundary, not message by message).
+
+## 14. The grilling against ADR 0002 (2026-10-02)
+
+ADR 0002 (`docs/adr/0002-the-conversation-is-the-interface.md`) puts one
+conversation in front and the structure behind it, with autonomy earned
+per decision kind. Nine questions settled how phase 6 meets it. Where this
+section differs from an earlier one, this section wins.
+
+1. **One front thread** per person, which never has to end. `aigentic`
+   reopens it from any folder; `/new` is a deliberate fresh start. The
+   working set (Q7) is therefore a requirement, not an optimisation.
+2. **The front thread switches project; big work goes behind it.**
+   Conversation-sized work runs in the front thread in its current
+   project, and switches are proposed as section 9 says. Bigger work runs
+   in a thread behind it (Q5), as `/build` already does, so its output
+   never floods the front thread.
+3. **Ask and measure now, promote later.** Every filing decision in phase 6
+   is a proposal answered in one keystroke, logged with its kind and
+   answer, and `aigentic stats --decisions` reports acceptance per kind.
+   Promotion to *tell* and *silent* comes after the acceptance week, from
+   its data. The event shape for proposals of any kind (reuse
+   `project_proposed`, or one general event) is settled when that ticket
+   is specified.
+4. **Kinds in phase 6: `project` and `job`.** `knowledge` stays automatic,
+   ADR 0002's one exception. The `ticket` kind ("this should be an issue")
+   gets its own issue, linked from ADR 0002 and #59. `route` comes later.
+5. **Background jobs.**
+   - The model proposes one with `start_job(task)`. It runs in a child
+     thread (`parent_thread`, the machinery `/build` uses) in the current
+     project, with a brief the front thread writes.
+   - The front thread carries on, and a one-screen summary returns as a
+     cell when the job ends.
+   - Visibility comes at three levels: `N working` on the status line; a
+     cell when a job starts and when it ends; and `/jobs` (what, project,
+     state, cost, number), with `/jobs <n>` opening one read-only. Builds
+     are listed as jobs.
+   - Exploration in a child context (section 13's fifth lever) is a
+     read-only job.
+6. **A job follows the front thread's permission mode.** Its questions come
+   to the front thread as in-place prompts tagged with the job, on #68's
+   checkpoint-prompt machinery; a key answers only the prompt on screen,
+   and waiting prompts queue oldest first. The step deny list (no
+   `git push`, reset or rebase, never `.env`) always applies.
+7. **The working set.**
+   - **Target:** about 120k tokens in context, shown on the status line
+     as `working 48k · thread 2.1M`.
+   - **Stubs:** a used tool result becomes a one-line stub with a handle
+     and a short summary.
+   - **`recall`:** returns a stub by handle, a log range, or a search over
+     the whole front thread. Across a project switch it reaches
+     everything, with other projects' results marked read-only.
+   - **Summaries:** older turns are summarised continuously on the utility
+     model. Eviction and summarising happen in batches at a boundary, so
+     the prompt cache survives.
+8. **Starting and scale.**
+   - No starting scopes (`-w` is dropped); the picker is the fallback.
+   - The workspace commands, `project init` and `doctor`'s checks stay.
+   - A workspace (a client or company) is the boundary for understanding,
+     and a project the boundary for touching.
+   - The prefix carries the current workspace in detail and every other
+     workspace as one line.
+9. **The acceptance (#12).** The hand checks and the phase 3 to 5 reruns
+   stay, against the updated done-when. Then a week of daily use from the
+   front thread, across at least two workspaces and three or more
+   projects, on TensorX only (alternating backends dropped). Each day
+   records:
+   - the asks, with the same target as before;
+   - the proposals per kind, with their answers;
+   - the jobs, and whether each summary was useful;
+   - the peak working set against 120k;
+   - whether Steve ever needed `/new` or had to think about threads.
+
+   The week's decision data sets the ladder's thresholds.
+
+The implementation tickets are cut from this section, replacing what
+section 10's steps 11 to 14 left open:
+- the project proposal on the ladder (#7, revised);
+- siblings and briefs (#8, unchanged);
+- the front thread and start-is-resume (#9, revised);
+- workspaces without starting scopes (#10, revised);
+- the working set (from Q7, replacing #11);
+- background jobs;
+- `/jobs` and the status count;
+- decision measurement;
+- the acceptance (#12, revised).
+

@@ -1,6 +1,6 @@
 # 0002: The conversation is the interface; structure is the harness's job
 
-Status: proposed, 2026-10-01 (Steve)
+Status: accepted, 2026-10-02 (Steve), after the grilling recorded in `docs/PLAN-phase6.md` §14
 
 ## Context
 
@@ -25,7 +25,7 @@ What's missing is the principle that joins them, and a rule for **when a decisio
 
 ## Decision
 
-**1. One conversation in front, any number of threads behind.** The person talks in one thread. They never have to choose a thread, a project or a model, or manage a context window. Behind the conversation, the harness keeps whatever the work needs:
+**1. One conversation in front, any number of threads behind.** The person talks in one **front thread** that never has to end. Plain `aigentic` reopens it from any folder, and `/new` exists for a deliberate fresh start. The working set (phase 6 §13) keeps it cheap however long it gets. The person never has to choose a thread, a project or a model, or manage a context window. Behind the conversation, the harness keeps whatever the work needs:
 - project threads;
 - build leads and their step children;
 - read-only sub-contexts;
@@ -41,8 +41,10 @@ All of it is logs a person *can* open, and none of it is something they *must* t
 | `ticket` | Is this a new issue, a comment on one, or nothing? | the person decides |
 | `knowledge` | Memory, project knowledge, a lesson, or nothing? | a keyword cue gate plus extraction (#14, ADR 0001's `memory_gate`) |
 | `route` | Which profile or model runs this turn or step? | the person (`--profile`) or the workflow file |
-| `work` | Should this become a build, a lane thread, or a task posted elsewhere? | the person |
+| `job` | Should this run in the background, as a build or a background job? | the person |
 | `working_set` | What stays in context? | no ask by design (phase 6 §13) |
+
+**`knowledge` is the one deliberate exception** to "every kind starts at *ask*": memory writes on its own, as it does today, because a memory line is cheap to see (`/memory`) and to undo, and proposals in every turn would be noise.
 
 New kinds are added as the harness takes on more filing. A kind is a `Decider` site when its question is small and closed (ADR 0001). Otherwise the main model proposes it.
 
@@ -51,7 +53,9 @@ New kinds are added as the harness takes on more filing. A kind is a `Decider` s
 - **Tell.** The harness acts, says what it did in one line, and offers an undo.
 - **Silent.** The harness acts. It shows in the log and in a daily digest, not in the conversation.
 
-A kind moves up when its recent record earns it. The default rule is at least 95% of the last 30 proposals of that kind accepted unchanged, and, for a `Decider` site, ADR 0001's evaluation agreeing. It moves down on an undo, a refusal or a correction: one in *tell* or *silent* drops it a stage. Thresholds are configurable per kind. Every stage change is a new event kind (`autonomy_changed`: kind, operator, from, to, the record that justified it), so the log says why the harness stopped asking. Every kind starts at **ask**.
+A kind moves up when its recent record earns it. The default rule is at least 95% of the last 30 proposals of that kind accepted unchanged, and, for a `Decider` site, ADR 0001's evaluation agreeing. It moves down on an undo, a refusal or a correction: one in *tell* or *silent* drops it a stage. Thresholds are configurable per kind. Every stage change is a new event kind (`autonomy_changed`: kind, operator, from, to, the record that justified it), so the log says why the harness stopped asking. Every kind starts at **ask**, `knowledge` excepted (point 2).
+
+**Sequencing.** Measuring ships first, promotion later. Phase 6 builds every decision as a proposal answered in one keystroke, logged with its kind, plus a per-kind acceptance report (`aigentic stats --decisions`). The promotion to *tell* and *silent* (`autonomy_changed`, thresholds, undo, the digest) comes after phase 6's acceptance week, which provides the data the thresholds are set from. That's ADR 0001's shadow-first rule.
 
 **4. Some decisions never leave *ask*:**
 - policy, permission and deny rules;
@@ -63,22 +67,27 @@ A kind moves up when its recent record earns it. The default rule is at least 95
 
 These are the PRD's "authority stays with humans", made explicit.
 
-**5. The work pulse is learned, not configured.** The harness proposes structure it sees in the log: recurring routines ("you check the open issues every morning"), groupings ("these three folders are one project"), and rhythms ("builds wait for you after 17:00"). Each proposal is a decision kind on the same ladder. Scheduled work, the orchestrator's heartbeat, is one such kind and starts at *ask* like the others.
+**5. Background work is a background job.** The model proposes one with `start_job(task)` (the `job` kind). It runs in a child thread in the current project, under the front thread's permission mode and the step deny list. Its questions come to the front thread as tagged in-place prompts. The front thread carries on, and the job's summary returns as a cell. `/jobs` lists jobs, builds among them, and the status line counts the running ones. Conversation-sized work stays in the front thread, which switches project as phase 6 §9 says.
+
+**6. The work pulse is learned, not configured.** The harness proposes structure it sees in the log: recurring routines ("you check the open issues every morning"), groupings ("these three folders are one project"), and rhythms ("builds wait for you after 17:00"). Each proposal is a decision kind on the same ladder. Scheduled work, the orchestrator's heartbeat, is one such kind and starts at *ask* like the others.
 
 ## Consequences
 
-- **Phase 6:**
-  - #7 (the project proposal) gains the ladder, where today it always asks.
-  - #9 and #10 (start-is-resume; workspaces and the picker) are read through point 1. The picker becomes the fallback, not the way in.
-  - #11 (the working set) is already consistent with this.
-  - #12's ask count becomes the measure this ADR optimises.
-- **The orchestrator** (phase 8) is the part of the harness that files and coordinates *behind* the conversation, not a second place a person goes. Parts of it (`ticket`, `work`) may come before phase 8.
-- **Layer 2:** `/build` in the REPL (#68) is the first step, starting work from the conversation. Later, `work` proposes "this should be a build" itself.
+- **Phase 6** (`docs/PLAN-phase6.md` §14 records the decisions):
+  - the front thread replaces "the latest thread" in start-is-resume (#9);
+  - #7's switch proposal is the `project` kind, logged for the ladder;
+  - `-w` starting scopes go, and the picker is the fallback (#10);
+  - the working set (#11) becomes a requirement;
+  - background jobs and `/jobs` are new scope;
+  - the acceptance week (#12) measures asks, proposals per kind, jobs, the working set, and whether a person ever needed `/new`.
+- **Scale:** the workspace (a client or company) is the boundary for understanding, and the project is the boundary for touching. The front thread's prefix carries the current workspace in detail and every other workspace as one line, so ten clients with three projects each stay manageable.
+- **The orchestrator** (phase 8) is the part of the harness that files and coordinates *behind* the conversation, not a second place a person goes. Background jobs are its first, local piece.
+- **Layer 2:** `/build` in the REPL (#68) is the first piece of starting work from the conversation, and a build is a kind of job. The `ticket` kind ("this should be an issue") comes after phase 6, tracked in its own issue and linked from #59.
 - **Code:**
-  - `log` gains `autonomy_changed` (added, never changed), and proposals reuse `decision_made` or the existing proposal events;
+  - `log` gains `autonomy_changed` (added, never changed) when promotion lands, and proposals use one event shape across kinds, settled in the plan;
   - `runtime` owns each kind's current stage, folded from the log;
-  - config gains per-kind thresholds.
-  - No crate gains a new edge.
+  - config gains per-kind thresholds;
+  - no crate gains a new edge.
 - **Risks:**
   - A wrong *silent* filing is invisible until it matters. So every *tell* or *silent* action must be reversible, the digest must exist before anything goes *silent*, and a correction demotes the kind at once.
   - With several people in a project (phase 5's multiplayer), stages are per operator, never shared.
@@ -86,7 +95,7 @@ These are the PRD's "authority stays with humans", made explicit.
 
 ## Open
 
-- The default thresholds, and whether *tell* needs a time window for undo.
-- The digest's form: a daily thread message, `aigentic stats`, or the status line.
-- Whether a kind's stage can differ by project for the same operator.
-- Which kinds come first after `project`. `knowledge` is a likely candidate, since ADR 0001 already orders `memory_gate` first.
+Deferred to the promotion work after phase 6's acceptance week:
+- the default thresholds, and whether *tell* needs a time window for undo;
+- the digest's form;
+- whether a kind's stage can differ by project for the same operator.
