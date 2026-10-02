@@ -38,6 +38,12 @@ and memory across threads.
 - `aigentic exec` for scripting (exit 0 done, 1 failed, 3 a human was
   needed), `aigentic doctor` for setup checks, and `aigentic stats` for
   what the logs spent, by day, project, thread or issue
+- Builds: `/build <n>` in the REPL, or `aigentic build <n>` from a script,
+  takes a trivial GitHub issue from brief to closed. A versioned workflow
+  renders each step's prompt; checks, the push and the install run as code;
+  the run's events stream into the thread, a checkpoint is answered in
+  place, and a killed run resumes from its log. The full path (plan, review,
+  fix) is next
 
 ## Getting started
 
