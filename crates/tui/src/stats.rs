@@ -20,8 +20,9 @@ use std::path::{Path, PathBuf};
 use aigentic_runtime::Prices;
 use aigentic_runtime::aigentic_core::{Author, ContentBlock, EventKind};
 use aigentic_runtime::aigentic_log::{
-    AssistantMessagePayload, Invoker, MemoryExtractedPayload, SkillLoadedPayload, ThreadLog,
-    ThreadRenamedPayload, ToolResultPayload, TurnEndedPayload, Usage, UserMessagePayload,
+    AssistantMessagePayload, DecisionAnswer, DecisionKind, DecisionRecord, Invoker,
+    MemoryExtractedPayload, SkillLoadedPayload, ThreadLog, ThreadRenamedPayload, ToolResultPayload,
+    TurnEndedPayload, Usage, UserMessagePayload, decision_records,
 };
 use aigentic_server::config::Config;
 use anyhow::{Context, bail};
@@ -1679,6 +1680,262 @@ pub fn render(stats: &Stats) -> String {
     }
     if stats.unreadable > 0 {
         out.push_str(&format!("\n{} thread(s) unreadable\n", stats.unreadable));
+    }
+    out
+}
+
+/// `aigentic stats --decisions` (issue #74): the decision record — how
+/// many decisions of each kind the harness proposed, and how the
+/// operator answered them. No producer writes the events yet, so on a
+/// machine built today this prints `no decisions recorded`.
+pub fn run_decisions(
+    base: &Path,
+    project: Option<&str>,
+    since: Option<&str>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let cutoff = match since {
+        Some(arg) => Some(parse_since(arg, OffsetDateTime::now_utc())?),
+        None => None,
+    };
+    let report = collect_decisions(base, project, cutoff)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{}", render_decisions(&report));
+    }
+    Ok(())
+}
+
+/// The decision record, and what `--json` prints.
+#[derive(Debug, Default, Serialize)]
+pub struct DecisionReport {
+    /// The window's start, RFC 3339, when `--since` was given.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub since: Option<String>,
+    /// One row per kind with a proposal in the window, in
+    /// `DecisionKind`'s declaration order.
+    pub kinds: Vec<DecisionKindStats>,
+    /// Answers that named no proposal, or answered one twice, or did not
+    /// parse: counted, never guessed.
+    pub orphans: u32,
+    /// Threads whose files could not be read; counted so a figure is
+    /// never silently short (the same count `collect` makes).
+    pub unreadable: u32,
+}
+
+/// One kind's row. `yes`, `no`, `corrected` and `withdrawn` count the
+/// answers by what they said, whichever author wrote them; `rate` and
+/// `last_30` count only the operator's own answers, so a `withdrawn` the
+/// system wrote never flatters the record.
+#[derive(Debug, Serialize)]
+pub struct DecisionKindStats {
+    pub kind: DecisionKind,
+    pub proposed: u32,
+    pub yes: u32,
+    pub no: u32,
+    pub corrected: u32,
+    pub withdrawn: u32,
+    pub pending: u32,
+    /// `yes / (yes + no + corrected)` over the operator's answers, as a
+    /// whole percentage truncated (never rounded up, so a record tested
+    /// at 95% is never read as more); absent when nobody answered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate: Option<u32>,
+    /// The same ratio over the 30 most recent proposals a person
+    /// answered; absent when there are none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_30: Option<u32>,
+}
+
+/// Fold every walked thread's decisions and gather the proposals inside
+/// the window. A proposal counts when **the proposal** is inside it,
+/// with whatever answer it has: an answer inside the window to a
+/// proposal before it is left out.
+pub fn collect_decisions(
+    base: &Path,
+    project: Option<&str>,
+    cutoff: Option<OffsetDateTime>,
+) -> anyhow::Result<DecisionReport> {
+    let mut report = DecisionReport {
+        since: cutoff.map(|c| c.format(&Rfc3339).unwrap_or_default()),
+        ..DecisionReport::default()
+    };
+    let mut records: Vec<DecisionRecord> = Vec::new();
+    for (_, dir) in groups(base, project)? {
+        for id in thread_ids(&dir) {
+            match ThreadLog::open(&dir, id).and_then(|log| log.read_all()) {
+                Ok(events) => {
+                    let fold = decision_records(&events);
+                    report.orphans += fold.orphans as u32;
+                    records.extend(fold.records);
+                }
+                Err(_) => report.unreadable += 1,
+            }
+        }
+    }
+    if let Some(cutoff) = cutoff {
+        records.retain(|r| r.at >= cutoff);
+    }
+    report.kinds = kind_rows(&records);
+    Ok(report)
+}
+
+/// The 30 most recent answers `last 30` is taken over: ADR 0002's "the
+/// last 30 proposals of that kind that a person answered".
+const LAST_N: usize = 30;
+
+/// One row per kind that has a proposal, in `DecisionKind`'s declaration
+/// order. A kind with no proposals has no row.
+fn kind_rows(records: &[DecisionRecord]) -> Vec<DecisionKindStats> {
+    let mut rows = Vec::new();
+    for kind in ALL_KINDS {
+        let of_kind: Vec<&DecisionRecord> = records.iter().filter(|r| r.kind == kind).collect();
+        if of_kind.is_empty() {
+            continue;
+        }
+        let mut row = DecisionKindStats {
+            kind,
+            proposed: of_kind.len() as u32,
+            yes: 0,
+            no: 0,
+            corrected: 0,
+            withdrawn: 0,
+            pending: 0,
+            rate: None,
+            last_30: None,
+        };
+        // The operator's own answers, kept apart from the counts above:
+        // `rate` is ADR 0002's "from the operator's own answers".
+        let (mut person_yes, mut person_no, mut person_corrected) = (0u32, 0u32, 0u32);
+        let mut answered: Vec<&DecisionRecord> = Vec::new();
+        for record in &of_kind {
+            let Some(answer) = &record.answer else {
+                row.pending += 1;
+                continue;
+            };
+            match answer.answer {
+                DecisionAnswer::Yes => row.yes += 1,
+                DecisionAnswer::No => row.no += 1,
+                DecisionAnswer::Corrected => row.corrected += 1,
+                DecisionAnswer::Withdrawn => row.withdrawn += 1,
+            }
+            if !is_person(&answer.by) {
+                continue;
+            }
+            match answer.answer {
+                DecisionAnswer::Yes => {
+                    person_yes += 1;
+                    answered.push(record);
+                }
+                DecisionAnswer::No => {
+                    person_no += 1;
+                    answered.push(record);
+                }
+                DecisionAnswer::Corrected => {
+                    person_corrected += 1;
+                    answered.push(record);
+                }
+                // `withdrawn` closes a proposal nobody answered, so it
+                // is no part of what a person's record was.
+                DecisionAnswer::Withdrawn => {}
+            }
+        }
+        row.rate = percent(person_yes, person_yes + person_no + person_corrected);
+        // The most recent by proposal time, the proposal's id settling a
+        // tie, as the costliest-threads order does.
+        answered.sort_by(|a, b| b.at.cmp(&a.at).then_with(|| b.id.cmp(&a.id)));
+        answered.truncate(LAST_N);
+        row.last_30 = percent(
+            answered
+                .iter()
+                .filter(|r| {
+                    matches!(
+                        r.answer.as_ref().map(|a| a.answer),
+                        Some(DecisionAnswer::Yes)
+                    )
+                })
+                .count() as u32,
+            answered.len() as u32,
+        );
+        rows.push(row);
+    }
+    rows
+}
+
+/// Every kind, in declaration order: a new variant fails to compile here
+/// until it is given its place in the report.
+const ALL_KINDS: [DecisionKind; 6] = [
+    DecisionKind::Project,
+    DecisionKind::Job,
+    DecisionKind::Ticket,
+    DecisionKind::Knowledge,
+    DecisionKind::Route,
+    DecisionKind::WorkingSet,
+];
+
+fn kind_name(kind: DecisionKind) -> &'static str {
+    match kind {
+        DecisionKind::Project => "project",
+        DecisionKind::Job => "job",
+        DecisionKind::Ticket => "ticket",
+        DecisionKind::Knowledge => "knowledge",
+        DecisionKind::Route => "route",
+        DecisionKind::WorkingSet => "working_set",
+    }
+}
+
+/// `Some(0)` when nobody answered at all, so the caller can print `-`
+/// rather than a rate nobody earned.
+fn percent(yes: u32, total: u32) -> Option<u32> {
+    (total > 0).then(|| yes * 100 / total)
+}
+
+fn is_person(author: &Author) -> bool {
+    matches!(author, Author::User(_))
+}
+
+fn percent_text(rate: Option<u32>) -> String {
+    match rate {
+        Some(rate) => format!("{rate}%"),
+        None => "-".to_owned(),
+    }
+}
+
+/// The report as the fixed-width text `stats` prints.
+pub fn render_decisions(report: &DecisionReport) -> String {
+    let mut out = String::new();
+    match &report.since {
+        Some(since) => out.push_str(&format!("proposals since {since} (with their answers)\n")),
+        None => out.push_str("proposals: all threads (with their answers)\n"),
+    }
+    if report.kinds.is_empty() {
+        out.push_str("no decisions recorded\n");
+    } else {
+        out.push_str(&format!(
+            "\n{:<14} {:>8} {:>5} {:>5} {:>10} {:>10} {:>7} {:>6} {:>8}\n",
+            "kind", "proposed", "yes", "no", "corrected", "withdrawn", "pending", "rate", "last 30"
+        ));
+        for k in &report.kinds {
+            out.push_str(&format!(
+                "{:<14} {:>8} {:>5} {:>5} {:>10} {:>10} {:>7} {:>6} {:>8}\n",
+                kind_name(k.kind),
+                k.proposed,
+                k.yes,
+                k.no,
+                k.corrected,
+                k.withdrawn,
+                k.pending,
+                percent_text(k.rate),
+                percent_text(k.last_30)
+            ));
+        }
+    }
+    if report.orphans > 0 {
+        out.push_str(&format!("\n{} orphan answers\n", report.orphans));
+    }
+    if report.unreadable > 0 {
+        out.push_str(&format!("\n{} thread(s) unreadable\n", report.unreadable));
     }
     out
 }
@@ -3779,5 +4036,476 @@ api_key_env = "TENSORX_API_KEY"
             )),
             "{text}"
         );
+    }
+
+    // ---- decisions (issue #74) ----
+
+    /// A person, and the system: only a person's answers count in `rate`
+    /// and `last 30`.
+    const PERSON: &str = "steve";
+    const SYS: &str = "system";
+
+    /// One fixture decision: the kind, the proposal's time, and how (and
+    /// by whom) it was answered. The lines are written from the table and
+    /// the expected figures are computed from it, so no number in an
+    /// assertion is hand-written.
+    #[derive(Clone, Copy)]
+    struct DecisionLine {
+        kind: &'static str,
+        at: &'static str,
+        answer: Option<(&'static str, &'static str)>,
+    }
+
+    fn proposed(id: Ulid, at: &str, kind: &str, proposal: &str) -> serde_json::Value {
+        json!({
+            "id": id.to_string(),
+            "kind": "decision_proposed",
+            "author": {"kind": "agent", "id": "assistant"},
+            "payload": {"kind": kind, "proposal": proposal, "reason": "the fixture says so"},
+            "created_at": at,
+        })
+    }
+
+    fn decision_answered(
+        id: Ulid,
+        at: &str,
+        parent: Ulid,
+        answer: &str,
+        who: &str,
+    ) -> serde_json::Value {
+        let author = if who == SYS {
+            json!({"kind": "system"})
+        } else {
+            json!({"kind": "user", "id": who})
+        };
+        json!({
+            "id": id.to_string(),
+            "kind": "decision_answered",
+            "author": author,
+            "parent_event": parent.to_string(),
+            "payload": {"answer": answer},
+            "created_at": at,
+        })
+    }
+
+    /// A log that keeps the ids it is given: `write_thread` stamps a fresh
+    /// one on every line, but an answer has to name its proposal's id.
+    fn write_decisions(dir: &Path, id: Ulid, lines: &[serde_json::Value]) {
+        std::fs::create_dir_all(dir).unwrap();
+        let text: String = lines
+            .iter()
+            .enumerate()
+            .map(|(seq, line)| {
+                let mut e = line.clone();
+                e["thread_id"] = json!(id.to_string());
+                e["seq"] = json!(seq);
+                format!("{e}\n")
+            })
+            .collect();
+        std::fs::write(dir.join(format!("{id}.jsonl")), text).unwrap();
+    }
+
+    /// Write a table of decisions into one thread under `project`.
+    fn decision_thread(project: &Path, table: &[DecisionLine]) {
+        let mut lines = Vec::new();
+        for (n, entry) in table.iter().enumerate() {
+            let proposal = Ulid::generate();
+            lines.push(proposed(
+                proposal,
+                entry.at,
+                entry.kind,
+                &format!("proposal {n}"),
+            ));
+            if let Some((answer, who)) = entry.answer {
+                lines.push(decision_answered(
+                    Ulid::generate(),
+                    entry.at,
+                    proposal,
+                    answer,
+                    who,
+                ));
+            }
+        }
+        write_decisions(project, Ulid::generate(), &lines);
+    }
+
+    /// The figures a table implies for one kind, recomputed from the table
+    /// rather than written down: proposals, the answers by what they said,
+    /// pending, and the operator's own rate.
+    fn expected_row(
+        table: &[DecisionLine],
+        kind: &str,
+    ) -> (u32, u32, u32, u32, u32, u32, Option<u32>) {
+        let of_kind: Vec<&DecisionLine> = table.iter().filter(|e| e.kind == kind).collect();
+        let (mut yes, mut no, mut corrected, mut withdrawn, mut pending) = (0, 0, 0, 0, 0);
+        for entry in &of_kind {
+            match entry.answer {
+                None => pending += 1,
+                Some((answer, _)) => match answer {
+                    "yes" => yes += 1,
+                    "no" => no += 1,
+                    "corrected" => corrected += 1,
+                    "withdrawn" => withdrawn += 1,
+                    other => panic!("the fixture named no answer: {other}"),
+                },
+            }
+        }
+        // The operator's own rate, over their own yes/no/corrected.
+        let person: Vec<&DecisionLine> = of_kind
+            .iter()
+            .copied()
+            .filter(|e| {
+                e.answer.is_some_and(|(answer, who)| {
+                    who != SYS && matches!(answer, "yes" | "no" | "corrected")
+                })
+            })
+            .collect();
+        let person_yes = person
+            .iter()
+            .filter(|e| e.answer.is_some_and(|(answer, _)| answer == "yes"))
+            .count() as u32;
+        let rate = (!person.is_empty()).then(|| person_yes * 100 / person.len() as u32);
+        (
+            of_kind.len() as u32,
+            yes,
+            no,
+            corrected,
+            withdrawn,
+            pending,
+            rate,
+        )
+    }
+
+    /// T5 (issue #74): `stats --decisions` over two projects — kinds in
+    /// declaration order, one kind nobody answered, a system `withdrawn`
+    /// and a pending proposal.
+    #[test]
+    fn decisions_report_each_kind_in_declaration_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let alpha = [
+            DecisionLine {
+                kind: "project",
+                at: "2026-09-22T09:00:00Z",
+                answer: Some(("yes", PERSON)),
+            },
+            DecisionLine {
+                kind: "job",
+                at: "2026-09-22T09:05:00Z",
+                answer: Some(("no", PERSON)),
+            },
+            DecisionLine {
+                kind: "project",
+                at: "2026-09-23T10:00:00Z",
+                answer: Some(("corrected", PERSON)),
+            },
+            DecisionLine {
+                kind: "working_set",
+                at: "2026-09-23T11:00:00Z",
+                answer: Some(("withdrawn", SYS)),
+            },
+            DecisionLine {
+                kind: "project",
+                at: "2026-09-23T12:00:00Z",
+                answer: None,
+            },
+        ];
+        let beta = [
+            DecisionLine {
+                kind: "job",
+                at: "2026-09-24T08:00:00Z",
+                answer: Some(("yes", PERSON)),
+            },
+            DecisionLine {
+                kind: "route",
+                at: "2026-09-24T08:30:00Z",
+                answer: Some(("withdrawn", SYS)),
+            },
+        ];
+        decision_thread(&dir.path().join("alpha"), &alpha);
+        decision_thread(&dir.path().join("beta"), &beta);
+        let all: Vec<DecisionLine> = alpha.iter().chain(beta.iter()).copied().collect();
+
+        let report = collect_decisions(dir.path(), None, None).unwrap();
+        let names: Vec<&str> = report.kinds.iter().map(|k| kind_name(k.kind)).collect();
+        assert_eq!(
+            names,
+            vec!["project", "job", "route", "working_set"],
+            "declaration order, and no row for a kind with no proposal"
+        );
+        for row in &report.kinds {
+            let name = kind_name(row.kind);
+            let (proposed, yes, no, corrected, withdrawn, pending, rate) = expected_row(&all, name);
+            assert_eq!(
+                (
+                    row.proposed,
+                    row.yes,
+                    row.no,
+                    row.corrected,
+                    row.withdrawn,
+                    row.pending
+                ),
+                (proposed, yes, no, corrected, withdrawn, pending),
+                "{name}"
+            );
+            assert_eq!(row.rate, rate, "{name} rate");
+            assert_eq!(row.last_30, rate, "{name} last 30: fewer than 30 answered");
+        }
+        assert_eq!((report.orphans, report.unreadable), (0, 0));
+
+        let text = render_decisions(&report);
+        assert!(
+            text.contains("proposals: all threads (with their answers)"),
+            "{text}"
+        );
+        for word in [
+            "kind",
+            "proposed",
+            "yes",
+            "corrected",
+            "withdrawn",
+            "pending",
+            "last 30",
+        ] {
+            assert!(
+                text.contains(word),
+                "{word} missing from the header: {text}"
+            );
+        }
+        // The kind nobody answered prints `-` for both ratios.
+        let quiet = text
+            .lines()
+            .find(|l| l.starts_with("working_set"))
+            .expect("a working_set row");
+        assert_eq!(quiet.matches('-').count(), 2, "{text}");
+        // A kind's own figure reaches its row, recomputed from the table.
+        let (_, _, _, _, _, _, rate) = expected_row(&all, "project");
+        let row = text.lines().find(|l| l.starts_with("project")).unwrap();
+        assert!(row.contains(&format!("{}%", rate.unwrap())), "{text}");
+    }
+
+    /// T6 (issue #74): `last 30` takes the 30 most recent proposals a
+    /// person answered, ordering two in the same second by the proposal's
+    /// id, and the rate is truncated.
+    #[test]
+    fn decisions_last_30_takes_the_thirty_most_recent_a_person_answered() {
+        let dir = tempfile::tempdir().unwrap();
+        // Two proposals in the same second: the boundary between the 30
+        // that count and those that do not is decided by the proposal's
+        // id, so the `no` with the smaller id is the one left out.
+        let mut ids: Vec<Ulid> = (0..2).map(|_| Ulid::generate()).collect();
+        ids.sort();
+        let (small, large) = (ids[0], ids[1]);
+        let boundary = "2026-09-24T09:00:00Z";
+        let mut lines = vec![
+            proposed(small, boundary, "project", "not this one"),
+            decision_answered(Ulid::generate(), boundary, small, "no", PERSON),
+            proposed(large, boundary, "project", "this one"),
+            decision_answered(Ulid::generate(), boundary, large, "yes", PERSON),
+        ];
+        // 29 later yes answers, so the 30 most recent are the 29 plus the
+        // larger-id proposal above.
+        let later = 29;
+        for n in 0..later {
+            let at = format!("2026-09-25T10:00:{n:02}Z");
+            let proposal = Ulid::generate();
+            lines.push(proposed(proposal, &at, "project", "later"));
+            lines.push(decision_answered(
+                Ulid::generate(),
+                &at,
+                proposal,
+                "yes",
+                PERSON,
+            ));
+        }
+        // One more `no`, a second earlier and with the largest id of all:
+        // time, not id, keeps it out of the 30.
+        let older = Ulid::generate();
+        lines.push(proposed(older, "2026-09-24T08:00:00Z", "project", "older"));
+        lines.push(decision_answered(
+            Ulid::generate(),
+            "2026-09-24T08:00:00Z",
+            older,
+            "no",
+            PERSON,
+        ));
+        write_decisions(&dir.path().join("alpha"), Ulid::generate(), &lines);
+
+        let report = collect_decisions(dir.path(), None, None).unwrap();
+        let row = &report.kinds[0];
+        assert_eq!(kind_name(row.kind), "project");
+        let person_yes = later + 1;
+        let person_answers = later + 2 + 1;
+        assert_eq!(row.proposed, person_answers as u32);
+        assert_eq!(
+            row.rate,
+            Some(person_yes as u32 * 100 / person_answers as u32),
+            "truncated over every person answer in the window"
+        );
+        // The 30 that count are all yes: 29 later plus the larger id.
+        let counted_yes = later + 1;
+        assert_eq!(row.last_30, Some(counted_yes as u32 * 100 / 30));
+    }
+
+    /// T7 (issue #74): `--since` keeps proposals inside the window — an
+    /// answer inside it to a proposal before it is left out — and the
+    /// global `--project` narrows the walk.
+    #[test]
+    fn decisions_honour_since_and_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = Ulid::generate();
+        let inside = Ulid::generate();
+        let alpha = vec![
+            proposed(before, "2026-09-21T23:00:00Z", "project", "before"),
+            // The proposal is before the boundary; the answer is inside.
+            decision_answered(
+                Ulid::generate(),
+                "2026-09-23T10:00:00Z",
+                before,
+                "yes",
+                PERSON,
+            ),
+            proposed(inside, "2026-09-23T09:00:00Z", "job", "inside"),
+            decision_answered(
+                Ulid::generate(),
+                "2026-09-23T09:00:01Z",
+                inside,
+                "no",
+                PERSON,
+            ),
+        ];
+        write_decisions(&dir.path().join("alpha"), Ulid::generate(), &alpha);
+        let beta = vec![proposed(
+            Ulid::generate(),
+            "2026-09-23T09:30:00Z",
+            "ticket",
+            "beta",
+        )];
+        write_decisions(&dir.path().join("beta"), Ulid::generate(), &beta);
+        let cutoff = datetime!(2026-09-23 00:00:00 UTC);
+
+        let report = collect_decisions(dir.path(), None, Some(cutoff)).unwrap();
+        let names: Vec<&str> = report.kinds.iter().map(|k| kind_name(k.kind)).collect();
+        assert_eq!(
+            names,
+            vec!["job", "ticket"],
+            "the proposal before the window is out, its answer inside it does not pull it in"
+        );
+
+        let narrowed = collect_decisions(dir.path(), Some("alpha"), Some(cutoff)).unwrap();
+        let names: Vec<&str> = narrowed.kinds.iter().map(|k| kind_name(k.kind)).collect();
+        assert_eq!(names, vec!["job"], "`--project` narrows the walk");
+
+        // Without the window the proposal is back, answered: pairing is by
+        // the whole thread, whatever the window says.
+        let all = collect_decisions(dir.path(), Some("alpha"), None).unwrap();
+        let project = all
+            .kinds
+            .iter()
+            .find(|k| k.kind == DecisionKind::Project)
+            .unwrap();
+        assert_eq!((project.proposed, project.yes, project.pending), (1, 1, 0));
+    }
+
+    /// T8 (issue #74): `--json` carries the table's figures, an orphan
+    /// answer and an unreadable thread are counted, and with nothing to
+    /// report the kind list is empty.
+    #[test]
+    fn decisions_json_matches_the_table_and_counts_orphans() {
+        let dir = tempfile::tempdir().unwrap();
+        let one = Ulid::generate();
+        let two = Ulid::generate();
+        let lines = vec![
+            proposed(one, "2026-09-24T09:00:00Z", "project", "one"),
+            decision_answered(Ulid::generate(), "2026-09-24T09:00:01Z", one, "yes", PERSON),
+            // An answer naming no proposal is an orphan.
+            decision_answered(
+                Ulid::generate(),
+                "2026-09-24T09:05:00Z",
+                Ulid::generate(),
+                "yes",
+                PERSON,
+            ),
+            proposed(two, "2026-09-24T09:10:00Z", "project", "two"),
+            decision_answered(Ulid::generate(), "2026-09-24T09:10:01Z", two, "no", PERSON),
+        ];
+        let alpha = dir.path().join("alpha");
+        write_decisions(&alpha, Ulid::generate(), &lines);
+        // A thread whose file cannot be read is counted, not swallowed.
+        std::fs::write(
+            alpha.join(format!("{}.jsonl", Ulid::generate())),
+            "not json\n",
+        )
+        .unwrap();
+
+        let report = collect_decisions(dir.path(), None, None).unwrap();
+        assert_eq!((report.orphans, report.unreadable), (1, 1));
+        let text = render_decisions(&report);
+        assert!(text.contains("1 orphan answers"), "{text}");
+        assert!(text.contains("1 thread(s) unreadable"), "{text}");
+
+        // The fixture answers one proposal yes and one no: half,
+        // truncated, recomputed from those two.
+        let (fixture_yes, fixture_no) = (1u32, 1u32);
+        let row = &report.kinds[0];
+        assert_eq!((row.yes, row.no), (fixture_yes, fixture_no));
+        assert_eq!(
+            row.rate,
+            Some(fixture_yes * 100 / (fixture_yes + fixture_no))
+        );
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["kinds"][0]["kind"], "project");
+        assert_eq!(json["kinds"][0]["proposed"], row.proposed);
+        assert_eq!(json["kinds"][0]["rate"], row.rate.unwrap());
+        assert_eq!(json["kinds"][0]["last_30"], row.last_30.unwrap());
+        assert_eq!(json["orphans"], 1);
+        assert_eq!(json["unreadable"], 1);
+
+        // A kind nobody answered carries no ratio key at all.
+        let quiet = DecisionReport {
+            kinds: vec![DecisionKindStats {
+                kind: DecisionKind::Route,
+                proposed: 1,
+                yes: 0,
+                no: 0,
+                corrected: 0,
+                withdrawn: 0,
+                pending: 1,
+                rate: None,
+                last_30: None,
+            }],
+            ..DecisionReport::default()
+        };
+        let quiet = serde_json::to_value(&quiet).unwrap();
+        let quiet = quiet["kinds"][0].as_object().unwrap();
+        assert!(!quiet.contains_key("rate"), "{quiet:?}");
+        assert!(!quiet.contains_key("last_30"), "{quiet:?}");
+
+        // With no decisions, an empty kind list with zero counts.
+        let empty = serde_json::to_value(DecisionReport::default()).unwrap();
+        assert_eq!(empty["kinds"], json!([]));
+        assert_eq!(empty["orphans"], 0);
+    }
+
+    /// T9 (issue #74): with no decisions it says so, naming the window as
+    /// `render` names it.
+    #[test]
+    fn decisions_with_none_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        write_thread(
+            &dir.path().join("alpha"),
+            Ulid::generate(),
+            &[user("2026-09-24T09:00:00Z", "no decisions here")],
+        );
+        let report = collect_decisions(dir.path(), None, None).unwrap();
+        assert!(report.kinds.is_empty());
+        let text = render_decisions(&report);
+        assert!(text.contains("all threads"), "{text}");
+        assert!(text.contains("no decisions recorded"), "{text}");
+
+        let windowed =
+            collect_decisions(dir.path(), None, Some(datetime!(2026-09-23 00:00:00 UTC))).unwrap();
+        let text = render_decisions(&windowed);
+        assert!(text.contains("2026-09-23T00:00:00Z"), "{text}");
+        assert!(text.contains("no decisions recorded"), "{text}");
     }
 }

@@ -116,6 +116,11 @@ enum Command {
         /// total: the cost of one issue's build cycle.
         #[arg(long, value_name = "N", conflicts_with = "thread")]
         issue: Option<u64>,
+        /// The decision record (issue #74): per kind, how many proposals
+        /// were made and how the operator answered them. Honours
+        /// `--since`; no producer writes the events yet.
+        #[arg(long, conflicts_with_all = ["thread", "issue"])]
+        decisions: bool,
     },
     /// Guided setup: config, project file and AGENTS.md, GitHub issues
     /// and labels through `gh`, knowledge links. Shows every file first.
@@ -361,6 +366,7 @@ async fn main() -> anyhow::Result<()> {
             json,
             assume_profile,
             issue,
+            decisions,
         }) => {
             // #40: the config's price tables travel with the request, so
             // an unpriced call can be retro-priced and marked estimated.
@@ -384,6 +390,12 @@ async fn main() -> anyhow::Result<()> {
                     since.as_deref(),
                     json,
                     &book,
+                )?,
+                (None, None) if decisions => stats::run_decisions(
+                    &threads_base,
+                    cli.project.as_deref(),
+                    since.as_deref(),
+                    json,
                 )?,
                 (None, None) => stats::run(
                     &threads_base,
@@ -794,11 +806,13 @@ mod tests {
                 json,
                 assume_profile,
                 issue,
+                decisions,
             }) => {
                 assert_eq!(since.as_deref(), Some("7d"));
                 assert!(json);
                 assert_eq!(assume_profile, None);
                 assert_eq!(issue, None);
+                assert!(!decisions);
             }
             other => panic!("expected stats: {other:?}"),
         }
@@ -811,11 +825,13 @@ mod tests {
                 json,
                 assume_profile,
                 issue,
+                decisions,
             }) => {
                 assert_eq!(since, None);
                 assert!(!json);
                 assert_eq!(assume_profile, None);
                 assert_eq!(issue, None);
+                assert!(!decisions);
             }
             other => panic!("expected stats: {other:?}"),
         }
@@ -864,6 +880,31 @@ mod tests {
                 assert_eq!(assume_profile.as_deref(), Some("tensorx"));
             }
             other => panic!("expected stats: {other:?}"),
+        }
+    }
+
+    /// Issue #74: `stats --decisions` parses, and asking for it together
+    /// with a drill-down is an error rather than a silent winner.
+    #[test]
+    fn stats_parses_the_decisions_flag() {
+        let cli = Cli::try_parse_from(["aigentic", "stats", "--decisions"]).unwrap();
+        match cli.command {
+            Some(Command::Stats {
+                decisions, issue, ..
+            }) => {
+                assert!(decisions);
+                assert_eq!(issue, None);
+            }
+            other => panic!("expected stats: {other:?}"),
+        }
+
+        let id = Ulid::generate();
+        let id = id.to_string();
+        let thread = vec!["aigentic", "stats", "--decisions", "--thread", &id];
+        let issue = vec!["aigentic", "stats", "--decisions", "--issue", "74"];
+        for args in [thread, issue] {
+            let clash = Cli::try_parse_from(args).unwrap_err();
+            assert_eq!(clash.kind(), clap::error::ErrorKind::ArgumentConflict);
         }
     }
 
