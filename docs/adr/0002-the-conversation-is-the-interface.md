@@ -82,7 +82,7 @@ These are the PRD's "authority stays with humans", made explicit.
   - the acceptance week (#12) measures asks, proposals per kind, jobs, the working set, and whether a person ever needed `/new`.
 - **Scale:** the workspace (a client or company) is the boundary for understanding, and the project is the boundary for touching. The front thread's prefix carries the current workspace in detail and every other workspace as one line, so ten clients with three projects each stay manageable.
 - **The orchestrator** (phase 8) is the part of the harness that files and coordinates *behind* the conversation, not a second place a person goes. Background jobs are its first, local piece.
-- **Layer 2:** `/build` in the REPL (#68) is the first piece of starting work from the conversation, and a build is a kind of job. The `ticket` kind ("this should be an issue") comes after phase 6, tracked in its own issue and linked from #59.
+- **Layer 2:** `/build` in the REPL (#68) is the first piece of starting work from the conversation, and a build is a kind of job. The `ticket` kind ("this should be an issue") comes after phase 6, tracked as #80 and linked from #59.
 - **Code:**
   - `log` gains `autonomy_changed` (added, never changed) when promotion lands, and proposals use one event shape across kinds, settled in the plan;
   - `runtime` owns each kind's current stage, folded from the log;
