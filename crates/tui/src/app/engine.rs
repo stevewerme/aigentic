@@ -3087,19 +3087,18 @@ mod tests {
         let root = project(dir.path(), "proj", "[memory]\nenabled = false\n");
         let cfg_dir = dir.path().join("cfg");
         std::fs::create_dir_all(&cfg_dir).unwrap();
-        let curl = || {
-            call(
-                "c",
-                "bash",
-                serde_json::json!({"command": "curl -s https://example.com"}),
-            )
-        };
+        // `uname -a` is local (no network) and absent from the policy's
+        // read-only allow list and no-op list, so it asks. Its prefix is
+        // the whole two-word command (a bare flag never looks like a
+        // value), so the grant still covers the riskiest segment's
+        // prefix (#16).
+        let probe = || call("c", "bash", serde_json::json!({"command": "uname -a"}));
         let script = vec![
-            // Turn 1: curl asks; `p` allows curl -s from now on.
-            vec![curl(), tool_use()],
+            // Turn 1: uname asks; `p` allows `uname -a` from now on.
+            vec![probe(), tool_use()],
             vec![text("fetched"), done()],
             // Turn 2: the same call runs without asking.
-            vec![curl(), tool_use()],
+            vec![probe(), tool_use()],
             vec![text("fetched again"), done()],
             // Turn 3: a different command asks; `n why` denies with a reason.
             vec![
@@ -3128,6 +3127,14 @@ mod tests {
         let role = welcome.projects[0].role.clone();
         let (thread, state, mode) = open(&client, "proj", None).await;
         let notices = client.take_notices().unwrap();
+        // `repl.run` owns the first connection's notices, so a second
+        // connection watches the same thread's state — the same pattern
+        // as `a_prompt_decided_elsewhere_is_withdrawn_and_a_reader_only_watches`.
+        let (watcher, _) = Client::connect(&Addr::Unix(embedded.socket.clone()), &embedded.token)
+            .await
+            .unwrap();
+        open(&watcher, "proj", Some(thread)).await;
+        let watcher_notices = watcher.take_notices().unwrap();
         let mut repl = ClientRepl::new(
             client,
             thread,
@@ -3140,17 +3147,33 @@ mod tests {
         );
         let (tx, rx) = mpsc::unbounded_channel();
         let feeder = async move {
-            let pause = || tokio::time::sleep(std::time::Duration::from_millis(400));
+            // The watcher must outlive the feeder's waits: dropping it
+            // closes the notice stream.
+            let _watcher = watcher;
+            let mut notices = watcher_notices;
+            // Every keystroke waits for the state it answers, so the
+            // test never races a sleep.
             tx.send("one".into()).unwrap();
-            pause().await;
+            until_state(
+                &mut notices,
+                |s| matches!(s, ThreadState::AwaitingApproval { call_id, .. } if call_id == "c"),
+            )
+            .await;
             tx.send("p".into()).unwrap();
-            pause().await;
+            until_state(&mut notices, |s| *s == ThreadState::Idle).await;
             tx.send("two".into()).unwrap();
-            pause().await;
+            // Running-then-Idle proves turn 2 ran to completion without
+            // an ask; a bare second Idle could match a queued notice.
+            until_state(&mut notices, |s| matches!(s, ThreadState::Running { .. })).await;
+            until_state(&mut notices, |s| *s == ThreadState::Idle).await;
             tx.send("three".into()).unwrap();
-            pause().await;
+            until_state(
+                &mut notices,
+                |s| matches!(s, ThreadState::AwaitingApproval { call_id, .. } if call_id == "d"),
+            )
+            .await;
             tx.send("n the build directory is shared".into()).unwrap();
-            pause().await;
+            until_state(&mut notices, |s| *s == ThreadState::Idle).await;
             tx.send("/quit".into()).unwrap();
         };
         let mut out = Lines::default();
@@ -3160,17 +3183,17 @@ mod tests {
             .iter()
             .filter(|l| l.starts_with("[permission] Run this command?"))
             .count();
-        assert_eq!(asks, 2, "curl asked once, rm once: {lines:#?}");
+        assert_eq!(asks, 2, "uname asked once, rm once: {lines:#?}");
         assert!(
             lines
                 .iter()
-                .any(|l| l.contains("don't ask again for `curl -s` in this project")),
+                .any(|l| l.contains("don't ask again for `uname -a` in this project")),
             "{lines:#?}"
         );
         assert!(
             lines
                 .iter()
-                .any(|l| l == "↳ Yes, and don't ask again for `curl -s` in this project"),
+                .any(|l| l == "↳ Yes, and don't ask again for `uname -a` in this project"),
             "the choice is echoed into the record: {lines:#?}"
         );
         assert!(
@@ -3180,7 +3203,7 @@ mod tests {
             "{lines:#?}"
         );
         let rules = std::fs::read_to_string(root.join(".aigentic/rules.toml")).unwrap();
-        assert!(rules.contains("\"curl -s\""), "{rules}");
+        assert!(rules.contains("\"uname -a\""), "{rules}");
     }
 
     /// The checklist (issue #21): a finished item checks off into the
