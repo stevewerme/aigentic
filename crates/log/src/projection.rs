@@ -1959,6 +1959,9 @@ mod tests {
         let line = first_line(&content);
         assert_eq!(line.chars().count(), 100, "the fixture is over the cut");
         let excerpt: String = line.chars().take(EXCERPT_MAX_CHARS).collect();
+        // The spec's number, literally (#75's review: the constant alone
+        // was pinned by nothing).
+        assert_eq!(excerpt.chars().count(), 80);
         assert_eq!(
             results(&p)[0].1,
             format!(

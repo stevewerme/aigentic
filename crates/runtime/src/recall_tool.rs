@@ -138,39 +138,108 @@ fn handle_output(
         None => "call not found".to_owned(),
     };
     let header = format!("[recalled result {handle} · {head}]");
-    let lines: Vec<&str> = p.result.content.lines().collect();
-    let total = lines.len();
-    let first = from_line.unwrap_or(1).max(1) as usize;
-    let start = (first - 1).min(total);
-    let pages = total - start;
-
-    // Fill the cap with whole lines, leaving room for the paging line and
-    // the read-only marker that may follow the tail.
     let marker = read_only_marker(events, handle, current);
-    let reserve = marker.as_ref().map_or(0, |m| m.len() + 1);
-    let mut shown = pages;
-    let text = loop {
-        let paging = if shown < pages {
-            let paging = paging_line(start + 1, start + shown, total, handle);
-            Some(paging)
-        } else {
-            None
-        };
-        let mut parts = vec![header.clone()];
-        parts.extend(lines[start..start + shown].iter().map(|l| (*l).to_owned()));
-        if let Some(paging) = paging {
-            parts.push(paging);
-        }
-        let text = parts.join("\n");
-        if shown == 0 || text.len() + reserve <= DEFAULT_OUTPUT_CAP {
-            break text;
-        }
-        shown -= 1;
-    };
+    let text = page(
+        &header,
+        &p.result.content,
+        from_line,
+        handle,
+        marker.as_deref(),
+    );
     Ok(match marker {
+        Some(marker) if text.ends_with('\n') => format!("{text}{marker}"),
         Some(marker) => format!("{text}\n{marker}"),
         None => text,
     })
+}
+
+/// One page of a result: the header, then the content's lines **byte for
+/// byte** from `from_line` on (each line keeps its own `\n` or `\r\n`, so
+/// the pages of a result put back together are its stored content), filled
+/// to the cap in one pass. When lines are left over, the paging line says
+/// where the next page starts; a single line longer than the whole page is
+/// shown as its head with a note, never as nothing (#75's review).
+fn page(
+    header: &str,
+    content: &str,
+    from_line: Option<u64>,
+    seq: u64,
+    marker: Option<&str>,
+) -> String {
+    let lines: Vec<&str> = content.split_inclusive('\n').collect();
+    let total = lines.len();
+    let first = from_line.unwrap_or(1).max(1) as usize;
+    let start = (first - 1).min(total);
+    let left = &lines[start..];
+    if left.is_empty() {
+        return header.to_owned();
+    }
+    // Room for the read-only marker that may follow the page.
+    let budget = DEFAULT_OUTPUT_CAP - marker.map_or(0, |m| m.len() + 1);
+
+    // The size of the page showing `shown` of the lines left: the header
+    // and its newline, the lines, and, when some are left over, the paging
+    // line on a line of its own.
+    let size = |body: usize, shown: usize, ends_nl: bool| -> usize {
+        let paging = if shown < left.len() {
+            let line = paging_line(start + 1, start + shown, total, seq);
+            usize::from(!ends_nl) + line.len()
+        } else {
+            0
+        };
+        header.len() + 1 + body + paging
+    };
+    let mut body = 0;
+    let mut shown = 0;
+    for line in left {
+        if size(body + line.len(), shown + 1, line.ends_with('\n')) > budget {
+            break;
+        }
+        body += line.len();
+        shown += 1;
+    }
+
+    let mut text = format!("{header}\n");
+    if shown == 0 && !left.is_empty() {
+        // One line longer than the page: its head, cut on a char boundary,
+        // and a note that says so instead of a paging line that would ask
+        // for the same line again.
+        let n = start + 1;
+        let line = left[0];
+        let note = |kept: usize| {
+            if n < total {
+                format!(
+                    "(line {n} is {} bytes, too long to show whole: its first {kept} bytes are above; recall {seq} with from_line {} for the next line)",
+                    line.len(),
+                    n + 1
+                )
+            } else {
+                format!(
+                    "(line {n} is {} bytes, too long to show whole: its first {kept} bytes are above)",
+                    line.len()
+                )
+            }
+        };
+        let room = budget.saturating_sub(header.len() + 1 + 1 + note(line.len()).len());
+        let mut cut = room.min(line.len());
+        while !line.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        text.push_str(&line[..cut]);
+        text.push('\n');
+        text.push_str(&note(cut));
+        return text;
+    }
+    for line in &left[..shown] {
+        text.push_str(line);
+    }
+    if shown < left.len() {
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&paging_line(start + 1, start + shown, total, seq));
+    }
+    text
 }
 
 /// `(lines {a}-{b} of {N} shown; recall {seq} with from_line {b+1} for more)`

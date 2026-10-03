@@ -434,6 +434,119 @@ async fn recall_from_line_returns_the_next_part() {
 // ---------------------------------------------------------------- T8 range
 
 /// T8: a range is `render_range`'s own text, through the cap.
+/// #75's review, item 1: the handle form returns the log's bytes exactly,
+/// whatever the line endings: a trailing newline, CRLF, or none, with and
+/// without `from_line`.
+#[tokio::test]
+async fn recall_by_handle_returns_the_stored_bytes_exactly() {
+    let contents = [
+        "lf one\nlf two\n",
+        "crlf one\r\ncrlf two\r\n",
+        "no newline at all",
+    ];
+    let mut events = vec![started(Some("alpha")), user("read them")];
+    for (i, c) in contents.iter().enumerate() {
+        let id = format!("c{i}");
+        events.push(call(&id, "read_file", json!({"path": format!("f{i}.txt")})));
+        events.push(result(&id, c));
+    }
+    let (_dir, log, written) = fixture(events);
+    let seqs: Vec<u64> = written
+        .iter()
+        .filter(|e| e.kind == EventKind::ToolResult)
+        .map(|e| e.seq)
+        .collect();
+    let mut calls = Vec::new();
+    for (i, seq) in seqs.iter().enumerate() {
+        calls.push((format!("h{i}"), json!({"handle": seq})));
+        calls.push((format!("l{i}"), json!({"handle": seq, "from_line": 1})));
+    }
+    let calls_ref: Vec<(&str, Value)> = calls
+        .iter()
+        .map(|(id, a)| (id.as_str(), a.clone()))
+        .collect();
+    let mut harness = drive(reply(&calls_ref), log);
+    turn(&mut harness, "go").await;
+    let got = recalls(&harness.log().read_all().unwrap());
+    assert_eq!(got.len(), contents.len() * 2, "{got:#?}");
+    for (i, content) in contents.iter().enumerate() {
+        let header = format!(
+            "[recalled result {} · read_file {}]",
+            seqs[i],
+            short_args(&json!({"path": format!("f{i}.txt")}))
+        );
+        let expect = format!("{header}\n{content}");
+        for (_, text, is_error) in &got[i * 2..i * 2 + 2] {
+            assert!(!is_error, "{text}");
+            assert_eq!(text, &expect, "result {i} comes back byte for byte");
+        }
+    }
+}
+
+/// #75's review, item 2: a line longer than the whole page comes back as
+/// its head with a note, never as nothing, and the note points past it.
+#[tokio::test]
+async fn a_line_longer_than_the_page_comes_back_as_its_head() {
+    let long_line = "j".repeat(DEFAULT_OUTPUT_CAP + 500);
+    let content = format!("{long_line}\nsecond");
+    let (_dir, log, written) = fixture(vec![
+        started(Some("alpha")),
+        call("c1", "bash", json!({"command": "cat min.json"})),
+        result("c1", &content),
+    ]);
+    let seq = written.last().unwrap().seq;
+    let mut harness = drive(
+        reply(&[
+            ("r1", json!({"handle": seq})),
+            ("r2", json!({"handle": seq, "from_line": 2})),
+        ]),
+        log,
+    );
+    turn(&mut harness, "go").await;
+    let got = recalls(&harness.log().read_all().unwrap());
+    let (_, head, is_error) = &got[0];
+    assert!(!is_error, "{head}");
+    assert!(head.len() <= DEFAULT_OUTPUT_CAP, "{}", head.len());
+    let body = head.lines().nth(1).expect("the line's head");
+    assert!(!body.is_empty(), "never nothing");
+    assert!(long_line.starts_with(body), "the head of the line");
+    let note = head.lines().last().unwrap();
+    assert_eq!(
+        note,
+        format!(
+            "(line 1 is {} bytes, too long to show whole: its first {} bytes are above; recall {seq} with from_line 2 for the next line)",
+            long_line.len() + 1,
+            body.len()
+        )
+    );
+    let (_, next, _) = &got[1];
+    assert!(next.ends_with("\nsecond"), "{next}");
+}
+
+/// #75's review, item 3: the page is filled in one pass, so a result of
+/// 65,536 short lines (128 KiB) pages in well under a second, where the
+/// first fill loop took minutes.
+#[tokio::test]
+async fn a_result_of_many_short_lines_pages_in_one_pass() {
+    let content = "x\n".repeat(65_536);
+    let (_dir, log, written) = fixture(vec![
+        started(Some("alpha")),
+        call("c1", "bash", json!({"command": "yes x"})),
+        result("c1", &content),
+    ]);
+    let seq = written.last().unwrap().seq;
+    let mut harness = drive(reply(&[("r1", json!({"handle": seq}))]), log);
+    let began = std::time::Instant::now();
+    turn(&mut harness, "go").await;
+    let took = began.elapsed();
+    assert!(took < std::time::Duration::from_secs(10), "{took:?}");
+    let got = recalls(&harness.log().read_all().unwrap());
+    let (_, page1, _) = &got[0];
+    assert!(page1.len() <= DEFAULT_OUTPUT_CAP, "{}", page1.len());
+    let p = paging(page1).expect("pages");
+    assert_eq!(p.n, 65_536);
+}
+
 #[tokio::test]
 async fn recall_by_range_is_the_renderers_text_through_the_cap() {
     let (_dir, log, written) = fixture(vec![
