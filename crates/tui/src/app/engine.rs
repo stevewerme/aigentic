@@ -449,19 +449,13 @@ impl ClientRepl {
             self.apply_checkpoint(keyed, out).await;
             return;
         }
-        // A switch proposal takes its one keystroke first (issue #7):
-        // `y`, `n`, or `n <where>`. Anything else is the chat's line.
-        if let ThreadState::AwaitingSwitch { call_id, .. } = &self.state
-            && self.prompted.as_deref() == Some(call_id)
-            && let Some(answer) = switch_reply(line)
-        {
-            self.answer_switch(answer, out).await;
-            return;
-        }
-        // A pending question or request this client prompted for takes
-        // the line first; without the role the line is what it is.
+        // A pending question, request or switch proposal this client
+        // prompted for takes the line first; without the role the line
+        // is what it is. A switch proposal goes the same route a
+        // question does (issue #82): `self.menu.line(line)`.
         match &self.state {
             ThreadState::AwaitingHuman { call_id, .. }
+            | ThreadState::AwaitingSwitch { call_id, .. }
                 if self.prompted.as_deref() == Some(call_id) && !line.trim().starts_with('/') =>
             {
                 if let Some(keyed) = self.menu.as_ref().and_then(|m| m.line(line)) {
@@ -484,8 +478,16 @@ impl ClientRepl {
                             self.decide(false, false, None, reason, out).await;
                         }
                         // A checkpoint pick never reaches here (its own prompt
-                        // handles it): issue #68.
-                        Pick::Answer | Pick::Other | Pick::StopRun | Pick::LeaveWaiting => {}
+                        // handles it): issue #68. Nor a switch pick
+                        // (issue #82).
+                        Pick::Answer
+                        | Pick::Other
+                        | Pick::StopRun
+                        | Pick::LeaveWaiting
+                        | Pick::SwitchYes
+                        | Pick::SwitchNo
+                        | Pick::SwitchElsewhere
+                        | Pick::SwitchCorrected { .. } => {}
                     }
                     return;
                 }
@@ -897,7 +899,16 @@ impl ClientRepl {
                 self.checkpoint = None;
                 out.line(&format!("[left {gate} waiting: /build <n> asks again]"));
             }
-            Pick::Answer | Pick::Other | Pick::Allow { .. } | Pick::Deny => {}
+            // Neither a switch's picks nor anything else reaches here:
+            // a checkpoint menu offers only the two above.
+            Pick::Answer
+            | Pick::Other
+            | Pick::Allow { .. }
+            | Pick::Deny
+            | Pick::SwitchYes
+            | Pick::SwitchNo
+            | Pick::SwitchElsewhere
+            | Pick::SwitchCorrected { .. } => {}
         }
     }
 
@@ -1030,7 +1041,17 @@ impl ClientRepl {
                     Pick::Deny => {
                         self.decide(false, false, None, reason, out).await;
                     }
-                    Pick::Answer | Pick::Other | Pick::StopRun | Pick::LeaveWaiting => {}
+                    // A switch proposal's three answers (issue #82).
+                    Pick::SwitchYes => self.answer_switch(SwitchReply::Yes, out).await,
+                    Pick::SwitchNo => self.answer_switch(SwitchReply::No, out).await,
+                    Pick::SwitchCorrected { to } => {
+                        self.answer_switch(SwitchReply::Corrected { to }, out).await;
+                    }
+                    Pick::Answer
+                    | Pick::Other
+                    | Pick::StopRun
+                    | Pick::LeaveWaiting
+                    | Pick::SwitchElsewhere => {}
                 }
             }
             Keyed::Answer { text, echo } => {
@@ -1072,8 +1093,8 @@ impl ClientRepl {
         self.answered(r, out);
     }
 
-    /// Answer the switch proposal this client is prompted for (issue
-    /// #7): `y`, `n`, or `n <where>`.
+    /// Answer the switch proposal this client is prompted for (issues
+    /// #7, #82): yes, no, or where it belongs.
     async fn answer_switch(&mut self, answer: SwitchReply, out: &mut dyn Printer) {
         let Some(call_id) = self.prompted.clone() else {
             return;
@@ -1118,6 +1139,20 @@ impl ClientRepl {
             }
             // A checkpoint has no text input: nothing to send.
             Some(Kind::Checkpoint) => {}
+            // A switch proposal's text input is where it belongs
+            // (issue #82): an empty one answers `No, stay here`.
+            Some(Kind::Switch) => {
+                match text.map(|t| t.trim().to_owned()).filter(|t| !t.is_empty()) {
+                    Some(to) => {
+                        out.line(&format!("↳ No, it belongs to: {to}"));
+                        self.answer_switch(SwitchReply::Corrected { to }, out).await;
+                    }
+                    None => {
+                        out.line("↳ No, stay here");
+                        self.answer_switch(SwitchReply::No, out).await;
+                    }
+                }
+            }
             None => {}
         }
     }
@@ -1479,17 +1514,17 @@ impl ClientRepl {
                 workspace,
                 reason,
             } => {
-                // A minimal prompt (issue #7): type `y`, `n`, or
-                // `n <where>`. #82 replaces it with a real one.
-                let where_it_is = workspace
-                    .as_ref()
-                    .map(|w| format!(" in {w}"))
-                    .unwrap_or_default();
-                out.line(&format!(
-                    "[switch to {project}{where_it_is}? {reason} — type y, n, or n <where>]"
-                ));
-                self.menu = None;
-                self.prompted = Some(call_id.clone());
+                if self.may_write() {
+                    // The in-place block (issue #82): the same prompt as
+                    // a permission or a question, answered in one
+                    // keystroke (ADR 0002).
+                    let menu = Menu::switch(project, workspace.as_deref(), reason);
+                    out.prompt(&menu);
+                    self.menu = Some(menu);
+                    self.prompted = Some(call_id.clone());
+                } else {
+                    out.line(&format!("[waiting for an answer: switch to {project}?]"));
+                }
             }
             ThreadState::Running { .. } | ThreadState::Idle => {
                 // A decision's or an answer's event named its author
@@ -1862,21 +1897,6 @@ pub(crate) fn author_name(author: &Author) -> String {
         Author::User(u) => u.0.clone(),
         Author::Agent(a) => a.0.clone(),
         Author::System => "system".into(),
-    }
-}
-
-/// `y`, `n`, or `n <where>`: the minimal REPL answer to a switch
-/// proposal (issue #7). Anything else is not an answer, and goes to the
-/// chat as usual.
-fn switch_reply(line: &str) -> Option<SwitchReply> {
-    let trimmed = line.trim();
-    match trimmed {
-        "y" => Some(SwitchReply::Yes),
-        "n" => Some(SwitchReply::No),
-        _ => {
-            let to = trimmed.strip_prefix("n ")?.trim();
-            (!to.is_empty()).then(|| SwitchReply::Corrected { to: to.to_owned() })
-        }
     }
 }
 
@@ -4638,13 +4658,21 @@ mod tests {
             },
             &mut out,
         );
-        assert!(
-            out.0.0.contains(
-                &"[switch to there in ~/there? the message is about the site — type y, n, or n <where>]"
-                    .to_owned()
-            ),
-            "{:#?}",
-            out.0.0
+        // The in-place block replaces #7's typed line (#82's T7): the
+        // menu is up, this client prompted for it, and the shell draws
+        // it. The `Copies` printer shows what a pipe would print.
+        assert_eq!(repl.menu().map(|m| m.kind), Some(Kind::Switch));
+        assert_eq!(repl.menu_id().as_deref(), Some("chat:c9"));
+        assert_eq!(
+            out.0.0,
+            vec![
+                "[switch] switch to there?".to_owned(),
+                "  the message is about the site".to_owned(),
+                "  in workspace ~/there".to_owned(),
+                "  1. Yes, switch to there".to_owned(),
+                "  2. No, stay here".to_owned(),
+                "  3. No, it belongs somewhere else…".to_owned(),
+            ]
         );
         assert_eq!(repl.prompted.as_deref(), Some("c9"));
 
@@ -4718,6 +4746,293 @@ mod tests {
         daemon.stop();
     }
 
+    /// Every `AnswerSwitch` the daemon was sent, in order.
+    fn switch_answers(daemon: &GuardedLead) -> Vec<SwitchReply> {
+        daemon
+            .requests()
+            .into_iter()
+            .filter_map(|r| match r {
+                Request::AnswerSwitch { answer, .. } => Some(answer),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The chat thread waiting on a switch proposal (issue #82).
+    fn switch_state(call_id: &str) -> ThreadState {
+        ThreadState::AwaitingSwitch {
+            call_id: call_id.into(),
+            project: "customer".into(),
+            workspace: Some("~/customer".into()),
+            reason: "the message is about the site".into(),
+        }
+    }
+
+    /// T4 (#82): `AwaitingSwitch` raises the switch block under
+    /// `chat:{call_id}`, and each row answers the proposal with the
+    /// specified echo — `1` yes, `2` no, `3` then a destination the
+    /// composer hands over.
+    #[tokio::test]
+    async fn a_switch_proposal_shows_the_block_and_answers_by_row() {
+        let state = switch_state("c9");
+
+        // 1: yes.
+        let (mut repl, mut out, daemon) = repl_for(Ulid::generate(), vec![]).await;
+        repl.render(
+            Notice::State {
+                thread: repl.thread,
+                state: state.clone(),
+            },
+            &mut out,
+        );
+        assert_eq!(repl.menu().map(|m| m.kind), Some(Kind::Switch));
+        assert_eq!(
+            repl.menu().map(|m| m.title.as_str()),
+            Some("switch to customer?")
+        );
+        assert_eq!(repl.menu_id().as_deref(), Some("chat:c9"));
+        repl.menu_key(&key_for('1'), true, true, &mut out).await;
+        assert_eq!(switch_answers(&daemon), vec![SwitchReply::Yes]);
+        assert!(
+            out.0.0.iter().any(|l| l == "↳ Yes, switch to customer"),
+            "{:#?}",
+            out.0.0
+        );
+        daemon.stop();
+
+        // 2: no.
+        let (mut repl, mut out, daemon) = repl_for(Ulid::generate(), vec![]).await;
+        repl.render(
+            Notice::State {
+                thread: repl.thread,
+                state: state.clone(),
+            },
+            &mut out,
+        );
+        repl.menu_key(&key_for('2'), true, true, &mut out).await;
+        assert_eq!(switch_answers(&daemon), vec![SwitchReply::No]);
+        assert!(
+            out.0.0.iter().any(|l| l == "↳ No, stay here"),
+            "{:#?}",
+            out.0.0
+        );
+        daemon.stop();
+
+        // 3: the composer takes where it belongs.
+        let (mut repl, mut out, daemon) = repl_for(Ulid::generate(), vec![]).await;
+        repl.render(
+            Notice::State {
+                thread: repl.thread,
+                state: state.clone(),
+            },
+            &mut out,
+        );
+        assert_eq!(
+            repl.menu_key(&key_for('3'), true, true, &mut out).await,
+            MenuKey::Text,
+            "3 keys open the composer"
+        );
+        repl.prompt_text(Some("customer X".into()), &mut out).await;
+        assert_eq!(
+            switch_answers(&daemon),
+            vec![SwitchReply::Corrected {
+                to: "customer X".into()
+            }]
+        );
+        assert!(
+            out.0
+                .0
+                .iter()
+                .any(|l| l == "↳ No, it belongs to: customer X"),
+            "{:#?}",
+            out.0.0
+        );
+
+        // An empty destination answers `No`, at once.
+        repl.render(
+            Notice::State {
+                thread: repl.thread,
+                state: switch_state("c10"),
+            },
+            &mut out,
+        );
+        repl.prompt_text(None, &mut out).await;
+        assert_eq!(switch_answers(&daemon).last(), Some(&SwitchReply::No));
+        assert!(
+            out.0.0.iter().any(|l| l == "↳ No, stay here"),
+            "{:#?}",
+            out.0.0
+        );
+        daemon.stop();
+    }
+
+    /// T4 (#82): a switch answered elsewhere withdraws the block; the
+    /// state that left `AwaitingSwitch` sends nothing.
+    #[tokio::test]
+    async fn a_switch_answered_elsewhere_leaves_no_menu() {
+        let (mut repl, mut out, daemon) = repl_for(Ulid::generate(), vec![]).await;
+        repl.render(
+            Notice::State {
+                thread: repl.thread,
+                state: switch_state("c9"),
+            },
+            &mut out,
+        );
+        assert_eq!(repl.menu().map(|m| m.kind), Some(Kind::Switch));
+
+        repl.render(
+            Notice::State {
+                thread: repl.thread,
+                state: ThreadState::Idle,
+            },
+            &mut out,
+        );
+        assert_eq!(repl.menu(), None, "the block goes with the state");
+        assert!(
+            out.0.0.iter().any(|l| l == "[answered elsewhere]"),
+            "{:#?}",
+            out.0.0
+        );
+        assert!(switch_answers(&daemon).is_empty(), "and nothing is sent");
+        daemon.stop();
+    }
+
+    /// T4 (#82): without `write` the user cannot answer a switch: the
+    /// waiting line, and no menu.
+    #[tokio::test]
+    async fn a_user_without_write_sees_the_waiting_line() {
+        let (mut repl, mut out, daemon) = repl_for(Ulid::generate(), vec![]).await;
+        repl.role = Some("read".into());
+        repl.render(
+            Notice::State {
+                thread: repl.thread,
+                state: switch_state("c9"),
+            },
+            &mut out,
+        );
+        assert_eq!(repl.menu(), None);
+        assert_eq!(repl.prompted, None);
+        assert!(
+            out.0
+                .0
+                .iter()
+                .any(|l| l == "[waiting for an answer: switch to customer?]"),
+            "{:#?}",
+            out.0.0
+        );
+        daemon.stop();
+    }
+
+    /// T5 (#82): #68's grace, for a switch. A permission prompt answered
+    /// by `1` and the Enter that follows leave the switch prompt that
+    /// replaces it unanswered.
+    #[tokio::test]
+    async fn the_enter_after_a_permission_does_not_answer_the_switch() {
+        let (mut repl, mut out, daemon) = repl_for(Ulid::generate(), vec![]).await;
+        repl.render(
+            Notice::State {
+                thread: repl.thread,
+                state: approval_state("c1"),
+            },
+            &mut out,
+        );
+        assert_eq!(repl.menu().map(|m| m.kind), Some(Kind::Permission));
+        let permission_id = repl.menu_id().expect("the permission prompt is up");
+
+        // The decision went out: the switch prompt takes the screen
+        // with a new id, so the answering keys restart their grace.
+        repl.render(
+            Notice::State {
+                thread: repl.thread,
+                state: switch_state("c2"),
+            },
+            &mut out,
+        );
+        let switch_id = repl.menu_id().expect("the switch prompt is up");
+        assert_ne!(
+            permission_id, switch_id,
+            "a change of prompt is a change of id"
+        );
+        assert!(
+            repl.menu_key(&key_for_enter(), true, false, &mut out).await == MenuKey::Passed,
+            "the Enter carrying over is not an answer"
+        );
+        assert!(
+            switch_answers(&daemon).is_empty(),
+            "the switch is unanswered: {:?}",
+            daemon.requests()
+        );
+        daemon.stop();
+    }
+
+    /// T6 (#82): plain mode prints the switch block through
+    /// `Menu::plain()`, and a typed `y` or `n <where>` answers it.
+    #[tokio::test]
+    async fn a_pipe_prints_the_switch_block_and_answers_it() {
+        let (mut repl, mut out, daemon) = repl_for(Ulid::generate(), vec![]).await;
+        repl.render(
+            Notice::State {
+                thread: repl.thread,
+                state: switch_state("c9"),
+            },
+            &mut out,
+        );
+        assert!(
+            out.0.0.iter().any(|l| l == "[switch] switch to customer?"),
+            "{:#?}",
+            out.0.0
+        );
+        assert!(
+            out.0
+                .0
+                .iter()
+                .any(|l| l.trim() == "1. Yes, switch to customer"),
+            "{:#?}",
+            out.0.0
+        );
+        repl.handle_line("y", &mut out).await;
+        assert_eq!(switch_answers(&daemon), vec![SwitchReply::Yes]);
+        daemon.stop();
+
+        let (mut repl, mut out, daemon) = repl_for(Ulid::generate(), vec![]).await;
+        repl.render(
+            Notice::State {
+                thread: repl.thread,
+                state: switch_state("c9"),
+            },
+            &mut out,
+        );
+        repl.handle_line("n customer X", &mut out).await;
+        assert_eq!(
+            switch_answers(&daemon),
+            vec![SwitchReply::Corrected {
+                to: "customer X".into()
+            }]
+        );
+        daemon.stop();
+
+        // An unrelated line is a chat line.
+        let (mut repl, mut out, daemon) = repl_for(Ulid::generate(), vec![]).await;
+        repl.render(
+            Notice::State {
+                thread: repl.thread,
+                state: switch_state("c9"),
+            },
+            &mut out,
+        );
+        repl.handle_line("good morning", &mut out).await;
+        let requests = daemon.requests();
+        assert!(
+            switch_answers(&daemon).is_empty(),
+            "an unrelated line answers nothing: {requests:?}"
+        );
+        assert!(
+            requests.iter().any(|r| matches!(r, Request::Post { .. })),
+            "it goes to the chat: {requests:?}"
+        );
+        daemon.stop();
+    }
+
     /// A REPL over a scripted daemon with one lead, for the tests that
     /// need the parts rather than the bundle.
     async fn repl_for(lead: Ulid, backlog: Vec<Event>) -> (ClientRepl, Copies, GuardedLead) {
@@ -4771,6 +5086,13 @@ mod tests {
     fn key_for(c: char) -> crossterm::event::KeyEvent {
         crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Char(c),
+            crossterm::event::KeyModifiers::NONE,
+        )
+    }
+
+    fn key_for_enter() -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
             crossterm::event::KeyModifiers::NONE,
         )
     }

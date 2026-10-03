@@ -84,15 +84,23 @@ impl Printer for Stdout {
     }
 
     fn prompt(&mut self, menu: &Menu) {
-        // No keys out here, so the prompt is printed once: a followed
-        // run's checkpoint (issue #68) must be visible, and the other
-        // prompts already spoke their lines where they were asked for.
-        if menu.kind == crate::app::menu::Kind::Checkpoint {
+        // No keys out here, so the prompt is printed once: the two
+        // prompts that have no earlier line of their own — a followed
+        // run's checkpoint (issue #68) and a switch proposal (#82).
+        // A permission or a question already spoke where it was asked
+        // for.
+        if prints_in_plain(menu.kind) {
             for line in menu.plain() {
                 println!("{line}");
             }
         }
     }
+}
+
+/// Which prompts a pipe prints (issue #82).
+fn prints_in_plain(kind: crate::app::menu::Kind) -> bool {
+    use crate::app::menu::Kind;
+    matches!(kind, Kind::Checkpoint | Kind::Switch)
 }
 
 /// How many cells the pager keeps.
@@ -606,6 +614,18 @@ fn next_grace(
         (Some(id), _) => Some((id, now)),
     }
 }
+/// The composer's hint while a prompt's text input is open: what the
+/// text means, per kind of prompt (issue #82). A switch proposal's text
+/// is where the work belongs; anything else is a deny's reason.
+fn text_hint(kind: Option<crate::app::menu::Kind>) -> &'static str {
+    use crate::app::menu::Kind;
+    match kind {
+        Some(Kind::Question) => "answer: Enter sends · Esc cancels",
+        Some(Kind::Switch) => "where it belongs: Enter sends · Esc cancels",
+        _ => "deny with a reason · Enter sends · Esc cancels",
+    }
+}
+
 async fn run_shell(
     mut engine: ClientRepl,
     mut notices: mpsc::Receiver<Notice>,
@@ -740,13 +760,9 @@ async fn run_shell(
         };
         let popup_lines = popup.as_ref().map(popup_lines).unwrap_or_default();
         let hint = match (&armed, &state) {
-            _ if prompt_draft.is_some() => Some(
-                match engine.menu().map(|m| m.kind) {
-                    Some(crate::app::menu::Kind::Question) => "answer: Enter sends · Esc cancels",
-                    _ => "deny with a reason · Enter sends · Esc cancels",
-                }
-                .to_owned(),
-            ),
+            _ if prompt_draft.is_some() => {
+                Some(text_hint(engine.menu().map(|m| m.kind)).to_owned())
+            }
             (Some((Action::QuitArm, _)), _) => Some("Ctrl-C again to quit".to_owned()),
             (Some((Action::RecallArm, _)), _) => {
                 Some("Esc again to recall the last message".to_owned())
@@ -1728,5 +1744,40 @@ mod tests {
             next_grace(Some("chat:c1".into()), None, later),
             Some(("chat:c1".to_owned(), later))
         );
+    }
+
+    /// T4 (#82): the composer's hint says what its text is for: a switch
+    /// proposal's text is where the work belongs, a question's is the
+    /// answer, anything else a deny's reason.
+    #[test]
+    fn the_hint_names_what_the_composer_holds() {
+        use crate::app::menu::Kind;
+        assert_eq!(
+            text_hint(Some(Kind::Switch)),
+            "where it belongs: Enter sends · Esc cancels"
+        );
+        assert_eq!(
+            text_hint(Some(Kind::Question)),
+            "answer: Enter sends · Esc cancels"
+        );
+        assert_eq!(
+            text_hint(Some(Kind::Permission)),
+            "deny with a reason · Enter sends · Esc cancels"
+        );
+        assert_eq!(
+            text_hint(None),
+            "deny with a reason · Enter sends · Esc cancels"
+        );
+    }
+
+    /// T6 (#82): a pipe prints the two prompts that have no line of
+    /// their own — a followed run's checkpoint and a switch proposal.
+    #[test]
+    fn a_pipe_prints_the_checkpoint_and_the_switch() {
+        use crate::app::menu::Kind;
+        assert!(prints_in_plain(Kind::Checkpoint));
+        assert!(prints_in_plain(Kind::Switch));
+        assert!(!prints_in_plain(Kind::Permission));
+        assert!(!prints_in_plain(Kind::Question));
     }
 }

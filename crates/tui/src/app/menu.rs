@@ -28,6 +28,15 @@ pub enum Pick {
     StopRun,
     /// Leave the followed run waiting: the prompt goes, nothing is sent.
     LeaveWaiting,
+    /// Switch the thread to the proposal's project (issue #82).
+    SwitchYes,
+    /// Turn the proposal down: the thread stays here.
+    SwitchNo,
+    /// The proposal is for somewhere else: the composer takes where.
+    SwitchElsewhere,
+    /// A typed destination, `n <where>` or `3 <where>`: #7's spelling,
+    /// kept working.
+    SwitchCorrected { to: String },
 }
 
 /// One row of the menu.
@@ -47,6 +56,9 @@ pub enum Kind {
     /// A followed build's checkpoint (issue #68): stop the run, or
     /// leave it waiting.
     Checkpoint,
+    /// A switch proposal (issue #82): go to the proposed project, stay,
+    /// or say where it belongs.
+    Switch,
 }
 
 /// What a key or a line came to.
@@ -248,6 +260,48 @@ impl Menu {
         }
     }
 
+    /// The switch proposal (issue #82; ADR 0002): a proposal is answered
+    /// in one keystroke, in the same in-place block as a permission or a
+    /// question. The title names the project the thread would move to;
+    /// the reason is the body, with the target's workspace on its own
+    /// line when there is one (#7's wording, kept).
+    pub fn switch(project: &str, workspace: Option<&str>, reason: &str) -> Self {
+        let mut body = reason.to_owned();
+        if let Some(w) = workspace {
+            if !body.is_empty() {
+                body.push('\n');
+            }
+            body.push_str(&format!("in workspace {w}"));
+        }
+        Self {
+            kind: Kind::Switch,
+            title: format!("switch to {project}?"),
+            body,
+            note: None,
+            rows: vec![
+                Row {
+                    label: format!("Yes, switch to {project}"),
+                    desc: None,
+                    pick: Pick::SwitchYes,
+                },
+                Row {
+                    label: "No, stay here".into(),
+                    desc: None,
+                    pick: Pick::SwitchNo,
+                },
+                Row {
+                    label: "No, it belongs somewhere else…".into(),
+                    desc: None,
+                    pick: Pick::SwitchElsewhere,
+                },
+            ],
+            selected: 0,
+            multi: false,
+            picked: Vec::new(),
+            questions: None,
+        }
+    }
+
     /// A question from `ask_human`: the first of the call's questions
     /// on the widget, the rest one after another as each is answered.
     /// A question without options has no rows: the composer takes the
@@ -378,6 +432,8 @@ impl Menu {
             KeyCode::Esc if self.kind == Kind::Permission => Keyed::Text,
             // Esc on a checkpoint leaves the run waiting, at once.
             KeyCode::Esc if self.kind == Kind::Checkpoint => self.pick(1),
+            // Esc on a switch proposal is `No, stay here`, at once.
+            KeyCode::Esc if self.kind == Kind::Switch => self.pick(1),
             _ if !settled => Keyed::Passed,
             KeyCode::Char(' ') if plain && self.multi && typing_safe => {
                 self.toggle(self.selected);
@@ -411,6 +467,14 @@ impl Menu {
                     reason: None,
                     echo: "↳ No".into(),
                 },
+                _ => Keyed::Passed,
+            },
+            // A switch proposal's accelerators too, but only on an empty
+            // composer: a message beginning with "n" must never answer
+            // `No`.
+            KeyCode::Char(c) if plain && self.kind == Kind::Switch && composer_empty => match c {
+                'y' => self.pick(0),
+                'n' => self.pick(1),
                 _ => Keyed::Passed,
             },
             _ => Keyed::Passed,
@@ -482,6 +546,17 @@ impl Menu {
                 }
             }
             Pick::Other => Keyed::Text,
+            // Where it belongs: the composer takes the destination, as
+            // a question's `Other` does.
+            Pick::SwitchElsewhere => Keyed::Text,
+            Pick::SwitchYes | Pick::SwitchNo => Keyed::Decide {
+                pick: row.pick.clone(),
+                reason: None,
+                echo: format!("↳ {}", row.label),
+            },
+            // A row never carries a typed destination: only `line`
+            // builds one. Nothing to send from here.
+            Pick::SwitchCorrected { .. } => Keyed::Passed,
             Pick::StopRun => Keyed::Decide {
                 pick: Pick::StopRun,
                 reason: None,
@@ -510,6 +585,11 @@ impl Menu {
                 _ => None,
             };
         }
+        // The switch arm is before the generic permission match, so
+        // `3 <where>` is never read as a deny with a reason.
+        if self.kind == Kind::Switch {
+            return self.switch_line(text);
+        }
         if self.rows.is_empty() {
             return None;
         }
@@ -535,6 +615,32 @@ impl Menu {
             "3" | "n" | "no" => deny(&reason),
             _ => return None,
         })
+    }
+
+    /// A typed line for a switch proposal: `1`/`y` is yes, `2`/`n` is
+    /// no, and #7's `n <where>` spelling keeps working (`3 <where>`
+    /// too). A typed bare `3` is not an answer: a typed line cannot
+    /// open the composer's text input, only the `3` key does. Anything
+    /// else is not an answer either. Trimmed, never case-folded, as #7.
+    fn switch_line(&self, text: &str) -> Option<Keyed> {
+        let t = text.trim();
+        let (head, rest) = t
+            .split_once(char::is_whitespace)
+            .map_or((t, ""), |(h, r)| (h, r.trim()));
+        match head {
+            "1" | "y" if rest.is_empty() => Some(self.pick(0)),
+            "2" | "n" if rest.is_empty() => Some(self.pick(1)),
+            "3" if rest.is_empty() => None,
+            "n" | "3" => {
+                let to = rest.to_owned();
+                (!to.is_empty()).then(|| Keyed::Decide {
+                    pick: Pick::SwitchCorrected { to: to.clone() },
+                    reason: None,
+                    echo: format!("↳ No, it belongs to: {to}"),
+                })
+            }
+            _ => None,
+        }
     }
 
     /// A line for a question: numbers pick rows (several, space or
@@ -587,6 +693,7 @@ impl Menu {
             Kind::Permission => "permission",
             Kind::Question => "question",
             Kind::Checkpoint => "checkpoint",
+            Kind::Switch => "switch",
         };
         let mut lines = vec![format!("[{tag}] {}", self.title)];
         if !self.body.is_empty() {
@@ -1092,5 +1199,211 @@ mod tests {
             Keyed::Text
         );
         assert_eq!(menu.free_text("magenta"), "colour: magenta");
+    }
+
+    // ---- #82: the switch-proposal block ----
+
+    fn switch(workspace: Option<&str>) -> Menu {
+        Menu::switch("customer", workspace, "the message is about the site")
+    }
+
+    fn switch_keyed(pick: Pick, echo: &str) -> Keyed {
+        Keyed::Decide {
+            pick,
+            reason: None,
+            echo: echo.to_owned(),
+        }
+    }
+
+    /// T1 (#82): `Menu::switch` is titled `switch to {project}?`, shows
+    /// the reason and, when there is one, the target's workspace on its
+    /// own line, and offers the three rows; the plain tag is `switch`.
+    #[test]
+    fn a_switch_proposal_is_a_three_row_block() {
+        let menu = switch(Some("~/customer"));
+        assert_eq!(menu.kind, Kind::Switch);
+        assert_eq!(menu.title, "switch to customer?");
+        assert_eq!(
+            menu.body,
+            "the message is about the site\nin workspace ~/customer"
+        );
+        assert_eq!(
+            menu.rows,
+            vec![
+                Row {
+                    label: "Yes, switch to customer".into(),
+                    desc: None,
+                    pick: Pick::SwitchYes,
+                },
+                Row {
+                    label: "No, stay here".into(),
+                    desc: None,
+                    pick: Pick::SwitchNo,
+                },
+                Row {
+                    label: "No, it belongs somewhere else…".into(),
+                    desc: None,
+                    pick: Pick::SwitchElsewhere,
+                },
+            ]
+        );
+        assert_eq!(menu.selected, 0);
+
+        // No workspace on the wire: just the reason.
+        let menu = switch(None);
+        assert_eq!(menu.body, "the message is about the site");
+
+        let plain = menu.plain();
+        assert_eq!(plain[0], "[switch] switch to customer?");
+        assert!(
+            plain
+                .iter()
+                .any(|l| l.contains("the message is about the site")),
+            "{plain:#?}"
+        );
+        assert!(
+            plain
+                .iter()
+                .any(|l| l.contains("1. Yes, switch to customer")),
+            "{plain:#?}"
+        );
+        assert!(
+            plain.iter().any(|l| l.contains("2. No, stay here")),
+            "{plain:#?}"
+        );
+        assert!(
+            plain
+                .iter()
+                .any(|l| l.contains("3. No, it belongs somewhere else…")),
+            "{plain:#?}"
+        );
+    }
+
+    /// T2 (#82): the switch's keys — digits 1-3, Up/Down then Enter,
+    /// Esc as *No, stay here* at once, `3` as the text input, and the
+    /// hidden `y`/`n` accelerators only with an empty composer, after
+    /// the grace.
+    #[test]
+    fn a_switch_answers_by_key() {
+        let empty = KeyModifiers::NONE;
+        assert_eq!(
+            switch(None).key(&key(KeyCode::Char('y'), empty), true, true),
+            switch_keyed(Pick::SwitchYes, "↳ Yes, switch to customer")
+        );
+        assert_eq!(
+            switch(None).key(&key(KeyCode::Char('n'), empty), true, true),
+            switch_keyed(Pick::SwitchNo, "↳ No, stay here")
+        );
+        // A draft in the composer is a message, not an answer: "never
+        // mind" must not answer No.
+        assert_eq!(
+            switch(None).key(&key(KeyCode::Char('n'), empty), false, true),
+            Keyed::Passed
+        );
+        assert_eq!(
+            switch(None).key(&key(KeyCode::Char('y'), empty), false, true),
+            Keyed::Passed
+        );
+
+        // The digits pick, as on every menu.
+        assert_eq!(
+            switch(None).key(&key(KeyCode::Char('1'), empty), true, true),
+            switch_keyed(Pick::SwitchYes, "↳ Yes, switch to customer")
+        );
+        assert_eq!(
+            switch(None).key(&key(KeyCode::Char('2'), empty), true, true),
+            switch_keyed(Pick::SwitchNo, "↳ No, stay here")
+        );
+        assert_eq!(
+            switch(None).key(&key(KeyCode::Char('3'), empty), true, true),
+            Keyed::Text,
+            "3 hands the composer the destination"
+        );
+
+        // Up/Down then Enter takes the selection.
+        let mut menu = switch(None);
+        assert_eq!(
+            menu.key(&key(KeyCode::Down, empty), true, true),
+            Keyed::Used
+        );
+        assert_eq!(menu.selected, 1);
+        assert_eq!(menu.key(&key(KeyCode::Up, empty), true, true), Keyed::Used);
+        assert_eq!(menu.selected, 0);
+        assert_eq!(
+            menu.key(&key(KeyCode::Enter, empty), true, true),
+            switch_keyed(Pick::SwitchYes, "↳ Yes, switch to customer")
+        );
+
+        // Esc is *No, stay here*, at once: no grace, no text input.
+        assert_eq!(
+            switch(None).key(&key(KeyCode::Esc, empty), true, false),
+            switch_keyed(Pick::SwitchNo, "↳ No, stay here")
+        );
+
+        // Before the grace has passed, the answering keys are gone.
+        for code in [KeyCode::Char('y'), KeyCode::Char('n'), KeyCode::Char('1')] {
+            assert_eq!(
+                switch(None).key(&key(code, empty), true, false),
+                Keyed::Passed,
+                "{code:?} waits out the grace"
+            );
+        }
+    }
+
+    /// T3 (#82): a typed line — `1`/`y` is yes, `2`/`n` is no, #7's
+    /// `n <where>` and its `3 <where>` sibling are corrected, a bare
+    /// `3` is not an answer, and neither is anything else. No
+    /// case-folding, as #7.
+    #[test]
+    fn a_typed_line_answers_a_switch() {
+        let menu = switch(None);
+        assert_eq!(
+            menu.line("1"),
+            Some(switch_keyed(Pick::SwitchYes, "↳ Yes, switch to customer"))
+        );
+        assert_eq!(
+            menu.line("y"),
+            Some(switch_keyed(Pick::SwitchYes, "↳ Yes, switch to customer"))
+        );
+        assert_eq!(
+            menu.line("2"),
+            Some(switch_keyed(Pick::SwitchNo, "↳ No, stay here"))
+        );
+        assert_eq!(
+            menu.line("n"),
+            Some(switch_keyed(Pick::SwitchNo, "↳ No, stay here"))
+        );
+        for line in ["n customer X", "3 customer X"] {
+            assert_eq!(
+                menu.line(line),
+                Some(switch_keyed(
+                    Pick::SwitchCorrected {
+                        to: "customer X".into()
+                    },
+                    "↳ No, it belongs to: customer X"
+                )),
+                "{line} says where it belongs"
+            );
+        }
+        // Trimmed.
+        assert_eq!(
+            menu.line("  n   customer X  "),
+            Some(switch_keyed(
+                Pick::SwitchCorrected {
+                    to: "customer X".into()
+                },
+                "↳ No, it belongs to: customer X"
+            ))
+        );
+        // A typed bare `3` cannot open the text input: only the key does.
+        assert_eq!(menu.line("3"), None);
+        // No case-folding and no wordier spellings, as #7.
+        assert_eq!(menu.line("Y"), None);
+        assert_eq!(menu.line("yes"), None);
+        assert_eq!(menu.line("N"), None);
+        assert_eq!(menu.line("No"), None);
+        // Anything else is a chat line.
+        assert_eq!(menu.line("good morning"), None);
+        assert_eq!(menu.line(""), None);
     }
 }

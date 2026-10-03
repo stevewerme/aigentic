@@ -346,6 +346,7 @@ pub(crate) mod fake_daemon {
                             }
                             // Every answer the REPL sends is accepted.
                             Request::AnswerCheckpoint { .. } => Response::Ok,
+                            Request::AnswerSwitch { .. } => Response::Ok,
                             other => panic!("the tests sent an unscripted request: {other:?}"),
                         };
                         write
