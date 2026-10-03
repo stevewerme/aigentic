@@ -288,6 +288,40 @@ impl Runtime {
         Ok(())
     }
 
+    /// The project the thread is in, by name, when it is in one: what
+    /// `suggest_project` compares a proposal against (issue #7).
+    pub fn current_project(&self) -> Option<String> {
+        self.layers.project.as_ref().map(|p| p.name.clone())
+    }
+
+    /// Append a `decision_answered` event (#74): `by` answered, about
+    /// the proposal `parent`. `correction` only with `Corrected`; `note`
+    /// when the answering path has words of its own (`no one to
+    /// answer`, `turn interrupted`, `switch failed: …`).
+    pub(crate) fn append_decision_answered(
+        &mut self,
+        answer: aigentic_log::DecisionAnswer,
+        correction: Option<String>,
+        note: Option<String>,
+        by: aigentic_core::Author,
+        parent: ulid::Ulid,
+        observe: &mut (dyn FnMut(Signal<'_>) + Send),
+    ) -> Result<(), crate::RuntimeError> {
+        let payload = aigentic_log::DecisionAnsweredPayload {
+            answer,
+            correction,
+            note,
+        };
+        self.append(
+            aigentic_core::EventKind::DecisionAnswered,
+            by,
+            serde_json::to_value(payload).expect("serialisable"),
+            Some(parent),
+            observe,
+        )?;
+        Ok(())
+    }
+
     /// A smaller model for side jobs (phase 6 step 9). `label` is its
     /// model name, recorded on `memory_extracted` so the log names the
     /// provider that ran the extraction (issue #18); `prices` is that

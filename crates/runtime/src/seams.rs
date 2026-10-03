@@ -181,6 +181,11 @@ impl Runtime {
                                 None,
                             )
                         }
+                        // An answer to another call's wait never reaches
+                        // this one (`decide` refuses the pair), so it
+                        // stays a deny by nobody rather than being read
+                        // as one.
+                        Ok(Answered::Switch { .. }) => (false, DecisionScope::Once, Author::System, None),
                         // The table dropped the sender: treat as a deny by nobody.
                         Ok(Answered::Human { .. }) | Err(_) => (false, DecisionScope::Once, Author::System, None),
                     },

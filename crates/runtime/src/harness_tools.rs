@@ -5,8 +5,9 @@
 
 use aigentic_core::{Author, EventKind, RiskClass, ToolCall, ToolResult, ToolSpec};
 use aigentic_log::{
-    CommitRef, Finding, FixSize, Handoff, Invoker, LedgerEntry, PinnedPayload, PlannedTest,
-    ReleaseImpact, ReportStatus, Route, SkillLoadedPayload, StepReport, Verdict,
+    CommitRef, DecisionAnswer, DecisionKind, DecisionProposedPayload, DecisionStage, Finding,
+    FixSize, Handoff, Invoker, LedgerEntry, PinnedPayload, PlannedTest, ReleaseImpact,
+    ReportStatus, Route, SkillLoadedPayload, StepReport, Verdict,
 };
 use aigentic_skills::Invocation;
 use serde::Deserialize;
@@ -30,6 +31,16 @@ pub const RECALL: &str = "recall";
 /// step thread and nowhere else; a call in an ordinary thread is
 /// refused with a result, and no `StepReported` event is written.
 pub const FINISH_STEP: &str = "finish_step";
+/// The project proposal (issue #7): the model proposes moving this
+/// thread to another project, the turn parks, and a person answers.
+/// Offered only in an ordinary thread; a step thread never sees the
+/// spec, and the switch itself is refused there.
+pub const SUGGEST_PROJECT: &str = "suggest_project";
+
+/// What `suggest_project`'s description says (issue #7): call it first
+/// and alone, the person decides, and a no leaves the thread where it
+/// is.
+pub const SUGGEST_PROJECT_DESCRIPTION: &str = "Propose moving this thread to another project, when the person's message belongs there. Call it first, alone; the person answers.";
 
 /// What `recall`'s description says (issue #75): the three forms, one per
 /// call, and what comes back for old text. The stubs and the truncation
@@ -41,7 +52,110 @@ pub const RECALL_DESCRIPTION: &str = "Bring back something from earlier in this 
 /// person's global ones. A tool description alone did not make GLM 5.3
 /// keep the checklist (zero calls on an explicit four-step task); this
 /// line did (four and five calls in two runs).
-pub const HARNESS_INSTRUCTIONS: &str = "For any request of three or more steps, call update_tasks before anything else with every step, then again as each step starts and finishes. Work one step at a time. A user message that arrives mid-turn is a correction or an addition from the person: read it before your next step and adjust your plan. Ask the human only through ask_human, with every question in the call (never \"answer the questions above\") and options when the answer is a choice; the client adds an Other row, so never list one yourself. The shell already starts in the project root and keeps its working directory between calls: do not cd to a guessed path.";
+pub const HARNESS_INSTRUCTIONS: &str = "For any request of three or more steps, call update_tasks before anything else with every step, then again as each step starts and finishes. Work one step at a time. A user message that arrives mid-turn is a correction or an addition from the person: read it before your next step and adjust your plan. Ask the human only through ask_human, with every question in the call (never \"answer the questions above\") and options when the answer is a choice; the client adds an Other row, so never list one yourself. The shell already starts in the project root and keeps its working directory between calls: do not cd to a guessed path. When a message belongs to another project under \"Projects in reach\", call suggest_project before anything else, as the only call in that reply.";
+
+/// A `suggest_project` call's arguments (issue #7). Both are required,
+/// and an unknown key is `invalid arguments: …` like every other
+/// harness call.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SuggestProjectArgs {
+    /// The project to switch to, by name.
+    pub project: String,
+    /// One line on why the message belongs there.
+    pub reason: String,
+}
+
+/// The proposal as a person reads it in the log (`switch to getscale/site`).
+pub fn proposal_text(project: &str) -> String {
+    format!("switch to {project}")
+}
+
+/// The tool result when the proposal names the project the thread is
+/// already in: nothing to decide, nothing to record.
+pub fn already_in_text(project: &str) -> String {
+    format!("already in {project}")
+}
+
+/// The tool result when a person said yes and the switch landed.
+pub fn switched_text(project: &str) -> String {
+    format!("switched to {project}; continuing there")
+}
+
+/// The tool result when a person said no.
+pub fn declined_text(project: &str) -> String {
+    format!("declined; continuing in {project}")
+}
+
+/// The tool result when a person said no and the thread is in no project
+/// at all: there is no name to stay in.
+pub const DECLINED_NO_PROJECT: &str = "declined; continuing here";
+
+/// The tool result when the person said the work belongs somewhere else.
+/// The correction is the useful part, so it is the whole answer.
+pub fn corrected_text(where_it_belongs: &str) -> String {
+    format!("declined; the person says it belongs to: {where_it_belongs}")
+}
+
+/// The tool result when nobody answered: an interrupted turn, a bare
+/// runtime with no one to ask, or a `Yes` the switch itself refused.
+pub fn not_answered_text(note: &str) -> String {
+    format!("not answered: {note}")
+}
+
+/// A switch that a `Yes` landed on but that could not happen: the note
+/// on the `withdrawn` answer, and the tool result beside it.
+pub fn switch_failed(reason: &str) -> String {
+    format!("switch failed: {reason}")
+}
+
+/// The note on the `withdrawn` answer when no `Decisions` is installed:
+/// a bare runtime has nobody to ask.
+pub const NO_ONE_TO_ANSWER: &str = "no one to answer";
+
+/// The note on the `withdrawn` answer when the turn was interrupted
+/// while the proposal waited.
+pub const TURN_INTERRUPTED: &str = "turn interrupted";
+
+/// The note on the `withdrawn` answer when a `Yes` arrived with no
+/// context to switch to: a client that answered without building one.
+pub const NO_CONTEXT: &str = "no context for the switch";
+
+/// The result every other call in a batch gets: the proposal must stand
+/// alone, and nothing may run in a project the person has not answered
+/// for yet. Named here so a client or a test asserts the constant, not a
+/// retyped copy.
+pub const NOT_RUN_SIBLING: &str =
+    "not run: suggest_project must be the only call; call it again after the person answers";
+
+/// The policy record's rule text for that refusal, as the interrupt path
+/// names its own.
+pub const NOT_RUN_SOLO: &str = "suggest_project must be the only call";
+
+/// A `suggest_project` call's arguments, parsed. An unknown key, or a
+/// missing one, is `invalid arguments: …`.
+fn suggest_project_args(args: &serde_json::Value) -> Result<SuggestProjectArgs, String> {
+    serde_json::from_value::<SuggestProjectArgs>(args.clone())
+        .map_err(|e| format!("invalid arguments: {e}"))
+}
+
+/// A tool result that says what happened, and succeeded.
+fn said(id: &str, content: String) -> ToolResult {
+    ToolResult {
+        id: id.to_owned(),
+        content,
+        is_error: false,
+    }
+}
+
+/// A tool result that reports a failure, the note as its whole text.
+fn refused(id: &str, note: &str) -> ToolResult {
+    ToolResult {
+        id: id.to_owned(),
+        content: note.to_owned(),
+        is_error: true,
+    }
+}
 
 /// One option an `ask_human` question offers.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]
@@ -219,8 +333,13 @@ impl From<FinishStepArgs> for StepReport {
 
 /// The harness tools' specs, in name order. `load_skill` is offered only
 /// when a model-invoked skill is enabled; `finish_step` only in a step
-/// thread (issue #55).
-pub fn harness_specs(offer_load_skill: bool, offer_finish_step: bool) -> Vec<ToolSpec> {
+/// thread (issue #55); `suggest_project` only when the runtime knows the
+/// projects in reach (issue #7).
+pub fn harness_specs(
+    offer_load_skill: bool,
+    offer_finish_step: bool,
+    offer_suggest_project: bool,
+) -> Vec<ToolSpec> {
     let mut specs = vec![
         ToolSpec {
             name: ASK_HUMAN.into(),
@@ -396,6 +515,21 @@ pub fn harness_specs(offer_load_skill: bool, offer_finish_step: bool) -> Vec<Too
             }),
         });
     }
+    if offer_suggest_project {
+        specs.push(ToolSpec {
+            name: SUGGEST_PROJECT.into(),
+            description: SUGGEST_PROJECT_DESCRIPTION.into(),
+            schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "project": {"type": "string", "description": "The project to switch to, by name, as the system prompt lists it."},
+                    "reason": {"type": "string", "description": "One line on why the message belongs there."}
+                },
+                "required": ["project", "reason"]
+            }),
+        });
+    }
     specs.sort_by(|a, b| a.name.cmp(&b.name));
     specs
 }
@@ -408,6 +542,7 @@ pub fn harness_names() -> Vec<String> {
         LOAD_SKILL.into(),
         PIN.into(),
         RECALL.into(),
+        SUGGEST_PROJECT.into(),
         UPDATE_TASKS.into(),
     ]
 }
@@ -418,7 +553,7 @@ pub fn harness_names() -> Vec<String> {
 pub fn is_harness_tool(name: &str) -> bool {
     matches!(
         name,
-        PIN | ASK_HUMAN | LOAD_SKILL | RECALL | UPDATE_TASKS | FINISH_STEP
+        PIN | ASK_HUMAN | LOAD_SKILL | RECALL | UPDATE_TASKS | FINISH_STEP | SUGGEST_PROJECT
     )
 }
 
@@ -603,9 +738,208 @@ impl Runtime {
                     Err(e) => err(e),
                 },
             },
+            // The project proposal (issue #7). A step thread refuses it
+            // outright, as `set_project` would; a proposal naming the
+            // project the thread is already in never becomes a
+            // decision.
+            SUGGEST_PROJECT => match suggest_project_args(&call.args) {
+                Err(e) => err(e),
+                Ok(args) => {
+                    // A step thread never sees the spec, but a call still
+                    // executes: it parks as anywhere else, and the `yes`
+                    // that follows is where `set_project` refuses it (T4).
+                    if self.current_project().as_deref() == Some(args.project.as_str()) {
+                        err(already_in_text(&args.project))
+                    } else {
+                        let (result, who) =
+                            self.suggest_project(call, args, cancel, observe).await?;
+                        by = who;
+                        result
+                    }
+                }
+            },
             other => err(format!("unknown harness tool: {other}")),
         };
         Ok((result, by))
+    }
+
+    /// Ask for a switch (issue #7). The `decision_proposed` event is
+    /// written before the wait is registered, so a client that sees the
+    /// waiting signal already finds it in the log; a `yes` is the one
+    /// answer that moves the thread, and it is recorded before it moves.
+    async fn suggest_project(
+        &mut self,
+        call: &ToolCall,
+        args: SuggestProjectArgs,
+        cancel: &crate::CancelToken,
+        observe: &mut (dyn FnMut(Signal<'_>) + Send),
+    ) -> Result<(ToolResult, Author), RuntimeError> {
+        let id = call.id.clone();
+        let payload = DecisionProposedPayload {
+            kind: DecisionKind::Project,
+            proposal: proposal_text(&args.project),
+            target: Some(args.project.clone()),
+            reason: args.reason.clone(),
+            call_id: Some(id.clone()),
+            stage: DecisionStage::Ask,
+        };
+        let proposal = self.append(
+            EventKind::DecisionProposed,
+            Author::Agent(self.agent.clone()),
+            serde_json::to_value(payload).expect("serialisable"),
+            None,
+            observe,
+        )?;
+        let staying = self.current_project();
+        match self.decisions.clone() {
+            None => {
+                // A bare runtime has nobody to ask, so the proposal is
+                // withdrawn rather than left open: it is still written,
+                // so the fold pairs the answer with it.
+                let note = NO_ONE_TO_ANSWER.to_owned();
+                self.withdraw_switch(proposal.id, note.clone(), observe)?;
+                Ok((refused(&id, &not_answered_text(&note)), Author::System))
+            }
+            Some(decisions) => {
+                let pending = crate::Pending::Switch {
+                    call_id: id.clone(),
+                    project: args.project.clone(),
+                    reason: args.reason.clone(),
+                };
+                let rx = decisions.register(pending.clone());
+                observe(Signal::Waiting(&pending));
+                tokio::select! {
+                    biased;
+                    _by = cancel.cancelled() => {
+                        decisions.withdraw(&id);
+                        let note = TURN_INTERRUPTED.to_owned();
+                        self.withdraw_switch(proposal.id, note.clone(), observe)?;
+                        Ok((refused(&id, &not_answered_text(&note)), Author::System))
+                    }
+                    decided = rx => match decided {
+                        Ok(crate::Answered::Switch { answer, by: who, ctx }) => {
+                            self.apply_switch(id, args, proposal.id, answer, who, ctx, staying, observe).await
+                        }
+                        // The table dropped the sender without an answer:
+                        // no path does, but the thread must not move and
+                        // must not be left waiting, so it reads as
+                        // withdrawn.
+                        _ => {
+                            let note = NO_ONE_TO_ANSWER.to_owned();
+                            self.withdraw_switch(proposal.id, note.clone(), observe)?;
+                            Ok((refused(&id, &not_answered_text(&note)), Author::System))
+                        }
+                    },
+                }
+            }
+        }
+    }
+
+    /// Apply a person's answer to a proposal (issue #7): record it, and
+    /// for a `yes` switch the project first, then say so. The ack the
+    /// answer came with fires with the outcome, so the session that sent
+    /// the context learns whether it was used.
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_switch(
+        &mut self,
+        id: String,
+        args: SuggestProjectArgs,
+        proposal: ulid::Ulid,
+        answer: crate::SwitchAnswer,
+        who: Author,
+        ctx: crate::SwitchCtx,
+        staying: Option<String>,
+        observe: &mut (dyn FnMut(Signal<'_>) + Send),
+    ) -> Result<(ToolResult, Author), RuntimeError> {
+        match answer {
+            crate::SwitchAnswer::Yes => match ctx.take() {
+                Some((target, ack)) => {
+                    // The switch happens here, in the turn, and the
+                    // project_switched event lands before the human's
+                    // answer does: the log says which project the yes
+                    // was about by naming the switch first.
+                    match self.set_project(target, who.clone(), observe) {
+                        Ok(()) => {
+                            self.append_decision_answered(
+                                DecisionAnswer::Yes,
+                                None,
+                                None,
+                                who.clone(),
+                                proposal,
+                                observe,
+                            )?;
+                            let _ = ack.send(Ok(()));
+                            Ok((said(&id, switched_text(&args.project)), who))
+                        }
+                        Err(e) => {
+                            let note = switch_failed(&e.to_string());
+                            self.withdraw_switch(proposal, note.clone(), observe)?;
+                            // The session that built the context is
+                            // told why it was not used.
+                            let _ = ack.send(Err(note.clone()));
+                            Ok((refused(&id, &not_answered_text(&note)), Author::System))
+                        }
+                    }
+                }
+                None => {
+                    // A `yes` with no context to switch to: nothing can
+                    // move, so nothing moves, and the answer is recorded
+                    // as withdrawn. Never a `yes` for a switch that did
+                    // not happen.
+                    let note = switch_failed(NO_CONTEXT);
+                    self.withdraw_switch(proposal, note.clone(), observe)?;
+                    Ok((refused(&id, &note), Author::System))
+                }
+            },
+            crate::SwitchAnswer::No => {
+                self.append_decision_answered(
+                    DecisionAnswer::No,
+                    None,
+                    None,
+                    who.clone(),
+                    proposal,
+                    observe,
+                )?;
+                let text = match staying.as_deref() {
+                    Some(project) => declined_text(project),
+                    // A thread in no project has no name to stay in.
+                    None => DECLINED_NO_PROJECT.to_owned(),
+                };
+                Ok((said(&id, text), who))
+            }
+            crate::SwitchAnswer::Corrected(where_it_belongs) => {
+                self.append_decision_answered(
+                    DecisionAnswer::Corrected,
+                    Some(where_it_belongs.clone()),
+                    None,
+                    who.clone(),
+                    proposal,
+                    observe,
+                )?;
+                Ok((said(&id, corrected_text(&where_it_belongs)), who))
+            }
+            crate::SwitchAnswer::Withdrawn(note) => {
+                self.withdraw_switch(proposal, note.clone(), observe)?;
+                Ok((refused(&id, &not_answered_text(&note)), Author::System))
+            }
+        }
+    }
+
+    /// Record a proposal nobody answered as `withdrawn`, by the system.
+    fn withdraw_switch(
+        &mut self,
+        proposal: ulid::Ulid,
+        note: String,
+        observe: &mut (dyn FnMut(Signal<'_>) + Send),
+    ) -> Result<(), RuntimeError> {
+        self.append_decision_answered(
+            DecisionAnswer::Withdrawn,
+            None,
+            Some(note),
+            Author::System,
+            proposal,
+            observe,
+        )
     }
 
     /// Append `step_reported` for a step's report (issue #55). The author

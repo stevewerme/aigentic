@@ -16,7 +16,10 @@ use futures_util::StreamExt;
 use aigentic_log::{Invoker, NewEvent, PolicyRecord};
 
 use crate::decisions::{CancelToken, Inbox, Queued};
-use crate::harness_tools::{ASK_HUMAN, FINISH_STEP, HARNESS_CLASS, harness_specs, is_harness_tool};
+use crate::harness_tools::{
+    ASK_HUMAN, FINISH_STEP, HARNESS_CLASS, NOT_RUN_SIBLING, NOT_RUN_SOLO, SUGGEST_PROJECT,
+    harness_specs, is_harness_tool,
+};
 use crate::runtime::{ASKED_HUMAN, INTERRUPTED, STEP_REPORTED};
 use crate::seams::{Verdict, author_name, denial_text};
 use crate::support::{Spent, append_queued, block_start, flush_text};
@@ -368,7 +371,7 @@ impl Runtime {
             // runner reads the report, not the rest of the batch.
             let mut reported = false;
             let mut calls = calls.into_iter();
-            for call in calls.by_ref() {
+            while let Some(call) = calls.next() {
                 self.drain_inbox(inbox, observe)?;
                 observe(Signal::ToolCallStarted(&call));
                 let (result, record, by) = self
@@ -381,7 +384,8 @@ impl Runtime {
                         &mut spent.wall_waited,
                     )
                     .await?;
-                answered |= call.name == ASK_HUMAN && !result.is_error;
+                answered |=
+                    (call.name == ASK_HUMAN || call.name == SUGGEST_PROJECT) && !result.is_error;
                 reported |= call.name == FINISH_STEP && !result.is_error;
                 let payload = serde_json::to_value(ToolResultPayload::new(result, record))
                     .expect("serialisable");
@@ -394,6 +398,34 @@ impl Runtime {
                     Some(assistant.id),
                     observe,
                 )?;
+                if call.name == SUGGEST_PROJECT {
+                    // A proposal stands alone (issue #7): a call after it
+                    // in the same batch was written before the person had
+                    // answered, and nothing may run in a project they have
+                    // not answered for yet. The results are written the
+                    // way the interrupt path writes its own. Calls before
+                    // it have already run; the instructions say to call it
+                    // first.
+                    for rest in calls.by_ref() {
+                        let result = ToolResult {
+                            id: rest.id.clone(),
+                            content: NOT_RUN_SIBLING.to_owned(),
+                            is_error: true,
+                        };
+                        let payload = serde_json::to_value(ToolResultPayload::new(
+                            result,
+                            PolicyRecord::rule(NOT_RUN_SOLO, "deny"),
+                        ))
+                        .expect("serialisable");
+                        self.append(
+                            EventKind::ToolResult,
+                            Author::System,
+                            payload,
+                            Some(assistant.id),
+                            observe,
+                        )?;
+                    }
+                }
                 if cancel.cancelled_by().is_some() {
                     break;
                 }
@@ -581,7 +613,7 @@ impl Runtime {
                 let (result, by) = if is_harness_tool(&call.name) {
                     let (started, started_wall) = (self.clock)();
                     let ran = self.run_harness_tool(call, cancel, observe).await?;
-                    if call.name == ASK_HUMAN {
+                    if call.name == ASK_HUMAN || call.name == SUGGEST_PROJECT {
                         *waited += started.elapsed();
                         *wall_waited += started_wall.elapsed().unwrap_or_default();
                     }
@@ -623,6 +655,9 @@ impl Runtime {
             !self.skills.model_invoked().is_empty(),
             // Offered exactly in a step thread (issue #55).
             self.step.is_some(),
+            // A proposal needs a person: offered in an ordinary thread,
+            // never in a step thread, which nobody watches (issue #7).
+            self.step.is_none(),
         ));
         specs.retain(|s| self.tool_visible(&s.name));
         specs.sort_by(|a, b| a.name.cmp(&b.name));

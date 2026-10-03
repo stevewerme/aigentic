@@ -5,11 +5,13 @@
 //! interrupt reaches a running turn, carrying who sent it.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use aigentic_core::{Author, ContentBlock};
 use aigentic_log::PermissionRequestedPayload;
 use tokio::sync::{mpsc, oneshot, watch};
+
+use crate::runtime::ProjectContext;
 
 /// What a turn is waiting for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,12 +30,22 @@ pub enum Pending {
         question: String,
         questions: Vec<crate::harness_tools::HumanQuestion>,
     },
+    /// The `suggest_project` tool: the model proposes moving this thread
+    /// to another project, and the turn parks until the person whose
+    /// message prompted it answers. Only `Yes` switches (issue #7).
+    Switch {
+        call_id: String,
+        project: String,
+        reason: String,
+    },
 }
 
 impl Pending {
     pub fn call_id(&self) -> &str {
         match self {
-            Pending::Permission { call_id, .. } | Pending::Human { call_id, .. } => call_id,
+            Pending::Permission { call_id, .. }
+            | Pending::Human { call_id, .. }
+            | Pending::Switch { call_id, .. } => call_id,
         }
     }
 }
@@ -55,7 +67,77 @@ pub enum Answered {
         text: String,
         by: Author,
     },
+    /// A person's answer to a `suggest_project` proposal. `ctx` carries
+    /// the target's `ProjectContext` and the ack a `Yes` is answered
+    /// with; it is empty for every other answer.
+    Switch {
+        answer: SwitchAnswer,
+        by: Author,
+        ctx: SwitchCtx,
+    },
 }
+
+/// What a person did with a `suggest_project` proposal (issue #7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SwitchAnswer {
+    /// Switch the thread to the project the model proposed.
+    Yes,
+    /// Stay put; the model is told, and the turn continues.
+    No,
+    /// Stay put, and the person names the project it actually belongs
+    /// to: the correction is the useful part, and the model is told.
+    Corrected(String),
+    /// Nobody answered — the turn was interrupted, or a daemon that
+    /// restarted found it waiting. Never a `yes`.
+    Withdrawn(String),
+}
+
+/// The target's `ProjectContext` and the ack a `Yes` fires, behind two
+/// `Arc`s so an answer stays `Clone` and `PartialEq` while its context
+/// is built once (a context is not `Clone`).
+///
+/// `Clone` shares the pair and the ack's receiver stays unique: a
+/// context handed out with an ack must be taken exactly once, or two
+/// projects would install and only one could be acked.
+#[derive(Debug)]
+pub struct SwitchCtx(Arc<Mutex<Option<(ProjectContext, oneshot::Sender<Result<(), String>>)>>>);
+
+impl SwitchCtx {
+    /// An answer with no context: every `No`, `Corrected` and
+    /// `Withdrawn`, and a `Yes` from a client that sent none.
+    pub fn none() -> Self {
+        Self(Arc::new(Mutex::new(None)))
+    }
+
+    /// A `Yes`'s payload: the built context and the channel the
+    /// answerer waits on for the outcome.
+    pub fn oneshot(context: ProjectContext) -> (Self, oneshot::Receiver<Result<(), String>>) {
+        let (tx, rx) = oneshot::channel();
+        (Self(Arc::new(Mutex::new(Some((context, tx))))), rx)
+    }
+
+    /// Take the context and the ack; `None` on a second call, and on
+    /// every answer but a real `Yes`.
+    pub(crate) fn take(&self) -> Option<(ProjectContext, oneshot::Sender<Result<(), String>>)> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+}
+
+impl Clone for SwitchCtx {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+/// The pair behind the `Arc` is not comparable, so a context compares
+/// by identity: the same payload, or two answers built from it.
+impl PartialEq for SwitchCtx {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for SwitchCtx {}
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DecisionError {
@@ -113,7 +195,8 @@ impl Decisions {
         };
         let (expected, given) = match (pending, &decided) {
             (Pending::Permission { .. }, Answered::Permission { .. })
-            | (Pending::Human { .. }, Answered::Human { .. }) => {
+            | (Pending::Human { .. }, Answered::Human { .. })
+            | (Pending::Switch { .. }, Answered::Switch { .. }) => {
                 let (_, tx) = inner.waiting.remove(call_id).expect("present");
                 inner.decided.insert(call_id.to_owned());
                 // A receiver that went away (the turn was cancelled) is
@@ -123,6 +206,10 @@ impl Decisions {
             }
             (Pending::Permission { .. }, Answered::Human { .. }) => ("decision", "human answer"),
             (Pending::Human { .. }, Answered::Permission { .. }) => ("human answer", "decision"),
+            (Pending::Switch { .. }, Answered::Permission { .. }) => ("switch answer", "decision"),
+            (Pending::Switch { .. }, Answered::Human { .. }) => ("switch answer", "human answer"),
+            (Pending::Permission { .. }, Answered::Switch { .. }) => ("decision", "switch answer"),
+            (Pending::Human { .. }, Answered::Switch { .. }) => ("human answer", "switch answer"),
         };
         Err(DecisionError::WrongKind {
             call_id: call_id.to_owned(),

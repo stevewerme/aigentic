@@ -754,7 +754,7 @@ async fn recall_marks_what_belongs_to_another_project() {
 /// forms and nothing else.
 #[test]
 fn recall_is_offered_with_a_closed_three_form_schema() {
-    let specs = harness_specs(true, true);
+    let specs = harness_specs(true, true, true);
     let spec = specs
         .iter()
         .find(|s| s.name == RECALL)

@@ -46,7 +46,8 @@ pub use audit::audit_tool_results;
 pub use compaction::SUMMARY_PROMPT;
 pub use context::{Prefix, build_context};
 pub use decisions::{
-    Answered, CancelToken, DecisionError, Decisions, Inbox, Outbox, Pending, Queued, inbox,
+    Answered, CancelToken, DecisionError, Decisions, Inbox, Outbox, Pending, Queued, SwitchAnswer,
+    SwitchCtx, inbox,
 };
 pub use error::RuntimeError;
 pub use evict::{
@@ -58,7 +59,7 @@ pub use layers::{Decided, GlobalLayer, Layers, WorkspaceLayer};
 pub use memory::{MEMORY_FILES, MEMORY_PROMPT};
 pub use mode::Mode;
 pub use project::{Project, ProjectError, ProjectFile};
-pub use resume::{INTERRUPTED_RESULT, Resumed};
+pub use resume::{DAEMON_RESTARTED, INTERRUPTED_RESULT, Resumed};
 pub use runtime::{
     ASKED_HUMAN, CompactionSettings, DEFAULT_BUDGET, DEFAULT_COMPACTION, INTERRUPTED, Prices,
     ProjectContext, Runtime, STEP_REPORTED, Signal, TurnOutcome, WindowUsage,

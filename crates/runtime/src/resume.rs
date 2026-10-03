@@ -3,8 +3,8 @@
 
 use aigentic_core::{Author, ContentBlock, Event, EventKind, ToolResult};
 use aigentic_log::{
-    AssistantMessagePayload, InterruptedPayload, PolicyRecord, ThreadLog, ToolResultPayload,
-    TurnEndedPayload,
+    AssistantMessagePayload, DecisionAnswer, InterruptedPayload, PolicyRecord, ThreadLog,
+    ToolResultPayload, TurnEndedPayload,
 };
 
 use crate::{Runtime, RuntimeError, Signal};
@@ -31,6 +31,12 @@ pub enum Resumed {
 pub const INTERRUPTED_RESULT: &str =
     "interrupted before a result was recorded; the outcome is unknown, rerun if needed";
 
+/// The note on the `withdrawn` answer resume writes for a proposal that
+/// was still open when the process died (issue #7). A proposal is not
+/// answerable after a restart, so it is closed rather than left open,
+/// and the model may propose again in the continued conversation.
+pub const DAEMON_RESTARTED: &str = "daemon restarted";
+
 impl Runtime {
     /// Call once after opening the log. Looks at the open turn, if any:
     ///
@@ -52,6 +58,10 @@ impl Runtime {
             return Ok(Resumed::Clean);
         };
         let after_seq = open.last().map_or(0, |e| e.seq);
+        // A proposal nobody answered dies with the process that parked on
+        // it: closed here, before `interrupted`, so a resume that crashes
+        // again writes no second answer.
+        self.withdraw_open_proposals(open, observe)?;
         let last_turn_event = open
             .iter()
             .rev()
@@ -151,6 +161,40 @@ impl Runtime {
             unanswered_calls: ids.len(),
             torn_bytes,
         })
+    }
+}
+
+impl Runtime {
+    /// Close every proposal in the open turn that nobody answered (issue
+    /// #7), as `withdrawn` by the system. The answers already written in
+    /// the turn's own events decide which proposals those are.
+    fn withdraw_open_proposals(
+        &mut self,
+        open: &[Event],
+        observe: &mut (dyn FnMut(Signal<'_>) + Send),
+    ) -> Result<usize, RuntimeError> {
+        let answered: Vec<ulid::Ulid> = open
+            .iter()
+            .filter(|e| e.kind == EventKind::DecisionAnswered)
+            .filter_map(|e| e.parent_event)
+            .collect();
+        let open_proposals: Vec<ulid::Ulid> = open
+            .iter()
+            .filter(|e| e.kind == EventKind::DecisionProposed)
+            .map(|e| e.id)
+            .filter(|id| !answered.contains(id))
+            .collect();
+        for id in &open_proposals {
+            self.append_decision_answered(
+                DecisionAnswer::Withdrawn,
+                None,
+                Some(DAEMON_RESTARTED.to_owned()),
+                Author::System,
+                *id,
+                observe,
+            )?;
+        }
+        Ok(open_proposals.len())
     }
 }
 
