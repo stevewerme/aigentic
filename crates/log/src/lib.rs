@@ -11,6 +11,7 @@
 mod decision_log;
 mod payload;
 mod projection;
+mod recall;
 mod run_state;
 mod store;
 
@@ -32,6 +33,9 @@ pub use payload::{
 pub use projection::{
     Projection, STUB_ARG_MAX_CHARS, project, project_body, shorten_call_args, skill_marker,
     summary_marker, truncate_middle,
+};
+pub use recall::{
+    Hit, SNIPPET_MAX_CHARS, call_index, call_of, project_at, render_range, search, short_args,
 };
 pub use run_state::{ChecksOutcome, NextMove, RunState, StepRecord, run_state};
 pub use store::{LogError, NewEvent, Repair, ThreadLog};

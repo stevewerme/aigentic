@@ -9,6 +9,7 @@ use crate::payload::{
     AssistantMessagePayload, CompactedPayload, CompactionStrategy, ContextEvictedPayload,
     InterruptedPayload, PinnedPayload, SkillLoadedPayload, ToolResultPayload, UserMessagePayload,
 };
+use crate::recall::{call_index, cut_chars, short_args};
 use crate::store::LogError;
 
 /// What the runtime builds context from.
@@ -105,10 +106,10 @@ pub fn project(events: &[Event]) -> Result<Projection, LogError> {
 
     // In-turn eviction: what each call is, what its result is, and the
     // last result of each distinct tool per turn, so the second pass can
-    // decide what the `context_evicted` events stub.
+    // decide what the `context_evicted` events stub. The call index is
+    // `recall`'s, shared with the stub text and the `recall` tool.
     let mut evictions: Vec<Eviction> = Vec::new();
-    let mut calls: std::collections::HashMap<String, (String, serde_json::Value)> =
-        std::collections::HashMap::new();
+    let calls = call_index(events)?;
     let mut results: std::collections::HashMap<String, CallResult> =
         std::collections::HashMap::new();
     let mut last_of_tool: std::collections::HashMap<(Option<u64>, String), u64> =
@@ -161,14 +162,6 @@ pub fn project(events: &[Event]) -> Result<Projection, LogError> {
                     turn,
                     through: p.through_seq,
                 });
-            }
-            EventKind::AssistantMessage => {
-                let p: AssistantMessagePayload = payload(event)?;
-                for block in &p.blocks {
-                    if let ContentBlock::ToolCall(c) = block {
-                        calls.insert(c.id.clone(), (c.name.clone(), c.args.clone()));
-                    }
-                }
             }
             EventKind::ToolResult => {
                 let p: ToolResultPayload = payload(event)?;
@@ -331,7 +324,8 @@ pub fn project(events: &[Event]) -> Result<Projection, LogError> {
                 let ToolResultPayload { mut result, .. } = payload(event)?;
                 if stubbed.contains(&result.id) {
                     if let Some((name, args)) = calls.get(&result.id) {
-                        result.content = result_stub(name, args, &result.content);
+                        result.content =
+                            result_stub(event.seq, name, args, &result.content);
                     }
                 } else if let Some(max) = truncations
                     .iter()
@@ -339,7 +333,7 @@ pub fn project(events: &[Event]) -> Result<Projection, LogError> {
                     .map(|t| t.max_bytes)
                     .min()
                 {
-                    result.content = truncate_middle(&result.content, max);
+                    result.content = truncate_middle(&result.content, max, Some(event.seq));
                 }
                 push(
                     &mut body,
@@ -488,25 +482,29 @@ pub fn skill_marker(name: &str) -> String {
 }
 
 /// The stub an evicted result projects to: what ran, roughly with what,
-/// how big it was, and how to get it back (issue #30).
-fn result_stub(name: &str, args: &serde_json::Value, content: &str) -> String {
-    format!(
-        "[result of {name} {} · {} lines · dropped from context; re-run it if you need it again]",
+/// how big it was, the result's own first line, and the handle to bring
+/// the whole of it back (issues #30, #75). A result with no non-empty
+/// line drops the excerpt and its separator, so nothing reads as empty.
+fn result_stub(seq: u64, name: &str, args: &serde_json::Value, content: &str) -> String {
+    let head = format!(
+        "[result {seq} · {name} {} · {} lines",
         short_args(args),
         content.lines().count()
-    )
-}
-
-/// A call's arguments as one short line: enough to tell two calls of the
-/// same tool apart, never the payload itself.
-fn short_args(args: &serde_json::Value) -> String {
-    let text = serde_json::to_string(args).unwrap_or_default();
-    if text.chars().count() <= 60 {
-        text
-    } else {
-        format!("{}…", text.chars().take(59).collect::<String>())
+    );
+    let excerpt = content
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .map(|l| cut_chars(l.trim(), EXCERPT_MAX_CHARS));
+    match excerpt {
+        Some(excerpt) => {
+            format!("{head} · {excerpt} · dropped from context; recall {seq} to bring it back]")
+        }
+        None => format!("{head} · dropped from context; recall {seq} to bring it back]"),
     }
 }
+
+/// How many characters of a result's first line the stub quotes.
+pub const EXCERPT_MAX_CHARS: usize = 80;
 
 /// The most characters an argument value keeps behind the eviction
 /// boundary (issue #51). Every value longer than this is cut and
@@ -613,9 +611,10 @@ fn payload<T: serde::de::DeserializeOwned>(event: &Event) -> Result<T, LogError>
 }
 
 /// Keep the head and the tail of `text` within `max_bytes`, noting what
-/// was omitted. The same rule the tools crate applies at capture time;
+/// was omitted and, with a handle, the seq to recall the whole of it
+/// (issue #75). The same rule the tools crate applies at capture time;
 /// duplicated here because `log` may not depend on `tools`.
-pub fn truncate_middle(text: &str, max_bytes: usize) -> String {
+pub fn truncate_middle(text: &str, max_bytes: usize, handle: Option<u64>) -> String {
     if text.len() <= max_bytes {
         return text.to_owned();
     }
@@ -628,11 +627,15 @@ pub fn truncate_middle(text: &str, max_bytes: usize) -> String {
         tail_start += 1;
     }
     let omitted = tail_start - head;
-    format!(
-        "{}\n[... {omitted} bytes omitted by compaction ...]\n{}",
-        &text[..head],
-        &text[tail_start..]
-    )
+    let marker = match handle {
+        Some(seq) => {
+            format!(
+                "[... {omitted} bytes omitted by compaction; recall {seq} for the whole result ...]"
+            )
+        }
+        None => format!("[... {omitted} bytes omitted by compaction ...]"),
+    };
+    format!("{}\n{marker}\n{}", &text[..head], &text[tail_start..])
 }
 
 /// Convenience for callers that only want the body.
@@ -655,6 +658,8 @@ mod tests {
     use serde_json::json;
     use time::macros::datetime;
     use ulid::Ulid;
+
+    use crate::recall::short_args;
 
     fn ev(seq: u64, kind: EventKind, author: Author, payload: serde_json::Value) -> Event {
         Event {
@@ -793,6 +798,25 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+    /// The line a stub quotes from a result: its first non-empty line,
+    /// trimmed. Hand-computed excerpts are how a stub test goes wrong,
+    /// so every expectation derives it from the fixture.
+    fn first_line(content: &str) -> String {
+        content
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .map(|l| l.trim().to_owned())
+            .unwrap_or_default()
+    }
+    /// Issue #75's derived stub prefix: `"[result "` plus a seq, then the
+    /// tool's name. Lets a test say "this result is stubbed" without
+    /// pinning the whole text, and `== 0` still means "no stub".
+    fn is_stub(text: &str, name: &str) -> bool {
+        text.strip_prefix("[result ")
+            .and_then(|rest| rest.split_once(' '))
+            .filter(|(seq, _)| !seq.is_empty() && seq.chars().all(|c| c.is_ascii_digit()))
+            .is_some_and(|(_, rest)| rest.starts_with(&format!("· {name} ")))
     }
     fn texts(p: &Projection) -> Vec<String> {
         p.body
@@ -1281,12 +1305,34 @@ mod tests {
 
     #[test]
     fn truncate_middle_keeps_head_and_tail_on_char_boundaries() {
-        assert_eq!(truncate_middle("short", 100), "short");
+        assert_eq!(truncate_middle("short", 100, None), "short");
         let text = "é".repeat(100);
-        let out = truncate_middle(&text, 21);
+        let out = truncate_middle(&text, 21, None);
         assert!(!out.contains('\u{FFFD}'));
         assert!(out.contains("omitted by compaction"));
         assert!(out.starts_with("ééééé\n"), "{out}");
+    }
+
+    /// T4 (issue #75): with a handle the truncation marker names the seq
+    /// to recall, and the kept text and the byte budget are unchanged.
+    #[test]
+    fn a_truncation_marker_with_a_handle_names_the_seq_to_recall() {
+        let text = "abcdefghij".repeat(10); // 100 bytes
+        let max_bytes = 40;
+        let plain = truncate_middle(&text, max_bytes, None);
+        let handled = truncate_middle(&text, max_bytes, Some(7));
+        let omitted = text.len() - max_bytes;
+        let plain_marker = format!("[... {omitted} bytes omitted by compaction ...]");
+        let handle_marker = format!(
+            "[... {omitted} bytes omitted by compaction; recall 7 for the whole result ...]"
+        );
+        assert!(plain.contains(&plain_marker), "{plain}");
+        assert!(handled.contains(&handle_marker), "{handled}");
+        assert_eq!(
+            handled.replace(&handle_marker, ""),
+            plain.replace(&plain_marker, ""),
+            "the kept text is the same with and without a handle"
+        );
     }
 
     #[test]
@@ -1416,7 +1462,12 @@ mod tests {
             vec![
                 (
                     "c1".into(),
-                    "[result of bash {\"command\":\"cargo test\"} · 200 lines · dropped from context; re-run it if you need it again]".into()
+                    format!(
+                        "[result 2 · bash {} · {} lines · {} · dropped from context; recall 2 to bring it back]",
+                        short_args(&json!({"command": "cargo test"})),
+                        long.lines().count(),
+                        first_line(&long),
+                    )
                 ),
                 // The last bash result of the turn stays, as before.
                 ("c2".into(), long.clone()),
@@ -1717,15 +1768,23 @@ mod tests {
         ];
         let p = project(&events).unwrap();
         let stub_c5 = format!(
-            "[result of write_file {} · 6 lines · dropped from context; re-run it if you need it again]",
-            short_args(&json!({"path": "src/new.rs", "content": payload}))
+            "[result 10 · write_file {} · 6 lines · {} · dropped from context; recall 10 to bring it back]",
+            short_args(&json!({"path": "src/new.rs", "content": payload})),
+            first_line(
+                "--- a/src/new.rs\n+++ b/src/new.rs\n@@ -0,0 +1,2 @@\n+one\n+two\nwrote 8 bytes to src/new.rs"
+            ),
         );
         assert_eq!(
             results(&p),
             vec![
                 (
                     "c1".into(),
-                    "[result of bash {\"command\":\"cargo test\"} · 200 lines · dropped from context; re-run it if you need it again]".into()
+                    format!(
+                        "[result 2 · bash {} · {} lines · {} · dropped from context; recall 2 to bring it back]",
+                        short_args(&json!({"command": "cargo test"})),
+                        long.lines().count(),
+                        first_line(&long),
+                    )
                 ),
                 ("c2".into(), long.clone()), // last read_file of the turn
                 ("c3".into(), long),         // last bash result of the turn
@@ -1813,15 +1872,12 @@ mod tests {
 
     #[test]
     fn long_result_args_are_shortened_in_the_stub() {
+        let content = "wrote 400 bytes to big.rs";
+        let long_args = json!({"path": "big.rs", "content": "z".repeat(400)});
         let events = vec![
             user(0, "go"),
-            call(
-                1,
-                "c1",
-                "write_file",
-                json!({"path": "big.rs", "content": "z".repeat(400)}),
-            ),
-            result(2, "c1", "wrote 400 bytes to big.rs"),
+            call(1, "c1", "write_file", long_args.clone()),
+            result(2, "c1", content),
             evicted(3, 2),
             call(
                 4,
@@ -1834,15 +1890,108 @@ mod tests {
         let p = project(&events).unwrap();
         let (_, stub) = results(&p)[0].clone();
         assert!(
-            stub.starts_with("[result of write_file {\"content\":\"zz"),
+            stub.starts_with("[result 2 · write_file {\"content\":\"zz"),
             "{stub}"
         );
         assert!(stub.contains("…"), "the arguments are cut short: {stub}");
         assert!(
-            stub.ends_with(" · dropped from context; re-run it if you need it again]"),
+            stub.ends_with(&format!(
+                " · {} · dropped from context; recall 2 to bring it back]",
+                first_line(content)
+            )),
             "{stub}"
         );
-        assert!(stub.len() < 200, "{stub}");
+        // The cut is real: the stub is shorter than the call's own
+        // arguments, and shorter than the result it stands for.
+        let args_len = serde_json::to_string(&long_args).unwrap().len();
+        assert!(stub.len() < args_len, "{stub}");
+        assert!(
+            stub.contains("recall 2 to bring it back"),
+            "the handle is in there: {stub}"
+        );
+    }
+
+    /// T1 (issue #75): the stub's two literal forms, derived from the
+    /// fixture — seq, name, shortened args, line count, excerpt, handle.
+    #[test]
+    fn a_stub_quotes_a_handle_and_the_result_first_line() {
+        let content = "one match\nsecond line\n";
+        let args = json!({"pattern": "x"});
+        let events = vec![
+            user(0, "find it"),
+            call(1, "c1", "grep", args.clone()),
+            result(2, "c1", content),
+            call(3, "c2", "grep", json!({"pattern": "y"})),
+            result(4, "c2", "another match"),
+            evicted(5, 2),
+        ];
+        let p = project(&events).unwrap();
+        assert_eq!(
+            results(&p)[0].1,
+            format!(
+                "[result 2 · grep {} · {} lines · {} · dropped from context; recall 2 to bring it back]",
+                short_args(&args),
+                content.lines().count(),
+                first_line(content),
+            ),
+            "the stub names the seq, the call, the size, the first line and the handle"
+        );
+        // The log's own payload still holds the result whole: the stub is
+        // a projection, not a rewrite.
+        assert_eq!(events[2].payload["content"], json!(content));
+    }
+
+    /// T2 (issue #75): the excerpt is the first non-empty line, trimmed,
+    /// cut at 80 chars plus `…`.
+    #[test]
+    fn an_excerpt_is_cut_at_eighty_chars() {
+        let content = format!("\n\n  {}\nrest\n", "x".repeat(100));
+        let args = json!({"command": "echo"});
+        let events = vec![
+            user(0, "run it"),
+            call(1, "c1", "bash", args.clone()),
+            result(2, "c1", &content),
+            call(3, "c2", "bash", json!({"command": "ls"})),
+            result(4, "c2", "ok"),
+            evicted(5, 2),
+        ];
+        let p = project(&events).unwrap();
+        let line = first_line(&content);
+        assert_eq!(line.chars().count(), 100, "the fixture is over the cut");
+        let excerpt: String = line.chars().take(EXCERPT_MAX_CHARS).collect();
+        assert_eq!(
+            results(&p)[0].1,
+            format!(
+                "[result 2 · bash {} · {} lines · {excerpt}… · dropped from context; recall 2 to bring it back]",
+                short_args(&args),
+                content.lines().count(),
+            )
+        );
+    }
+
+    /// T2 (issue #75): a result with no non-empty line takes the second
+    /// form — no excerpt, and no separator where it would have stood.
+    #[test]
+    fn a_stub_for_a_result_with_no_line_at_all_has_no_excerpt() {
+        let content = "\n   \n";
+        let args = json!({"command": "echo"});
+        let events = vec![
+            user(0, "run it"),
+            call(1, "c1", "bash", args.clone()),
+            result(2, "c1", content),
+            call(3, "c2", "bash", json!({"command": "ls"})),
+            result(4, "c2", "ok"),
+            evicted(5, 2),
+        ];
+        let p = project(&events).unwrap();
+        assert_eq!(
+            results(&p)[0].1,
+            format!(
+                "[result 2 · bash {} · {} lines · dropped from context; recall 2 to bring it back]",
+                short_args(&args),
+                content.lines().count(),
+            )
+        );
     }
 
     /// The fixture of T1/T2/T3: a bash call whose `command` is several
@@ -1904,7 +2053,11 @@ mod tests {
         );
         // And it is stubbed on the other side of the same fixture, so the
         // comparison above is not vacuous.
-        assert!(results(&p)[0].1.starts_with("[result of bash"));
+        assert!(
+            is_stub(&results(&p)[0].1, "bash"),
+            "c1 is stubbed on the other side of the same fixture: {}",
+            results(&p)[0].1
+        );
     }
 
     #[test]
@@ -1938,8 +2091,9 @@ mod tests {
         ];
         let p = project(&events).unwrap();
         assert!(
-            results(&p)[0].1.starts_with("[result of grep"),
-            "c1 is behind the boundary"
+            is_stub(&results(&p)[0].1, "grep"),
+            "c1 is behind the boundary: {}",
+            results(&p)[0].1
         );
         assert_eq!(
             serde_json::to_string(&call_args(&p)[0]).unwrap(),

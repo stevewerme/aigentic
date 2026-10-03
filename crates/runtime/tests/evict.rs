@@ -477,6 +477,21 @@ fn flat_text(messages: &[Message]) -> String {
         .collect()
 }
 
+/// The derived stub prefix of issue #75: `"[result "` plus a digit. The
+/// stub's text changed (seq, excerpt, handle), so the counts below are
+/// over that opening alone — and `== 0` still means "no stub at all".
+fn stubs(text: &str) -> usize {
+    let head = "[result ";
+    text.match_indices(head)
+        .filter(|(i, _)| {
+            text[i + head.len()..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_digit())
+        })
+        .count()
+}
+
 /// The seqs of the turn's completed calls, oldest first. This fixture is
 /// a single turn, and every result in it belongs to one of its calls.
 fn turn_calls(events: &[Event]) -> Vec<u64> {
@@ -627,7 +642,7 @@ async fn a_two_hundred_call_turn_with_large_results_and_edits_stays_under_128k()
         let flat = flat_text(requests.last().unwrap());
         // Results stub to one line each; 200 calls leave at most the
         // last 12 plus the last of each distinct tool in full.
-        let stubs = flat.matches("dropped from context; re-run it").count();
+        let stubs = stubs(&flat);
         assert!((150..=200).contains(&stubs), "{stubs} stubs");
         // Calls stub their arguments inside their own keys too: the
         // fixture's long-argument call is the every-third write_file
@@ -707,7 +722,7 @@ async fn the_ceiling_drives_the_sweep_deeper_than_the_last_calls_window() {
     let flat = flat_text(requests.last().unwrap());
     // Deeper than the last-calls rule alone would go (48 of 60): the
     // ceiling pushed the boundary past it.
-    let stubs = flat.matches("dropped from context; re-run it").count();
+    let stubs = stubs(&flat);
     assert!(stubs >= 50, "only {stubs} calls stubbed");
 
     // The gate applies to a fitting turn too: every sweep freed enough
@@ -736,7 +751,7 @@ async fn a_small_context_is_never_swept() {
     assert_eq!(ran.sweeps(), 0);
     let requests = ran.seen.lock().unwrap();
     let flat = flat_text(requests.last().unwrap());
-    assert_eq!(flat.matches("dropped from context; re-run it").count(), 0);
+    assert_eq!(stubs(&flat), 0);
 }
 
 #[tokio::test]
