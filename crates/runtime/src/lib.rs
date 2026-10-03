@@ -31,6 +31,7 @@ pub mod layers;
 mod memory;
 pub mod mode;
 pub mod project;
+pub mod recall_tool;
 mod resume;
 pub mod runner;
 mod runtime;

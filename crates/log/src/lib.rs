@@ -35,7 +35,8 @@ pub use projection::{
     summary_marker, truncate_middle,
 };
 pub use recall::{
-    Hit, SNIPPET_MAX_CHARS, call_index, call_of, project_at, render_range, search, short_args,
+    Hit, SNIPPET_MAX_CHARS, call_index, call_of, kind_name, project_at, render_range, search,
+    short_args,
 };
 pub use run_state::{ChecksOutcome, NextMove, RunState, StepRecord, run_state};
 pub use store::{LogError, NewEvent, Repair, ThreadLog};

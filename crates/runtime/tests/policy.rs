@@ -464,6 +464,7 @@ async fn pin_and_ask_human_are_harness_tools_in_the_specs() {
             "list_dir",
             "pin",
             "read_file",
+            "recall",
             "touch",
             "update_tasks",
             "write_file"

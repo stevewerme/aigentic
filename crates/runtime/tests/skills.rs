@@ -94,7 +94,7 @@ async fn the_prefix_lists_skills_after_pins_and_offers_load_skill() {
     let names: Vec<String> = rt.tool_specs().into_iter().map(|s| s.name).collect();
     assert_eq!(
         names,
-        vec!["ask_human", "load_skill", "pin", "update_tasks"]
+        vec!["ask_human", "load_skill", "pin", "recall", "update_tasks"]
     );
 
     rt.run_turn(steve(), vec![ContentBlock::Text("hi".into())], &mut |_| {})
@@ -129,7 +129,7 @@ async fn without_skills_there_is_no_prefix_block_and_no_load_skill() {
         aigentic_core::AgentId("worker".into()),
     );
     let names: Vec<String> = rt.tool_specs().into_iter().map(|s| s.name).collect();
-    assert_eq!(names, vec!["ask_human", "pin", "update_tasks"]);
+    assert_eq!(names, vec!["ask_human", "pin", "recall", "update_tasks"]);
     rt.run_turn(steve(), vec![ContentBlock::Text("hi".into())], &mut |_| {})
         .await
         .unwrap();

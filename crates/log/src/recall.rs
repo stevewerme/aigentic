@@ -263,7 +263,9 @@ fn render_event(event: &Event) -> String {
     }
 }
 
-fn kind_name(kind: EventKind) -> String {
+/// An event kind's serde name, `snake_case`: the label `render_range`
+/// heads a block with, and the one `recall` names a non-result seq by.
+pub fn kind_name(kind: EventKind) -> String {
     serde_json::to_value(kind)
         .ok()
         .and_then(|v| v.as_str().map(str::to_owned))

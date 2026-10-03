@@ -22,10 +22,20 @@ pub const LOAD_SKILL: &str = "load_skill";
 /// whole list is in its arguments, so a client draws it from the call and
 /// a replay of the log shows every version.
 pub const UPDATE_TASKS: &str = "update_tasks";
+/// Bringing back what the harness forgot (issue #75): one dropped result
+/// by its handle, a range of the log, or a search over the thread. Always
+/// offered, in every thread.
+pub const RECALL: &str = "recall";
 /// The step thread's report (issue #55, PLAN-layer2 §2). Offered in a
 /// step thread and nowhere else; a call in an ordinary thread is
 /// refused with a result, and no `StepReported` event is written.
 pub const FINISH_STEP: &str = "finish_step";
+
+/// What `recall`'s description says (issue #75): the three forms, one per
+/// call, and what comes back for old text. The stubs and the truncation
+/// markers the harness writes name this tool, so the model meets it in
+/// the thread before it meets the spec.
+pub const RECALL_DESCRIPTION: &str = "Bring back something from earlier in this thread: a dropped result by its number, a range of the log, or a search.";
 
 /// The harness's standing instructions, one system block after the
 /// person's global ones. A tool description alone did not make GLM 5.3
@@ -276,6 +286,46 @@ pub fn harness_specs(offer_load_skill: bool, offer_finish_step: bool) -> Vec<Too
                 "required": ["text"]
             }),
         },
+        ToolSpec {
+            name: RECALL.into(),
+            description: RECALL_DESCRIPTION.into(),
+            // Exactly one form per call, so the schema is the three forms
+            // and nothing else: each is closed, and their union is the
+            // whole vocabulary. The arguments are still checked by name
+            // (`recall_form`), since a provider may ignore `anyOf`.
+            schema: json!({
+                "type": "object",
+                "anyOf": [
+                    {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "handle": {"type": "integer", "description": "The seq of a dropped result, as its stub or truncation marker names it."},
+                            "from_line": {"type": "integer", "description": "The first line to show (1-based), for paging through a long result."}
+                        },
+                        "required": ["handle"]
+                    },
+                    {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "from": {"type": "integer", "description": "The first seq to show."},
+                            "to": {"type": "integer", "description": "The last seq to show, inclusive."}
+                        },
+                        "required": ["from", "to"]
+                    },
+                    {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "query": {"type": "string", "description": "Text to search the whole thread for."},
+                            "limit": {"type": "integer", "description": "How many hits to show, 10 by default, 50 at most."}
+                        },
+                        "required": ["query"]
+                    }
+                ]
+            }),
+        },
     ];
     if offer_load_skill {
         specs.push(ToolSpec {
@@ -357,6 +407,7 @@ pub fn harness_names() -> Vec<String> {
         ASK_HUMAN.into(),
         LOAD_SKILL.into(),
         PIN.into(),
+        RECALL.into(),
         UPDATE_TASKS.into(),
     ]
 }
@@ -367,8 +418,18 @@ pub fn harness_names() -> Vec<String> {
 pub fn is_harness_tool(name: &str) -> bool {
     matches!(
         name,
-        PIN | ASK_HUMAN | LOAD_SKILL | UPDATE_TASKS | FINISH_STEP
+        PIN | ASK_HUMAN | LOAD_SKILL | RECALL | UPDATE_TASKS | FINISH_STEP
     )
+}
+
+/// A `recall` call's form: its arguments parsed, then exactly one of the
+/// three forms (issue #75). An unknown key is `invalid arguments: …`, as
+/// for every other harness call; any other combination is the form error.
+fn recall_form(args: &serde_json::Value) -> Result<crate::recall_tool::Form, String> {
+    match serde_json::from_value::<crate::recall_tool::RecallArgs>(args.clone()) {
+        Ok(parsed) => crate::recall_tool::form(&parsed),
+        Err(e) => Err(format!("invalid arguments: {e}")),
+    }
 }
 
 /// Every harness tool is `safe`.
@@ -535,6 +596,13 @@ impl Runtime {
                     }
                 }
             }
+            RECALL => match recall_form(&call.args) {
+                Err(e) => err(e),
+                Ok(form) => match crate::recall_tool::output(self.log.events(), &form) {
+                    Ok(text) => ok(text),
+                    Err(e) => err(e),
+                },
+            },
             other => err(format!("unknown harness tool: {other}")),
         };
         Ok((result, by))
