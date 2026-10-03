@@ -11,6 +11,7 @@ use aigentic_api::{
 };
 use aigentic_runtime::Mode;
 use aigentic_runtime::aigentic_core::{AgentId, Author, UserId};
+use aigentic_runtime::aigentic_policy::Role;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot};
 use ulid::Ulid;
@@ -198,13 +199,26 @@ pub async fn serve(
     Ok(())
 }
 
+/// The role `user` holds in a project of this daemon: `read` counts, so
+/// a reader is listed. This is the one rule — the client's project list
+/// ([`project_infos`]) and #81's projects listing both ask it, never a
+/// copy of it.
+pub(crate) fn role_in_project(
+    config: &ServerConfig,
+    threads: &ThreadTable,
+    project: &str,
+    user: &str,
+) -> Option<Role> {
+    let participants = threads.participants(project).ok()?;
+    auth::role_in(user, config.owner(), &participants)
+}
+
 fn project_infos(config: &ServerConfig, threads: &ThreadTable, user: &str) -> Vec<ProjectInfo> {
     threads
         .projects()
         .into_iter()
         .filter_map(|(name, root, count)| {
-            let participants = threads.participants(&name).ok()?;
-            let role = auth::role_in(user, config.owner(), &participants)?;
+            let role = role_in_project(config, threads, &name, user)?;
             Some(ProjectInfo {
                 name,
                 root,
@@ -715,4 +729,132 @@ async fn ask_actor(
     rx.await.unwrap_or(Response::Error {
         message: "the thread's actor dropped the request".into(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use aigentic_runtime::aigentic_core::UserId;
+
+    use super::*;
+    use crate::awake::detect;
+    use crate::config::{Config, ProjectConfig, UserConfig};
+
+    /// A project `name` at `dir/name`, with `participants` written into
+    /// its file.
+    fn project(dir: &std::path::Path, name: &str, participants: &str) -> PathBuf {
+        let root = dir.join(name);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("aigentic.toml"),
+            format!("[project]\nname = \"{name}\"\n{participants}"),
+        )
+        .unwrap();
+        root
+    }
+
+    /// A factory the test never calls: it only needs to exist before the
+    /// first build.
+    struct Stub;
+
+    impl crate::build::ProviderFactory for Stub {
+        fn build(
+            &self,
+            _: &str,
+        ) -> Result<
+            (Box<dyn aigentic_runtime::aigentic_core::Provider>, String),
+            crate::build::BuildError,
+        > {
+            Err(crate::build::BuildError::Config("no build".into()))
+        }
+    }
+
+    fn table(dir: &std::path::Path, config: &Arc<ServerConfig>) -> ThreadTable {
+        ThreadTable::new(
+            Arc::new(
+                Config::parse(
+                    "default_profile = \"a\"\n[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n",
+                )
+                .unwrap(),
+            ),
+            dir.join("cfg"),
+            config.clone(),
+            Arc::new(Stub),
+            Arc::new(crate::actor::NoReports),
+            dir.join("threads"),
+            detect(false),
+        )
+    }
+
+    /// T3 (issue #81): the projects a creator can reach are the shared
+    /// role helper's projects — a `read`-only role counts — and the
+    /// listing shows exactly those. `mia` reads `alpha` and has no role
+    /// in the other two, so the block names `alpha` alone.
+    #[test]
+    fn a_read_only_role_is_a_project_in_reach() {
+        let dir = tempfile::tempdir().unwrap();
+        let projects: Vec<ProjectConfig> = vec![
+            // mia reads alpha and nothing else.
+            ProjectConfig {
+                name: "alpha".into(),
+                root: project(dir.path(), "alpha", "[participants]\nmia = \"read\"\n"),
+            },
+            ProjectConfig {
+                name: "beta".into(),
+                root: project(dir.path(), "beta", "[participants]\nsteve = \"admin\"\n"),
+            },
+            ProjectConfig {
+                name: "gamma".into(),
+                root: project(dir.path(), "gamma", ""),
+            },
+        ];
+        let config = Arc::new(ServerConfig {
+            listen: "unix".into(),
+            idle_unload_secs: 3600,
+            users: vec![
+                UserConfig {
+                    name: "steve".into(),
+                    token_env: None,
+                    token: Some("t".into()),
+                },
+                UserConfig {
+                    name: "mia".into(),
+                    token_env: None,
+                    token: Some("t2".into()),
+                },
+            ],
+            projects: projects.clone(),
+            resume_runs: false,
+        });
+        let table = table(dir.path(), &config);
+
+        // A `read`-only role counts.
+        assert_eq!(
+            role_in_project(&config, &table, "alpha", "mia"),
+            Some(Role::Read)
+        );
+        assert_eq!(role_in_project(&config, &table, "beta", "mia"), None);
+
+        // The client's list and the rule agree: one set, no copy.
+        let infos: Vec<String> = project_infos(&config, &table, "mia")
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        assert_eq!(infos, vec!["alpha"]);
+
+        // The listing is over exactly that set: no other project's name
+        // appears anywhere in it.
+        let listing = table
+            .projects_in_reach(Some(&UserId("mia".into())), Some("alpha"))
+            .unwrap();
+        assert!(
+            listing.starts_with("Projects in reach. This thread is in alpha "),
+            "{listing}"
+        );
+        for name in ["alpha", "beta", "gamma"] {
+            let allowed = role_in_project(&config, &table, name, "mia").is_some();
+            assert_eq!(listing.contains(name), allowed, "{listing}");
+        }
+    }
 }

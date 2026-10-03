@@ -175,6 +175,9 @@ pub async fn project_context(
             registry: tools,
             provider,
             model_label: model,
+            // The listing is the table's to render (issue #81), never
+            // `project_context`'s: it has no creator and no home.
+            projects: None,
             profile: Some(profile_name.clone()),
             effort: config
                 .profiles
@@ -192,7 +195,13 @@ pub async fn project_context(
 }
 
 /// Open or create a thread's log in `root.threads_dir` and build its
-/// runtime from the project at `root.root`.
+/// runtime from the project at `root.root`. `projects` is the daemon's
+/// listing of the projects in reach for this thread (issue #81), which
+/// `ThreadTable::shown_projects` renders; `None` leaves the prefix
+/// exactly as it was.
+// The listing is one argument beside the project's own (issue #81);
+// clippy counts eight, one past its threshold.
+#[allow(clippy::too_many_arguments)]
 pub async fn build_thread(
     config: &Config,
     config_dir: &Path,
@@ -201,6 +210,7 @@ pub async fn build_thread(
     workspaces: &[Workspace],
     thread: Ulid,
     profile_override: Option<&str>,
+    projects: Option<String>,
 ) -> Result<Built, BuildError> {
     let Context {
         ctx,
@@ -230,6 +240,7 @@ pub async fn build_thread(
         .with_effort(ctx.effort)
         .with_policy(ctx.policy)
         .with_skills(ctx.skills)
+        .with_projects(projects)
         .with_harness_instructions();
     if let Some(utility) = &config.utility_profile
         && *utility != profile_name
@@ -404,6 +415,7 @@ mod tests {
                 &[],
                 Ulid::from_datetime(std::time::SystemTime::now()),
                 Some(profile),
+                None,
             )
             .await
             .unwrap();
@@ -421,6 +433,7 @@ mod tests {
             &[],
             Ulid::from_datetime(std::time::SystemTime::now()),
             Some("plain"),
+            None,
         )
         .await
         .unwrap();
@@ -467,6 +480,7 @@ mod tests {
             &[],
             Ulid::from_datetime(std::time::SystemTime::now()),
             Some("main"),
+            None,
         )
         .await
         .unwrap();
@@ -482,6 +496,7 @@ mod tests {
             &[],
             Ulid::from_datetime(std::time::SystemTime::now()),
             Some("main"),
+            None,
         )
         .await
         .unwrap();

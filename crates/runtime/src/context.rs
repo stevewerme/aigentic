@@ -20,6 +20,12 @@ pub struct Prefix<'a> {
     /// participants (phase 5): who is in it and their roles, so the
     /// model knows whom it may ask to approve.
     pub participants: Option<String>,
+    /// Which projects exist and which workspace each is in (issue #81):
+    /// the current one in detail, the others as one line, so the model
+    /// knows where else a message might belong. Rendered by the daemon,
+    /// which is the only thing that knows every project; absent when the
+    /// thread has no listing.
+    pub projects: Option<String>,
     pub knowledge: Option<String>,
     pub memory: Option<String>,
     pub skills: Option<String>,
@@ -57,7 +63,7 @@ pub fn build_context(prefix: &Prefix<'_>, events: &[Event]) -> Result<Vec<Messag
             name_message(message, &name);
         }
     }
-    let mut context = Vec::with_capacity(body.len() + 7);
+    let mut context = Vec::with_capacity(body.len() + 8);
     if let Some(text) = prefix.global {
         context.push(system(text.to_owned()));
     }
@@ -71,6 +77,9 @@ pub fn build_context(prefix: &Prefix<'_>, events: &[Event]) -> Result<Vec<Messag
         context.push(system(text.to_owned()));
     }
     if let Some(text) = &prefix.participants {
+        context.push(system(text.clone()));
+    }
+    if let Some(text) = &prefix.projects {
         context.push(system(text.clone()));
     }
     if let Some(text) = &prefix.knowledge {
@@ -173,6 +182,7 @@ mod tests {
             workspace: None,
             project: Some("This is Vendela."),
             participants: None,
+            projects: None,
             knowledge: Some("# Knowledge\n\n...".into()),
             memory: Some("# Project memory\n\n- Use Swedish.".into()),
             skills: Some("# Skills\n\n- tdd: x".into()),
@@ -284,5 +294,59 @@ mod tests {
             ]
         );
         assert_eq!(ctx[2].role, Role::System);
+    }
+
+    /// T4 (issue #81): the projects block is a system message of its own,
+    /// after `participants` and before `knowledge`. With `projects: None`
+    /// the built context is byte-identical to what it was before the
+    /// block existed, which is what keeps every cached prefix and every
+    /// existing context test valid.
+    #[test]
+    fn the_projects_block_sits_after_participants_and_before_knowledge() {
+        let events = vec![by(0, "steve", "hej")];
+        let listed = "Projects in reach. This thread is in p (w).\nw: p (here) ~/p";
+        let prefix = Prefix {
+            global: Some("g"),
+            project: Some("p"),
+            participants: Some("Participants in this project: steve (admin)".into()),
+            knowledge: Some("k".into()),
+            projects: Some(listed.into()),
+            ..Prefix::default()
+        };
+        let ctx = build_context(&prefix, &events).unwrap();
+        let texts: Vec<&str> = ctx.iter().map(text).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "g",
+                "p",
+                "Participants in this project: steve (admin)",
+                listed,
+                "k",
+                "hej"
+            ]
+        );
+        assert_eq!(ctx[3].role, Role::System);
+
+        // No listing: not one byte moves.
+        let prefix = Prefix {
+            projects: None,
+            ..prefix
+        };
+        let texts: Vec<String> = build_context(&prefix, &events)
+            .unwrap()
+            .iter()
+            .map(|m| text(m).to_owned())
+            .collect();
+        assert_eq!(
+            texts,
+            vec![
+                "g",
+                "p",
+                "Participants in this project: steve (admin)",
+                "k",
+                "hej"
+            ]
+        );
     }
 }

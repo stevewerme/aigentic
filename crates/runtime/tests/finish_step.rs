@@ -702,6 +702,7 @@ async fn t18_a_step_thread_refuses_a_project_switch() {
         registry: ToolRegistry::empty(),
         provider,
         model_label: "test".into(),
+        projects: None,
         profile: None,
         effort: None,
         prices: None,

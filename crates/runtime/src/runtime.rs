@@ -153,6 +153,12 @@ pub struct Runtime {
     /// builder asks, so the library's own context stays exactly what its
     /// caller put in.
     pub(crate) harness_instructions: Option<&'static str>,
+    /// The daemon's listing of the projects in reach (issue #81), filled
+    /// for a thread a person created and rendered into the prefix after
+    /// `participants`. The runtime cannot compute it: only the daemon
+    /// knows every project and which workspace each is in. `None` is no
+    /// block at all, which is what the library and every test keep.
+    pub(crate) projects: Option<String>,
     /// The provider for side jobs (titles, memory extraction): the
     /// config's `utility_profile` when set, else the thread's own.
     pub(crate) utility: Option<Box<dyn Provider>>,
@@ -215,6 +221,7 @@ impl Runtime {
             ratio: 1.0,
             overhead: 0,
             harness_instructions: None,
+            projects: None,
             utility: None,
             utility_label: None,
             utility_prices: None,
@@ -258,6 +265,7 @@ impl Runtime {
         self.registry = ctx.registry;
         self.provider = ctx.provider;
         self.model_label = ctx.model_label;
+        self.projects = ctx.projects;
         self.profile = ctx.profile;
         self.effort = ctx.effort;
         self.prices = ctx.prices;
@@ -635,6 +643,15 @@ impl Runtime {
         self
     }
 
+    /// The daemon's listing of the projects in reach (issue #81), which
+    /// `ThreadTable` renders and hands to a first build. A runtime built
+    /// without it carries no projects block at all.
+    pub fn with_projects(mut self, projects: Option<String>) -> Self {
+        self.projects = projects;
+        self.measured = None;
+        self
+    }
+
     /// Read the knowledge folder, count it with the provider, decide the
     /// mode, and register or remove `search_knowledge` accordingly.
     pub fn reload_knowledge(&mut self) -> Result<(), crate::ProjectError> {
@@ -745,6 +762,7 @@ impl Runtime {
             workspace: self.layers.workspace_instructions(),
             project: self.layers.project_instructions(),
             participants: self.participants_line(),
+            projects: self.projects.clone(),
             knowledge: self.knowledge.prefix(self.knowledge_mode),
             memory: self.layers.memory_prefix(),
             skills: self.skills_prefix(),
@@ -836,6 +854,10 @@ pub struct ProjectContext {
     pub registry: ToolRegistry,
     pub provider: Box<dyn Provider>,
     pub model_label: String,
+    /// The projects in reach for this thread (issue #81), rendered by the
+    /// daemon's `ThreadTable`; `None` when the caller has no listing,
+    /// which is every caller that is not the daemon.
+    pub projects: Option<String>,
     pub profile: Option<String>,
     /// The profile's reasoning effort, when it sets one. Carried to the
     /// wire so a client's footer can name it (issue #43); the runtime

@@ -8,6 +8,7 @@ pub mod auth;
 pub mod awake;
 pub mod build;
 pub mod config;
+pub mod listing;
 pub mod reports;
 pub mod runs;
 pub mod serve;

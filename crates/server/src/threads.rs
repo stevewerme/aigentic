@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use aigentic_api::{CheckpointAnswer, Notice, ReportKind, ThreadInfo, ThreadState};
-use aigentic_runtime::aigentic_core::{Author, ContentBlock, Event, EventKind};
+use aigentic_runtime::aigentic_core::{Author, ContentBlock, Event, EventKind, UserId};
 use aigentic_runtime::aigentic_log::{
     NewEvent, Repair, RunStartedPayload, ThreadLog, ThreadStartedPayload, UserMessagePayload,
 };
@@ -23,9 +23,11 @@ use crate::actor::{Mail, Mailbox, Reports, ThreadActor};
 use crate::awake::KeepAwake;
 use crate::build::{BuildError, ProviderFactory, Root, build_thread, project_context};
 use crate::config::{Config, ServerConfig};
+use crate::listing::{Listed, projects_listing};
 use crate::runs::{Answer, Claim, IssueLock, ProdDeps, RunDeps, RunWorld, Runs, drive};
+use crate::session::role_in_project;
 use crate::skills::SkillPaths;
-use crate::workspaces::Workspace;
+use crate::workspaces::{Workspace, workspace_of};
 
 /// Threads of a root without a project file.
 pub const NO_PROJECT_DIR: &str = "_none";
@@ -37,6 +39,11 @@ pub const DEFAULT_WORKFLOW: &str = "build";
 struct Entry {
     mailbox: Mailbox,
     project: String,
+    /// Who started the thread, from its log's `thread_started` (issue
+    /// #81): the listing is theirs, so someone else opening the thread
+    /// sees the same one. `None` for a thread an agent started — a
+    /// build's or a step's child — which gets no block.
+    creator: Option<UserId>,
     /// Sessions that opened it and have not closed.
     open: usize,
     /// When the last session closed, for the idle clock.
@@ -185,7 +192,7 @@ impl ThreadTable {
     pub async fn switch(&self, thread: Ulid, project: &str, by: Author) -> Result<(), ThreadError> {
         let mailbox = self.mailbox(thread).ok_or(ThreadError::NoThread(thread))?;
         let root = self.root_of(project)?;
-        let built = project_context(
+        let mut built = project_context(
             &self.config,
             &self.config_dir,
             &*self.providers,
@@ -194,6 +201,11 @@ impl ThreadTable {
             self.profile_override.as_deref(),
         )
         .await?;
+        // The listing follows the switch: the target is now the current
+        // project. The creator comes from the entry, never a log read —
+        // a switch must not touch another project's threads directory
+        // (#81).
+        built.ctx.projects = self.projects_in_reach(self.creator(thread).as_ref(), Some(project));
         let (reply, rx) = oneshot::channel();
         mailbox
             .send(Mail::SwitchProject {
@@ -217,6 +229,71 @@ impl ThreadTable {
             aigentic_api::Response::Refused { reason } => Err(ThreadError::Refused(reason)),
             other => Err(ThreadError::Refused(format!("{other:?}"))),
         }
+    }
+
+    /// The workspace naming a project (issue #81): `workspace_of`'s
+    /// first match over the loaded workspace files. #7's
+    /// `AwaitingSwitch { workspace }` reuses it.
+    pub fn workspace_label(&self, project: &str) -> Option<String> {
+        let root = self.root_of(project).ok()?;
+        workspace_of(&self.workspaces, &root.root).map(|w| w.name.clone())
+    }
+
+    /// The projects block for a thread (issue #81), rendered for whoever
+    /// asks: the projects its creator holds a role in, the thread's
+    /// `project` marked as its own. `None` when the creator is not a
+    /// person (an agent's thread) or holds no role anywhere — no block
+    /// at all, so the prefix is exactly what it was.
+    pub fn shown_projects(&self, thread: Ulid, project: Option<&str>) -> Option<String> {
+        let creator = self.creator(thread);
+        self.projects_in_reach(creator.as_ref(), project)
+    }
+
+    /// The thread's creator, stored when it was opened; `None` for an
+    /// agent's thread and for one this table has not opened.
+    fn creator(&self, thread: Ulid) -> Option<UserId> {
+        self.entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&thread)
+            .and_then(|e| e.creator.clone())
+    }
+
+    /// The listing for a creator: the projects where they hold any role
+    /// — `read` counts — in the daemon's order, each with the workspace
+    /// naming it, and `project` as the thread's own. The rule is
+    /// `role_in_project`'s, the same one the client's project list uses.
+    pub(crate) fn projects_in_reach(
+        &self,
+        creator: Option<&UserId>,
+        project: Option<&str>,
+    ) -> Option<String> {
+        let user = creator?.0.as_str();
+        let all: Vec<Listed> = self
+            .server
+            .projects
+            .iter()
+            .filter(|p| role_in_project(&self.server, self, &p.name, user).is_some())
+            .map(|p| Listed {
+                name: p.name.clone(),
+                root: p.root.clone(),
+                workspace: self.workspace_label(&p.name),
+            })
+            .collect();
+        let current = project.and_then(|name| {
+            all.iter().find(|l| l.name == name).cloned().or_else(|| {
+                // The thread's own project can be outside its
+                // creator's reach: line 1 still names it, from
+                // itself, and no row is marked as it.
+                self.server.project(name).map(|p| Listed {
+                    name: p.name.clone(),
+                    root: p.root.clone(),
+                    workspace: self.workspace_label(&p.name),
+                })
+            })
+        });
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        projects_listing(&all, current.as_ref(), home.as_deref())
     }
 
     fn root_of(&self, project: &str) -> Result<Root, ThreadError> {
@@ -353,6 +430,9 @@ impl ThreadTable {
             .project_of(thread)
             .ok_or(ThreadError::NoThread(thread))?;
         let home_root = self.root_of(&home)?;
+        // The creator, once, from the log at the thread's home: the
+        // listing is theirs for as long as the thread lives (#81).
+        let creator = creator_of(&home_root.threads_dir, thread);
         let project = last_switch(&home_root.threads_dir, thread)
             .filter(|p| self.server.project(p).is_some())
             .unwrap_or_else(|| home.clone());
@@ -360,6 +440,7 @@ impl ThreadTable {
             threads_dir: home_root.threads_dir,
             ..self.root_of(&project)?
         };
+        let projects = self.projects_in_reach(creator.as_ref(), Some(&project));
         let built = build_thread(
             &self.config,
             &self.config_dir,
@@ -368,6 +449,7 @@ impl ThreadTable {
             &self.workspaces,
             thread,
             self.profile_override.as_deref(),
+            projects,
         )
         .await?;
         let (actor, mailbox) = ThreadActor::new(built.runtime, built.torn, self.reports.clone())?;
@@ -379,6 +461,7 @@ impl ThreadTable {
         let e = entries.entry(thread).or_insert_with(|| Entry {
             mailbox,
             project: project.clone(),
+            creator,
             open: 0,
             idle_since: Instant::now(),
         });
@@ -590,6 +673,9 @@ impl ThreadTable {
             &self.workspaces,
             thread,
             self.profile_override.as_deref(),
+            // A report renders events; it builds no prompt, so the
+            // listing would go nowhere (#81).
+            None,
         )
         .await?;
         Ok(self.reports.render(&built.runtime, &events, kind))
@@ -888,6 +974,23 @@ fn summarise(dir: &Path, id: Ulid, project: &str) -> ThreadInfo {
         state: ThreadState::Idle,
         title: aigentic_runtime::title::title_of(&events),
     }
+}
+
+/// Who started a thread, from its log: `thread_started.created_by`. Only
+/// a person counts (issue #81) — an `Author::Agent` thread (a build's or
+/// a step's child) gets no projects block.
+fn creator_of(dir: &Path, id: Ulid) -> Option<UserId> {
+    let events = ThreadLog::open(dir, id).ok()?.read_all().ok()?;
+    events
+        .iter()
+        .find(|e| e.kind == EventKind::ThreadStarted)
+        .and_then(|e| serde_json::from_value::<ThreadStartedPayload>(e.payload.clone()).ok())
+        .and_then(|p| match p.created_by {
+            Author::User(user) => Some(user),
+            // Only a person gets a block: an agent's thread (a build's
+            // or a step's child) and a system line get none.
+            Author::Agent(_) | Author::System => None,
+        })
 }
 
 /// The project a thread last switched to, from its log.

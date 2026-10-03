@@ -203,6 +203,10 @@ impl RunnerHost for ServerHost {
                 &world.workspaces,
                 id,
                 Some(&profile),
+                // A step's child is an agent's thread — its
+                // `thread_started` says `Author::Agent("runner")` — so
+                // it gets no projects block (#81).
+                None,
             )
             .await
             .map_err(|e| RunnerError::Host(e.to_string()))?;
