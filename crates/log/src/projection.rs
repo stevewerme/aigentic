@@ -1994,6 +1994,31 @@ mod tests {
         );
     }
 
+    /// T4 (issue #75): a result behind the eviction boundary and inside a
+    /// truncation range is stubbed, never also truncated: the stub branch
+    /// wins, so the marker of the other rule never appears beside it.
+    #[test]
+    fn a_stub_beats_truncation_on_the_same_result() {
+        let long = "x".repeat(1000);
+        let events = vec![
+            user(0, "go"),
+            call(1, "c1", "bash", json!({"command": "cat big.txt"})),
+            result(2, "c1", &long),
+            call(3, "c2", "bash", json!({"command": "ls"})),
+            result(4, "c2", "ok"),
+            evicted(5, 4),
+            truncation(6, 0, 5, 100),
+        ];
+        let p = project(&events).unwrap();
+        let stubbed = &results(&p)[0].1;
+        assert!(is_stub(stubbed, "bash"), "{stubbed}");
+        assert!(!stubbed.contains("omitted by compaction"), "{stubbed}");
+        assert!(stubbed.len() < 200, "{} bytes: {stubbed}", stubbed.len());
+        // The other result is in the truncation range and stays whole:
+        // both rules were seen, and only one touched a result.
+        assert_eq!(results(&p)[1].1, "ok");
+    }
+
     /// The fixture of T1/T2/T3: a bash call whose `command` is several
     /// lines and longer than the cap, with a `timeout_secs` beside it.
     fn long_bash_args() -> (String, serde_json::Value) {
