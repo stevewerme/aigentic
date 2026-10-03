@@ -46,7 +46,13 @@ impl Provider for Growing {
             .lock()
             .unwrap()
             .push((request.messages.to_vec(), is_summary));
-        let prompt = estimate(request.messages);
+        // Like a real provider, the prompt it reports includes the tool
+        // schemas; the runtime calibrates against that (issue #52), so a
+        // provider that left them out would skew the estimate down a
+        // little more with every tool the harness offers (it pushed this
+        // test over its line once #7 added suggest_project).
+        let prompt =
+            estimate(request.messages) + aigentic_runtime::evict::schemas_tokens(request.tools);
         let usage = |out: u64| {
             ProviderEvent::Usage(Usage {
                 input_tokens: prompt,

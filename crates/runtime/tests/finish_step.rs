@@ -188,8 +188,14 @@ async fn t9_finish_step_is_offered_only_in_a_step_thread() {
 
     let r = rig(vec![], Some(&["git push"]));
     let names: Vec<String> = r.runtime.tool_specs().into_iter().map(|s| s.name).collect();
-    // The expected list is the plain one's, plus the new name, sorted.
-    let mut expected = plain_names.clone();
+    // The expected list is the plain one's, without `suggest_project`
+    // (a proposal needs a person, so a step thread never offers it, #7),
+    // plus the new name, sorted.
+    let mut expected: Vec<String> = plain_names
+        .iter()
+        .filter(|n| n.as_str() != "suggest_project")
+        .cloned()
+        .collect();
     expected.push("finish_step".into());
     expected.sort();
     assert_eq!(names, expected);
