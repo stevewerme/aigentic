@@ -9,7 +9,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use aigentic_api::client::Client;
-use aigentic_api::{Notice, Request, Response, ThreadState};
+use aigentic_api::{Notice, Request, Response, SwitchReply, ThreadState};
 use aigentic_runtime::aigentic_core::{ContentBlock, EventKind};
 use aigentic_runtime::aigentic_log::{
     AssistantMessagePayload, ToolResultPayload, TurnEndedPayload,
@@ -31,8 +31,18 @@ pub const EXIT_INTERRUPTED: i32 = 130;
 pub const NO_HUMAN: &str = "No human is available: this is a non-interactive run (aigentic exec). Continue without an answer, or stop and say what you needed.";
 
 /// Why a permission request is denied here, told to the model.
+/// What `exec` tells the runtime when a proposal reaches it: nobody is
+/// there to answer, so the proposal is closed rather than left open
+/// (issue #7).
+pub const SWITCH_DECLINED: &str = "exec declines proposals";
+
 pub const NON_INTERACTIVE: &str =
     "this is a non-interactive run (aigentic exec) and nobody can approve";
+
+/// The line `exec` prints when it declines a switch proposal.
+pub fn switch_declined_line(project: &str) -> String {
+    format!("[switch to {project} not answered: non-interactive]")
+}
 
 /// How many result lines the progress on stderr shows per tool call.
 const RESULT_LINES: usize = 3;
@@ -284,6 +294,23 @@ impl Follow {
                         })
                         .await?;
                 }
+                ThreadState::AwaitingSwitch {
+                    call_id, project, ..
+                } => {
+                    self.running = true;
+                    self.end_line(err)?;
+                    self.denied += 1;
+                    writeln!(err, "{}", switch_declined_line(&project))?;
+                    client
+                        .request(Request::AnswerSwitch {
+                            thread,
+                            call_id,
+                            answer: SwitchReply::Withdrawn {
+                                note: SWITCH_DECLINED.into(),
+                            },
+                        })
+                        .await?;
+                }
             },
             Notice::Note { text, .. } => {
                 self.end_line(err)?;
@@ -513,6 +540,33 @@ mod tests {
         assert_eq!(o.code, EXIT_NEEDS_HUMAN, "{err}");
         assert!(err.contains("[denied bash: non-interactive]"), "{err}");
         assert_eq!(out, "could not fetch\n");
+    }
+
+    /// T11: a switch proposal is declined with `withdrawn`, the line is
+    /// printed, the turn continues in place, and the exit code is three.
+    #[tokio::test]
+    async fn a_switch_proposal_is_declined_and_exit_is_three() {
+        let call = ProviderEvent::ToolCall(ToolCall {
+            id: "c1".into(),
+            name: "suggest_project".into(),
+            args: serde_json::json!({"project": "q", "reason": "belongs elsewhere"}),
+        });
+        let (o, out, err) = exec(
+            vec![
+                vec![call, finish("tool_use")],
+                vec![text("staying put"), finish("stop")],
+            ],
+            args(false),
+        )
+        .await;
+        assert_eq!(o.denied, 1, "{err}");
+        assert_eq!(o.code, EXIT_NEEDS_HUMAN, "{err}");
+        assert!(err.contains(&switch_declined_line("q")), "{err}");
+        assert_eq!(
+            out, "staying put\n",
+            "the turn continued in place: nothing waited for a person"
+        );
+        assert_eq!(o.reason.as_deref(), Some("done"), "{err}");
     }
 
     #[tokio::test]

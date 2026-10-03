@@ -15,8 +15,11 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 /// Sent in `Hello`; a mismatch is refused with both numbers. Version 2
-/// adds `Build`/`AnswerCheckpoint` and `Response::Run` (issue #58).
-pub const PROTOCOL_VERSION: u32 = 2;
+/// adds `Build`/`AnswerCheckpoint` and `Response::Run` (issue #58);
+/// version 3 adds `AnswerSwitch` and `ThreadState::AwaitingSwitch`
+/// (issue #7), so a version-2 client is refused rather than left never
+/// seeing the switch it is asked to answer.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// One line on the wire.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -123,6 +126,14 @@ pub enum Request {
         thread: Ulid,
         call_id: String,
         text: String,
+    },
+    /// Answer a `suggest_project` proposal (issue #7), read from
+    /// `ThreadState::AwaitingSwitch`; needs `write` in the thread's
+    /// project, and for a `yes` in the target too.
+    AnswerSwitch {
+        thread: Ulid,
+        call_id: String,
+        answer: SwitchReply,
     },
     Pin {
         thread: Ulid,
@@ -385,6 +396,32 @@ pub enum ThreadState {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         questions: Vec<AskedQuestion>,
     },
+    /// A `suggest_project` proposal waits for someone with `write`
+    /// (issue #7). `workspace` is the daemon's label for the target.
+    AwaitingSwitch {
+        call_id: String,
+        project: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace: Option<String>,
+        reason: String,
+    },
+}
+
+/// A person's answer to a switch proposal (issue #7). Mirrors the
+/// runtime's `SwitchAnswer` rather than take an edge to it (AGENTS.md).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "answer", rename_all = "snake_case")]
+pub enum SwitchReply {
+    Yes,
+    No,
+    /// The person named where the work belongs instead.
+    Corrected {
+        to: String,
+    },
+    /// Nobody answered it: `exec`'s decline, or a client giving up.
+    Withdrawn {
+        note: String,
+    },
 }
 
 /// One `ask_human` question on the wire; mirrors the runtime's
@@ -538,6 +575,30 @@ mod tests {
                 call_id: "c2".into(),
                 text: "yes".into(),
             },
+            Request::AnswerSwitch {
+                thread: thread(),
+                call_id: "c3".into(),
+                answer: SwitchReply::Yes,
+            },
+            Request::AnswerSwitch {
+                thread: thread(),
+                call_id: "c3".into(),
+                answer: SwitchReply::No,
+            },
+            Request::AnswerSwitch {
+                thread: thread(),
+                call_id: "c3".into(),
+                answer: SwitchReply::Corrected {
+                    to: "customer X".into(),
+                },
+            },
+            Request::AnswerSwitch {
+                thread: thread(),
+                call_id: "c3".into(),
+                answer: SwitchReply::Withdrawn {
+                    note: "exec declines proposals".into(),
+                },
+            },
             Request::Pin {
                 thread: thread(),
                 text: "Use Swedish.".into(),
@@ -666,6 +727,15 @@ mod tests {
                         }],
                         multi: false,
                     }],
+                },
+            },
+            Notice::State {
+                thread: thread(),
+                state: ThreadState::AwaitingSwitch {
+                    call_id: "c3".into(),
+                    project: "aigentic-web".into(),
+                    workspace: Some("~/aigentic-web".into()),
+                    reason: "the message is about the site".into(),
                 },
             },
             Notice::Mode {

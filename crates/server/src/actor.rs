@@ -19,7 +19,7 @@ use aigentic_runtime::aigentic_core::{Author, ContentBlock, Event, EventKind};
 use aigentic_runtime::aigentic_log::{PermissionRequestedPayload, UserMessagePayload};
 use aigentic_runtime::{
     ASKED_HUMAN, Answered, CancelToken, Decisions, Mode, Outbox, Pending, Queued, Resumed, Runtime,
-    RuntimeError, Signal, TurnOutcome, WindowUsage, inbox,
+    RuntimeError, Signal, SwitchAnswer, SwitchCtx, TurnOutcome, WindowUsage, inbox,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -60,6 +60,16 @@ pub enum Mail {
         by: Author,
         call_id: String,
         text: String,
+        reply: oneshot::Sender<Response>,
+    },
+    /// A person's answer to a `suggest_project` proposal (issue #7). A
+    /// `yes` carries the target's context and the ack the session waits
+    /// on; every other answer carries `SwitchCtx::none()`.
+    AnswerSwitch {
+        by: Author,
+        call_id: String,
+        answer: SwitchAnswer,
+        ctx: SwitchCtx,
         reply: oneshot::Sender<Response>,
     },
     Pin {
@@ -109,6 +119,11 @@ pub enum Mail {
         reply: oneshot::Sender<(ThreadState, Vec<Event>, String, Identity)>,
     },
 }
+
+/// Names the workspace a project sits in, for the switch notice (issue
+/// #7). The table's `workspace_label`, as a seam so the actor is built
+/// with it and tests can pass one of their own.
+pub type WorkspaceLabel = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 
 /// Who the thread runs as: the profile, its model and its effort
 /// label, carried on `Subscribe` so a client's footer can name them
@@ -162,6 +177,14 @@ struct Shared {
     /// The last window fill the runtime reported, re-sent when the queue
     /// changes or the turn ends so a status line stays current.
     last_usage: Mutex<Option<WindowUsage>>,
+    /// Names the workspace a project sits in (issue #7), handed in when
+    /// the actor is built: the table's `workspace_label`, so the actor
+    /// never re-derives it. An `AwaitingSwitch` state carries it.
+    labels: WorkspaceLabel,
+    /// Set when the running turn switched the thread's project (issue
+    /// #7): `after_turn` announces the new identity once, as an idle
+    /// switch does.
+    switched: Mutex<bool>,
     /// The keep-awake guard and whether a hold is outstanding (issue
     /// #47), under one lock. `held` keeps hold and release paired, so a
     /// turn interrupted while it was waiting cannot release twice, and
@@ -321,12 +344,19 @@ impl Shared {
                         self.push_usage();
                     }
                 }
+                // A switch inside the turn (issue #7) rebinds the
+                // provider and the profile; `after_turn` announces it.
+                if event.kind == EventKind::ProjectSwitched {
+                    *self.switched.lock().unwrap_or_else(|e| e.into_inner()) = true;
+                }
                 // A decision or a result ends a wait.
                 let waiting = !matches!(self.state(), ThreadState::Running { .. });
                 if waiting
                     && matches!(
                         event.kind,
-                        EventKind::PermissionDecided | EventKind::ToolResult
+                        EventKind::PermissionDecided
+                            | EventKind::ToolResult
+                            | EventKind::DecisionAnswered
                     )
                 {
                     self.running(turn_by.clone());
@@ -366,6 +396,16 @@ impl Shared {
                             reason,
                         }
                     }
+                    Pending::Switch {
+                        call_id,
+                        project,
+                        reason,
+                    } => ThreadState::AwaitingSwitch {
+                        call_id: call_id.clone(),
+                        project: project.clone(),
+                        workspace: (self.labels)(project),
+                        reason: reason.clone(),
+                    },
                     Pending::Human {
                         call_id,
                         question,
@@ -427,6 +467,7 @@ impl ThreadActor {
         mut runtime: Runtime,
         torn: Option<u64>,
         reports: Arc<dyn Reports>,
+        labels: WorkspaceLabel,
     ) -> Result<(Self, Mailbox), aigentic_runtime::RuntimeError> {
         let decisions = Arc::new(Decisions::new());
         runtime = runtime.with_decisions(decisions.clone());
@@ -443,6 +484,8 @@ impl ThreadActor {
             last_queued_by: Mutex::new(None),
             mode: Mutex::new(runtime.mode().name().to_owned()),
             identity: Mutex::new(runtime.identity()),
+            labels,
+            switched: Mutex::new(false),
             guard: Mutex::new(Hold {
                 guard: Arc::new(crate::awake::ProcessGuard::off()),
                 held: false,
@@ -575,7 +618,9 @@ impl ThreadActor {
                 let _ = reply.send(Response::Ok);
                 Some(Start::Skill(author, name, args))
             }
-            Mail::Decide { call_id, reply, .. } | Mail::Answer { call_id, reply, .. } => {
+            Mail::Decide { call_id, reply, .. }
+            | Mail::Answer { call_id, reply, .. }
+            | Mail::AnswerSwitch { call_id, reply, .. } => {
                 let _ = reply.send(Response::Refused {
                     reason: format!("nothing is pending for call {call_id}"),
                 });
@@ -960,6 +1005,26 @@ impl ThreadActor {
                     },
                 );
             }
+            Mail::AnswerSwitch {
+                by,
+                call_id,
+                answer,
+                ctx,
+                reply,
+            } => {
+                // A refused decide hands the context back by dropping
+                // it, which closes the ack: the session reads that as
+                // "the turn left" and never waits for a context that
+                // cannot arrive.
+                let _ = reply.send(
+                    match decisions.decide(&call_id, Answered::Switch { answer, by, ctx }) {
+                        Ok(()) => Response::Ok,
+                        Err(e) => Response::Refused {
+                            reason: e.to_string(),
+                        },
+                    },
+                );
+            }
             Mail::Subscribe {
                 from_seq,
                 notices,
@@ -1024,6 +1089,18 @@ impl ThreadActor {
         outcome: Result<TurnOutcome, aigentic_runtime::RuntimeError>,
         last_poster: Option<Author>,
     ) -> Option<Start> {
+        // A turn that switched the thread's project (issue #7) may run
+        // a different model now: tell the subscribers, as an idle switch
+        // does, before the continuation.
+        if std::mem::take(
+            &mut *self
+                .shared
+                .switched
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        ) {
+            self.announce_identity();
+        }
         let queued = *self.shared.queued.lock().unwrap_or_else(|e| e.into_inner());
         match outcome {
             Ok(o) if o.reason == ASKED_HUMAN => {

@@ -414,7 +414,8 @@ fn rig_with_guard(script: Vec<Option<Vec<ProviderEvent>>>, guard: Arc<dyn KeepAw
     )
     .with_policy(Policy::defaults());
     let (actor, mailbox) =
-        ThreadActor::new(runtime, None, Arc::new(NoReports)).expect("the actor builds");
+        ThreadActor::new(runtime, None, Arc::new(NoReports), Arc::new(|_: &str| None))
+            .expect("the actor builds");
     let actor = actor.with_keep_awake(guard);
     tokio::spawn(actor.run());
     Rig {

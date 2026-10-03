@@ -951,3 +951,17 @@ fn killed_while_parked_log(dir: &std::path::Path, thread: Ulid) -> ThreadLog {
     .unwrap();
     log
 }
+
+/// T13: two contexts that are not the same `Arc` compare unequal — the
+/// `PartialEq` `Answered::Switch` needs, without comparing project
+/// contents.
+#[test]
+fn switch_ctx_compares_by_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, _ack_a) = SwitchCtx::oneshot(target_context("p", dir.path().to_path_buf()));
+    let (b, _ack_b) = SwitchCtx::oneshot(target_context("p", dir.path().to_path_buf()));
+    let twin = a.clone();
+    assert_eq!(a, twin, "a clone is the same context");
+    assert_ne!(a, b, "two contexts are not one");
+    assert_ne!(a, SwitchCtx::none(), "an empty context is not a context");
+}

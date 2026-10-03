@@ -191,6 +191,36 @@ impl ThreadTable {
     /// actor swaps it in while idle and records `project_switched`.
     pub async fn switch(&self, thread: Ulid, project: &str, by: Author) -> Result<(), ThreadError> {
         let mailbox = self.mailbox(thread).ok_or(ThreadError::NoThread(thread))?;
+        let ctx = self.build_target(thread, project).await?;
+        let (reply, rx) = oneshot::channel();
+        mailbox
+            .send(Mail::SwitchProject {
+                ctx: Box::new(ctx),
+                by,
+                reply,
+            })
+            .map_err(|_| ThreadError::Gone)?;
+        match rx.await.map_err(|_| ThreadError::Gone)? {
+            aigentic_api::Response::Ok => {
+                self.note_project(thread, project);
+                Ok(())
+            }
+            aigentic_api::Response::Refused { reason } => Err(ThreadError::Refused(reason)),
+            other => Err(ThreadError::Refused(format!("{other:?}"))),
+        }
+    }
+
+    /// The context a move to `project` needs: its providers, seams and
+    /// listing, built the one way both a `SwitchProject` and a `yes` to
+    /// a `suggest_project` proposal use (issue #7). The listing follows
+    /// the switch: the target is now the current project. The creator
+    /// comes from the entry, never a log read — a switch must not touch
+    /// another project's threads directory (#81).
+    pub async fn build_target(
+        &self,
+        thread: Ulid,
+        project: &str,
+    ) -> Result<aigentic_runtime::ProjectContext, ThreadError> {
         let root = self.root_of(project)?;
         let mut built = project_context(
             &self.config,
@@ -201,34 +231,52 @@ impl ThreadTable {
             self.profile_override.as_deref(),
         )
         .await?;
-        // The listing follows the switch: the target is now the current
-        // project. The creator comes from the entry, never a log read —
-        // a switch must not touch another project's threads directory
-        // (#81).
         built.ctx.projects = self.projects_in_reach(self.creator(thread).as_ref(), Some(project));
-        let (reply, rx) = oneshot::channel();
-        mailbox
-            .send(Mail::SwitchProject {
-                ctx: Box::new(built.ctx),
-                by,
-                reply,
-            })
-            .map_err(|_| ThreadError::Gone)?;
-        match rx.await.map_err(|_| ThreadError::Gone)? {
-            aigentic_api::Response::Ok => {
-                if let Some(e) = self
-                    .entries
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .get_mut(&thread)
-                {
-                    e.project = project.to_owned();
-                }
-                Ok(())
-            }
-            aigentic_api::Response::Refused { reason } => Err(ThreadError::Refused(reason)),
-            other => Err(ThreadError::Refused(format!("{other:?}"))),
+        Ok(built.ctx)
+    }
+
+    /// Remember that the thread is in `project` now. The log's
+    /// `project_switched` is the truth; this is the entry, so the next
+    /// open does not rebuild the old project.
+    pub fn note_project(&self, thread: Ulid, project: &str) {
+        if let Some(e) = self
+            .entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&thread)
+        {
+            e.project = project.to_owned();
         }
+    }
+
+    /// The project a live `suggest_project` proposal names, when one
+    /// waits on `call_id` (issue #7): what a `yes` needs before it can
+    /// build the target's context and check the role there. `None` when
+    /// nothing is pending — the turn has moved on, or another client
+    /// answered first.
+    pub async fn waiting_switch(&self, thread: Ulid, call_id: &str) -> Option<String> {
+        let mailbox = self.mailbox(thread)?;
+        let (reply, rx) = oneshot::channel();
+        mailbox.send(Mail::Status { reply }).ok()?;
+        match rx.await.ok()? {
+            ThreadState::AwaitingSwitch {
+                call_id: waiting,
+                project,
+                ..
+            } if waiting == call_id => Some(project),
+            _ => None,
+        }
+    }
+
+    /// Names the workspace a project sits in (issue #7), for the actor:
+    /// `workspace_label` without the table, so an actor never holds one.
+    fn labels(&self) -> crate::actor::WorkspaceLabel {
+        let projects = self.server.projects.clone();
+        let workspaces = self.workspaces.clone();
+        Arc::new(move |project: &str| {
+            let root = &projects.iter().find(|p| p.name == project)?.root;
+            workspace_of(&workspaces, root).map(|w| w.name.clone())
+        })
     }
 
     /// The workspace naming a project (issue #81): `workspace_of`'s
@@ -452,7 +500,12 @@ impl ThreadTable {
             projects,
         )
         .await?;
-        let (actor, mailbox) = ThreadActor::new(built.runtime, built.torn, self.reports.clone())?;
+        let (actor, mailbox) = ThreadActor::new(
+            built.runtime,
+            built.torn,
+            self.reports.clone(),
+            self.labels(),
+        )?;
         let actor = actor.with_keep_awake(self.guard());
         tokio::spawn(actor.run());
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());

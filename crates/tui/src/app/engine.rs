@@ -13,7 +13,7 @@
 use std::collections::{HashMap, VecDeque};
 
 use aigentic_api::client::Client;
-use aigentic_api::{Notice, ReportKind, Request, Response, ThreadState};
+use aigentic_api::{Notice, ReportKind, Request, Response, SwitchReply, ThreadState};
 use aigentic_runtime::aigentic_core::{Author, ContentBlock, EventKind, ToolCall};
 use aigentic_runtime::aigentic_log::{
     AssistantMessagePayload, CheckpointAnsweredPayload, CheckpointAskedPayload, CompactedPayload,
@@ -449,6 +449,15 @@ impl ClientRepl {
             self.apply_checkpoint(keyed, out).await;
             return;
         }
+        // A switch proposal takes its one keystroke first (issue #7):
+        // `y`, `n`, or `n <where>`. Anything else is the chat's line.
+        if let ThreadState::AwaitingSwitch { call_id, .. } = &self.state
+            && self.prompted.as_deref() == Some(call_id)
+            && let Some(answer) = switch_reply(line)
+        {
+            self.answer_switch(answer, out).await;
+            return;
+        }
         // A pending question or request this client prompted for takes
         // the line first; without the role the line is what it is.
         match &self.state {
@@ -569,6 +578,9 @@ impl ClientRepl {
                 }
                 ThreadState::AwaitingHuman { question, .. } => {
                     format!("waiting for an answer: {question}")
+                }
+                ThreadState::AwaitingSwitch { project, .. } => {
+                    format!("waiting for an answer: switch to {project}?")
                 }
             }),
             Command::Threads => {
@@ -1060,6 +1072,22 @@ impl ClientRepl {
         self.answered(r, out);
     }
 
+    /// Answer the switch proposal this client is prompted for (issue
+    /// #7): `y`, `n`, or `n <where>`.
+    async fn answer_switch(&mut self, answer: SwitchReply, out: &mut dyn Printer) {
+        let Some(call_id) = self.prompted.clone() else {
+            return;
+        };
+        let r = self
+            .request(Request::AnswerSwitch {
+                thread: self.thread,
+                call_id,
+                answer,
+            })
+            .await;
+        self.answered(r, out);
+    }
+
     /// The composer's text for the prompt, Enter on its text input: a
     /// deny's reason, with none when it was empty, or a question's
     /// free-text answer, headed like any other. A prompt answered
@@ -1445,6 +1473,24 @@ impl ClientRepl {
                     out.line(&format!("[waiting for an answer: {question}]"));
                 }
             }
+            ThreadState::AwaitingSwitch {
+                call_id,
+                project,
+                workspace,
+                reason,
+            } => {
+                // A minimal prompt (issue #7): type `y`, `n`, or
+                // `n <where>`. #82 replaces it with a real one.
+                let where_it_is = workspace
+                    .as_ref()
+                    .map(|w| format!(" in {w}"))
+                    .unwrap_or_default();
+                out.line(&format!(
+                    "[switch to {project}{where_it_is}? {reason} — type y, n, or n <where>]"
+                ));
+                self.menu = None;
+                self.prompted = Some(call_id.clone());
+            }
             ThreadState::Running { .. } | ThreadState::Idle => {
                 // A decision's or an answer's event named its author
                 // before this state arrived and closed the prompt; this
@@ -1816,6 +1862,21 @@ pub(crate) fn author_name(author: &Author) -> String {
         Author::User(u) => u.0.clone(),
         Author::Agent(a) => a.0.clone(),
         Author::System => "system".into(),
+    }
+}
+
+/// `y`, `n`, or `n <where>`: the minimal REPL answer to a switch
+/// proposal (issue #7). Anything else is not an answer, and goes to the
+/// chat as usual.
+fn switch_reply(line: &str) -> Option<SwitchReply> {
+    let trimmed = line.trim();
+    match trimmed {
+        "y" => Some(SwitchReply::Yes),
+        "n" => Some(SwitchReply::No),
+        _ => {
+            let to = trimmed.strip_prefix("n ")?.trim();
+            (!to.is_empty()).then(|| SwitchReply::Corrected { to: to.to_owned() })
+        }
     }
 }
 
@@ -4556,6 +4617,105 @@ mod tests {
             "both runs have their cell: {:?}",
             lead.lines()
         );
+    }
+
+    /// T12: `AwaitingSwitch` prints the line, and `y`, `n` and `n customer
+    /// X` send `Yes`, `No` and `Corrected`; an unrelated line goes to the
+    /// chat as usual.
+    #[tokio::test]
+    async fn t12_the_repl_answers_a_switch_proposal_with_one_keystroke() {
+        let (mut repl, mut out, daemon) = repl_for(Ulid::generate(), vec![]).await;
+        let state = ThreadState::AwaitingSwitch {
+            call_id: "c9".into(),
+            project: "there".into(),
+            workspace: Some("~/there".into()),
+            reason: "the message is about the site".into(),
+        };
+        repl.render(
+            Notice::State {
+                thread: repl.thread,
+                state: state.clone(),
+            },
+            &mut out,
+        );
+        assert!(
+            out.0.0.contains(
+                &"[switch to there in ~/there? the message is about the site — type y, n, or n <where>]"
+                    .to_owned()
+            ),
+            "{:#?}",
+            out.0.0
+        );
+        assert_eq!(repl.prompted.as_deref(), Some("c9"));
+
+        repl.handle_line("y", &mut out).await;
+        let answers: Vec<SwitchReply> = daemon
+            .requests()
+            .into_iter()
+            .filter_map(|r| match r {
+                Request::AnswerSwitch { answer, .. } => Some(answer),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(answers, vec![SwitchReply::Yes]);
+
+        // `n`, and `n <where>`.
+        for (line, expected) in [
+            ("n", SwitchReply::No),
+            (
+                "n customer X",
+                SwitchReply::Corrected {
+                    to: "customer X".into(),
+                },
+            ),
+        ] {
+            let (mut repl, mut out, daemon) = repl_for(Ulid::generate(), vec![]).await;
+            repl.render(
+                Notice::State {
+                    thread: repl.thread,
+                    state: state.clone(),
+                },
+                &mut out,
+            );
+            repl.handle_line(line, &mut out).await;
+            let answers: Vec<SwitchReply> = daemon
+                .requests()
+                .into_iter()
+                .filter_map(|r| match r {
+                    Request::AnswerSwitch { answer, .. } => Some(answer),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                answers,
+                vec![expected.clone()],
+                "`{line}` sends {expected:?}"
+            );
+            daemon.stop();
+        }
+
+        // Anything else is a chat line, as before.
+        let (mut repl, mut out, daemon) = repl_for(Ulid::generate(), vec![]).await;
+        repl.render(
+            Notice::State {
+                thread: repl.thread,
+                state: state.clone(),
+            },
+            &mut out,
+        );
+        repl.handle_line("good morning", &mut out).await;
+        let requests = daemon.requests();
+        assert!(
+            !requests
+                .iter()
+                .any(|r| matches!(r, Request::AnswerSwitch { .. })),
+            "an unrelated line answers nothing: {requests:?}"
+        );
+        assert!(
+            requests.iter().any(|r| matches!(r, Request::Post { .. })),
+            "it goes to the chat: {requests:?}"
+        );
+        daemon.stop();
     }
 
     /// A REPL over a scripted daemon with one lead, for the tests that

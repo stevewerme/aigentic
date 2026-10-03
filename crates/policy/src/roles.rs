@@ -116,6 +116,7 @@ pub fn needs(request: &Request) -> Option<Role> {
         | Request::InvokeSkill { .. }
         | Request::Interrupt { .. }
         | Request::AnswerHuman { .. }
+        | Request::AnswerSwitch { .. }
         | Request::Rename { .. }
         | Request::SwitchProject { .. }
         | Request::Pin { .. }
@@ -236,6 +237,14 @@ mod tests {
                     thread: t,
                     call_id: "c".into(),
                     text: "yes".into(),
+                },
+                Some(Role::Write),
+            ),
+            (
+                Request::AnswerSwitch {
+                    thread: t,
+                    call_id: "c".into(),
+                    answer: aigentic_api::SwitchReply::No,
                 },
                 Some(Role::Write),
             ),

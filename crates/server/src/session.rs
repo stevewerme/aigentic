@@ -7,11 +7,11 @@ use std::sync::Arc;
 
 use aigentic_api::{
     Body, CheckpointAnswer, Frame, Notice, PROTOCOL_VERSION, ProjectInfo, Request, Response,
-    ThreadState, Welcome, decode, encode,
+    SwitchReply, ThreadState, Welcome, decode, encode,
 };
-use aigentic_runtime::Mode;
 use aigentic_runtime::aigentic_core::{AgentId, Author, UserId};
 use aigentic_runtime::aigentic_policy::Role;
+use aigentic_runtime::{Mode, SwitchAnswer, SwitchCtx};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot};
 use ulid::Ulid;
@@ -124,7 +124,11 @@ pub async fn serve(
                             ),
                         },
                     ));
-                    writer_task.abort();
+                    // Give the writer a moment to flush the refusal (issue
+                    // #7: the numbers are what a stale client needs to
+                    // read), then close.
+                    drop(out_tx);
+                    let _ = writer_task.await;
                     return Ok(());
                 }
                 match auth::user_for_token(&config, &token) {
@@ -244,6 +248,7 @@ fn project_for(threads: &ThreadTable, request: &Request) -> Option<String> {
         | Request::Interrupt { thread }
         | Request::Decide { thread, .. }
         | Request::AnswerHuman { thread, .. }
+        | Request::AnswerSwitch { thread, .. }
         | Request::Pin { thread, .. }
         | Request::Remember { thread, .. }
         | Request::Rename { thread, .. }
@@ -403,6 +408,86 @@ async fn handle(
                 reply,
             })
             .await
+        }
+        Request::AnswerSwitch {
+            thread,
+            call_id,
+            answer,
+        } => {
+            // A `yes` needs the target's context built here, before the
+            // answer reaches the actor, so the proposal's project is
+            // read from the actor's state first (issue #7). The role in
+            // the target is the one a `SwitchProject` needs, and the
+            // refusal text is the same.
+            let mut ack = None;
+            let mut target = None;
+            let (answer, ctx) = match answer {
+                SwitchReply::Yes => {
+                    let Some(project) = threads.waiting_switch(thread, &call_id).await else {
+                        return Response::Refused {
+                            reason: format!("nothing is pending for call {call_id}"),
+                        };
+                    };
+                    let participants = match threads.participants(&project) {
+                        Ok(p) => p,
+                        Err(e) => return thread_error(e),
+                    };
+                    let asked = Request::AnswerSwitch {
+                        thread,
+                        call_id: call_id.clone(),
+                        answer: SwitchReply::Yes,
+                    };
+                    if let Err(denied) = auth::allowed(user, config.owner(), &participants, &asked)
+                    {
+                        return Response::Refused {
+                            reason: format!("in {project}: {}", denied.reason),
+                        };
+                    }
+                    match threads.build_target(thread, &project).await {
+                        Ok(ctx) => {
+                            let (ctx, rx) = SwitchCtx::oneshot(ctx);
+                            ack = Some(rx);
+                            target = Some(project);
+                            (SwitchAnswer::Yes, ctx)
+                        }
+                        Err(e) => return thread_error(e),
+                    }
+                }
+                SwitchReply::No => (SwitchAnswer::No, SwitchCtx::none()),
+                SwitchReply::Corrected { to } => (SwitchAnswer::Corrected(to), SwitchCtx::none()),
+                SwitchReply::Withdrawn { note } => {
+                    (SwitchAnswer::Withdrawn(note), SwitchCtx::none())
+                }
+            };
+            let by = author.clone();
+            let reply = ask_actor(threads, open, thread, |reply| Mail::AnswerSwitch {
+                by,
+                call_id,
+                answer,
+                ctx,
+                reply,
+            })
+            .await;
+            match (ack, target) {
+                // The switch happened only when the parked turn says so:
+                // an `Ok` ack is the only evidence a `yes` was applied.
+                (Some(ack), Some(project)) if matches!(reply, Response::Ok) => match ack.await {
+                    Ok(Ok(())) => {
+                        threads.note_project(thread, &project);
+                        Response::Ok
+                    }
+                    // The turn left, or the runtime refused the switch
+                    // itself; either way the log is the truth and the
+                    // entry is left alone.
+                    Ok(Err(e)) => Response::Refused {
+                        reason: format!("in {project}: {e}"),
+                    },
+                    Err(_) => Response::Refused {
+                        reason: "the turn left before the switch happened".into(),
+                    },
+                },
+                _ => reply,
+            }
         }
         Request::Pin { thread, text } => {
             let author = author.clone();

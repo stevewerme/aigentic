@@ -92,6 +92,9 @@ pub enum SwitchAnswer {
     Withdrawn(String),
 }
 
+/// The pair `SwitchCtx` carries: the target's context and the ack.
+pub type SwitchSlot = Arc<Mutex<Option<(ProjectContext, oneshot::Sender<Result<(), String>>)>>>;
+
 /// The target's `ProjectContext` and the ack a `Yes` fires, behind two
 /// `Arc`s so an answer stays `Clone` and `PartialEq` while its context
 /// is built once (a context is not `Clone`).
@@ -100,7 +103,7 @@ pub enum SwitchAnswer {
 /// context handed out with an ack must be taken exactly once, or two
 /// projects would install and only one could be acked.
 #[derive(Debug)]
-pub struct SwitchCtx(Arc<Mutex<Option<(ProjectContext, oneshot::Sender<Result<(), String>>)>>>);
+pub struct SwitchCtx(SwitchSlot);
 
 impl SwitchCtx {
     /// An answer with no context: every `No`, `Corrected` and

@@ -83,6 +83,7 @@ impl Status {
             }
             ThreadState::AwaitingApproval { .. } => self.waiting = Some("awaiting approval"),
             ThreadState::AwaitingHuman { .. } => self.waiting = Some("awaiting an answer"),
+            ThreadState::AwaitingSwitch { .. } => self.waiting = Some("awaiting switch"),
         }
     }
 }
@@ -246,6 +247,13 @@ mod tests {
             questions: vec![],
         });
         assert_eq!(s.waiting, Some("awaiting an answer"));
+        s.apply_state(&ThreadState::AwaitingSwitch {
+            call_id: "c".into(),
+            project: "there".into(),
+            workspace: Some("~/there".into()),
+            reason: "belongs there".into(),
+        });
+        assert_eq!(s.waiting, Some("awaiting switch"));
         s.apply_state(&ThreadState::Idle);
         assert_eq!(s.queued, 0);
         assert_eq!(s.waiting, None);

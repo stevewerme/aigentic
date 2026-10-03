@@ -164,7 +164,8 @@ fn rig_delayed(script: Vec<Option<Vec<ProviderEvent>>>, allow_slow: bool, delay:
         aigentic_runtime::aigentic_core::AgentId("worker".into()),
     )
     .with_policy(policy);
-    let (actor, mailbox) = ThreadActor::new(runtime, None, Arc::new(NoReports)).unwrap();
+    let (actor, mailbox) =
+        ThreadActor::new(runtime, None, Arc::new(NoReports), Arc::new(|_: &str| None)).unwrap();
     let task = tokio::spawn(actor.run());
     Rig {
         mailbox,
@@ -727,7 +728,8 @@ async fn a_resumed_open_turn_is_continued_before_the_first_mail() {
         log,
         aigentic_runtime::aigentic_core::AgentId("worker".into()),
     );
-    let (actor, mailbox) = ThreadActor::new(runtime, None, Arc::new(NoReports)).unwrap();
+    let (actor, mailbox) =
+        ThreadActor::new(runtime, None, Arc::new(NoReports), Arc::new(|_: &str| None)).unwrap();
     let task = tokio::spawn(actor.run());
     // Subscribe after the continuation had time to finish.
     tokio::time::sleep(Duration::from_millis(100)).await;
