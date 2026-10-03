@@ -170,6 +170,16 @@ so the rule can be judged, not just obeyed. The `brief`, `plan-check` and
   on the machine could read. Judge the dumps from `raw.bin` when rows
   appear or vanish: pyte mis-renders scroll-region inserts (#48 was found
   that way).
+- **A red gate is never "pre-existing" until it's proven at the base,
+  built in its own target dir.** #7's implementer and judge both cleared
+  a failing test as pre-existing by building the base commit in a
+  `git worktree` with a **shared** `CARGO_TARGET_DIR`, and ran the newer
+  binary for both. Built separately, the base passed. And **`cargo test`
+  stops at the first failing test binary**, so that one failure hid four
+  more that #7 had caused (tool lists missing `suggest_project`). Any
+  failure in the gate blocks: rerun with `--no-fail-fast` to see them
+  all, and prove a "pre-existing" claim at the base in a separate target
+  dir before accepting it.
 
 ## Git and GitHub
 
