@@ -546,13 +546,9 @@ impl Daemon {
 
     /// The lead's log, read with repair as the daemon does.
     fn lead_log(&self, lead: Ulid) -> ThreadLog {
-        ThreadLog::open_with(
-            self.fixture.threads.join("p"),
-            lead,
-            Repair::TruncateTornTail,
-        )
-        .unwrap()
-        .0
+        ThreadLog::open_with(self.fixture.threads.clone(), lead, Repair::TruncateTornTail)
+            .unwrap()
+            .0
     }
 
     fn lead_events(&self, lead: Ulid) -> Vec<Event> {
@@ -566,7 +562,7 @@ impl Daemon {
     /// Any thread's log, read with repair.
     fn events(&self, thread: Ulid) -> Vec<Event> {
         ThreadLog::open_with(
-            self.fixture.threads.join("p"),
+            self.fixture.threads.clone(),
             thread,
             Repair::TruncateTornTail,
         )
@@ -667,7 +663,7 @@ impl Fixture {
     /// A thread's log under this fixture's threads directory, read with
     /// repair as the daemon does.
     fn events(&self, thread: Ulid) -> Vec<Event> {
-        ThreadLog::open_with(self.threads.join("p"), thread, Repair::TruncateTornTail)
+        ThreadLog::open_with(self.threads.clone(), thread, Repair::TruncateTornTail)
             .unwrap()
             .0
             .events()
@@ -748,7 +744,13 @@ fn write_test_workflow(bundled: &Path) {
 
 /// The world a run is driven in, for the host tests that need no daemon.
 fn world(daemon: &Daemon) -> aigentic_server::runs::RunWorld {
-    daemon.server.threads.run_world("p").unwrap()
+    // The run's world points at the flat threads directory (issue #9):
+    // children are written beside their lead, at `<base>/<id>.jsonl`.
+    daemon
+        .server
+        .threads
+        .run_world("p", daemon.fixture.threads.clone())
+        .unwrap()
 }
 
 /// T1 — `create_child` is idempotent: one `thread_started` with
@@ -762,17 +764,9 @@ async fn t1_create_child_is_idempotent() {
     let mut host = aigentic_server::runs::ServerHost::new(world(&daemon), lead);
 
     // An empty file first: a `kill -9` between creating the file and
-    // writing its header leaves one.
-    std::fs::create_dir_all(daemon.fixture.threads.join("p")).unwrap();
-    std::fs::write(
-        daemon
-            .fixture
-            .threads
-            .join("p")
-            .join(format!("{child}.jsonl")),
-        "",
-    )
-    .unwrap();
+    // writing its header leaves one. Flat, like every log since #9.
+    std::fs::create_dir_all(&daemon.fixture.threads).unwrap();
+    std::fs::write(daemon.fixture.threads.join(format!("{child}.jsonl")), "").unwrap();
     host.create_child(child, "implement-alone").unwrap();
     host.create_child(child, "implement-alone").unwrap();
 
@@ -1314,17 +1308,13 @@ async fn t6b_a_torn_tail_is_repaired_and_the_run_finishes() {
 
     // A half-written line at the end of both logs: bytes that were never
     // a complete event, as a `kill -9` between flush and fsync leaves.
-    tear_tail(&files.threads.join("p"), child);
-    tear_tail(&files.threads.join("p"), built.lead);
+    tear_tail(&files.threads, child);
+    tear_tail(&files.threads, built.lead);
 
     // The torn lead is still read as an unfinished run, by the same
     // lookup the daemon uses.
-    let (repaired, cut) = ThreadLog::open_with(
-        files.threads.join("p"),
-        built.lead,
-        Repair::TruncateTornTail,
-    )
-    .unwrap();
+    let (repaired, cut) =
+        ThreadLog::open_with(files.threads.clone(), built.lead, Repair::TruncateTornTail).unwrap();
     assert!(cut.is_some(), "the tail was cut");
     assert!(
         aigentic_server::runs::unfinished(&repaired, 58).is_some(),
@@ -1547,7 +1537,7 @@ async fn three_leads() -> (Fixture, Ulid, Ulid, Ulid) {
     // A finished lead: `thread_started`, `run_started`, `run_finished`,
     // written straight into the threads directory.
     let finished = Ulid::generate();
-    let dir = files.threads.join("p");
+    let dir = files.threads.clone();
     let mut log = ThreadLog::open(&dir, finished).unwrap();
     let user = Author::User(aigentic_runtime::aigentic_core::UserId("steve".into()));
     for (kind, payload) in [
@@ -1925,7 +1915,7 @@ async fn t12_an_answer_written_before_the_crash_is_acted_on_once() {
     // it: append it by hand, exactly as `Runner::answer` would, and leave
     // no task holding the lead.
     let (mut log, _cut) =
-        ThreadLog::open_with(files.threads.join("p"), lead, Repair::TruncateTornTail).unwrap();
+        ThreadLog::open_with(files.threads.clone(), lead, Repair::TruncateTornTail).unwrap();
     let before = log.len() as usize;
     log.append(aigentic_runtime::aigentic_log::NewEvent {
         kind: EventKind::CheckpointAnswered,
@@ -2174,12 +2164,7 @@ async fn t15_one_writer_per_lead_across_processes() {
         "the first daemon's run waits at its gate"
     );
     assert!(
-        first
-            .fixture
-            .threads
-            .join("p")
-            .join(format!("{lead}.lock"))
-            .exists(),
+        first.fixture.threads.join(format!("{lead}.lock")).exists(),
         "the lead's lock file sits beside its log"
     );
 
@@ -2240,14 +2225,15 @@ async fn t15c_two_processes_racing_a_fresh_build_make_one_lead() {
 
     let fixture = Fixture::new(Vec::new());
     let twin = fixture.twin();
-    let project_threads = fixture.threads.join("p");
+    let project_threads = fixture.threads.clone();
     std::fs::create_dir_all(&project_threads).unwrap();
+    // The issue's lock names its project since #9: `issue-<n>-<project>.lock`.
     let held = std::fs::File::options()
         .create(true)
         .read(true)
         .write(true)
         .truncate(false)
-        .open(project_threads.join("issue-58.lock"))
+        .open(project_threads.join("issue-58-p.lock"))
         .unwrap();
     held.try_lock().expect("nobody holds the issue's lock yet");
 
@@ -2373,8 +2359,8 @@ async fn t16_report_on_a_run_owned_thread_answers_without_an_actor() {
 #[tokio::test]
 async fn t15b_a_corrupt_lead_log_refuses_a_new_run() {
     let fx = Fixture::new(Vec::new());
-    // The project's own threads directory: `threads_dir/<project>`.
-    let threads = fx.threads.join("p");
+    // The threads directory itself: logs live flat in it since #9.
+    let threads = fx.threads.clone();
     let repo = fx.repo.clone();
 
     // A lead whose log was damaged: a good `thread_started`, then a line

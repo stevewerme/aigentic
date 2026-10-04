@@ -344,7 +344,7 @@ async fn a_thread_moves_to_another_project_and_stays_there_across_a_reload() {
             "{with_result}"
         );
     }
-    let kinds: Vec<EventKind> = ThreadLog::open(threads_base.join("p"), id)
+    let kinds: Vec<EventKind> = ThreadLog::open(threads_base.clone(), id)
         .unwrap()
         .read_all()
         .unwrap()
@@ -405,12 +405,10 @@ fn proposal(call_id: &str, project: &str, reason: &str) -> ProviderEvent {
 }
 
 /// Every event of a thread's log, read where the switch left it.
-fn events_under(
-    base: &std::path::Path,
-    project: &str,
-    id: Ulid,
-) -> Vec<aigentic_runtime::aigentic_core::Event> {
-    ThreadLog::open(base.join(project), id)
+fn events_under(base: &std::path::Path, id: Ulid) -> Vec<aigentic_runtime::aigentic_core::Event> {
+    // Logs live flat in the threads directory since #9: the switch
+    // changes where the thread is built, not where its log sits.
+    ThreadLog::open(base, id)
         .expect("the log opens")
         .read_all()
         .expect("the log reads")
@@ -626,7 +624,7 @@ async fn t9_a_proposal_reaches_the_client_and_a_yes_switches_the_project() {
     assert_eq!(reason, "the message is about q");
 
     // The proposal is in the log before anyone answers it.
-    let them = events_under(&rig.threads_base, "p", id);
+    let them = events_under(&rig.threads_base, id);
     let proposed: Vec<aigentic_runtime::aigentic_log::DecisionProposedPayload> = them
         .iter()
         .filter(|e| e.kind == EventKind::DecisionProposed)
@@ -653,7 +651,7 @@ async fn t9_a_proposal_reaches_the_client_and_a_yes_switches_the_project() {
     until_idle(&mut notices).await;
 
     assert_eq!(rig.server.threads.project_of(id).as_deref(), Some("q"));
-    let kinds: Vec<EventKind> = events_under(&rig.threads_base, "p", id)
+    let kinds: Vec<EventKind> = events_under(&rig.threads_base, id)
         .iter()
         .map(|e| e.kind)
         .collect();
@@ -723,7 +721,7 @@ async fn t9_a_no_leaves_the_project_and_the_prefix_alone() {
     until_idle(&mut notices).await;
 
     assert_eq!(rig.server.threads.project_of(id).as_deref(), Some("p"));
-    let them = events_under(&rig.threads_base, "p", id);
+    let them = events_under(&rig.threads_base, id);
     assert!(
         !them.iter().any(|e| e.kind == EventKind::ProjectSwitched),
         "nothing switched"
@@ -771,7 +769,7 @@ async fn t9_a_yes_without_write_in_the_target_is_refused_and_stays_pending() {
     );
     assert_eq!(rig.server.threads.project_of(id).as_deref(), Some("p"));
     assert!(
-        answers(&events_under(&rig.threads_base, "p", id)).is_empty(),
+        answers(&events_under(&rig.threads_base, id)).is_empty(),
         "the proposal is still open"
     );
 
@@ -1027,7 +1025,7 @@ async fn t9_the_second_client_to_answer_is_refused_and_the_first_stands() {
     until_idle(&mut notices).await;
     assert_eq!(rig.server.threads.project_of(id).as_deref(), Some("q"));
     assert_eq!(
-        answers(&events_under(&rig.threads_base, "p", id)).len(),
+        answers(&events_under(&rig.threads_base, id)).len(),
         1,
         "one answer, not two"
     );
@@ -1076,7 +1074,7 @@ async fn t9_a_cancelled_turn_leaves_the_answer_refused_and_the_entry_alone() {
         "the turn left: {refused:?}"
     );
     assert_eq!(rig.server.threads.project_of(id).as_deref(), Some("p"));
-    let them = events_under(&rig.threads_base, "p", id);
+    let them = events_under(&rig.threads_base, id);
     assert!(
         !them.iter().any(|e| e.kind == EventKind::ProjectSwitched),
         "no switch happened"

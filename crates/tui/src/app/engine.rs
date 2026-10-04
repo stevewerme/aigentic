@@ -2348,13 +2348,12 @@ mod tests {
             "a retry draws no transcript line: {lines:#?}"
         );
         // And the retry is in the log the transcript was built from.
-        let events = aigentic_runtime::aigentic_log::ThreadLog::open(
-            dir.path().join("threads/proj"),
-            thread,
-        )
-        .unwrap()
-        .read_all()
-        .unwrap();
+        // Flat since #9: one log directory, not one per project.
+        let events =
+            aigentic_runtime::aigentic_log::ThreadLog::open(dir.path().join("threads"), thread)
+                .unwrap()
+                .read_all()
+                .unwrap();
         assert!(
             events.iter().any(|e| e.kind == EventKind::ProviderRetried),
             "the retry is logged: {events:#?}"

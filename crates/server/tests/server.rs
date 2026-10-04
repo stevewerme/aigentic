@@ -114,8 +114,10 @@ impl Daemon {
             .unwrap()
     }
 
-    fn log(&self, project: &str, thread: ulid::Ulid) -> Vec<EventKind> {
-        ThreadLog::open(self.threads_base.join(project), thread)
+    fn log(&self, thread: ulid::Ulid) -> Vec<EventKind> {
+        // Logs live flat in the threads directory since #9: the project
+        // no longer names a subdirectory.
+        ThreadLog::open(self.threads_base.clone(), thread)
             .unwrap()
             .read_all()
             .unwrap()
@@ -225,8 +227,8 @@ async fn roles_are_checked_before_the_log_and_thread_started_comes_first() {
         panic!("thread")
     };
     assert_eq!(thread.project.as_deref(), Some("p"));
-    assert_eq!(d.log("p", thread.id), vec![EventKind::ThreadStarted]);
-    let events = ThreadLog::open(d.threads_base.join("p"), thread.id)
+    assert_eq!(d.log(thread.id), vec![EventKind::ThreadStarted]);
+    let events = ThreadLog::open(d.threads_base.clone(), thread.id)
         .unwrap()
         .read_all()
         .unwrap();
@@ -244,7 +246,7 @@ async fn roles_are_checked_before_the_log_and_thread_started_comes_first() {
         .await
         .unwrap();
     assert!(matches!(r, Response::Refused { .. }), "{r:?}");
-    assert_eq!(d.log("p", thread.id), vec![EventKind::ThreadStarted]);
+    assert_eq!(d.log(thread.id), vec![EventKind::ThreadStarted]);
     // A write-level action by an approver runs; a decide by a read user
     // is refused before anything is looked at.
     let r = reviewer
@@ -468,7 +470,7 @@ async fn idle_threads_unload_but_never_while_awaiting_approval() {
         .await
         .unwrap();
     for _ in 0..100 {
-        if d.log("q", thread.id).last() == Some(&EventKind::TurnEnded) {
+        if d.log(thread.id).last() == Some(&EventKind::TurnEnded) {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -539,7 +541,7 @@ async fn tcp_on_a_loopback_port_serves_the_same_sessions() {
         .unwrap();
     until_state(&mut notices, |s| *s == ThreadState::Idle).await;
     assert_eq!(
-        d.log("q", thread.id),
+        d.log(thread.id),
         vec![
             EventKind::ThreadStarted,
             EventKind::UserMessage,
@@ -608,10 +610,10 @@ async fn remember_files_a_line_with_no_model_call() {
         .unwrap();
     assert!(matches!(r, Response::Ok), "{r:?}");
     assert_eq!(
-        d.log("p", thread.id),
+        d.log(thread.id),
         vec![EventKind::ThreadStarted, EventKind::MemoryRemembered]
     );
-    let events = ThreadLog::open(d.threads_base.join("p"), thread.id)
+    let events = ThreadLog::open(d.threads_base.clone(), thread.id)
         .unwrap()
         .read_all()
         .unwrap();

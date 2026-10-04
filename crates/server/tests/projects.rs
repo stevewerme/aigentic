@@ -365,8 +365,9 @@ async fn the_listing_follows_two_switches_and_opens_no_stray_log() {
     assert_eq!(third, expected);
     println!("after the second switch:\n{third}");
 
-    // The log never left its home: the switches open none.
-    assert_eq!(logs_under(&d.threads_base), vec![format!("p1/{id}.jsonl")]);
+    // The log never left its home, and since #9 the home is the one
+    // flat threads directory: the switches open none.
+    assert_eq!(logs_under(&d.threads_base), vec![format!("{id}.jsonl")]);
 }
 
 /// T6 (issue #81): the block is the creator's, not the opener's; an
@@ -529,6 +530,11 @@ async fn the_listing_keeps_a_missing_root_and_the_first_of_two_claims() {
 }
 
 /// A log for a thread, written by hand: `author` started it.
+///
+/// This deliberately writes under `<base>/<project>/`, the legacy
+/// layout, **after** the daemon exists (issue #9): it is the case a
+/// thread turns up in a legacy subdirectory the index never scanned, so
+/// the miss path has to find it. Don't move it flat.
 fn hand_written(base: &Path, project: &str, root: &Path, author: Author) -> Ulid {
     let threads = base.join(project);
     std::fs::create_dir_all(&threads).unwrap();

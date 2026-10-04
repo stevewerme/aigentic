@@ -212,6 +212,11 @@ impl Server {
             .threads_dir
             .clone()
             .unwrap_or_else(crate::config::default_threads_dir);
+        // Every daemon start moves what is left of the per-project
+        // layout flat, once, before the table reads it (issue #9). An
+        // error never stops the daemon: the table still reads the legacy
+        // directories, so a log nobody moved stays reachable.
+        let migrated = crate::migrate::migrate(&threads_base).map_err(|e| e.to_string());
         let threads = Arc::new(
             ThreadTable::new(
                 config.clone(),
@@ -222,6 +227,7 @@ impl Server {
                 threads_base,
                 guard,
             )
+            .with_migrated(migrated)
             .with_profile(profile)
             .with_workspaces(workspaces),
         );
@@ -303,10 +309,10 @@ impl Server {
 
     /// A daemon in this process for one user over a private socket:
     /// what `aigentic` does when nothing listens. `root` becomes the one
-    /// project (named by its file, else `_none`); the token is random and
-    /// lives only in memory. `profile` is the client's `--profile`,
-    /// which wins over the project's `[model] profile` for every thread
-    /// this daemon builds.
+    /// project (named by its file, else its basename). The token is
+    /// random and lives only in memory. `profile` is the client's
+    /// `--profile`, which wins over the project's `[model] profile` for
+    /// every thread this daemon builds.
     pub async fn embed(
         config: Config,
         config_dir: PathBuf,
@@ -337,7 +343,13 @@ impl Server {
         let dir = tempfile_dir()?;
         let socket = dir.join("aigentic.sock");
         let token = random_token();
-        let project = project_name_at(&root);
+        // The workspace files of the real config name projects too, and
+        // a bare root must not borrow one of their names when its
+        // basename clashes at another root (issue #9): the embedded
+        // daemon loads them the way `build` does, an error counting as
+        // none, and hands the merged set to `Server::build`.
+        let workspaces = crate::workspaces::load_all(&config_dir).unwrap_or_default();
+        let project = project_name_at(&root, &workspaces);
         let server = ServerConfig {
             listen: format!("unix:{}", socket.display()),
             idle_unload_secs: 24 * 3600,

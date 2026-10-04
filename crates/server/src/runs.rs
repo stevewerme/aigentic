@@ -331,10 +331,14 @@ impl Drop for LeadLock {
 /// [`LeadLock`] is keyed by the lead, so it cannot exist before the lead
 /// does: two processes that both find no unfinished run for an issue
 /// would each create a lead, and each would drive its own. This lock, on
-/// `<threads_dir>/issue-<n>.lock`, is held across the whole
+/// `<base>/issue-<n>-<project>.lock`, is held across the whole
 /// check-and-create, so the second process waits, then finds the first
 /// one's lead and is refused (or attaches) rather than starting another.
 /// Like the lead's lock, the file is left in place.
+///
+/// The project is in the name because the base is one flat directory
+/// once threads moved there (issue #9): two projects building issue 7 at
+/// once are two different runs, and must not wait for one another.
 pub struct IssueLock {
     file: std::fs::File,
 }
@@ -345,11 +349,11 @@ impl IssueLock {
     /// holder is stuck; the caller is refused rather than kept waiting.
     const WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
-    /// Take `issue`'s lock under `threads_dir`, waiting while another
-    /// process holds it.
-    pub async fn take(threads_dir: &std::path::Path, issue: u64) -> Result<Self, String> {
-        let path = threads_dir.join(format!("issue-{issue}.lock"));
-        let file = open_lock_file(threads_dir, &path)?;
+    /// Take `issue`'s lock under `base` for `project`, waiting while
+    /// another process holds it.
+    pub async fn take(base: &std::path::Path, project: &str, issue: u64) -> Result<Self, String> {
+        let path = base.join(format!("issue-{issue}-{}.lock", lock_name(project)));
+        let file = open_lock_file(base, &path)?;
         let deadline = tokio::time::Instant::now() + Self::WAIT;
         loop {
             match file.try_lock() {
@@ -375,6 +379,22 @@ impl Drop for IssueLock {
     fn drop(&mut self) {
         let _ = self.file.unlock();
     }
+}
+
+/// A project name as a file name: every character outside
+/// `[A-Za-z0-9_-]` becomes `_` (issue #9), so an issue lock's name is a
+/// safe path whatever a project is called.
+pub fn lock_name(project: &str) -> String {
+    project
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// Open (creating it if needed) a lock file under `threads_dir`.

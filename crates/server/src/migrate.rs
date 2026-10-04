@@ -20,7 +20,7 @@ use ulid::Ulid;
 const LOCK: &str = ".migrate.lock";
 
 /// What one [`migrate`] did.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Migrated {
     /// Logs renamed to `<base>/<id>.jsonl`.
     pub moved: usize,
