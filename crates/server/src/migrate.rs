@@ -24,9 +24,11 @@ const LOCK: &str = ".migrate.lock";
 pub struct Migrated {
     /// Logs renamed to `<base>/<id>.jsonl`.
     pub moved: usize,
-    /// Ids another process was driving: the lock was held, so both the
-    /// log and its lock stay in the legacy directory until a later
-    /// daemon start can take the lock.
+    /// Ids left in a legacy directory where another process held a
+    /// lock (a lead being driven, or an issue's check-and-create): the
+    /// whole directory stays, logs and locks, until a later daemon start
+    /// finds every lock free. A lead's step children have no lock of
+    /// their own, so moving any log there could split a live one.
     pub held: Vec<Ulid>,
     /// Ids that already had a flat log: the legacy file is left alone
     /// and the flat one wins.
@@ -47,18 +49,35 @@ pub fn migrate(base: &Path) -> io::Result<Migrated> {
     let _serialise = lock_for_update(&base.join(LOCK))?;
 
     for sub in legacy_dirs(base)? {
-        for id in legacy_logs(&sub)? {
-            let flat = base.join(format!("{id}.jsonl"));
-            let lock_path = sub.join(format!("{id}.lock"));
-            let lock = match take_lead_lock(&lock_path)? {
-                Lead::None => None,
+        // Every lock in the directory first (#9 review): a lead's step
+        // children have no lock of their own and are written beside it,
+        // so while any lock here is held — a lead being driven, or an
+        // issue's check-and-create — the whole directory is left for a
+        // later start. Moving one of its logs would let the live writer
+        // recreate it at the old path, splitting it in two.
+        let mut free: Vec<(Ulid, File)> = Vec::new();
+        let mut busy = false;
+        for (stem, lock_path) in locks_in(&sub)? {
+            match take_lead_lock(&lock_path)? {
+                Lead::None => {}
                 Lead::Held => {
-                    // Another process drives this lead; leave both.
-                    out.held.push(id);
-                    continue;
+                    busy = true;
+                    break;
                 }
-                Lead::Free(file) => Some(file),
-            };
+                Lead::Free(file) => {
+                    if let Ok(id) = stem.parse::<Ulid>() {
+                        free.push((id, file));
+                    }
+                }
+            }
+        }
+        let logs = legacy_logs(&sub)?;
+        if busy {
+            out.held.extend(logs);
+            continue;
+        }
+        for id in logs {
+            let flat = base.join(format!("{id}.jsonl"));
             if flat.exists() {
                 // The flat log wins; the legacy file stays put.
                 out.clashes.push(id);
@@ -70,10 +89,13 @@ pub fn migrate(base: &Path) -> io::Result<Migrated> {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e),
             }
-            if lock.is_some() {
-                let _ = std::fs::remove_file(&lock_path);
+            // A lead's lock goes with its log; we hold it, so no one
+            // else is between the check and the removal.
+            if free.iter().any(|(lead, _)| *lead == id) {
+                let _ = std::fs::remove_file(sub.join(format!("{id}.lock")));
             }
         }
+        // The free locks are released here, as `free` drops.
     }
     Ok(out)
 }
@@ -116,6 +138,22 @@ fn take_lead_lock(path: &Path) -> io::Result<Lead> {
         // from under. Leave it, the way a held one is left.
         Err(std::fs::TryLockError::Error(_)) => Ok(Lead::Held),
     }
+}
+
+/// Every `<stem>.lock` in `dir`, in name order: a lead's
+/// `<ulid>.lock` and an issue's `issue-<n>.lock` alike.
+fn locks_in(dir: &Path) -> io::Result<Vec<(String, PathBuf)>> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if let Some(stem) = name.strip_suffix(".lock") {
+            out.push((stem.to_owned(), entry.path()));
+        }
+    }
+    out.sort();
+    Ok(out)
 }
 
 /// Every subdirectory of `base` whose name doesn't start with `.`, in

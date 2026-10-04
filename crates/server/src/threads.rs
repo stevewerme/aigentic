@@ -555,15 +555,10 @@ impl ThreadTable {
         // A row's count is the threads whose project is that row: a
         // switched thread counts under its current project, and one
         // whose project names no configured project counts nowhere
-        // (issue #9). Read the ids under the lock, then ask
-        // `project_of`, which takes it again.
-        let ids: Vec<Ulid> = self
-            .index
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .keys()
-            .copied()
-            .collect();
+        // (issue #9). `known_ids` adds what is on disk, so a thread
+        // another daemon made since this one started counts too (#9
+        // review); `project_of` scans it on its first miss.
+        let ids = self.known_ids();
         let projects: Vec<Option<String>> = ids.iter().map(|id| self.project_of(*id)).collect();
         self.server
             .projects
@@ -584,13 +579,9 @@ impl ThreadTable {
     pub fn list(&self, project: &str) -> Result<Vec<ThreadInfo>, ThreadError> {
         // The project has to be one this daemon knows, as before.
         self.root_of(project)?;
-        let mut ids: Vec<Ulid> = self
-            .index
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .keys()
-            .copied()
-            .collect();
+        // The index plus what is on disk: a thread another daemon made
+        // since this one started is listed too (#9 review).
+        let mut ids = self.known_ids();
         ids.retain(|id| self.project_of(*id).as_deref() == Some(project));
         ids.sort_unstable_by(|a, b| b.cmp(a));
         let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());

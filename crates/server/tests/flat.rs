@@ -173,6 +173,64 @@ fn migrate_holds_a_driven_lead_and_skips_a_clash() {
     assert!(!b_lock.exists());
 }
 
+/// #9 review, item 1: a lead's step children have no lock of their own
+/// and are written beside it, so a held lock anywhere in a directory —
+/// a lead's or an issue's — leaves the whole directory, or a live child
+/// would be moved and recreated at the old path, split in two.
+#[test]
+fn migrate_leaves_a_whole_directory_while_any_lock_in_it_is_held() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("threads");
+    std::fs::create_dir_all(&base).unwrap();
+
+    let p = base.join("p");
+    let q = base.join("q");
+    let r = base.join("r");
+    let lead = Ulid::generate();
+    let child = Ulid::generate();
+    let plain = Ulid::generate();
+    let starting = Ulid::generate();
+    let lead_legacy = write_log(&p, lead, &body(lead));
+    let child_legacy = write_log(&p, child, &body(child));
+    let lead_lock = hold(&p.join(format!("{lead}.lock")));
+    write_log(&q, plain, &body(plain));
+    write_log(&r, starting, &body(starting));
+    let issue_lock = hold(&r.join("issue-7.lock"));
+
+    let out = migrate(&base).unwrap();
+    assert_eq!(out.moved, 1, "only q's log moves: {out:?}");
+    let mut held = out.held.clone();
+    held.sort();
+    let mut expected = vec![lead, child, starting];
+    expected.sort();
+    assert_eq!(held, expected, "{out:?}");
+    assert!(lead_legacy.is_file() && child_legacy.is_file());
+    assert!(
+        !flat(&base, child).exists(),
+        "the unlocked child stays beside its lead"
+    );
+    assert!(r.join(format!("{starting}.jsonl")).is_file());
+    assert!(flat(&base, plain).is_file());
+
+    // Both builds end: the next start moves the rest.
+    drop(lead_lock);
+    drop(issue_lock);
+    let after = migrate(&base).unwrap();
+    assert_eq!(after.moved, 3, "{after:?}");
+    assert!(after.held.is_empty(), "{after:?}");
+    for id in [lead, child, starting] {
+        assert!(flat(&base, id).is_file());
+    }
+    assert!(
+        !p.join(format!("{lead}.lock")).exists(),
+        "the lead's lock went with it"
+    );
+    assert!(
+        r.join("issue-7.lock").is_file(),
+        "an issue lock is never touched"
+    );
+}
+
 #[test]
 fn two_migrations_at_once_move_every_log_exactly_once() {
     let dir = tempfile::tempdir().unwrap();
@@ -747,6 +805,67 @@ async fn t6_listings_and_counts_follow_the_log() {
         !daemon.base().join("p").exists(),
         "no per-project directory is made"
     );
+}
+
+/// #9 review, item 3: a thread another daemon made after this one
+/// started — two terminals, two embedded daemons — is listed and counted,
+/// written flat or under a legacy directory.
+#[tokio::test]
+async fn a_thread_made_behind_the_daemon_is_listed_and_counted() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = project(dir.path(), "p", "");
+    let q = project(dir.path(), "q", "");
+    let daemon = Daemon::new(
+        dir.path(),
+        vec![pc("p", &p), pc("q", &q)],
+        &["steve"],
+        false,
+    )
+    .await;
+    let mut steve = daemon.connect("steve").await;
+    let mine = created(&mut steve, "p").await;
+
+    // Written after the daemon was built, so not in its index yet.
+    let flat_one = Ulid::generate();
+    let mut log = hand_log(daemon.base(), None, flat_one);
+    append_started(&mut log, Some("p"), &p, "steve");
+    let legacy_one = Ulid::generate();
+    let mut log = hand_log(daemon.base(), Some("p"), legacy_one);
+    append_started(&mut log, Some("q"), &q, "steve");
+
+    let Response::Threads { threads } = steve
+        .request(Request::ListThreads {
+            project: "p".into(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("threads")
+    };
+    let ids: Vec<Ulid> = threads.iter().map(|t| t.id).collect();
+    assert!(ids.contains(&mine) && ids.contains(&flat_one), "{ids:?}");
+    assert!(!ids.contains(&legacy_one), "its log says q: {ids:?}");
+
+    let Response::Threads { threads } = steve
+        .request(Request::ListThreads {
+            project: "q".into(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("threads")
+    };
+    assert!(threads.iter().any(|t| t.id == legacy_one));
+
+    let Response::Projects { projects } = steve.request(Request::ListProjects).await.unwrap()
+    else {
+        panic!("projects")
+    };
+    let rows: Vec<(&str, u64)> = projects
+        .iter()
+        .map(|p| (p.name.as_str(), p.threads))
+        .collect();
+    assert_eq!(rows, vec![("p", 2), ("q", 1)]);
 }
 
 /// T7 — the issue lock names the project, so two projects' builds of one
