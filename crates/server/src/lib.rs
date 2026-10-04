@@ -9,6 +9,7 @@ pub mod awake;
 pub mod build;
 pub mod config;
 pub mod listing;
+pub mod migrate;
 pub mod reports;
 pub mod runs;
 pub mod serve;
