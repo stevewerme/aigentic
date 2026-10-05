@@ -1798,6 +1798,10 @@ pub fn collect_decisions(
     Ok(report)
 }
 
+/// The decisions table's narrowest name column: what it was before
+/// start-up rows (issue #85), so a table of plain rows is unchanged.
+const MIN_NAME_WIDTH: usize = 14;
+
 /// The 30 most recent answers `last 30` is taken over: ADR 0002's "the
 /// last 30 proposals of that kind that a person answered".
 const LAST_N: usize = 30;
@@ -1958,14 +1962,15 @@ pub fn render_decisions(report: &DecisionReport) -> String {
     } else {
         // The name column is as wide as the longest name printed, so
         // `project (start-up)` lines up with the rest (issue #85), and
-        // never narrower than the header's own `kind`.
+        // never narrower than the 14 it always was, so a table of plain
+        // rows reads as it did before (#85's review).
         let name_width = report
             .kinds
             .iter()
             .map(|k| row_name(k).chars().count())
-            .chain(std::iter::once("kind".len()))
+            .chain(std::iter::once(MIN_NAME_WIDTH))
             .max()
-            .unwrap_or(4);
+            .unwrap_or(MIN_NAME_WIDTH);
         out.push_str(&format!(
             "\n{:<name_width$} {:>8} {:>5} {:>5} {:>10} {:>10} {:>7} {:>6} {:>8}\n",
             "kind", "proposed", "yes", "no", "corrected", "withdrawn", "pending", "rate", "last 30"
@@ -5191,5 +5196,31 @@ api_key_env = "TENSORX_API_KEY"
         let text = render_decisions(&report);
         assert!(!text.lines().any(|l| l == "project"), "{text}");
         assert!(text.contains("project (start-up)"), "{text}");
+    }
+
+    /// #85's review: a table with plain rows only keeps the 14-wide
+    /// name column it always had.
+    #[test]
+    fn a_plain_decisions_table_keeps_its_name_column() {
+        let report = DecisionReport {
+            kinds: vec![DecisionKindStats {
+                kind: DecisionKind::Project,
+                proposed: 1,
+                yes: 1,
+                no: 0,
+                corrected: 0,
+                withdrawn: 0,
+                pending: 0,
+                rate: Some(100),
+                last_30: Some(100),
+                startup: false,
+            }],
+            ..DecisionReport::default()
+        };
+        let text = render_decisions(&report);
+        let header = text.lines().find(|l| l.starts_with("kind")).unwrap();
+        // `kind` padded to the column, one space, then `proposed`,
+        // which fills its own 8-wide column exactly.
+        assert_eq!(header.find("proposed"), Some(MIN_NAME_WIDTH + 1), "{text}");
     }
 }
