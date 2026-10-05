@@ -103,6 +103,7 @@ fn started(project: Option<&str>) -> NewEvent {
         created_by: Author::User(UserId("steve".into())),
         parent_thread: None,
         step: None,
+        front: false,
     };
     event(
         EventKind::ThreadStarted,

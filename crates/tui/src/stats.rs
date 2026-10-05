@@ -4553,6 +4553,7 @@ api_key_env = "TENSORX_API_KEY"
                 created_by: Author::User(UserId("steve".into())),
                 parent_thread: None,
                 step: None,
+                front: false,
             })
             .unwrap(),
             "created_at": at,

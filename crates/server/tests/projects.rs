@@ -546,6 +546,8 @@ fn hand_written(base: &Path, project: &str, root: &Path, author: Author) -> Ulid
         created_by: author.clone(),
         parent_thread: None,
         step: None,
+        // never a front thread (issue #84)
+        front: false,
     };
     log.append(NewEvent {
         kind: EventKind::ThreadStarted,

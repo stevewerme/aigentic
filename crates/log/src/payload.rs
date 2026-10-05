@@ -84,6 +84,9 @@ pub struct ThreadStartedPayload {
     /// not). `None` on older lines.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub step: Option<String>,
+    /// The person's front thread (#84): plain `aigentic` reopens the newest one they made.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub front: bool,
 }
 
 /// Token usage for one model call, as persisted. The token fields mirror
@@ -1170,6 +1173,7 @@ mod tests {
             created_by: Author::User(aigentic_core::UserId("steve".into())),
             parent_thread: None,
             step: None,
+            front: false,
         };
         let value = serde_json::to_value(&started).unwrap();
         assert_eq!(
@@ -2136,6 +2140,41 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<ThreadStartedPayload>(value).unwrap(),
             child
+        );
+    }
+
+    /// T1 (issue #84): `front` is the person's front thread's flag. A
+    /// line written before #84 reads as `false`, `false` is never
+    /// written (so the bytes are the ones an old line has), and `true`
+    /// round-trips.
+    #[test]
+    fn the_front_flag_round_trips_and_an_old_line_reads_as_false() {
+        let old = json!({
+            "project": "vendela",
+            "root": "/srv/vendela",
+            "created_by": {"kind": "user", "id": "steve"}
+        });
+        let read: ThreadStartedPayload = serde_json::from_value(old.clone()).unwrap();
+        assert!(!read.front, "a line without the key is not front");
+        // And it writes back byte for byte: `false` is never serialised.
+        assert_eq!(serde_json::to_value(&read).unwrap(), old);
+        assert!(
+            !serde_json::to_value(&read)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("front"),
+            "the flag is absent when false"
+        );
+
+        // A front thread's line carries the key, and reads back as front.
+        let mut front = read.clone();
+        front.front = true;
+        let value = serde_json::to_value(&front).unwrap();
+        assert_eq!(value["front"], json!(true));
+        assert_eq!(
+            serde_json::from_value::<ThreadStartedPayload>(value).unwrap(),
+            front
         );
     }
 }

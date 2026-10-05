@@ -532,6 +532,8 @@ fn append_started(log: &mut ThreadLog, project: Option<&str>, root: &Path, by: &
             created_by: Author::User(UserId(by.to_owned())),
             parent_thread: None,
             step: None,
+            // never a front thread (issue #84)
+            front: false,
         })
         .unwrap(),
         parent_event: None,

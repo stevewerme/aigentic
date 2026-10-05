@@ -1549,6 +1549,8 @@ async fn three_leads() -> (Fixture, Ulid, Ulid, Ulid) {
                 created_by: user.clone(),
                 parent_thread: None,
                 step: None,
+                // never a front thread (issue #84)
+                front: false,
             })
             .unwrap(),
         ),
@@ -2379,6 +2381,8 @@ async fn t15b_a_corrupt_lead_log_refuses_a_new_run() {
                 created_by: Author::User(aigentic_runtime::aigentic_core::UserId("steve".into())),
                 parent_thread: None,
                 step: None,
+                // never a front thread (issue #84)
+                front: false,
             })
             .unwrap(),
         ),

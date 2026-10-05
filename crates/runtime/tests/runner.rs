@@ -289,6 +289,7 @@ impl RunnerHost for FakeHost {
                 created_by: Author::User(UserId("steve".into())),
                 parent_thread: Some(self.lead),
                 step: Some(step.to_owned()),
+                front: false,
             })
             .expect("thread_started serialises"),
             parent_event: None,

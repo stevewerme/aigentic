@@ -18,8 +18,9 @@ use ulid::Ulid;
 /// adds `Build`/`AnswerCheckpoint` and `Response::Run` (issue #58);
 /// version 3 adds `AnswerSwitch` and `ThreadState::AwaitingSwitch`
 /// (issue #7), so a version-2 client is refused rather than left never
-/// seeing the switch it is asked to answer.
-pub const PROTOCOL_VERSION: u32 = 3;
+/// seeing the switch it is asked to answer; version 4 adds
+/// `Front`/`NewFront` and `Response::Front` (issue #84).
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// One line on the wire.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -78,6 +79,19 @@ pub enum Request {
         project: String,
     },
     CreateThread {
+        project: String,
+    },
+    /// The user's front thread (issue #84): the newest thread they made
+    /// with `front` set, or a new one in `project` when they have none
+    /// or the old one can't be opened. The handler judges the roles:
+    /// `read` in the front thread's project to resume, `write` in the
+    /// requested project to create.
+    Front {
+        project: String,
+    },
+    /// A new front thread in `project` (issue #84), replacing whatever
+    /// was front; the old one stays listed.
+    NewFront {
         project: String,
     },
     /// The events since `from_seq`, then a live subscription.
@@ -235,6 +249,14 @@ pub enum Response {
     Thread {
         thread: ThreadInfo,
     },
+    /// The reply to `Front` (issue #84): the front thread, and how it
+    /// was arrived at. `Replaced` names why the old one could not be
+    /// opened, in words a banner can print; the old thread stays
+    /// listed.
+    Front {
+        thread: ThreadInfo,
+        outcome: FrontOutcome,
+    },
     /// The reply to `Build` (issue #58): the run's lead thread.
     /// `resumed` says an unfinished run was picked up rather than a new
     /// one started. The session subscribes this client to the lead.
@@ -280,6 +302,20 @@ pub enum Response {
     Error {
         message: String,
     },
+}
+
+/// How a `Front` request was answered (issue #84).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FrontOutcome {
+    /// The user's existing front thread, opened where it was.
+    Resumed,
+    /// The user had none: this is the first one.
+    First,
+    /// The old front thread could not be opened; this is a new one, and
+    /// `reason` says why the old one could not be, in words a banner
+    /// can print.
+    Replaced { reason: String },
 }
 
 /// The reply to `Hello`.
@@ -534,6 +570,19 @@ mod tests {
         Ulid::from_parts(1_700_000_000_000, 1)
     }
 
+    /// A thread row, for the replies that carry one.
+    fn info() -> ThreadInfo {
+        ThreadInfo {
+            id: thread(),
+            project: Some("p".into()),
+            date: "2026-09-22".into(),
+            events: 9,
+            first_line: "What's next?".into(),
+            state: ThreadState::Idle,
+            title: None,
+        }
+    }
+
     fn every_request() -> Vec<Request> {
         vec![
             Request::Hello {
@@ -546,6 +595,12 @@ mod tests {
             },
             Request::CreateThread {
                 project: "p".into(),
+            },
+            Request::Front {
+                project: "p".into(),
+            },
+            Request::NewFront {
+                project: "q".into(),
             },
             Request::Open {
                 thread: thread(),
@@ -631,35 +686,41 @@ mod tests {
     }
 
     fn every_response() -> Vec<Response> {
-        let info = ProjectInfo {
+        let project_info = ProjectInfo {
             name: "p".into(),
             root: PathBuf::from("/srv/p"),
             role: Some("approve".into()),
             threads: 2,
         };
-        let thread_info = ThreadInfo {
-            id: thread(),
-            project: Some("p".into()),
-            date: "2026-09-22".into(),
-            events: 9,
-            first_line: "What's next?".into(),
-            state: ThreadState::Idle,
-            title: None,
-        };
+        let thread_info = info();
         vec![
             Response::Welcome(Welcome {
                 user: "steve".into(),
-                projects: vec![info.clone()],
+                projects: vec![project_info.clone()],
                 server: "aigentic 0.1.0".into(),
             }),
             Response::Projects {
-                projects: vec![info],
+                projects: vec![project_info],
             },
             Response::Threads {
                 threads: vec![thread_info.clone()],
             },
             Response::Thread {
+                thread: thread_info.clone(),
+            },
+            Response::Front {
+                thread: thread_info.clone(),
+                outcome: FrontOutcome::Resumed,
+            },
+            Response::Front {
+                thread: thread_info.clone(),
+                outcome: FrontOutcome::First,
+            },
+            Response::Front {
                 thread: thread_info,
+                outcome: FrontOutcome::Replaced {
+                    reason: "you no longer have a role in p".into(),
+                },
             },
             Response::Run {
                 lead: thread(),
@@ -770,6 +831,56 @@ mod tests {
             assert!(line.ends_with('\n'));
             assert_eq!(line.matches('\n').count(), 1, "{line}");
             assert_eq!(decode(&line).unwrap(), frame, "{line}");
+        }
+    }
+
+    /// T2 (issue #84): the front thread's requests and reply are on the
+    /// wire at protocol 4, and the outcome is tagged by kind.
+    #[test]
+    fn the_front_requests_and_their_reply_are_at_protocol_four() {
+        assert_eq!(PROTOCOL_VERSION, 4);
+        let line = encode(&Frame::request(
+            1,
+            Request::Front {
+                project: "p".into(),
+            },
+        ));
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["request"]["kind"], "front");
+        assert_eq!(v["request"]["project"], "p");
+
+        let line = encode(&Frame::request(
+            2,
+            Request::NewFront {
+                project: "p".into(),
+            },
+        ));
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["request"]["kind"], "new_front");
+
+        // The three outcomes, each through the codec, tagged by kind.
+        for (outcome, kind) in [
+            (FrontOutcome::Resumed, "resumed"),
+            (FrontOutcome::First, "first"),
+            (
+                FrontOutcome::Replaced {
+                    reason: "gone".into(),
+                },
+                "replaced",
+            ),
+        ] {
+            let frame = Frame::response(
+                3,
+                Response::Front {
+                    thread: info(),
+                    outcome: outcome.clone(),
+                },
+            );
+            let line = encode(&frame);
+            assert_eq!(decode(&line).unwrap(), frame, "{line}");
+            let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(v["response"]["kind"], "front");
+            assert_eq!(v["response"]["outcome"]["kind"], kind);
         }
     }
 

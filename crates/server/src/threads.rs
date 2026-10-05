@@ -76,6 +76,9 @@ pub struct Indexed {
     pub run: RunThread,
     /// A line promised a `run_started` and wasn't: its issue is unknown.
     pub torn_run: bool,
+    /// `thread_started.front` (issue #84): the person's front thread,
+    /// the newest of which plain `aigentic` reopens.
+    pub front: bool,
 }
 
 /// The table, shared by every session.
@@ -602,8 +605,15 @@ impl ThreadTable {
     }
 
     /// A new thread in `project`: its log starts with `thread_started`.
-    /// It is written flat, and entered in the index.
-    pub async fn create(&self, project: &str, by: Author) -> Result<ThreadInfo, ThreadError> {
+    /// It is written flat, and entered in the index. `front` makes it
+    /// the person's front thread (issue #84); only `Front`'s and
+    /// `NewFront`'s handlers set it.
+    pub async fn create(
+        &self,
+        project: &str,
+        by: Author,
+        front: bool,
+    ) -> Result<ThreadInfo, ThreadError> {
         let root = self.root_of(project)?;
         std::fs::create_dir_all(&root.threads_dir).map_err(BuildError::from)?;
         let id = Ulid::generate();
@@ -624,6 +634,7 @@ impl ThreadTable {
                 created_by: by,
                 parent_thread: None,
                 step: None,
+                front,
             })
             .expect("serialisable"),
             parent_event: None,
@@ -639,6 +650,7 @@ impl ThreadTable {
                 creator,
                 run: RunThread::No,
                 torn_run: false,
+                front,
             },
         );
         Ok(summarise(&root.threads_dir, id, project))
@@ -1060,7 +1072,7 @@ impl ThreadTable {
         // (issue #58, rule 4).
         let name = workflow.unwrap_or_else(|| DEFAULT_WORKFLOW.to_owned());
         let loaded = WorkflowFile::load(&name, &world.workflow_roots())?;
-        let info = self.create(project, by.clone()).await?;
+        let info = self.create(project, by.clone(), false).await?;
         let lead = info.id;
         // The lead's log starts `thread_started`, then `run_started`: the
         // runner insists on it, and this is the last write before a task
@@ -1105,6 +1117,8 @@ impl ThreadTable {
             creator: None,
             run: RunThread::No,
             torn_run: false,
+            // A lead is never front (issue #84).
+            front: false,
         });
         entry.dir = dir.to_path_buf();
         entry.run = RunThread::Lead { issue };
@@ -1341,6 +1355,7 @@ fn scan_log(
         creator: None,
         run: RunThread::No,
         torn_run: false,
+        front: false,
     };
     let mut parent: Option<Ulid> = None;
     let mut step: Option<String> = None;
@@ -1376,6 +1391,9 @@ fn scan_log(
                     Author::User(user) => Some(user),
                     Author::Agent(_) | Author::System => None,
                 };
+                // The person's front thread (issue #84); a line written
+                // before the field reads as `false`.
+                entry.front = p.front;
                 parent = p.parent_thread;
                 step = p.step.clone();
             }

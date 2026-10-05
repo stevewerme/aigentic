@@ -256,6 +256,9 @@ fn project_for(threads: &ThreadTable, request: &Request) -> Option<String> {
         | Request::Compact { thread }
         | Request::SetMode { thread, .. }
         | Request::Report { thread, .. } => threads.project_of(*thread),
+        // The front thread (issue #84): an existing one says its
+        // project; a new one is made in the project asked for.
+        Request::Front { project } | Request::NewFront { project } => Some(project.clone()),
         Request::Hello { .. } | Request::ListProjects => None,
     }
 }
@@ -313,6 +316,10 @@ async fn handle(
         Request::Hello { .. } => Response::Refused {
             reason: "already said hello".into(),
         },
+        // Issue #84, commit 2: the front thread's requests.
+        Request::Front { .. } | Request::NewFront { .. } => Response::Refused {
+            reason: "the front thread is not yet".into(),
+        },
         Request::ListProjects => Response::Projects {
             projects: project_infos(config, threads, user),
         },
@@ -320,10 +327,12 @@ async fn handle(
             Ok(list) => Response::Threads { threads: list },
             Err(e) => thread_error(e),
         },
-        Request::CreateThread { project } => match threads.create(&project, author.clone()).await {
-            Ok(info) => Response::Thread { thread: info },
-            Err(e) => thread_error(e),
-        },
+        Request::CreateThread { project } => {
+            match threads.create(&project, author.clone(), false).await {
+                Ok(info) => Response::Thread { thread: info },
+                Err(e) => thread_error(e),
+            }
+        }
         Request::Open { thread, from_seq } => {
             let run = threads.run_thread(thread);
             if run != RunThread::No {

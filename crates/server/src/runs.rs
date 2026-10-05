@@ -174,6 +174,8 @@ impl RunnerHost for ServerHost {
                 created_by: Author::Agent(AgentId("runner".into())),
                 parent_thread: Some(self.lead),
                 step: Some(step.to_owned()),
+                // A step's child is never a front thread (issue #84).
+                front: false,
             })
             .expect("thread_started serialises"),
             parent_event: None,

@@ -107,11 +107,16 @@ impl Participants {
 pub fn needs(request: &Request) -> Option<Role> {
     match request {
         Request::Hello { .. } | Request::ListProjects => None,
+        // The `Front` handler judges it (issue #84): `read` in the front
+        // thread's project to resume, `write` in the requested project
+        // to create.
+        Request::Front { .. } => None,
         Request::ListThreads { .. }
         | Request::Open { .. }
         | Request::Close { .. }
         | Request::Report { .. } => Some(Role::Read),
         Request::CreateThread { .. }
+        | Request::NewFront { .. }
         | Request::Post { .. }
         | Request::InvokeSkill { .. }
         | Request::Interrupt { .. }
@@ -189,6 +194,21 @@ mod tests {
                 None,
             ),
             (Request::ListProjects, None),
+            // T3 (issue #84): `Front`'s handler judges the roles, so the
+            // pre-check asks for none; `NewFront` creates, so it is a
+            // write in the requested project.
+            (
+                Request::Front {
+                    project: "p".into(),
+                },
+                None,
+            ),
+            (
+                Request::NewFront {
+                    project: "p".into(),
+                },
+                Some(Role::Write),
+            ),
             (
                 Request::ListThreads {
                     project: "p".into(),

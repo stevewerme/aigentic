@@ -233,6 +233,7 @@ mod tests {
                 created_by: Author::User(UserId("steve".into())),
                 parent_thread: None,
                 step: None,
+                front: false,
             })
             .unwrap(),
             parent_event: None,

@@ -378,6 +378,7 @@ mod tests {
             created_by: author.clone(),
             parent_thread: None,
             step: None,
+            front: false,
         };
         ev(
             seq,
