@@ -14,9 +14,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      # The toolchain is pinned in rust-toolchain.toml; rustup installs
+      # exactly that one, with its components.
+      - name: rust toolchain
+        run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - name: cargo fmt
         run: cargo fmt --check

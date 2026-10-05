@@ -1,0 +1,8 @@
+# One Rust for every machine and for CI (2026-10-05): CI was red for four
+# days because GitHub's runners took a newer stable than the Mac had, and
+# its new deprecation failed `-D warnings`. Bump this on purpose, then fix
+# what the new release flags, in one commit.
+[toolchain]
+channel = "1.99.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

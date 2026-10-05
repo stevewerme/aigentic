@@ -57,6 +57,8 @@ add an event kind, not a side table.
 
 ## Commands
 
+The Rust toolchain is pinned in `rust-toolchain.toml`, for every machine and for CI. Bump it on purpose, and fix what the new release flags in the same commit.
+
 All three must pass before a change is finished:
 
 ```bash
