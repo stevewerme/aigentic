@@ -15,6 +15,7 @@ use ulid::Ulid;
 
 use crate::payload::{
     DecisionAnswer, DecisionAnsweredPayload, DecisionKind, DecisionProposedPayload, DecisionStage,
+    is_startup_call,
 };
 
 /// One proposal and, if it was answered, its answer. `answer: None` is a
@@ -31,6 +32,10 @@ pub struct DecisionRecord {
     pub target: Option<String>,
     pub reason: String,
     pub answer: Option<RecordedAnswer>,
+    /// Raised while no turn ran (issue #85): the payload's `call_id`
+    /// starts with `STARTUP_PREFIX`. `false` for a model's proposal and
+    /// for every log written before this.
+    pub startup: bool,
 }
 
 /// An answer that named a proposal.
@@ -82,6 +87,7 @@ pub fn decision_records(events: &[Event]) -> DecisionFold {
                             target: p.target,
                             reason: p.reason,
                             answer: None,
+                            startup: is_startup_call(p.call_id.as_deref()),
                         });
                     }
                     Err(_) => orphans += 1,
@@ -112,6 +118,30 @@ pub fn decision_records(events: &[Event]) -> DecisionFold {
     }
 
     DecisionFold { records, orphans }
+}
+
+/// Whether a person already said no to a start-up proposal for `target`
+/// (issue #85), since the thread last switched project: what #92 asks
+/// before proposing again.
+///
+/// The scope is the events after the last `project_switched`, or the
+/// whole log when there is none — the first start of a front thread. A
+/// `No` and a `Corrected` both count; a `Yes` does not, and neither does
+/// a model's own `No` on a proposal `suggest_project` raised. Pure, like
+/// [`decision_records`], and built on it.
+pub fn declined_at_startup(events: &[Event], target: &str) -> bool {
+    let start = events
+        .iter()
+        .rposition(|e| e.kind == EventKind::ProjectSwitched)
+        .map_or(0, |i| i + 1);
+    decision_records(&events[start..]).records.iter().any(|r| {
+        r.startup
+            && r.target.as_deref() == Some(target)
+            && matches!(
+                r.answer.as_ref().map(|a| a.answer),
+                Some(DecisionAnswer::No | DecisionAnswer::Corrected)
+            )
+    })
 }
 
 #[cfg(test)]

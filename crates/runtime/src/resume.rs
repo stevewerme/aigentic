@@ -55,6 +55,21 @@ impl Runtime {
     ) -> Result<Resumed, RuntimeError> {
         let events = self.log.read_all()?;
         let Some(open) = ThreadLog::open_turn(&events) else {
+            // No turn is open, but a proposal raised while idle may still
+            // be open (issue #85): it dies with the process too, so the
+            // tail after the last `turn_ended` is closed here. That tail
+            // is not `open_turn`'s slice — `open_turn` is `None` above
+            // precisely because it holds no message — and it is not the
+            // whole log either: an unanswered proposal from an earlier
+            // turn is not this restart's to relabel.
+            let start = events
+                .iter()
+                .rposition(|e| e.kind == EventKind::TurnEnded)
+                .map_or(0, |i| i + 1);
+            let tail = events[start..].to_vec();
+            if !tail.is_empty() {
+                self.withdraw_open_proposals(&tail, observe)?;
+            }
             return Ok(Resumed::Clean);
         };
         let after_seq = open.last().map_or(0, |e| e.seq);

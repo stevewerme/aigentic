@@ -954,6 +954,17 @@ pub struct DecisionProposedPayload {
     pub stage: DecisionStage,
 }
 
+/// The `call_id` prefix of a proposal raised while no turn runs (issue
+/// #85): #92's start-up proposal, which `suggest_project` never writes.
+/// It is a value, not an event kind — an idle proposal is an ordinary
+/// `decision_proposed` — so a log from before this reads as it did.
+pub const STARTUP_PREFIX: &str = "startup-";
+
+/// Whether a `call_id` names a proposal raised while no turn runs.
+pub fn is_startup_call(call_id: Option<&str>) -> bool {
+    call_id.is_some_and(|c| c.starts_with(STARTUP_PREFIX))
+}
+
 /// A `decision_answered` event's answer (issue #74). The first three are
 /// **a person's** answers; `Withdrawn` closes a proposal nobody answered
 /// — an interrupted turn, a restarted daemon, or `exec` declining

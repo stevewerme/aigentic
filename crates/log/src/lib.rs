@@ -15,7 +15,9 @@ mod recall;
 mod run_state;
 mod store;
 
-pub use decision_log::{DecisionFold, DecisionRecord, RecordedAnswer, decision_records};
+pub use decision_log::{
+    DecisionFold, DecisionRecord, RecordedAnswer, decision_records, declined_at_startup,
+};
 pub use payload::{
     AssistantMessagePayload, BudgetScope, BudgetWarnedPayload, CheckOutcome, CheckResult,
     CheckpointAnswer, CheckpointAnsweredPayload, CheckpointAskedPayload, ChecksRunPayload,
@@ -26,9 +28,9 @@ pub use payload::{
     MemoryRememberedPayload, PermissionDecidedPayload, PermissionRequestedPayload, PinnedPayload,
     PlannedTest, PolicyRecord, ProjectSwitchedPayload, ProviderRetriedPayload, PushedPayload,
     ReleaseImpact, ReportStatus, RevealMark, Route, RouteTakenPayload, RunFinishedPayload,
-    RunOutcome, RunStartedPayload, SkillLoadedPayload, StepFinishedPayload, StepReport,
-    StepStartedPayload, StepStatus, ThreadRenamedPayload, ThreadStartedPayload, ToolResultPayload,
-    TurnEndedPayload, Usage, UserMessagePayload, Verdict,
+    RunOutcome, RunStartedPayload, STARTUP_PREFIX, SkillLoadedPayload, StepFinishedPayload,
+    StepReport, StepStartedPayload, StepStatus, ThreadRenamedPayload, ThreadStartedPayload,
+    ToolResultPayload, TurnEndedPayload, Usage, UserMessagePayload, Verdict, is_startup_call,
 };
 pub use projection::{
     Projection, STUB_ARG_MAX_CHARS, project, project_body, shorten_call_args, skill_marker,

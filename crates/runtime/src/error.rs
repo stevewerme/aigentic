@@ -21,4 +21,10 @@ pub enum RuntimeError {
     /// replace the policy its deny overlay stands in front of.
     #[error("step thread: {0}")]
     StepThread(String),
+    /// An answer to a proposal that isn't open in this log (issue #85):
+    /// an id that names no `decision_proposed`, or one already answered.
+    /// The idle path has no `Decisions` entry to refuse it, so the log
+    /// is asked instead — a second answer would read as an orphan.
+    #[error("no open proposal: {0}")]
+    NoOpenProposal(String),
 }

@@ -570,6 +570,35 @@ fn recall_form(args: &serde_json::Value) -> Result<crate::recall_tool::Form, Str
 /// Every harness tool is `safe`.
 pub const HARNESS_CLASS: RiskClass = RiskClass::Safe;
 
+/// A proposal raised while no turn runs (issue #85), as #92's start-up
+/// path hands it back: the `call_id` its answer will carry, and the
+/// `decision_proposed` event's id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdleProposal {
+    pub call_id: String,
+    pub proposal: ulid::Ulid,
+}
+
+/// What an answer settled (issues #7, #85): the log writes are already
+/// done, and this says which they were, so `apply_switch` can render the
+/// model-facing text without repeating the `match`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Settled {
+    /// A `yes` that moved the thread.
+    Switched,
+    /// A `no`: the thread stays where it is.
+    Declined,
+    /// A correction, which is the person's own words.
+    Corrected(String),
+    /// The answer was a withdrawal.
+    Withdrawn(String),
+    /// A `yes` whose `set_project` failed: the note is `switch_failed(e)`.
+    SwitchFailed(String),
+    /// A `yes` with no context to switch to: the note is
+    /// `switch_failed(NO_CONTEXT)`.
+    NoContext(String),
+}
+
 impl Runtime {
     /// Answer a harness tool. Called only after `policy_check` said run.
     /// The author is who the result's event belongs to: the human who
@@ -851,6 +880,56 @@ impl Runtime {
         staying: Option<String>,
         observe: &mut (dyn FnMut(Signal<'_>) + Send),
     ) -> Result<(ToolResult, Author), RuntimeError> {
+        let settled = self
+            .settle_switch(proposal, answer, who.clone(), ctx, observe)
+            .await?;
+        // The model-facing text, from what was settled: `Withdrawn` and a
+        // failed `yes` are the same refusal with the note spelled out; a
+        // `yes` with no context to switch to is the bare note, as it has
+        // been since #7.
+        let result = match &settled {
+            Settled::Switched => said(&id, switched_text(&args.project)),
+            Settled::Declined => said(
+                &id,
+                match staying.as_deref() {
+                    Some(project) => declined_text(project),
+                    // A thread in no project has no name to stay in.
+                    None => DECLINED_NO_PROJECT.to_owned(),
+                },
+            ),
+            Settled::Corrected(where_it_belongs) => said(&id, corrected_text(where_it_belongs)),
+            Settled::Withdrawn(note) | Settled::SwitchFailed(note) => {
+                refused(&id, &not_answered_text(note))
+            }
+            Settled::NoContext(note) => refused(&id, note),
+        };
+        // An answer a person gave is theirs; a refused or withdrawn one
+        // is the system's.
+        let by = match settled {
+            Settled::Switched | Settled::Declined | Settled::Corrected(_) => who,
+            Settled::Withdrawn(_) | Settled::SwitchFailed(_) | Settled::NoContext(_) => {
+                Author::System
+            }
+        };
+        Ok((result, by))
+    }
+
+    /// The core of an answer, whatever raised the proposal (issues #7,
+    /// #85): record it, and for a `yes` switch the project first, then
+    /// say so. The ack the answer came with fires with the outcome, so
+    /// the session that sent the context learns whether it was used.
+    ///
+    /// `apply_switch` turns what this settles into the model-facing text;
+    /// `answer_switch_idle` is this and nothing else, so a start-up
+    /// proposal's `yes`, failure and ack behave exactly as #7's.
+    async fn settle_switch(
+        &mut self,
+        proposal: ulid::Ulid,
+        answer: crate::SwitchAnswer,
+        who: Author,
+        ctx: crate::SwitchCtx,
+        observe: &mut (dyn FnMut(Signal<'_>) + Send),
+    ) -> Result<Settled, RuntimeError> {
         match answer {
             crate::SwitchAnswer::Yes => match ctx.take() {
                 Some((target, ack)) => {
@@ -864,12 +943,12 @@ impl Runtime {
                                 DecisionAnswer::Yes,
                                 None,
                                 None,
-                                who.clone(),
+                                who,
                                 proposal,
                                 observe,
                             )?;
                             let _ = ack.send(Ok(()));
-                            Ok((said(&id, switched_text(&args.project)), who))
+                            Ok(Settled::Switched)
                         }
                         Err(e) => {
                             let note = switch_failed(&e.to_string());
@@ -877,7 +956,7 @@ impl Runtime {
                             // The session that built the context is
                             // told why it was not used.
                             let _ = ack.send(Err(note.clone()));
-                            Ok((refused(&id, &not_answered_text(&note)), Author::System))
+                            Ok(Settled::SwitchFailed(note))
                         }
                     }
                 }
@@ -888,7 +967,7 @@ impl Runtime {
                     // not happen.
                     let note = switch_failed(NO_CONTEXT);
                     self.withdraw_switch(proposal, note.clone(), observe)?;
-                    Ok((refused(&id, &note), Author::System))
+                    Ok(Settled::NoContext(note))
                 }
             },
             crate::SwitchAnswer::No => {
@@ -896,33 +975,110 @@ impl Runtime {
                     DecisionAnswer::No,
                     None,
                     None,
-                    who.clone(),
+                    who,
                     proposal,
                     observe,
                 )?;
-                let text = match staying.as_deref() {
-                    Some(project) => declined_text(project),
-                    // A thread in no project has no name to stay in.
-                    None => DECLINED_NO_PROJECT.to_owned(),
-                };
-                Ok((said(&id, text), who))
+                Ok(Settled::Declined)
             }
             crate::SwitchAnswer::Corrected(where_it_belongs) => {
                 self.append_decision_answered(
                     DecisionAnswer::Corrected,
                     Some(where_it_belongs.clone()),
                     None,
-                    who.clone(),
+                    who,
                     proposal,
                     observe,
                 )?;
-                Ok((said(&id, corrected_text(&where_it_belongs)), who))
+                Ok(Settled::Corrected(where_it_belongs))
             }
             crate::SwitchAnswer::Withdrawn(note) => {
                 self.withdraw_switch(proposal, note.clone(), observe)?;
-                Ok((refused(&id, &not_answered_text(&note)), Author::System))
+                Ok(Settled::Withdrawn(note))
             }
         }
+    }
+
+    /// Propose a switch while no turn runs (issue #85): #92's start-up
+    /// proposal, for a person who opened their front thread from another
+    /// project's folder.
+    ///
+    /// The event is an ordinary `decision_proposed` with
+    /// `Author::System`, and its `call_id` starts with
+    /// [`aigentic_log::STARTUP_PREFIX`], which is what `stats` and
+    /// `declined_at_startup` read to tell it from the model's own. It is
+    /// registered with nothing: no turn waits, so there is nothing to
+    /// resume. The caller checks the thread is idle; this one does not.
+    pub async fn propose_switch_idle(
+        &mut self,
+        project: &str,
+        reason: &str,
+        observe: &mut (dyn FnMut(Signal<'_>) + Send),
+    ) -> Result<IdleProposal, RuntimeError> {
+        // A step thread keeps its overlay for its whole life (issue #55),
+        // so it has no project of its own to propose leaving.
+        if let Some(step) = &self.step {
+            return Err(RuntimeError::StepThread(format!(
+                "`{}` is a step thread and cannot propose a switch",
+                step.name
+            )));
+        }
+        let call_id = format!("{}{}", aigentic_log::STARTUP_PREFIX, ulid::Ulid::generate());
+        let payload = DecisionProposedPayload {
+            kind: DecisionKind::Project,
+            proposal: proposal_text(project),
+            target: Some(project.to_owned()),
+            reason: reason.to_owned(),
+            call_id: Some(call_id.clone()),
+            stage: DecisionStage::Ask,
+        };
+        let proposal = self.append(
+            EventKind::DecisionProposed,
+            Author::System,
+            serde_json::to_value(payload).expect("serialisable"),
+            None,
+            observe,
+        )?;
+        Ok(IdleProposal {
+            call_id,
+            proposal: proposal.id,
+        })
+    }
+
+    /// Answer an idle proposal (issue #85): `settle_switch` and nothing
+    /// else, so the `yes` path, the failure path and the ack behave as
+    /// #7's.
+    ///
+    /// A `decision_answered` is only ever written once per proposal:
+    /// [`RuntimeError::NoOpenProposal`], writing nothing, when `proposal`
+    /// names no `decision_proposed` in this log or already has an answer.
+    /// The turn path gets that guard from the `Decisions` table
+    /// ([`crate::DecisionError::AlreadyDecided`]); with no table entry
+    /// this path asks the log instead, so a second answer cannot land as
+    /// an orphan in `decision_records`.
+    pub async fn answer_switch_idle(
+        &mut self,
+        proposal: ulid::Ulid,
+        answer: crate::SwitchAnswer,
+        who: Author,
+        ctx: crate::SwitchCtx,
+        observe: &mut (dyn FnMut(Signal<'_>) + Send),
+    ) -> Result<Settled, RuntimeError> {
+        let open = {
+            let events = self.log.events();
+            let raised = events
+                .iter()
+                .any(|e| e.id == proposal && e.kind == EventKind::DecisionProposed);
+            let answered = events
+                .iter()
+                .any(|e| e.kind == EventKind::DecisionAnswered && e.parent_event == Some(proposal));
+            raised && !answered
+        };
+        if !open {
+            return Err(RuntimeError::NoOpenProposal(proposal.to_string()));
+        }
+        self.settle_switch(proposal, answer, who, ctx, observe)
+            .await
     }
 
     /// Record a proposal nobody answered as `withdrawn`, by the system.
