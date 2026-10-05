@@ -1737,6 +1737,11 @@ pub struct DecisionReport {
 #[derive(Debug, Serialize)]
 pub struct DecisionKindStats {
     pub kind: DecisionKind,
+    /// True for #85's start-up proposals (a `startup-` call id), which
+    /// get their own row so the model's own `project` record isn't
+    /// diluted by them.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub startup: bool,
     pub proposed: u32,
     pub yes: u32,
     pub no: u32,
@@ -1797,82 +1802,99 @@ pub fn collect_decisions(
 /// last 30 proposals of that kind that a person answered".
 const LAST_N: usize = 30;
 
-/// One row per kind that has a proposal, in `DecisionKind`'s declaration
-/// order. A kind with no proposals has no row.
+/// One row per `(kind, startup)` that has a proposal, each kind's
+/// start-up row right after its plain one and kinds in `DecisionKind`'s
+/// declaration order.
+///
+/// A subset with no proposals has no row: a kind whose plain subset is
+/// empty but whose start-up subset isn't prints the start-up row alone,
+/// so there is no all-zero row and no empty slice reaches `percent`.
 fn kind_rows(records: &[DecisionRecord]) -> Vec<DecisionKindStats> {
     let mut rows = Vec::new();
     for kind in ALL_KINDS {
-        let of_kind: Vec<&DecisionRecord> = records.iter().filter(|r| r.kind == kind).collect();
-        if of_kind.is_empty() {
-            continue;
-        }
-        let mut row = DecisionKindStats {
-            kind,
-            proposed: of_kind.len() as u32,
-            yes: 0,
-            no: 0,
-            corrected: 0,
-            withdrawn: 0,
-            pending: 0,
-            rate: None,
-            last_30: None,
-        };
-        // The operator's own answers, kept apart from the counts above:
-        // `rate` is ADR 0002's "from the operator's own answers".
-        let (mut person_yes, mut person_no, mut person_corrected) = (0u32, 0u32, 0u32);
-        let mut answered: Vec<&DecisionRecord> = Vec::new();
-        for record in &of_kind {
-            let Some(answer) = &record.answer else {
-                row.pending += 1;
-                continue;
-            };
-            match answer.answer {
-                DecisionAnswer::Yes => row.yes += 1,
-                DecisionAnswer::No => row.no += 1,
-                DecisionAnswer::Corrected => row.corrected += 1,
-                DecisionAnswer::Withdrawn => row.withdrawn += 1,
-            }
-            if !is_person(&answer.by) {
-                continue;
-            }
-            match answer.answer {
-                DecisionAnswer::Yes => {
-                    person_yes += 1;
-                    answered.push(record);
-                }
-                DecisionAnswer::No => {
-                    person_no += 1;
-                    answered.push(record);
-                }
-                DecisionAnswer::Corrected => {
-                    person_corrected += 1;
-                    answered.push(record);
-                }
-                // `withdrawn` closes a proposal nobody answered, so it
-                // is no part of what a person's record was.
-                DecisionAnswer::Withdrawn => {}
-            }
-        }
-        row.rate = percent(person_yes, person_yes + person_no + person_corrected);
-        // The most recent by proposal time, the proposal's id settling a
-        // tie, as the costliest-threads order does.
-        answered.sort_by(|a, b| b.at.cmp(&a.at).then_with(|| b.id.cmp(&a.id)));
-        answered.truncate(LAST_N);
-        row.last_30 = percent(
-            answered
+        for startup in [false, true] {
+            let of_kind: Vec<&DecisionRecord> = records
                 .iter()
-                .filter(|r| {
-                    matches!(
-                        r.answer.as_ref().map(|a| a.answer),
-                        Some(DecisionAnswer::Yes)
-                    )
-                })
-                .count() as u32,
-            answered.len() as u32,
-        );
-        rows.push(row);
+                .filter(|r| r.kind == kind && r.startup == startup)
+                .collect();
+            if of_kind.is_empty() {
+                continue;
+            }
+            rows.push(kind_row(kind, startup, &of_kind));
+        }
     }
     rows
+}
+
+/// One `(kind, startup)`'s figures: the counts by what each answer said,
+/// then `rate` and `last_30` over the operator's own answers.
+fn kind_row(kind: DecisionKind, startup: bool, of_kind: &[&DecisionRecord]) -> DecisionKindStats {
+    let mut row = DecisionKindStats {
+        kind,
+        startup,
+        proposed: of_kind.len() as u32,
+        yes: 0,
+        no: 0,
+        corrected: 0,
+        withdrawn: 0,
+        pending: 0,
+        rate: None,
+        last_30: None,
+    };
+    // The operator's own answers, kept apart from the counts above:
+    // `rate` is ADR 0002's "from the operator's own answers".
+    let (mut person_yes, mut person_no, mut person_corrected) = (0u32, 0u32, 0u32);
+    let mut answered: Vec<&DecisionRecord> = Vec::new();
+    for record in of_kind {
+        let Some(answer) = &record.answer else {
+            row.pending += 1;
+            continue;
+        };
+        match answer.answer {
+            DecisionAnswer::Yes => row.yes += 1,
+            DecisionAnswer::No => row.no += 1,
+            DecisionAnswer::Corrected => row.corrected += 1,
+            DecisionAnswer::Withdrawn => row.withdrawn += 1,
+        }
+        if !is_person(&answer.by) {
+            continue;
+        }
+        match answer.answer {
+            DecisionAnswer::Yes => {
+                person_yes += 1;
+                answered.push(record);
+            }
+            DecisionAnswer::No => {
+                person_no += 1;
+                answered.push(record);
+            }
+            DecisionAnswer::Corrected => {
+                person_corrected += 1;
+                answered.push(record);
+            }
+            // `withdrawn` closes a proposal nobody answered, so it
+            // is no part of what a person's record was.
+            DecisionAnswer::Withdrawn => {}
+        }
+    }
+    row.rate = percent(person_yes, person_yes + person_no + person_corrected);
+    // The most recent by proposal time, the proposal's id settling a
+    // tie, as the costliest-threads order does.
+    answered.sort_by(|a, b| b.at.cmp(&a.at).then_with(|| b.id.cmp(&a.id)));
+    answered.truncate(LAST_N);
+    row.last_30 = percent(
+        answered
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r.answer.as_ref().map(|a| a.answer),
+                    Some(DecisionAnswer::Yes)
+                )
+            })
+            .count() as u32,
+        answered.len() as u32,
+    );
+    row
 }
 
 /// Every kind, in declaration order: a new variant fails to compile here
@@ -1885,6 +1907,16 @@ const ALL_KINDS: [DecisionKind; 6] = [
     DecisionKind::Route,
     DecisionKind::WorkingSet,
 ];
+
+/// A row's name: the kind, plus `(start-up)` for #85's proposals, which
+/// are the person's start-up question rather than the model's own.
+fn row_name(row: &DecisionKindStats) -> String {
+    if row.startup {
+        format!("{} (start-up)", kind_name(row.kind))
+    } else {
+        kind_name(row.kind).to_owned()
+    }
+}
 
 fn kind_name(kind: DecisionKind) -> &'static str {
     match kind {
@@ -1924,14 +1956,24 @@ pub fn render_decisions(report: &DecisionReport) -> String {
     if report.kinds.is_empty() {
         out.push_str("no decisions recorded\n");
     } else {
+        // The name column is as wide as the longest name printed, so
+        // `project (start-up)` lines up with the rest (issue #85), and
+        // never narrower than the header's own `kind`.
+        let name_width = report
+            .kinds
+            .iter()
+            .map(|k| row_name(k).chars().count())
+            .chain(std::iter::once("kind".len()))
+            .max()
+            .unwrap_or(4);
         out.push_str(&format!(
-            "\n{:<14} {:>8} {:>5} {:>5} {:>10} {:>10} {:>7} {:>6} {:>8}\n",
+            "\n{:<name_width$} {:>8} {:>5} {:>5} {:>10} {:>10} {:>7} {:>6} {:>8}\n",
             "kind", "proposed", "yes", "no", "corrected", "withdrawn", "pending", "rate", "last 30"
         ));
         for k in &report.kinds {
             out.push_str(&format!(
-                "{:<14} {:>8} {:>5} {:>5} {:>10} {:>10} {:>7} {:>6} {:>8}\n",
-                kind_name(k.kind),
+                "{:<name_width$} {:>8} {:>5} {:>5} {:>10} {:>10} {:>7} {:>6} {:>8}\n",
+                row_name(k),
                 k.proposed,
                 k.yes,
                 k.no,
@@ -4085,6 +4127,40 @@ api_key_env = "TENSORX_API_KEY"
         })
     }
 
+    /// #85's start-up proposal: the same line with a `startup-` call id,
+    /// which is what the fold reads as `startup: true`.
+    fn proposed_startup(id: Ulid, at: &str, kind: &str, proposal: &str) -> serde_json::Value {
+        let mut line = proposed(id, at, kind, proposal);
+        let prefix = aigentic_runtime::aigentic_log::STARTUP_PREFIX;
+        line["payload"]["call_id"] = json!(format!("{prefix}{}", Ulid::generate()));
+        line
+    }
+
+    /// Like `decision_thread`, but every proposal is a start-up one
+    /// (issue #85), so the report gives it its own row.
+    fn startup_thread(project: &Path, table: &[DecisionLine]) {
+        let mut lines = Vec::new();
+        for (n, entry) in table.iter().enumerate() {
+            let proposal = Ulid::generate();
+            lines.push(proposed_startup(
+                proposal,
+                entry.at,
+                entry.kind,
+                &format!("proposal {n}"),
+            ));
+            if let Some((answer, who)) = entry.answer {
+                lines.push(decision_answered(
+                    Ulid::generate(),
+                    entry.at,
+                    proposal,
+                    answer,
+                    who,
+                ));
+            }
+        }
+        write_decisions(project, Ulid::generate(), &lines);
+    }
+
     fn decision_answered(
         id: Ulid,
         at: &str,
@@ -4488,6 +4564,7 @@ api_key_env = "TENSORX_API_KEY"
         let quiet = DecisionReport {
             kinds: vec![DecisionKindStats {
                 kind: DecisionKind::Route,
+                startup: false,
                 proposed: 1,
                 yes: 0,
                 no: 0,
@@ -4946,5 +5023,173 @@ api_key_env = "TENSORX_API_KEY"
         assert_eq!(beta.unreadable, 0);
         let decisions = collect_decisions(base, &[], Some("alpha"), None).unwrap();
         assert_eq!(decisions.unreadable, 1, "the same rule for the record");
+    }
+    // ---- start-up proposals (issue #85) ----
+
+    /// T6 (issue #85): the model's `project` proposals and start-up ones
+    /// get their own rows, in that order, each with its own figures, and
+    /// `--json` marks the start-up row alone.
+    #[test]
+    fn t6a_startup_proposals_have_their_own_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = [DecisionLine {
+            kind: "project",
+            at: "2026-10-05T09:00:00Z",
+            answer: Some(("yes", PERSON)),
+        }];
+        let startup = [
+            DecisionLine {
+                kind: "project",
+                at: "2026-10-05T09:05:00Z",
+                answer: Some(("no", PERSON)),
+            },
+            DecisionLine {
+                kind: "project",
+                at: "2026-10-05T09:06:00Z",
+                answer: None,
+            },
+        ];
+        decision_thread(&dir.path().join("model"), &plain);
+        startup_thread(&dir.path().join("start-up"), &startup);
+
+        let report = collect_decisions(dir.path(), &[], None, None).unwrap();
+        let names: Vec<String> = report.kinds.iter().map(row_name).collect();
+        assert_eq!(
+            names,
+            vec!["project".to_owned(), "project (start-up)".to_owned()],
+            "the start-up row follows the plain one"
+        );
+        for (row, table, name) in [
+            (&report.kinds[0], &plain[..], "project"),
+            (&report.kinds[1], &startup[..], "project (start-up)"),
+        ] {
+            let (proposed, yes, no, corrected, withdrawn, pending, rate) =
+                expected_row(table, "project");
+            assert_eq!(
+                (
+                    row.proposed,
+                    row.yes,
+                    row.no,
+                    row.corrected,
+                    row.withdrawn,
+                    row.pending
+                ),
+                (proposed, yes, no, corrected, withdrawn, pending),
+                "{name}"
+            );
+            assert_eq!(row.rate, rate, "{name} rate");
+            assert_eq!(row.last_30, rate, "{name} last 30: under 30 answered");
+        }
+        assert!(!report.kinds[0].startup, "the plain row");
+        assert!(report.kinds[1].startup, "the start-up row");
+
+        // The model's own record is its own: the plain row's rate comes
+        // from its one `yes`, not from the start-up `no` beside it.
+        assert_eq!(report.kinds[0].yes, 1);
+        assert_eq!(report.kinds[0].no, 0);
+        assert_eq!(report.kinds[1].no, 1);
+
+        let json = serde_json::to_value(&report).unwrap();
+        let rows = json["kinds"].as_array().unwrap();
+        assert!(rows[0].get("startup").is_none(), "{}", rows[0]);
+        assert_eq!(rows[1]["startup"], json!(true));
+    }
+
+    /// T6c (issue #85): the rendered table lines up — the start-up row
+    /// carries the same column count as the plain one, and the header and
+    /// both rows start their first figure in the same column.
+    #[test]
+    fn t6c_the_rendered_table_lines_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = [DecisionLine {
+            kind: "project",
+            at: "2026-10-05T09:00:00Z",
+            answer: Some(("yes", PERSON)),
+        }];
+        let startup = [DecisionLine {
+            kind: "project",
+            at: "2026-10-05T09:05:00Z",
+            answer: Some(("no", PERSON)),
+        }];
+        decision_thread(&dir.path().join("model"), &plain);
+        startup_thread(&dir.path().join("start-up"), &startup);
+        let report = collect_decisions(dir.path(), &[], None, None).unwrap();
+        let text = render_decisions(&report);
+        let header = text.lines().find(|l| l.starts_with("kind")).unwrap();
+        // `project (start-up)` also starts with `project `, so the plain
+        // row is the one without the suffix.
+        let plain_row = text
+            .lines()
+            .find(|l| l.starts_with("project ") && !l.starts_with("project ("))
+            .unwrap();
+        let startup_row = text
+            .lines()
+            .find(|l| l.starts_with("project (start-up)"))
+            .unwrap();
+        // Every figure after the name, counted the same way.
+        let figures = |line: &str, name: &str| line[name.len()..].split_whitespace().count();
+        assert_eq!(
+            figures(plain_row, "project"),
+            figures(startup_row, "project (start-up)"),
+            "the same figures:\n{text}"
+        );
+        // And the numbers begin in the same column on every line: the
+        // name column is as wide as the longest name printed, so the
+        // header's first figure field starts where each row's does.
+        let name_width = header.find("proposed").unwrap() - 1;
+        for line in [&header, &plain_row, &startup_row] {
+            assert_eq!(line.len(), header.len(), "a fixed-width table:\n{text}");
+        }
+        assert_eq!(
+            &plain_row[..name_width],
+            &format!("{:<name_width$}", "project"),
+            "the plain row's name column:\n{text}"
+        );
+        assert_eq!(
+            &startup_row[..name_width],
+            &format!("{:<name_width$}", "project (start-up)"),
+            "the start-up row's name column, not truncated:\n{text}"
+        );
+        for line in [&plain_row, &startup_row] {
+            assert_eq!(
+                line.as_bytes()[name_width],
+                b' ',
+                "the name column ends where the numbers begin:\n{text}"
+            );
+        }
+    }
+    /// T6b: only start-up proposals: the start-up row alone, and no
+    /// all-zero `project` row beside it.
+    #[test]
+    fn t6b_only_startup_proposals_print_one_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let startup = [DecisionLine {
+            kind: "project",
+            at: "2026-10-05T09:00:00Z",
+            answer: Some(("yes", PERSON)),
+        }];
+        startup_thread(&dir.path().join("start-up"), &startup);
+
+        let report = collect_decisions(dir.path(), &[], None, None).unwrap();
+        let names: Vec<String> = report.kinds.iter().map(row_name).collect();
+        assert_eq!(names, vec!["project (start-up)".to_owned()]);
+        let (proposed, yes, no, corrected, withdrawn, pending, rate) =
+            expected_row(&startup, "project");
+        let row = &report.kinds[0];
+        assert_eq!(
+            (
+                row.proposed,
+                row.yes,
+                row.no,
+                row.corrected,
+                row.withdrawn,
+                row.pending
+            ),
+            (proposed, yes, no, corrected, withdrawn, pending)
+        );
+        assert_eq!(row.rate, rate);
+        let text = render_decisions(&report);
+        assert!(!text.lines().any(|l| l == "project"), "{text}");
+        assert!(text.contains("project (start-up)"), "{text}");
     }
 }
