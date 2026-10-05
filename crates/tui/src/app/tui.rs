@@ -50,6 +50,15 @@ pub fn needed_rows(pane: &Pane<'_>) -> u16 {
     u16::try_from(rows).unwrap_or(u16::MAX)
 }
 
+/// The viewport's floor for the next frame (issue #93). While a turn
+/// runs the pane only grows: its rows swing with every think, tool and
+/// write, and each change of height moves the composer, so the floor
+/// keeps the most this turn has needed. Between turns the floor is
+/// gone, and the pane shrinks to fit once.
+pub fn held_rows(held: u16, wanted: u16, turning: bool) -> u16 {
+    if turning { held.max(wanted) } else { 0 }
+}
+
 /// What the bottom pane shows.
 pub struct Pane<'a> {
     /// What is still changing: pending reads, a running tool, the
@@ -608,6 +617,37 @@ impl Shell {
         result
     }
 
+    /// Fit the viewport and draw the pane as one frame (issue #93): the
+    /// resize's scroll and clear and the redraw that follows go out as a
+    /// single synchronized update, so the terminal shows the finished
+    /// frame instead of the cleared one in between. A terminal without
+    /// synchronized output ignores the markers. `floor` is the height
+    /// the viewport must not shrink below: the turn's high-water mark.
+    pub fn frame(&mut self, pane: &Pane<'_>, floor: u16) -> anyhow::Result<()> {
+        self.sync(true)?;
+        let result = self
+            .fit(needed_rows(pane).max(floor))
+            .and_then(|()| self.draw(pane));
+        // End the update whatever happened, so a failed frame never
+        // leaves the terminal holding its output back.
+        self.sync(false)?;
+        result
+    }
+
+    /// Begin or end a synchronized update on the real terminal; a test
+    /// screen has nothing to hold back.
+    fn sync(&mut self, begin: bool) -> std::io::Result<()> {
+        if !matches!(self.terminal.backend().inner, Screen::Terminal(_)) {
+            return Ok(());
+        }
+        let mut out = std::io::stdout();
+        if begin {
+            crossterm::queue!(out, crossterm::terminal::BeginSynchronizedUpdate)
+        } else {
+            crossterm::execute!(out, crossterm::terminal::EndSynchronizedUpdate)
+        }
+    }
+
     /// Draw the bottom pane.
     pub fn draw(&mut self, pane: &Pane<'_>) -> anyhow::Result<()> {
         self.terminal.draw(|f| {
@@ -846,6 +886,54 @@ pub fn wrap_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
 mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
+
+    /// Issue #93: through a turn's think, tool, think and write cycle
+    /// the viewport never shrinks, and it shrinks once when the turn
+    /// ends.
+    #[test]
+    fn a_turn_holds_the_pane_and_the_end_lets_it_go() {
+        let mut shell = Shell::test_inline(40, 30, MIN_ROWS);
+        // The rows a pane wants, frame by frame: thinking, a tool's
+        // row, thinking again, the two-row writing slot, a tool again.
+        let turn = [7u16, 8, 7, 9, 8, 7];
+        let mut held = 0;
+        let mut heights = Vec::new();
+        for wanted in turn {
+            held = held_rows(held, wanted, true);
+            shell.fit(wanted.max(held)).unwrap();
+            heights.push(shell.rows);
+        }
+        assert!(
+            heights.windows(2).all(|w| w[1] >= w[0]),
+            "the pane never shrinks mid-turn: {heights:?}"
+        );
+        assert_eq!(*heights.last().unwrap(), *turn.iter().max().unwrap());
+        // The turn ends: the floor goes, and the pane fits what it shows.
+        held = held_rows(held, MIN_ROWS, false);
+        assert_eq!(held, 0);
+        shell.fit(MIN_ROWS.max(held)).unwrap();
+        assert_eq!(shell.rows, MIN_ROWS);
+    }
+
+    /// Issue #93: `frame` fits and draws in one go and keeps the floor.
+    #[test]
+    fn a_frame_keeps_the_floor() {
+        let mut shell = Shell::test_inline(40, 30, MIN_ROWS);
+        let composer = Composer::default();
+        let pane = Pane {
+            active: &[],
+            composer: &composer,
+            status: "s",
+            hint: None,
+            block: &[],
+            popup: &[],
+            activity: None,
+        };
+        shell.frame(&pane, 9).unwrap();
+        assert_eq!(shell.rows, 9, "the floor wins over a smaller pane");
+        shell.frame(&pane, 0).unwrap();
+        assert_eq!(shell.rows, needed_rows(&pane).max(MIN_ROWS));
+    }
 
     fn composer_with(text: &str) -> Composer {
         let mut c = Composer::default();

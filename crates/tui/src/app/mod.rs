@@ -38,7 +38,7 @@ use crate::app::keymap::{Action, KeyContext, action_for};
 use crate::app::menu::{Menu, Pick};
 use crate::app::pager::Pager;
 use crate::app::status::Status;
-use crate::app::tui::{Pane, Shell, needed_rows, wrap_line};
+use crate::app::tui::{Pane, Shell, held_rows, needed_rows, wrap_line};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -653,6 +653,8 @@ async fn run_shell(
     // The turn's phase, kept across ticks: the live area's height
     // changes at phase boundaries only (issue #43).
     let mut phase = LivePhase::Idle;
+    // The turn's high-water mark for the pane's height (issue #93).
+    let mut held: u16 = 0;
     // The file index for `@`, walked once off the loop.
     let mut files_task = Some(tokio::task::spawn_blocking(move || FileIndex::walk(&root)));
     let mut files: Option<FileIndex> = None;
@@ -798,8 +800,10 @@ async fn run_shell(
             popup: &popup_lines,
             activity,
         };
-        out.shell.fit(needed_rows(&pane))?;
-        out.shell.draw(&pane)?;
+        // The pane holds its height through a turn (issue #93): it
+        // grows when it must and shrinks once, when the turn ends.
+        held = held_rows(held, needed_rows(&pane), engine.turn().is_some());
+        out.shell.frame(&pane, held)?;
         if let Some((title, text)) = out.page.take() {
             let lines = if title == "diff" {
                 diff::lines(&text)
