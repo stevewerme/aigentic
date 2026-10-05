@@ -12,7 +12,8 @@ use aigentic_api::{CheckpointAnswer, Notice, ReportKind, ThreadInfo, ThreadState
 use aigentic_runtime::ProjectFile;
 use aigentic_runtime::aigentic_core::{Author, ContentBlock, Event, EventKind, UserId};
 use aigentic_runtime::aigentic_log::{
-    NewEvent, Repair, RunStartedPayload, ThreadLog, ThreadStartedPayload, UserMessagePayload,
+    NewEvent, ProjectSwitchedPayload, Repair, RunStartedPayload, ThreadLog, ThreadStartedPayload,
+    UserMessagePayload,
 };
 use aigentic_runtime::aigentic_policy::Participants;
 use aigentic_runtime::workflow::WorkflowFile;
@@ -68,6 +69,12 @@ pub struct Indexed {
     pub home: Option<String>,
     /// The last `project_switched.to`.
     pub switched: Option<String>,
+    /// `project_switched.root` (issue #88): the root of the project a
+    /// switch moved the thread to, as the log has it. A live switch
+    /// refreshes it through `note_project`, so it is the daemon's root
+    /// for the name while the switch runs and the log's root after a
+    /// restart. `None` for an index built before the field existed.
+    pub switched_root: Option<PathBuf>,
     /// `thread_started.root`.
     pub root: Option<PathBuf>,
     /// Who started it, a person only, filled only where it is read.
@@ -247,6 +254,12 @@ impl ThreadTable {
         &self.workspaces
     }
 
+    /// The directory the logs live in (issue #88): where the front lock
+    /// and `front_root` work, the same base `build` computes.
+    pub fn threads_base(&self) -> &Path {
+        &self.threads_base
+    }
+
     /// Move an open thread to `project`: its context is built here, the
     /// actor swaps it in while idle and records `project_switched`.
     pub async fn switch(&self, thread: Ulid, project: &str, by: Author) -> Result<(), ThreadError> {
@@ -316,6 +329,11 @@ impl ThreadTable {
             .get_mut(&thread)
         {
             i.switched = Some(project.to_owned());
+            // Where the daemon has that project now (issue #88): the
+            // switch's root is this daemon's, not the one an older log
+            // line recorded. A name this daemon cannot resolve leaves
+            // the field as the log had it.
+            i.switched_root = self.root_of(project).ok().map(|r| r.root);
         }
     }
 
@@ -570,6 +588,23 @@ impl ThreadTable {
             .or(indexed.home)
     }
 
+    /// The root of the project a thread is in now (issue #88), for the
+    /// front-thread root check: when `project_of` answers the switched
+    /// name, the switch's root; when it answers the home, the home's
+    /// root. `None` when nothing is recorded — a thread whose switch
+    /// predates this field, which is not refused for it.
+    pub fn root_of_thread(&self, thread: Ulid) -> Option<PathBuf> {
+        let indexed = self.lookup(thread)?;
+        let project = self.project_of(thread);
+        root_of_indexed(&indexed, project.as_deref())
+    }
+
+    /// The root this daemon has for a project name (issue #88). `None`
+    /// for a name no project has.
+    pub fn project_root(&self, project: &str) -> Option<PathBuf> {
+        self.root_of(project).ok().map(|r| r.root)
+    }
+
     pub fn projects(&self) -> Vec<(String, PathBuf, u64)> {
         // A row's count is the threads whose project is that row: a
         // switched thread counts under its current project, and one
@@ -671,6 +706,7 @@ impl ThreadTable {
                 dir: root.threads_dir.clone(),
                 home: Some(project.to_owned()),
                 switched: None,
+                switched_root: None,
                 root: Some(root.root.clone()),
                 creator,
                 run: RunThread::No,
@@ -1138,6 +1174,7 @@ impl ThreadTable {
             dir: dir.to_path_buf(),
             home: Some(project.to_owned()),
             switched: None,
+            switched_root: None,
             root: None,
             creator: None,
             run: RunThread::No,
@@ -1316,7 +1353,7 @@ fn legacy_dirs(base: &Path) -> Vec<PathBuf> {
 
 /// Is `a` the same root as `b`? Both sides are canonicalised when they
 /// exist, so `/tmp` and `/private/tmp` match on macOS (issue #9).
-fn same_root(a: &Path, b: &Path) -> bool {
+pub(crate) fn same_root(a: &Path, b: &Path) -> bool {
     match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
         (Ok(a), Ok(b)) => a == b,
         _ => a == b,
@@ -1376,6 +1413,7 @@ fn scan_log(
         dir,
         home: None,
         switched: None,
+        switched_root: None,
         root: None,
         creator: None,
         run: RunThread::No,
@@ -1427,6 +1465,10 @@ fn scan_log(
                     aigentic_runtime::aigentic_log::ProjectSwitchedPayload,
                 >(event.payload.clone())
                 {
+                    // The root too (issue #88): the last switch's root,
+                    // whatever its `to` is, so `switched` and
+                    // `switched_root` never disagree.
+                    entry.switched_root = p.to.as_ref().map(|_| p.root.clone());
                     entry.switched = p.to;
                 }
             }
@@ -1566,6 +1608,116 @@ pub fn name_clashes(name: &str, root: &Path, workspaces: &[Workspace]) -> bool {
         .any(|p| crate::workspaces::project_name(p) == name && !same_root(p, root))
 }
 
+/// The front thread's current project and its root, read from the logs
+/// without a table (issue #88): the built-in daemon learns where the
+/// person's front thread lives before it fixes its project list.
+///
+/// Walks the flat directory and every legacy one, reads the first line
+/// of each log — a daemon-made log starts with `thread_started` — keeps
+/// the ones whose `thread_started` is a person's front thread, and takes
+/// the largest id. `None` when there is no front thread, when its
+/// project is `None`, or when it is the legacy `_none` a front thread
+/// can never have.
+pub fn front_root(base: &Path, user: &str) -> Option<(String, PathBuf)> {
+    let mut newest: Option<(Ulid, PathBuf)> = None;
+    for path in log_files(base).into_iter().chain(
+        legacy_dirs(base)
+            .into_iter()
+            .flat_map(|sub| log_files(&sub)),
+    ) {
+        let Some((id, front)) = front_head(&path, user) else {
+            continue;
+        };
+        if front && newest.as_ref().is_none_or(|(best, _)| id > *best) {
+            newest = Some((id, path));
+        }
+    }
+    let (_, path) = newest?;
+    front_project_of(&path)
+}
+
+/// The rule behind `root_of_thread` (issue #88), pure so the pre-#88
+/// index — `switched` set, no root — can be tested on an entry no table
+/// would build: when the name `project_of` answers is the log's last
+/// switch, the switch's root, **never** the home root when that root is
+/// unrecorded; else the entry's own root.
+fn root_of_indexed(indexed: &Indexed, project: Option<&str>) -> Option<PathBuf> {
+    if indexed.switched.is_some() && indexed.switched.as_deref() == project {
+        indexed.switched_root.clone()
+    } else {
+        indexed.root.clone()
+    }
+}
+
+/// The id and the `front` flag in a log's first line, when that line is
+/// a `thread_started` this person made (issue #88). Reads one line.
+fn front_head(path: &Path, user: &str) -> Option<(Ulid, bool)> {
+    let id: Ulid = path.file_stem()?.to_str()?.parse().ok()?;
+    let file = std::fs::File::open(path).ok()?;
+    let first = BufReader::new(file).lines().next()?.ok()?;
+    if !first.contains("\"kind\":\"thread_started\"") {
+        return None;
+    }
+    let event: Event = serde_json::from_str(&first).ok()?;
+    if event.kind != EventKind::ThreadStarted {
+        return None;
+    }
+    let p: ThreadStartedPayload = serde_json::from_value(event.payload).ok()?;
+    if p.created_by != Author::User(UserId(user.to_owned())) {
+        return None;
+    }
+    Some((id, p.front))
+}
+
+/// The project and root a log names now (issue #88), mirroring
+/// `scan_log`'s reading of the same two lines: the last
+/// `project_switched` with `to` as the log has it, else the
+/// `thread_started`'s own project. A last switch with `to: None` clears
+/// the switch, exactly as it does in the index.
+fn front_project_of(path: &Path) -> Option<(String, PathBuf)> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut started: Option<(Option<String>, PathBuf)> = None;
+    let mut switched: Option<(Option<String>, PathBuf)> = None;
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else {
+            break;
+        };
+        let wants_started = line.contains("\"kind\":\"thread_started\"");
+        let wants_switch = line.contains("\"kind\":\"project_switched\"");
+        if !(wants_started || wants_switch) {
+            continue;
+        }
+        let Ok(event) = serde_json::from_str::<Event>(&line) else {
+            continue;
+        };
+        match event.kind {
+            EventKind::ThreadStarted if wants_started => {
+                let Ok(p) = serde_json::from_value::<ThreadStartedPayload>(event.payload) else {
+                    continue;
+                };
+                started = Some((p.project, p.root));
+            }
+            EventKind::ProjectSwitched if wants_switch => {
+                let Ok(p) = serde_json::from_value::<ProjectSwitchedPayload>(event.payload) else {
+                    continue;
+                };
+                switched = Some((p.to, p.root));
+            }
+            _ => {}
+        }
+    }
+    // Only the last switch counts, and only when it named a project.
+    let (project, root) = match switched {
+        Some((to @ Some(_), root)) => (to, root),
+        _ => started?,
+    };
+    let name = project?;
+    if name == LEGACY_NONE_PROJECT {
+        return None;
+    }
+    Some((name, root))
+}
+
 /// `root` as it really is, or as given when it does not exist.
 fn canonical(root: &Path) -> PathBuf {
     std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf())
@@ -1580,4 +1732,38 @@ fn fnv1a_32(bytes: &[u8]) -> u32 {
         hash = hash.wrapping_mul(0x0100_0193);
     }
     hash
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn indexed(switched: Option<&str>, switched_root: Option<&str>, root: Option<&str>) -> Indexed {
+        Indexed {
+            dir: PathBuf::from("/threads"),
+            home: Some("a".to_owned()),
+            switched: switched.map(str::to_owned),
+            switched_root: switched_root.map(PathBuf::from),
+            root: root.map(PathBuf::from),
+            creator: None,
+            run: RunThread::No,
+            torn_run: false,
+            front: false,
+        }
+    }
+
+    /// T5(d): an index from before #88 has `switched` and no
+    /// `switched_root`. It must give `None` — never the home root, which
+    /// belongs to another project.
+    #[test]
+    fn a_switch_with_no_recorded_root_is_never_the_home_root() {
+        let old = indexed(Some("c"), None, Some("/a"));
+        assert_eq!(root_of_indexed(&old, Some("c")), None);
+        // A name `project_of` does not answer as the switch falls back to
+        // the entry's own root.
+        assert_eq!(root_of_indexed(&old, Some("a")), Some(PathBuf::from("/a")));
+        // A switch whose root the log recorded gives it.
+        let new = indexed(Some("c"), Some("/c"), Some("/a"));
+        assert_eq!(root_of_indexed(&new, Some("c")), Some(PathBuf::from("/c")));
+    }
 }

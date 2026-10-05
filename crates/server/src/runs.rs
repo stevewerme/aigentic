@@ -383,6 +383,53 @@ impl Drop for IssueLock {
     }
 }
 
+/// The front thread's per-user lock (issue #88): two terminals launched
+/// together on a first run must not both find no front thread and both
+/// make one. Built like [`IssueLock`], over `<base>/front-<user>.lock`,
+/// and held across `Front`'s check-and-create. The file is left in
+/// place.
+pub struct FrontLock {
+    file: std::fs::File,
+}
+
+impl FrontLock {
+    /// How long a `Front` waits for another process's check-and-create.
+    /// That window is a few file writes, so waiting this long means the
+    /// holder is stuck; the caller is refused rather than kept waiting.
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// Take `user`'s front-thread lock under `base`, waiting while
+    /// another process holds it.
+    pub async fn take(base: &std::path::Path, user: &str) -> Result<Self, String> {
+        let path = base.join(format!("front-{}.lock", lock_name(user)));
+        let file = open_lock_file(base, &path)?;
+        let deadline = tokio::time::Instant::now() + Self::WAIT;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(Self { file }),
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(format!(
+                            "another aigentic process has been starting {user}'s front thread for {}s; try again",
+                            Self::WAIT.as_secs()
+                        ));
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Err(std::fs::TryLockError::Error(e)) => {
+                    return Err(format!("cannot lock {}: {e}", path.display()));
+                }
+            }
+        }
+    }
+}
+
+impl Drop for FrontLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
 /// A project name as a file name: every character outside
 /// `[A-Za-z0-9_-]` becomes `_` (issue #9), so an issue lock's name is a
 /// safe path whatever a project is called.
@@ -399,8 +446,9 @@ pub fn lock_name(project: &str) -> String {
         .collect()
 }
 
-/// Open (creating it if needed) a lock file under `threads_dir`.
-fn open_lock_file(
+/// Open (creating it if needed) a lock file under `threads_dir`. Shared
+/// by `IssueLock` and `FrontLock` (issue #88).
+pub(crate) fn open_lock_file(
     threads_dir: &std::path::Path,
     path: &std::path::Path,
 ) -> Result<std::fs::File, String> {

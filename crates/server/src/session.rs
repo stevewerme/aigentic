@@ -278,6 +278,14 @@ async fn front_thread(
     author: &Author,
     project: &str,
 ) -> FrontReply {
+    // One process at a time, per user (issue #88): two terminals launched
+    // together must not both find no front thread and both make one. Held
+    // across the whole check-and-create, and released by the guard's drop
+    // however this returns; a `kill -9` closes the fd.
+    let _lock = match crate::runs::FrontLock::take(threads.threads_base(), user).await {
+        Ok(lock) => lock,
+        Err(reason) => return FrontReply::Refused(Box::new(Response::Refused { reason })),
+    };
     let replaced = match threads.latest_front(user) {
         Some(front) => match resumable(config, threads, user, front) {
             Ok(info) => return FrontReply::Open(Box::new(info), FrontOutcome::Resumed),
@@ -331,6 +339,24 @@ fn resumable(
             return Err(format!("your front thread {front} cannot be opened: {e}"));
         }
     };
+    // The name must be the same project, not another folder's project of
+    // that name (issue #88): a front thread in bare `/x/app` must not
+    // open in a daemon whose `/y/app` is the project. Compared only when
+    // the thread's recorded root is still there — a project whose folder
+    // moved is resumed by name, as #84 did, and a thread with no recorded
+    // root is never refused for it.
+    let thread_root = threads.root_of_thread(front);
+    let daemon_root = threads.project_root(&project);
+    if let (Some(thread_root), Some(daemon_root)) = (&thread_root, &daemon_root)
+        && thread_root.is_dir()
+        && !crate::threads::same_root(thread_root, daemon_root)
+    {
+        return Err(format!(
+            "your front thread is in {project} at {}, not this daemon's {project} at {}",
+            thread_root.display(),
+            daemon_root.display()
+        ));
+    }
     // A resume is an `Open` of the front thread, so that is the request
     // `auth` judges: `read` where the front thread lives.
     let open = Request::Open {

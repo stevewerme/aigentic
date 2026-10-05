@@ -769,3 +769,544 @@ async fn t11_a_stale_client_is_refused_with_both_numbers() {
     assert!(reason.contains(&stale.to_string()), "{reason}");
     assert!(reason.contains(&PROTOCOL_VERSION.to_string()), "{reason}");
 }
+
+// ---------------------------------------------------------------------------
+// Issue #88: the built-in daemon opens the front thread from any folder,
+// and two daemons never race to make two front threads. The rig here is
+// `embed_with`, the daemon plain `aigentic` starts, not `Server::new`.
+// ---------------------------------------------------------------------------
+
+/// A daemon the way plain `aigentic` starts one: `embed_with`, which
+/// registers the front thread's project when it can (issue #88). One
+/// config dir and one threads base per test dir, so a second one over
+/// the same dir is the next `aigentic` in another folder.
+struct Plain {
+    inner: aigentic_server::Embedded,
+}
+
+impl Plain {
+    async fn new(dir: &Path, root: &Path, user: &str) -> Self {
+        let cfg_dir = dir.join("cfg");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        let base = dir.join("threads");
+        let config = Config::parse(&format!(
+            "threads_dir = {:?}\n[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n",
+            base.display()
+        ))
+        .unwrap();
+        let inner = Server::embed_with(
+            config,
+            cfg_dir,
+            root.to_path_buf(),
+            user,
+            None,
+            Arc::new(OkFactory),
+            Arc::new(NoReports),
+        )
+        .await
+        .unwrap();
+        Self { inner }
+    }
+
+    async fn connect(&self) -> Client {
+        Client::connect(&Addr::Unix(self.inner.socket.clone()), &self.inner.token)
+            .await
+            .unwrap()
+            .0
+    }
+
+    fn project(&self) -> &str {
+        &self.inner.project
+    }
+
+    fn base(&self) -> PathBuf {
+        self.inner.server.threads.threads_base().to_path_buf()
+    }
+
+    fn threads(&self) -> &aigentic_server::threads::ThreadTable {
+        &self.inner.server.threads
+    }
+}
+
+/// The files in `base` whose first line marks a front thread: what a
+/// count of front threads has to look at, not a table's memory.
+fn front_logs(base: &Path) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = std::fs::read_dir(base)
+        .map(|d| {
+            d.filter_map(Result::ok)
+                .map(|e| e.path())
+                .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl"))
+                .filter(|p| {
+                    std::fs::read_to_string(p)
+                        .unwrap_or_default()
+                        .lines()
+                        .next()
+                        .is_some_and(|line| line.contains("\"front\":true"))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    found.sort();
+    found
+}
+
+/// A workspace file naming `projects`, written the way a person's does.
+fn workspace_naming(dir: &Path, name: &str, projects: &[&Path]) {
+    let ws = dir.join("cfg").join("workspaces");
+    std::fs::create_dir_all(&ws).unwrap();
+    let list = projects
+        .iter()
+        .map(|p| format!("{:?}", p.display().to_string()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    std::fs::write(
+        ws.join(format!("{name}.toml")),
+        format!("name = \"{name}\"\nprojects = [{list}]\n"),
+    )
+    .unwrap();
+}
+
+/// A copy of a daemon's `Front` reply for `join!`, which cannot take
+/// references across both arms for long.
+async fn front_pair(
+    first: &mut Client,
+    second: &mut Client,
+    name: &str,
+) -> ((Ulid, FrontOutcome), (Ulid, FrontOutcome)) {
+    tokio::join!(front(first, name), front(second, name))
+}
+
+/// T1 — a front thread made in `a` is resumed by a daemon embedded in
+/// bare `b`, and `a` is in that daemon's project list.
+#[tokio::test]
+async fn t88_1_a_front_thread_opens_from_any_folder() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = project(dir.path(), "a", "");
+    let b = dir.path().join("b");
+    std::fs::create_dir_all(&b).unwrap();
+
+    let first = Plain::new(dir.path(), &a, "steve").await;
+    assert_eq!(first.project(), "a");
+    let mut client = first.connect().await;
+    let (made, outcome) = front(&mut client, first.project()).await;
+    assert_eq!(outcome, FrontOutcome::First);
+    drop(first);
+
+    let second = Plain::new(dir.path(), &b, "steve").await;
+    assert_eq!(
+        second.project(),
+        aigentic_server::threads::project_name_at(&b, &[]),
+        "the folder's own name, derived"
+    );
+    assert_eq!(second.inner.front_project.as_deref(), Some("a"));
+
+    let mut client = second.connect().await;
+    let (again, outcome) = front(&mut client, second.project()).await;
+    assert_eq!(outcome, FrontOutcome::Resumed);
+    assert_eq!(again, made, "the same front thread");
+    assert!(
+        opens(&mut client, again).await,
+        "the resumed front thread opens"
+    );
+
+    // The registration is visible: the client's project list and the #81
+    // block a thread of this daemon gets both name `a`.
+    let Response::Projects { projects } = client.request(Request::ListProjects).await.unwrap()
+    else {
+        panic!("a project list")
+    };
+    assert!(
+        projects.iter().any(|p| p.name == "a"),
+        "the front project is listed: {projects:?}"
+    );
+    let block = second
+        .threads()
+        .shown_projects(again, Some("a"))
+        .expect("a block");
+    assert!(block.contains("a"), "{block}");
+}
+
+/// Whether an `Open` succeeds.
+async fn opens(client: &mut Client, thread: Ulid) -> bool {
+    !matches!(
+        client
+            .request(Request::Open {
+                thread,
+                from_seq: 0,
+            })
+            .await
+            .unwrap(),
+        Response::Refused { .. } | Response::Error { .. }
+    )
+}
+
+/// Open a thread's actor, so a `SwitchProject` has one to act on. A
+/// `Front` reply only names the id.
+async fn open(client: &mut Client, thread: Ulid) {
+    let opened = client
+        .request(Request::Open {
+            thread,
+            from_seq: 0,
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(opened, Response::Opened { .. }),
+        "opening the thread: {opened:?}"
+    );
+}
+
+/// T2 — a front thread switched to `c` is registered at `c`'s root by a
+/// daemon that has no workspace naming `c`.
+#[tokio::test]
+async fn t88_2_a_switched_front_thread_is_registered_where_it_switched_to() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = project(dir.path(), "a", "");
+    let c = project(dir.path(), "c", "");
+    let b = dir.path().join("b");
+    std::fs::create_dir_all(&b).unwrap();
+    workspace_naming(dir.path(), "w", &[&c]);
+
+    let first = Plain::new(dir.path(), &a, "steve").await;
+    let mut client = first.connect().await;
+    let (made, outcome) = front(&mut client, "a").await;
+    assert_eq!(outcome, FrontOutcome::First);
+    open(&mut client, made).await;
+    assert_eq!(
+        client
+            .request(Request::SwitchProject {
+                thread: made,
+                project: "c".into(),
+            })
+            .await
+            .unwrap(),
+        Response::Ok
+    );
+    drop(first);
+
+    // No workspace names `c` any more.
+    std::fs::remove_file(dir.path().join("cfg/workspaces/w.toml")).unwrap();
+    let second = Plain::new(dir.path(), &b, "steve").await;
+    assert_eq!(second.inner.front_project.as_deref(), Some("c"));
+
+    let mut client = second.connect().await;
+    let (again, outcome) = front(&mut client, second.project()).await;
+    assert_eq!(outcome, FrontOutcome::Resumed);
+    assert_eq!(again, made);
+}
+
+/// T3 — the front thread's folder is gone, so nothing is registered and
+/// `Front` says which project it cannot reach.
+#[tokio::test]
+async fn t88_3_a_gone_root_is_not_registered_and_is_named_in_the_reason() {
+    let dir = tempfile::tempdir().unwrap();
+    let x = dir.path().join("x");
+    std::fs::create_dir_all(&x).unwrap();
+    let b = dir.path().join("b");
+    std::fs::create_dir_all(&b).unwrap();
+
+    let first = Plain::new(dir.path(), &x, "steve").await;
+    assert_eq!(first.project(), "x");
+    let mut client = first.connect().await;
+    let (made, outcome) = front(&mut client, "x").await;
+    assert_eq!(outcome, FrontOutcome::First);
+    drop(first);
+    std::fs::remove_dir_all(&x).unwrap();
+
+    let second = Plain::new(dir.path(), &b, "steve").await;
+    assert_eq!(
+        second.inner.front_project, None,
+        "a gone root registers nothing"
+    );
+    let mut client = second.connect().await;
+    let (again, outcome) = front(&mut client, second.project()).await;
+    let FrontOutcome::Replaced { reason } = outcome else {
+        panic!("a replacement: {outcome:?}")
+    };
+    assert!(reason.contains('x'), "{reason}");
+    assert_ne!(again, made, "a new thread, not the gone one");
+    assert_eq!(second.inner.front_project, None);
+}
+
+/// T4 — two bare folders named `app`: nothing is registered, and the
+/// refusal names both roots.
+#[tokio::test]
+async fn t88_4_two_bare_folders_named_app_never_share_a_front_thread() {
+    let dir = tempfile::tempdir().unwrap();
+    let t1_app = dir.path().join("t1").join("app");
+    let t2_app = dir.path().join("t2").join("app");
+    std::fs::create_dir_all(&t1_app).unwrap();
+    std::fs::create_dir_all(&t2_app).unwrap();
+
+    let first = Plain::new(dir.path(), &t1_app, "steve").await;
+    assert_eq!(first.project(), "app");
+    let mut client = first.connect().await;
+    let (made, outcome) = front(&mut client, "app").await;
+    assert_eq!(outcome, FrontOutcome::First);
+    drop(first);
+
+    let second = Plain::new(dir.path(), &t2_app, "steve").await;
+    assert_eq!(second.project(), "app");
+    assert_eq!(
+        second.inner.front_project, None,
+        "a name already taken is not registered"
+    );
+    let mut client = second.connect().await;
+    let (again, outcome) = front(&mut client, "app").await;
+    let FrontOutcome::Replaced { reason } = outcome else {
+        panic!("a replacement: {outcome:?}")
+    };
+    assert!(
+        reason.contains(&t1_app.display().to_string()),
+        "the reason names where the front thread is: {reason}"
+    );
+    assert!(
+        reason.contains(&t2_app.display().to_string()),
+        "the reason names this daemon's app: {reason}"
+    );
+    let payload = front_of(&second.base(), again);
+    assert_eq!(payload.root, t2_app, "the new front thread is here");
+    assert_ne!(again, made);
+}
+
+/// T5a — a front thread the daemon itself switched, unloaded and
+/// resumed by the same daemon, comes back.
+#[tokio::test]
+async fn t88_5a_a_switched_front_thread_resumes_after_being_unloaded() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = project(dir.path(), "a", "");
+    let c = project(dir.path(), "c", "");
+    let b = dir.path().join("b");
+    std::fs::create_dir_all(&b).unwrap();
+    workspace_naming(dir.path(), "w", &[&a, &c]);
+
+    let daemon = Plain::new(dir.path(), &a, "steve").await;
+    let mut client = daemon.connect().await;
+    let (made, outcome) = front(&mut client, "a").await;
+    assert_eq!(outcome, FrontOutcome::First);
+    open(&mut client, made).await;
+    assert_eq!(
+        client
+            .request(Request::SwitchProject {
+                thread: made,
+                project: "c".into(),
+            })
+            .await
+            .unwrap(),
+        Response::Ok
+    );
+    let root = daemon
+        .threads()
+        .root_of_thread(made)
+        .expect("the index learned the switched root");
+    assert!(root.ends_with("c"), "the switched project's root: {root:?}");
+    // The last session closes the thread, so a sweep can unload it while
+    // the daemon stays up.
+    assert_eq!(
+        client
+            .request(Request::Close { thread: made })
+            .await
+            .unwrap(),
+        Response::Ok
+    );
+    let unloaded = daemon.threads().sweep(Duration::ZERO).await;
+    assert!(unloaded.contains(&made), "unloaded: {unloaded:?}");
+
+    let (again, outcome) = front(&mut client, "c").await;
+    assert_eq!(outcome, FrontOutcome::Resumed, "same daemon, still known");
+    assert_eq!(again, made);
+}
+
+/// T5b — the same thread under a daemon whose project of that name is
+/// another live root is refused.
+#[tokio::test]
+async fn t88_5b_another_root_of_the_same_name_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = project(dir.path(), "a", "");
+    let c = project(dir.path(), "c", "");
+    // A second project named `c`, at another root that exists.
+    let other = dir.path().join("other");
+    std::fs::create_dir_all(other.join(".aigentic")).unwrap();
+    std::fs::write(
+        other.join("aigentic.toml"),
+        "[project]\nname = \"c\"\n[memory]\nenabled = false\n",
+    )
+    .unwrap();
+    let b = dir.path().join("b");
+    std::fs::create_dir_all(&b).unwrap();
+    workspace_naming(dir.path(), "w", &[&c]);
+
+    let first = Plain::new(dir.path(), &a, "steve").await;
+    let mut client = first.connect().await;
+    let (made, outcome) = front(&mut client, "a").await;
+    assert_eq!(outcome, FrontOutcome::First);
+    open(&mut client, made).await;
+    assert_eq!(
+        client
+            .request(Request::SwitchProject {
+                thread: made,
+                project: "c".into(),
+            })
+            .await
+            .unwrap(),
+        Response::Ok
+    );
+    drop(first);
+
+    // Now `c` is the other folder: the workspace names that one.
+    workspace_naming(dir.path(), "w", &[&other]);
+    let second = Plain::new(dir.path(), &b, "steve").await;
+    assert_eq!(second.inner.front_project, None, "the name is taken");
+    let mut client = second.connect().await;
+    let (again, outcome) = front(&mut client, second.project()).await;
+    assert!(
+        matches!(outcome, FrontOutcome::Replaced { .. }),
+        "another root's `c`: {outcome:?}"
+    );
+    assert_ne!(again, made);
+}
+
+/// T5c — a project whose folder moved: the recorded root no longer
+/// exists, so the daemon's project of that name resumes it.
+#[tokio::test]
+async fn t88_5c_a_moved_project_still_resumes() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = project(dir.path(), "a", "");
+    let c = project(dir.path(), "c", "");
+    let moved = dir.path().join("c-moved");
+    let b = dir.path().join("b");
+    std::fs::create_dir_all(&b).unwrap();
+    workspace_naming(dir.path(), "w", &[&c]);
+
+    let first = Plain::new(dir.path(), &a, "steve").await;
+    let mut client = first.connect().await;
+    let (made, outcome) = front(&mut client, "a").await;
+    assert_eq!(outcome, FrontOutcome::First);
+    open(&mut client, made).await;
+    assert_eq!(
+        client
+            .request(Request::SwitchProject {
+                thread: made,
+                project: "c".into(),
+            })
+            .await
+            .unwrap(),
+        Response::Ok
+    );
+    drop(first);
+
+    // The folder moves and the workspace file follows it.
+    std::fs::rename(&c, &moved).unwrap();
+    workspace_naming(dir.path(), "w", &[&moved]);
+    let second = Plain::new(dir.path(), &b, "steve").await;
+    let mut client = second.connect().await;
+    let (again, outcome) = front(&mut client, second.project()).await;
+    assert_eq!(
+        outcome,
+        FrontOutcome::Resumed,
+        "the moved root is not a clash"
+    );
+    assert_eq!(again, made);
+}
+
+/// T6 — two daemons in one folder on one threads directory, both asked
+/// for the front thread at once, make exactly one.
+#[tokio::test]
+async fn t88_6_two_daemons_starting_together_make_one_front_thread() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = project(dir.path(), "p", "");
+    let first = Plain::new(dir.path(), &p, "steve").await;
+    let second = Plain::new(dir.path(), &p, "steve").await;
+    assert_eq!(first.project(), second.project());
+    let mut a = first.connect().await;
+    let mut b = second.connect().await;
+
+    let name = first.project().to_owned();
+    let ((id_a, outcome_a), (id_b, outcome_b)) = front_pair(&mut a, &mut b, &name).await;
+    assert_eq!(id_a, id_b, "one front thread");
+    let made = [&outcome_a, &outcome_b]
+        .iter()
+        .filter(|o| matches!(o, FrontOutcome::First))
+        .count();
+    let resumed = [&outcome_a, &outcome_b]
+        .iter()
+        .filter(|o| matches!(o, FrontOutcome::Resumed))
+        .count();
+    assert_eq!(made, 1, "one made it: {outcome_a:?} / {outcome_b:?}");
+    assert_eq!(resumed, 1, "one found it: {outcome_a:?} / {outcome_b:?}");
+    assert_eq!(
+        front_logs(&first.base()).len(),
+        1,
+        "exactly one front log: {:?}",
+        front_logs(&first.base())
+    );
+
+    // The lock itself is what serialises them (issue #88): a `Front` that
+    // is already in flight does not answer while the test holds the same
+    // per-user lock, and does once it is released. Without the lock in
+    // `front_thread`, it would answer immediately and this would fail.
+    let held = aigentic_server::runs::FrontLock::take(&first.base(), "steve")
+        .await
+        .expect("holding the front lock");
+    let queued = tokio::time::timeout(Duration::from_millis(300), front(&mut b, &name)).await;
+    assert!(
+        queued.is_err(),
+        "a second Front waits for the lock: {queued:?}"
+    );
+    drop(held);
+    let (id_c, outcome_c) = front(&mut b, &name).await;
+    assert_eq!(outcome_c, FrontOutcome::Resumed, "released, so it finds it");
+    assert_eq!(id_c, id_a, "still one front thread");
+}
+
+/// T7 — the per-user lock's file name comes from `lock_name`, and a
+/// second take waits while the first is held.
+#[tokio::test]
+async fn t88_7_the_front_lock_is_per_user_and_refuses_a_second_taker() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("threads");
+    let held = aigentic_server::runs::FrontLock::take(&base, "a b")
+        .await
+        .expect("the first take");
+    let expected = base.join(format!(
+        "front-{}.lock",
+        aigentic_server::runs::lock_name("a b")
+    ));
+    assert!(expected.is_file(), "{}", expected.display());
+
+    let second = tokio::time::timeout(
+        Duration::from_millis(200),
+        aigentic_server::runs::FrontLock::take(&base, "a b"),
+    )
+    .await;
+    assert!(second.is_err(), "the second take waited, as IssueLock does");
+
+    drop(held);
+    assert!(
+        aigentic_server::runs::FrontLock::take(&base, "a b")
+            .await
+            .is_ok(),
+        "released"
+    );
+}
+
+/// T8 — the served daemon never registers: `server.toml` is all it has.
+#[tokio::test]
+async fn t88_8_the_served_daemon_never_registers_a_front_project() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = project(dir.path(), "a", "");
+    let q = project(dir.path(), "q", "");
+    // A front thread in `a`, in the same threads base the daemon opens.
+    let id = Ulid::generate();
+    let mut log = hand_log(&dir.path().join("threads"), id);
+    append_started(&mut log, Some("a"), &a, "steve", true);
+
+    let daemon = Daemon::new(dir.path(), vec![pc("q", &q)], &["steve"], false).await;
+    let mut steve = steve(&daemon).await;
+    let (made, outcome) = front(&mut steve, "q").await;
+    let FrontOutcome::Replaced { reason } = outcome else {
+        panic!("a replacement: {outcome:?}")
+    };
+    assert!(reason.contains("does not know"), "{reason}");
+    assert_ne!(made, id, "not the thread in a");
+}

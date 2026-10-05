@@ -350,6 +350,33 @@ impl Server {
         // none, and hands the merged set to `Server::build`.
         let workspaces = crate::workspaces::load_all(&config_dir).unwrap_or_default();
         let project = project_name_at(&root, &workspaces);
+        // The person's front thread may live in a project this folder's
+        // daemon does not know (issue #88), and the project list is fixed
+        // once the daemon starts (#87 is live reload). Learn it here, at
+        // start: when the front thread's project is not in the set
+        // `build` will end with, and its folder is still there, register
+        // it. A name already taken is left alone — a different project of
+        // that name must answer `Replaced`, never resume in the wrong
+        // root, and `resumable` sorts the roots out.
+        let threads_base = config
+            .threads_dir
+            .clone()
+            .unwrap_or_else(crate::config::default_threads_dir);
+        let known = crate::workspaces::merge(
+            vec![ProjectConfig {
+                name: project.clone(),
+                root: root.clone(),
+            }],
+            &workspaces,
+        );
+        let front_project = crate::threads::front_root(&threads_base, user)
+            .filter(|(name, front_root)| {
+                !known.iter().any(|p| &p.name == name) && front_root.is_dir()
+            })
+            .map(|(name, front_root)| ProjectConfig {
+                name,
+                root: front_root,
+            });
         let server = ServerConfig {
             listen: format!("unix:{}", socket.display()),
             idle_unload_secs: 24 * 3600,
@@ -358,13 +385,23 @@ impl Server {
                 token_env: None,
                 token: Some(token.clone()),
             }],
-            projects: vec![ProjectConfig {
-                name: project.clone(),
-                root,
-            }],
+            projects: match &front_project {
+                Some(extra) => vec![
+                    ProjectConfig {
+                        name: project.clone(),
+                        root,
+                    },
+                    extra.clone(),
+                ],
+                None => vec![ProjectConfig {
+                    name: project.clone(),
+                    root,
+                }],
+            },
             // An embedded daemon resumes nothing on its own (issue #58).
             resume_runs: false,
         };
+        let front_name = front_project.as_ref().map(|p| p.name.clone());
         let server = Arc::new(Self::build(
             config,
             config_dir,
@@ -386,6 +423,7 @@ impl Server {
             socket,
             token,
             project,
+            front_project: front_name,
             server,
             task,
             _dir: dir,
@@ -400,6 +438,11 @@ pub struct Embedded {
     /// Never printed; the client sends it in `Hello`.
     pub token: String,
     pub project: String,
+    /// The front thread's project, when this daemon registered it at
+    /// start (issue #88): `None` when no front thread exists, when its
+    /// root is gone, or when a project already holds its name. For tests
+    /// and a later banner; the client still sends `project`.
+    pub front_project: Option<String>,
     pub server: Arc<Server>,
     task: tokio::task::JoinHandle<Result<(), ServerError>>,
     _dir: PathBuf,
