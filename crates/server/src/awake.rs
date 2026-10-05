@@ -188,9 +188,24 @@ impl KeepAwake for ProcessGuard {
     }
 
     fn release(&self) {
-        let previous = self
-            .holds
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
+        // Take one hold off, never below zero. A compare-and-swap loop
+        // rather than `fetch_update`, which Rust 1.99 deprecated for
+        // `try_update` (not in 1.98): this compiles clean on both.
+        let mut current = self.holds.load(Ordering::SeqCst);
+        let previous = loop {
+            let Some(next) = current.checked_sub(1) else {
+                break Err(current);
+            };
+            match self.holds.compare_exchange_weak(
+                current,
+                next,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(was) => break Ok(was),
+                Err(now) => current = now,
+            }
+        };
         if !matches!(previous, Ok(1)) {
             // No hold to give back, or other turns are still working.
             return;
