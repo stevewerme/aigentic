@@ -428,7 +428,11 @@ async fn the_listing_belongs_to_the_creator_and_only_a_person_has_one() {
         p1.display()
     );
     assert_eq!(block, expected);
-    assert!(!block.contains("p2"), "{block}");
+    // No row names p2. The check reads the block without p1's root:
+    // that root is a temp path, and a temp path can contain `p2`
+    // (`…/.tmp2iLLNa/p1`), which made this fail at random (#94).
+    let names = block.replace(&p1.display().to_string(), "");
+    assert!(!names.contains("p2"), "{block}");
 
     // A thread an agent started: `runner` is no person.
     let agent = hand_written(
