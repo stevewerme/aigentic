@@ -3,20 +3,26 @@
 //! Nothing here touches a real threads directory: every base is a
 //! `tempdir`.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aigentic_api::client::{Addr, Client};
-use aigentic_api::{FrontOutcome, PROTOCOL_VERSION, Request, Response};
+use aigentic_api::{
+    FrontOutcome, Notice, PROTOCOL_VERSION, Request, Response, SwitchReply, ThreadState,
+};
 use aigentic_runtime::aigentic_core::{
-    Author, Capabilities, CompletionRequest, EventKind, Message, Provider, ProviderEvent, UserId,
+    Author, Capabilities, CompletionRequest, ContentBlock, EventKind, Message, Provider,
+    ProviderEvent, ToolCall, UserId,
 };
 use aigentic_runtime::aigentic_log::{
-    NewEvent, RunStartedPayload, ThreadLog, ThreadStartedPayload,
+    DecisionAnswer, DecisionAnsweredPayload, DecisionKind, DecisionProposedPayload, NewEvent,
+    RunStartedPayload, STARTUP_PREFIX, ThreadLog, ThreadStartedPayload,
 };
 use aigentic_runtime::runner::RunnerHost;
+use aigentic_server::awake::KeepAwake;
 use aigentic_server::build::{BuildError, ProviderFactory};
 use aigentic_server::config::{Config, ProjectConfig, ServerConfig, UserConfig};
 use aigentic_server::runs::ServerHost;
@@ -104,6 +110,117 @@ impl ProviderFactory for OkFactory {
     }
 }
 
+/// One script shared by every provider the factory builds (issue #92): a
+/// `None` step parks the turn, which is what a test needs to see a
+/// running thread refuse the start-up proposal.
+struct Scripted {
+    script: Arc<Mutex<VecDeque<Option<Vec<ProviderEvent>>>>>,
+}
+
+impl Provider for Scripted {
+    fn complete(
+        &self,
+        _: &CompletionRequest<'_>,
+    ) -> Pin<Box<dyn Stream<Item = ProviderEvent> + Send + '_>> {
+        match self
+            .script
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop_front()
+        {
+            Some(Some(events)) => Box::pin(futures_util::stream::iter(events)),
+            _ => Box::pin(futures_util::stream::pending()),
+        }
+    }
+    fn count_tokens(&self, _: &[Message]) -> u64 {
+        7
+    }
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            supports_tools: true,
+            supports_images: false,
+            supports_caching: false,
+            supports_structured_output: false,
+            max_context_tokens: 100_000,
+        }
+    }
+}
+
+struct ScriptedFactory {
+    script: Arc<Mutex<VecDeque<Option<Vec<ProviderEvent>>>>>,
+}
+
+impl ScriptedFactory {
+    fn new(script: Vec<Option<Vec<ProviderEvent>>>) -> Arc<Self> {
+        Arc::new(Self {
+            script: Arc::new(Mutex::new(script.into())),
+        })
+    }
+}
+
+impl ProviderFactory for ScriptedFactory {
+    fn build(&self, _: &str) -> Result<(Box<dyn Provider>, String), BuildError> {
+        Ok((
+            Box::new(Scripted {
+                script: self.script.clone(),
+            }),
+            "scripted".into(),
+        ))
+    }
+}
+
+/// A guard that records the calls the daemon makes (issue #47), so a test
+/// can read the hold/release scope around an answer or a withdrawal with
+/// no turn to hide it — a copy of `tests/awake.rs`'s, which is private to
+/// that file.
+struct Recording {
+    inner: Mutex<Rec>,
+}
+
+#[derive(Default)]
+struct Rec {
+    held: usize,
+    calls: Vec<&'static str>,
+}
+
+impl Recording {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(Rec::default()),
+        })
+    }
+
+    fn rec(&self) -> std::sync::MutexGuard<'_, Rec> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn calls(&self) -> Vec<&'static str> {
+        self.rec().calls.clone()
+    }
+
+    fn outstanding(&self) -> usize {
+        self.rec().held
+    }
+}
+
+impl KeepAwake for Recording {
+    fn hold(&self) {
+        let mut rec = self.rec();
+        rec.held += 1;
+        rec.calls.push("hold");
+    }
+
+    fn release(&self) {
+        let mut rec = self.rec();
+        rec.held = rec.held.saturating_sub(1);
+        rec.calls.push("release");
+    }
+
+    fn status(&self) -> String {
+        "on".to_owned()
+    }
+}
+
 /// A daemon over a temp directory the caller holds: `<dir>/threads` is
 /// its threads base, so a test can write logs into it before the daemon
 /// starts, and a second daemon over the same directory is its restart.
@@ -119,6 +236,19 @@ impl Daemon {
     /// `users`. With `bundled`, `dir` is also the bundled directory, so a
     /// `Build` finds a workflow there.
     async fn new(dir: &Path, projects: Vec<ProjectConfig>, users: &[&str], bundled: bool) -> Self {
+        Self::new_with(dir, projects, users, bundled, Arc::new(OkFactory)).await
+    }
+
+    /// The same, with the factory given: a scripted provider lets a test
+    /// park a turn, so a running thread can be asked for its proposal
+    /// (issue #92).
+    async fn new_with(
+        dir: &Path,
+        projects: Vec<ProjectConfig>,
+        users: &[&str],
+        bundled: bool,
+        factory: Arc<dyn ProviderFactory>,
+    ) -> Self {
         let dir = dir.to_path_buf();
         let cfg_dir = dir.join("cfg");
         std::fs::create_dir_all(&cfg_dir).unwrap();
@@ -154,7 +284,7 @@ impl Daemon {
             config,
             cfg_dir,
             server_cfg,
-            Arc::new(OkFactory),
+            factory,
             Arc::new(NoReports),
         ));
         let socket = dir.join("d.sock");
@@ -296,9 +426,20 @@ async fn steve(daemon: &Daemon) -> Client {
 
 /// Ask for the front thread and answer with its row and outcome.
 async fn front(client: &mut Client, project_name: &str) -> (Ulid, FrontOutcome) {
+    front_here(client, project_name, None).await
+}
+
+/// The same ask, standing in a folder whose project the client names in
+/// `here` (issue #92); `None` is a bare folder, the old client's frame.
+async fn front_here(
+    client: &mut Client,
+    project_name: &str,
+    here: Option<&str>,
+) -> (Ulid, FrontOutcome) {
     match client
         .request(Request::Front {
             project: project_name.into(),
+            here: here.map(str::to_owned),
         })
         .await
         .unwrap()
@@ -306,6 +447,43 @@ async fn front(client: &mut Client, project_name: &str) -> (Ulid, FrontOutcome) 
         Response::Front { thread, outcome } => (thread.id, outcome),
         other => panic!("a front thread: {other:?}"),
     }
+}
+
+/// Open `id` and answer with the state the client would draw.
+async fn open_state(client: &mut Client, id: Ulid) -> ThreadState {
+    match client
+        .request(Request::Open {
+            thread: id,
+            from_seq: 0,
+        })
+        .await
+        .unwrap()
+    {
+        Response::Opened { state, .. } => state,
+        other => panic!("an open: {other:?}"),
+    }
+}
+
+/// Every `decision_proposed` in `id`'s log, with the author that wrote
+/// it.
+fn proposed_of(base: &Path, id: Ulid) -> Vec<(Author, DecisionProposedPayload)> {
+    events_of(base, id)
+        .into_iter()
+        .filter(|e| e.kind == EventKind::DecisionProposed)
+        .map(|e| {
+            let payload = serde_json::from_value(e.payload.clone()).unwrap();
+            (e.author, payload)
+        })
+        .collect()
+}
+
+/// Every `decision_answered` in `id`'s log, in order.
+fn answered_of(base: &Path, id: Ulid) -> Vec<DecisionAnsweredPayload> {
+    events_of(base, id)
+        .into_iter()
+        .filter(|e| e.kind == EventKind::DecisionAnswered)
+        .map(|e| serde_json::from_value(e.payload.clone()).unwrap())
+        .collect()
 }
 
 /// The id `ListThreads` lists, if it lists it.
@@ -566,6 +744,7 @@ async fn t9a_a_lost_role_in_the_requested_project_refuses_to_create_one() {
         &mut cara,
         Request::Front {
             project: "p".into(),
+            here: None,
         },
     )
     .await;
@@ -700,6 +879,7 @@ async fn t10b_a_front_that_must_create_is_refused_without_write() {
         &mut cara,
         Request::Front {
             project: "p".into(),
+            here: None,
         },
     )
     .await;
@@ -1309,4 +1489,697 @@ async fn t88_8_the_served_daemon_never_registers_a_front_project() {
     };
     assert!(reason.contains("does not know"), "{reason}");
     assert_ne!(made, id, "not the thread in a");
+}
+
+// ---------------------------------------------------------------------------
+// T2–T5 (issue #92): the start-up project proposal
+// ---------------------------------------------------------------------------
+
+/// The kinds of `t`'s log.
+fn kinds_of(base: &Path, t: Ulid) -> Vec<EventKind> {
+    events_of(base, t).iter().map(|e| e.kind).collect()
+}
+
+/// The position of the first event of `kind` in `t`'s log.
+fn at(base: &Path, t: Ulid, kind: EventKind) -> Option<usize> {
+    kinds_of(base, t).iter().position(|k| *k == kind)
+}
+
+/// The `AwaitingSwitch` in `t`'s state, if it is waiting for one.
+async fn waiting(client: &mut Client, t: Ulid) -> (String, String) {
+    match open_state(client, t).await {
+        ThreadState::AwaitingSwitch {
+            call_id, project, ..
+        } => (call_id, project),
+        other => panic!("a waiting switch: {other:?}"),
+    }
+}
+
+/// Answer a switch as the given role.
+async fn answer_switch(
+    client: &mut Client,
+    t: Ulid,
+    call_id: &str,
+    answer: SwitchReply,
+) -> Response {
+    client
+        .request(Request::AnswerSwitch {
+            thread: t,
+            call_id: call_id.into(),
+            answer,
+        })
+        .await
+        .unwrap()
+}
+
+/// Post a message.
+async fn post(client: &mut Client, t: Ulid, text: &str) -> Response {
+    client
+        .request(Request::Post {
+            thread: t,
+            blocks: vec![ContentBlock::Text(text.into())],
+            interrupt: false,
+        })
+        .await
+        .unwrap()
+}
+
+/// A daemon with `a`, `b` and `c` known, all writable by `steve`.
+async fn three_projects(dir: &Path) -> (Daemon, PathBuf, PathBuf, PathBuf) {
+    let a = project(dir, "a", "");
+    let b = project(dir, "b", "");
+    let c = project(dir, "c", "");
+    let daemon = Daemon::new(
+        dir,
+        vec![pc("a", &a), pc("b", &b), pc("c", &c)],
+        &["steve"],
+        false,
+    )
+    .await;
+    (daemon, a, b, c)
+}
+
+/// A front thread in `a`, made and unloaded, ready for a start-up
+/// proposal against `here`.
+async fn idle_front_in_a(daemon: &Daemon) -> (Client, Ulid) {
+    let mut steve = daemon.connect("steve").await;
+    let (t, outcome) = front(&mut steve, "a").await;
+    assert_eq!(outcome, FrontOutcome::First);
+    // Load it and let the session go, so the sweep below has something to
+    // unload: that is the baseline the proposal then has to survive.
+    let _ = steve
+        .request(Request::Open {
+            thread: t,
+            from_seq: 0,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        steve.request(Request::Close { thread: t }).await.unwrap(),
+        Response::Ok
+    );
+    let swept = daemon.threads().sweep(Duration::ZERO).await;
+    assert!(swept.contains(&t), "unloaded, so the next Front loads it");
+    (steve, t)
+}
+
+/// T2 — the proposal shows: a `Resumed` front thread in `b`'s folder
+/// raises it, the client sees `AwaitingSwitch`, the log holds the
+/// System `decision_proposed`, a subscriber gets it as a
+/// `Notice::Event`, and a sweep leaves it loaded while it waits.
+#[tokio::test]
+async fn t2_the_start_up_proposal_shows_and_is_not_swept_away() {
+    let dir = tempfile::tempdir().unwrap();
+    let (daemon, _a, _b, _c) = three_projects(dir.path()).await;
+    let (mut steve, t) = idle_front_in_a(&daemon).await;
+    let viewer = daemon.connect("steve").await;
+
+    // A live subscriber: `Open` replays, then keeps the client live, so
+    // the proposal reaches it as an event.
+    assert!(matches!(
+        viewer
+            .request(Request::Open {
+                thread: t,
+                from_seq: 0,
+            })
+            .await
+            .unwrap(),
+        Response::Opened { .. }
+    ));
+    let mut notices = viewer.take_notices().expect("notices");
+
+    let (again, outcome) = front_here(&mut steve, "b", Some("b")).await;
+    assert_eq!(
+        outcome,
+        FrontOutcome::Resumed,
+        "the front reply is unchanged"
+    );
+    assert_eq!(again, t);
+
+    let (call_id, project) = waiting(&mut steve, t).await;
+    assert_eq!(project, "b");
+    assert!(
+        call_id.starts_with(STARTUP_PREFIX),
+        "the call id is a start-up one: {call_id}"
+    );
+
+    let proposed = proposed_of(daemon.base(), t);
+    assert_eq!(proposed.len(), 1, "{proposed:?}");
+    assert_eq!(proposed[0].1.kind, DecisionKind::Project);
+    assert_eq!(proposed[0].0, Author::System, "raised by the System");
+    let events = events_of(daemon.base(), t);
+    let proposal = events
+        .iter()
+        .find(|e| e.kind == EventKind::DecisionProposed)
+        .unwrap();
+    assert_eq!(proposal.author, Author::System);
+
+    // A live subscriber was told, as #47's keep-awake path expects.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut seen_proposal = false;
+    while tokio::time::Instant::now() < deadline {
+        let Ok(Some(notice)) = tokio::time::timeout(Duration::from_secs(5), notices.recv()).await
+        else {
+            break;
+        };
+        if matches!(&notice, Notice::Event { event, .. }
+            if event.kind == EventKind::DecisionProposed)
+        {
+            seen_proposal = true;
+            break;
+        }
+    }
+    assert!(seen_proposal, "the subscriber saw the decision_proposed");
+    drop(notices);
+
+    // While it waits, the sweep leaves the thread loaded: every session
+    // on it lets go first, so only the pending answer can be the reason.
+    assert_eq!(
+        viewer.request(Request::Close { thread: t }).await.unwrap(),
+        Response::Ok
+    );
+    let swept = daemon.threads().sweep(Duration::ZERO).await;
+    assert!(
+        !swept.contains(&t),
+        "a thread waiting for an answer stays loaded"
+    );
+    let (again, _) = waiting(&mut steve, t).await;
+    assert_eq!(again, call_id, "still the same proposal");
+}
+
+/// T3a — `Yes` switches: the log records the switch, then the answer,
+/// `project_of` moves, and the state returns to `Idle`.
+#[tokio::test]
+async fn t3_a_yes_switches_the_project_and_returns_to_idle() {
+    let dir = tempfile::tempdir().unwrap();
+    let (daemon, _a, _b, _c) = three_projects(dir.path()).await;
+    let (mut steve, t) = idle_front_in_a(&daemon).await;
+    front_here(&mut steve, "b", Some("b")).await;
+    let (call_id, _) = waiting(&mut steve, t).await;
+
+    assert_eq!(
+        answer_switch(&mut steve, t, &call_id, SwitchReply::Yes).await,
+        Response::Ok
+    );
+    assert_eq!(daemon.threads().project_of(t).as_deref(), Some("b"));
+    assert_eq!(open_state(&mut steve, t).await, ThreadState::Idle);
+
+    let switched = at(daemon.base(), t, EventKind::ProjectSwitched);
+    let answered = at(daemon.base(), t, EventKind::DecisionAnswered);
+    assert!(
+        switched.zip(answered).is_some_and(|(s, a)| s < a),
+        "the switch is recorded before the answer"
+    );
+    let answers = answered_of(daemon.base(), t);
+    assert_eq!(answers[0].answer, DecisionAnswer::Yes);
+}
+
+/// T3b — `No` and `Corrected` record their answer and leave the
+/// project alone.
+#[tokio::test]
+async fn t3_b_no_and_corrected_record_and_do_not_switch() {
+    for reply in [SwitchReply::No, SwitchReply::Corrected { to: "1".into() }] {
+        let dir = tempfile::tempdir().unwrap();
+        let (daemon, _a, _b, _c) = three_projects(dir.path()).await;
+        let (mut steve, t) = idle_front_in_a(&daemon).await;
+        front_here(&mut steve, "b", Some("b")).await;
+        let (call_id, _) = waiting(&mut steve, t).await;
+
+        assert_eq!(
+            answer_switch(&mut steve, t, &call_id, reply.clone()).await,
+            Response::Ok,
+            "{reply:?}"
+        );
+        assert_eq!(daemon.threads().project_of(t).as_deref(), Some("a"));
+        assert_eq!(open_state(&mut steve, t).await, ThreadState::Idle);
+        assert_eq!(at(daemon.base(), t, EventKind::ProjectSwitched), None);
+        let answers = answered_of(daemon.base(), t);
+        assert_eq!(answers.len(), 1, "{answers:?}");
+        assert_ne!(answers[0].answer, DecisionAnswer::Yes, "{reply:?}");
+    }
+}
+
+/// T3c — a `No` is remembered: a second start-up in the same folder
+/// raises nothing, and the state stays `Idle`.
+#[tokio::test]
+async fn t3_c_a_declined_start_up_is_not_raised_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let (daemon, _a, _b, _c) = three_projects(dir.path()).await;
+    let (mut steve, t) = idle_front_in_a(&daemon).await;
+    front_here(&mut steve, "b", Some("b")).await;
+    let (call_id, _) = waiting(&mut steve, t).await;
+    answer_switch(&mut steve, t, &call_id, SwitchReply::No).await;
+
+    // Unload, so the next Front loads it afresh and would propose.
+    daemon.threads().sweep(Duration::ZERO).await;
+    let (again, outcome) = front_here(&mut steve, "b", Some("b")).await;
+    assert_eq!(outcome, FrontOutcome::Resumed);
+    assert_eq!(again, t);
+    assert_eq!(open_state(&mut steve, t).await, ThreadState::Idle);
+    assert_eq!(proposed_of(daemon.base(), t).len(), 1, "no second proposal");
+}
+
+/// T3d — a real switch afterwards clears the decline: the same folder
+/// proposes again once the thread has been there and come back.
+#[tokio::test]
+async fn t3_d_a_real_switch_lets_the_same_folder_propose_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let (daemon, _a, _b, _c) = three_projects(dir.path()).await;
+    let (mut steve, t) = idle_front_in_a(&daemon).await;
+    front_here(&mut steve, "b", Some("b")).await;
+    let (call_id, _) = waiting(&mut steve, t).await;
+    answer_switch(&mut steve, t, &call_id, SwitchReply::No).await;
+
+    // Switch to b by hand, then back to a.
+    for to in ["b", "a"] {
+        assert_eq!(
+            steve
+                .request(Request::SwitchProject {
+                    thread: t,
+                    project: to.into(),
+                })
+                .await
+                .unwrap(),
+            Response::Ok,
+            "{to}"
+        );
+    }
+    daemon.threads().sweep(Duration::ZERO).await;
+    let (again, outcome) = front_here(&mut steve, "b", Some("b")).await;
+    assert_eq!(outcome, FrontOutcome::Resumed);
+    assert_eq!(again, t);
+    let (call_id, project) = waiting(&mut steve, t).await;
+    assert_eq!(project, "b");
+    assert!(call_id.starts_with(STARTUP_PREFIX), "{call_id}");
+    assert_eq!(proposed_of(daemon.base(), t).len(), 2);
+}
+
+/// T3e — keep-awake balances: after a yes and after a withdrawal the
+/// holds and releases match, with nothing held once the thread is
+/// `Idle` (issue #47).
+#[tokio::test]
+async fn t3_e_the_proposal_never_leaves_the_machine_awake() {
+    for reply in [SwitchReply::Yes, SwitchReply::No] {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = three_projects(dir.path()).await.0;
+        let guard = Recording::new();
+        daemon.threads().with_keep_awake(guard.clone());
+        let (mut steve, t) = idle_front_in_a(&daemon).await;
+        front_here(&mut steve, "b", Some("b")).await;
+        let (call_id, _) = waiting(&mut steve, t).await;
+        answer_switch(&mut steve, t, &call_id, reply.clone()).await;
+
+        // The last state change settles; the guard must be balanced.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if guard.outstanding() == 0 && open_state(&mut steve, t).await == ThreadState::Idle {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{reply:?}: {} holds outstanding, {:?}",
+                guard.outstanding(),
+                guard.calls()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(guard.outstanding(), 0, "{reply:?}: {:?}", guard.calls());
+        assert_eq!(
+            guard.calls().iter().filter(|c| **c == "hold").count(),
+            guard.calls().iter().filter(|c| **c == "release").count(),
+            "balanced: {:?}",
+            guard.calls()
+        );
+        assert!(
+            guard.calls().contains(&"hold"),
+            "{reply:?}: the answer put the guard back up, so releasing it is the \
+             thing under test: {:?}",
+            guard.calls()
+        );
+        assert!(
+            guard.calls().contains(&"release"),
+            "{reply:?}: and it came down again: {:?}",
+            guard.calls()
+        );
+    }
+}
+
+/// T4a — a bare folder (`here: None`) raises nothing.
+#[tokio::test]
+async fn t4_a_a_bare_folder_raises_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (daemon, _a, _b, _c) = three_projects(dir.path()).await;
+    let (mut steve, t) = idle_front_in_a(&daemon).await;
+    let (again, outcome) = front(&mut steve, "b").await;
+    assert_eq!(outcome, FrontOutcome::Resumed);
+    assert_eq!(again, t);
+    assert_eq!(open_state(&mut steve, t).await, ThreadState::Idle);
+    assert!(proposed_of(daemon.base(), t).is_empty());
+}
+
+/// T4b — the thread's own project raises nothing.
+#[tokio::test]
+async fn t4_b_the_threads_own_project_raises_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (daemon, _a, _b, _c) = three_projects(dir.path()).await;
+    let (mut steve, t) = idle_front_in_a(&daemon).await;
+    front_here(&mut steve, "a", Some("a")).await;
+    assert_eq!(open_state(&mut steve, t).await, ThreadState::Idle);
+    assert!(proposed_of(daemon.base(), t).is_empty());
+}
+
+/// T4c — a folder whose project the daemon does not know raises
+/// nothing.
+#[tokio::test]
+async fn t4_c_an_unknown_folder_project_raises_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (daemon, _a, _b, _c) = three_projects(dir.path()).await;
+    let (mut steve, t) = idle_front_in_a(&daemon).await;
+    front_here(&mut steve, "b", Some("nowhere")).await;
+    assert_eq!(open_state(&mut steve, t).await, ThreadState::Idle);
+    assert!(proposed_of(daemon.base(), t).is_empty());
+}
+
+/// T4d — a user with only `read` in the folder's project: no proposal.
+#[tokio::test]
+async fn t4_d_a_reader_of_the_folder_gets_no_proposal() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = project(dir.path(), "a", "[participants]\nmagnus = \"write\"\n");
+    let b = project(dir.path(), "b", "[participants]\nmagnus = \"read\"\n");
+    let daemon = Daemon::new(
+        dir.path(),
+        vec![pc("a", &a), pc("b", &b)],
+        &["steve", "magnus"],
+        false,
+    )
+    .await;
+    let mut magnus = daemon.connect("magnus").await;
+    // Magnus makes his own front thread while he may still write `a`.
+    let (t, outcome) = front(&mut magnus, "a").await;
+    assert_eq!(outcome, FrontOutcome::First);
+    // Then he is reduced to `read` there, which is all a resume needs.
+    participants(dir.path(), "a", "[participants]\nmagnus = \"read\"\n");
+
+    let (again, outcome) = front_here(&mut magnus, "a", Some("b")).await;
+    assert_eq!(outcome, FrontOutcome::Resumed);
+    assert_eq!(again, t);
+    assert_eq!(open_state(&mut magnus, t).await, ThreadState::Idle);
+    assert!(proposed_of(daemon.base(), t).is_empty());
+}
+
+/// T4e — a user who could switch here but cannot write the thread's own
+/// project is offered nothing: an unanswerable proposal is never raised.
+#[tokio::test]
+async fn t4_e_a_user_who_cannot_answer_gets_no_proposal() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = project(dir.path(), "a", "[participants]\nmagnus = \"write\"\n");
+    let b = project(dir.path(), "b", "[participants]\nmagnus = \"write\"\n");
+    let daemon = Daemon::new(
+        dir.path(),
+        vec![pc("a", &a), pc("b", &b)],
+        &["steve", "magnus"],
+        false,
+    )
+    .await;
+    let mut magnus = daemon.connect("magnus").await;
+    let (t, outcome) = front(&mut magnus, "a").await;
+    assert_eq!(outcome, FrontOutcome::First);
+    // He may write `b`, but only read `a`, the thread's own project.
+    participants(dir.path(), "a", "[participants]\nmagnus = \"read\"\n");
+
+    let (again, outcome) = front_here(&mut magnus, "a", Some("b")).await;
+    assert_eq!(outcome, FrontOutcome::Resumed);
+    assert_eq!(again, t);
+    assert_eq!(open_state(&mut magnus, t).await, ThreadState::Idle);
+    assert!(
+        proposed_of(daemon.base(), t).is_empty(),
+        "nobody could answer it"
+    );
+}
+
+/// T4f — an outcome other than `Resumed` raises nothing: a first front
+/// thread, and a replacement.
+#[tokio::test]
+async fn t4_f_first_and_replaced_raise_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (daemon, _a, _b, _c) = three_projects(dir.path()).await;
+    let mut steve = daemon.connect("steve").await;
+    let (t, outcome) = front_here(&mut steve, "b", Some("c")).await;
+    assert_eq!(outcome, FrontOutcome::First);
+    assert_eq!(open_state(&mut steve, t).await, ThreadState::Idle);
+    assert!(proposed_of(daemon.base(), t).is_empty());
+
+    // A front thread in a project this daemon does not know is replaced,
+    // not resumed; the new one is in `b`, and `here` is still not its
+    // project, so nothing is proposed.
+    let other = tempfile::tempdir().unwrap();
+    let old = project(other.path(), "old", "");
+    let id = Ulid::generate();
+    let mut log = hand_log(&other.path().join("threads"), id);
+    append_started(&mut log, Some("old"), &old, "steve", true);
+    let b = project(other.path(), "b", "");
+    let c = project(other.path(), "c", "");
+    let daemon = Daemon::new(
+        other.path(),
+        vec![pc("b", &b), pc("c", &c)],
+        &["steve"],
+        false,
+    )
+    .await;
+    let mut steve = daemon.connect("steve").await;
+    let (t, outcome) = front_here(&mut steve, "b", Some("c")).await;
+    let FrontOutcome::Replaced { reason } = outcome else {
+        panic!("a replacement: {outcome:?}")
+    };
+    assert!(reason.contains("does not know"), "{reason}");
+    assert_ne!(t, id, "not the thread in the unknown project");
+    assert_eq!(open_state(&mut steve, t).await, ThreadState::Idle);
+    assert!(proposed_of(daemon.base(), t).is_empty());
+}
+
+/// T4g — a thread that is already waiting for an approval, or running,
+/// is not offered a switch.
+#[tokio::test]
+async fn t4_g_a_busy_thread_is_not_offered_a_switch() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = project(dir.path(), "a", "");
+    let b = project(dir.path(), "b", "");
+    // First script: a turn that asks for a tool call and stops there, so
+    // the thread waits. Second: one that never answers, so it runs.
+    let factory = ScriptedFactory::new(vec![
+        Some(vec![
+            ProviderEvent::ToolCall(ToolCall {
+                id: "c1".into(),
+                name: "write_file".into(),
+                args: serde_json::json!({"path": "x", "content": "y"}),
+            }),
+            ProviderEvent::Done {
+                finish_reason: "tool_use".into(),
+            },
+        ]),
+        None,
+    ]);
+    let daemon = Daemon::new_with(
+        dir.path(),
+        vec![pc("a", &a), pc("b", &b)],
+        &["steve"],
+        false,
+        factory,
+    )
+    .await;
+    let mut steve = daemon.connect("steve").await;
+    let (t, _) = front(&mut steve, "a").await;
+
+    // A tool call that writes waits for a person: `AwaitingApproval`.
+    post(&mut steve, t, "do it").await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if matches!(
+            open_state(&mut steve, t).await,
+            ThreadState::AwaitingApproval { .. }
+        ) {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "a waiting turn");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let (_, outcome) = front_here(&mut steve, "b", Some("b")).await;
+    assert_eq!(
+        outcome,
+        FrontOutcome::Resumed,
+        "the front thread is the same"
+    );
+    assert!(proposed_of(daemon.base(), t).is_empty(), "already waiting");
+
+    // Now a running turn: the second script never answers.
+    let dir = tempfile::tempdir().unwrap();
+    let a = project(dir.path(), "a", "");
+    let b = project(dir.path(), "b", "");
+    let factory = ScriptedFactory::new(vec![None]);
+    let daemon = Daemon::new_with(
+        dir.path(),
+        vec![pc("a", &a), pc("b", &b)],
+        &["steve"],
+        false,
+        factory,
+    )
+    .await;
+    let mut steve = daemon.connect("steve").await;
+    let (t, _) = front(&mut steve, "a").await;
+    post(&mut steve, t, "go").await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if matches!(open_state(&mut steve, t).await, ThreadState::Running { .. }) {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "a running turn");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let (_, outcome) = front_here(&mut steve, "b", Some("b")).await;
+    assert_eq!(outcome, FrontOutcome::Resumed);
+    assert!(proposed_of(daemon.base(), t).is_empty(), "already running");
+}
+
+/// T5a — a message withdraws the proposal, with its note, before the
+/// turn's own `user_message`, and the turn runs.
+#[tokio::test]
+async fn t5_a_a_message_withdraws_the_proposal_before_the_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let (daemon, _a, _b, _c) = three_projects(dir.path()).await;
+    let (mut steve, t) = idle_front_in_a(&daemon).await;
+    front_here(&mut steve, "b", Some("b")).await;
+    let (call_id, _) = waiting(&mut steve, t).await;
+
+    assert_eq!(post(&mut steve, t, "hello").await, Response::Ok);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if at(daemon.base(), t, EventKind::UserMessage).is_some() {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "the turn started");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let withdrawn = at(daemon.base(), t, EventKind::DecisionAnswered).expect("withdrawn");
+    let message = at(daemon.base(), t, EventKind::UserMessage).expect("the message");
+    assert!(withdrawn < message, "the withdrawal comes first");
+    let answers = answered_of(daemon.base(), t);
+    assert_eq!(answers[0].answer, DecisionAnswer::Withdrawn);
+    assert_eq!(
+        answers[0].note.as_deref(),
+        Some("a message was sent instead")
+    );
+
+    // The stale call id is refused, and nothing new is written.
+    let before = answered_of(daemon.base(), t).len();
+    let refused = answer_switch(&mut steve, t, &call_id, SwitchReply::Yes).await;
+    assert!(matches!(refused, Response::Refused { .. }), "{refused:?}");
+    assert_eq!(answered_of(daemon.base(), t).len(), before);
+}
+
+/// T5d — the proposal is answered by another path (here, the person
+/// answers `No`): the message that follows is never refused for it, and
+/// no second `decision_answered` is written. The withdrawal itself is a
+/// no-op then, and a withdrawal that fails must never refuse a message.
+#[tokio::test]
+async fn t5_d_a_message_is_never_refused_by_the_proposal() {
+    let dir = tempfile::tempdir().unwrap();
+    let (daemon, _a, _b, _c) = three_projects(dir.path()).await;
+    let (mut steve, t) = idle_front_in_a(&daemon).await;
+    front_here(&mut steve, "b", Some("b")).await;
+    let (call_id, _) = waiting(&mut steve, t).await;
+
+    // Another path answers it first: the proposal is settled and gone.
+    let answered = answer_switch(&mut steve, t, &call_id, SwitchReply::No).await;
+    assert_eq!(answered, Response::Ok, "{answered:?}");
+    assert_eq!(answered_of(daemon.base(), t).len(), 1);
+    assert_eq!(open_state(&mut steve, t).await, ThreadState::Idle);
+
+    // The message runs its turn, and the earlier answer stays the only one.
+    assert_eq!(post(&mut steve, t, "hello").await, Response::Ok);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if at(daemon.base(), t, EventKind::UserMessage).is_some() {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "the turn started");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        answered_of(daemon.base(), t).len(),
+        1,
+        "the answer stays the only one"
+    );
+}
+
+/// T5b — a skill withdraws it too, with its own note, before the turn.
+#[tokio::test]
+async fn t5_b_a_skill_withdraws_the_proposal() {
+    let dir = tempfile::tempdir().unwrap();
+    let (daemon, _a, _b, _c) = three_projects(dir.path()).await;
+    let (mut steve, t) = idle_front_in_a(&daemon).await;
+    front_here(&mut steve, "b", Some("b")).await;
+    waiting(&mut steve, t).await;
+
+    assert_eq!(
+        steve
+            .request(Request::InvokeSkill {
+                thread: t,
+                name: "any".into(),
+                args: "{}".to_owned(),
+            })
+            .await
+            .unwrap(),
+        Response::Ok
+    );
+    let answers = answered_of(daemon.base(), t);
+    assert_eq!(answers[0].answer, DecisionAnswer::Withdrawn);
+    assert_eq!(answers[0].note.as_deref(), Some("a skill was run instead"));
+}
+
+/// T5c — a hand switch withdraws it, with its own note, and the switch
+/// still happens.
+#[tokio::test]
+async fn t5_c_a_hand_switch_withdraws_the_proposal() {
+    let dir = tempfile::tempdir().unwrap();
+    let (daemon, _a, _b, _c) = three_projects(dir.path()).await;
+    let guard = Recording::new();
+    daemon.threads().with_keep_awake(guard.clone());
+    let (mut steve, t) = idle_front_in_a(&daemon).await;
+    front_here(&mut steve, "b", Some("b")).await;
+    waiting(&mut steve, t).await;
+
+    assert_eq!(
+        steve
+            .request(Request::SwitchProject {
+                thread: t,
+                project: "c".into(),
+            })
+            .await
+            .unwrap(),
+        Response::Ok
+    );
+    let answers = answered_of(daemon.base(), t);
+    assert_eq!(answers[0].answer, DecisionAnswer::Withdrawn);
+    assert_eq!(
+        answers[0].note.as_deref(),
+        Some("the project was switched by hand")
+    );
+    assert_eq!(daemon.threads().project_of(t).as_deref(), Some("c"));
+    assert_eq!(open_state(&mut steve, t).await, ThreadState::Idle);
+
+    // No turn ran, so only the withdrawal's own hold can be here: it must
+    // be balanced, with the machine released once the thread is idle.
+    assert_eq!(guard.outstanding(), 0, "{:?}", guard.calls());
+    assert_eq!(
+        guard.calls().iter().filter(|c| **c == "hold").count(),
+        guard.calls().iter().filter(|c| **c == "release").count(),
+        "balanced: {:?}",
+        guard.calls()
+    );
+    assert!(
+        guard.calls().contains(&"hold"),
+        "the withdrawal put the guard up, so bringing it down is the thing \
+         under test: {:?}",
+        guard.calls()
+    );
 }

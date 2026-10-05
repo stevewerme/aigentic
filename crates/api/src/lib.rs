@@ -86,8 +86,16 @@ pub enum Request {
     /// or the old one can't be opened. The handler judges the roles:
     /// `read` in the front thread's project to resume, `write` in the
     /// requested project to create.
+    ///
+    /// `here` is the folder's own project (issue #92), from `--project`
+    /// or the folder's `aigentic.toml`; a plain launch sends it so the
+    /// daemon may offer to switch to it when the front thread is
+    /// somewhere else. `None` from an old client or a bare folder, and
+    /// an old daemon ignores it.
     Front {
         project: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        here: Option<String>,
     },
     /// A new front thread in `project` (issue #84), replacing whatever
     /// was front; the old one stays listed.
@@ -598,6 +606,7 @@ mod tests {
             },
             Request::Front {
                 project: "p".into(),
+                here: Some("q".into()),
             },
             Request::NewFront {
                 project: "q".into(),
@@ -843,6 +852,7 @@ mod tests {
             1,
             Request::Front {
                 project: "p".into(),
+                here: None,
             },
         ));
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
@@ -882,6 +892,47 @@ mod tests {
             assert_eq!(v["response"]["kind"], "front");
             assert_eq!(v["response"]["outcome"]["kind"], kind);
         }
+    }
+
+    /// T1 (issue #92): `Front`'s `here` is an additive optional field. A
+    /// frame carrying it round-trips; one without it is serialised with
+    /// no `here` key at all and a frame that predates the field decodes
+    /// as `here: None`, the old client's frame.
+    #[test]
+    fn t1_front_here_round_trips_and_the_old_frame_still_decodes() {
+        let with = Frame::request(
+            1,
+            Request::Front {
+                project: "p".into(),
+                here: Some("q".into()),
+            },
+        );
+        let line = encode(&with);
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["request"]["here"], "q");
+        assert_eq!(decode(&line).unwrap(), with, "{line}");
+
+        let without = Frame::request(
+            2,
+            Request::Front {
+                project: "p".into(),
+                here: None,
+            },
+        );
+        let line = encode(&without);
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert!(v["request"].get("here").is_none(), "{line}");
+        assert_eq!(decode(&line).unwrap(), without, "{line}");
+
+        // An old client's frame, with no `here` key at all.
+        let old = decode(r#"{"id":3,"request":{"kind":"front","project":"p"}}"#).unwrap();
+        assert_eq!(
+            old.body,
+            Body::Request(Request::Front {
+                project: "p".into(),
+                here: None,
+            })
+        );
     }
 
     #[test]

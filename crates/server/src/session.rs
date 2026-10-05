@@ -258,7 +258,7 @@ fn project_for(threads: &ThreadTable, request: &Request) -> Option<String> {
         | Request::Report { thread, .. } => threads.project_of(*thread),
         // The front thread (issue #84): an existing one says its
         // project; a new one is made in the project asked for.
-        Request::Front { project } | Request::NewFront { project } => Some(project.clone()),
+        Request::Front { project, .. } | Request::NewFront { project } => Some(project.clone()),
         Request::Hello { .. } | Request::ListProjects => None,
     }
 }
@@ -399,6 +399,64 @@ async fn create_front(
         .map_err(|e| Box::new(thread_error(e)))
 }
 
+/// Offer the resumed front thread a switch to the folder's project
+/// (issue #92), in #82's block. Raised only when the daemon knows
+/// `here`, the user could switch there, and the user could answer it —
+/// `write` in the thread's own project, without which a proposal would
+/// be raised that nobody can answer or clear. The reply is ignored:
+/// the `Front` answer is the same either way. The actor refuses, too,
+/// when a proposal is already waiting or the thread is not idle.
+async fn raise_startup_proposal(
+    config: &Arc<ServerConfig>,
+    threads: &Arc<ThreadTable>,
+    open: &mut HashMap<Ulid, OpenThread>,
+    user: &str,
+    thread: Ulid,
+    here: Option<&str>,
+) {
+    let Some(here) = here else {
+        return;
+    };
+    // The thread's own project, and `here`, must be two different ones.
+    let Some(project) = threads.project_of(thread) else {
+        return;
+    };
+    if here == project {
+        return;
+    }
+    // The daemon must know `here`, and the user must be able to switch
+    // there — the role a `SwitchProject` needs.
+    let Ok(participants_here) = threads.participants(here) else {
+        return;
+    };
+    let switch = Request::SwitchProject {
+        thread,
+        project: here.to_owned(),
+    };
+    if auth::allowed(user, config.owner(), &participants_here, &switch).is_err() {
+        return;
+    }
+    // And the user must be able to answer it: `write` in the thread's
+    // own project, the role `AnswerSwitch` needs.
+    let Ok(participants_thread) = threads.participants(&project) else {
+        return;
+    };
+    let answer = Request::AnswerSwitch {
+        thread,
+        call_id: String::new(),
+        answer: SwitchReply::No,
+    };
+    if auth::allowed(user, config.owner(), &participants_thread, &answer).is_err() {
+        return;
+    }
+    let _ = ask_actor(threads, open, thread, |reply| Mail::ProposeSwitch {
+        project: here.to_owned(),
+        reason: format!("aigentic was started in {here}'s folder"),
+        reply,
+    })
+    .await;
+}
+
 async fn handle(
     config: &Arc<ServerConfig>,
     threads: &Arc<ThreadTable>,
@@ -454,12 +512,30 @@ async fn handle(
         },
         // The front thread (issue #84): `Front` resumes one or makes
         // the replacement, `NewFront` always makes one.
-        Request::Front { project } => {
+        Request::Front { project, here } => {
             match front_thread(config, threads, user, author, &project).await {
-                FrontReply::Open(thread, outcome) => Response::Front {
-                    thread: *thread,
-                    outcome,
-                },
+                FrontReply::Open(thread, outcome) => {
+                    // Issue #92: a resumed front thread started in
+                    // another folder's project is offered a switch in
+                    // #82's block. The `Front` reply is the same either
+                    // way; the proposal only changes the state the
+                    // client's `Open` then finds.
+                    if matches!(outcome, FrontOutcome::Resumed) {
+                        raise_startup_proposal(
+                            config,
+                            threads,
+                            open,
+                            user,
+                            thread.id,
+                            here.as_deref(),
+                        )
+                        .await;
+                    }
+                    Response::Front {
+                        thread: *thread,
+                        outcome,
+                    }
+                }
                 FrontReply::Refused(refusal) => *refusal,
             }
         }

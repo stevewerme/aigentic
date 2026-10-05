@@ -16,10 +16,13 @@ use std::time::Instant;
 
 use aigentic_api::{AskedOption, AskedQuestion, Notice, ReportKind, Response, ThreadState};
 use aigentic_runtime::aigentic_core::{Author, ContentBlock, Event, EventKind};
-use aigentic_runtime::aigentic_log::{PermissionRequestedPayload, UserMessagePayload};
+use aigentic_runtime::aigentic_log::{
+    PermissionRequestedPayload, UserMessagePayload, declined_at_startup,
+};
 use aigentic_runtime::{
-    ASKED_HUMAN, Answered, CancelToken, Decisions, Mode, Outbox, Pending, Queued, Resumed, Runtime,
-    RuntimeError, Signal, SwitchAnswer, SwitchCtx, TurnOutcome, WindowUsage, inbox,
+    ASKED_HUMAN, Answered, CancelToken, Decisions, IdleProposal, Mode, Outbox, Pending, Queued,
+    Resumed, Runtime, RuntimeError, Settled, Signal, SwitchAnswer, SwitchCtx, TurnOutcome,
+    WindowUsage, inbox,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -91,6 +94,16 @@ pub enum Mail {
     SwitchProject {
         ctx: Box<aigentic_runtime::ProjectContext>,
         by: Author,
+        reply: oneshot::Sender<Response>,
+    },
+    /// Offer to switch the thread to `project` while it is idle (issue
+    /// #92): the start-up proposal. Refused, writing nothing, when one
+    /// is already waiting, when a turn is running, or when `project`
+    /// has already been declined at start-up. Otherwise the proposal's
+    /// `decision_proposed` is appended and the thread waits.
+    ProposeSwitch {
+        project: String,
+        reason: String,
         reply: oneshot::Sender<Response>,
     },
     Compact {
@@ -249,6 +262,13 @@ impl Shared {
 
     fn hold(&self) -> std::sync::MutexGuard<'_, Hold> {
         self.guard.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Take the switch flag `after_turn` reads (issues #7, #92). A switch
+    /// settled outside a turn must announce its identity and clear this
+    /// itself, since `after_turn` never runs for it.
+    fn take_switched(&self) -> bool {
+        std::mem::take(&mut *self.switched.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
     /// `Notice::Usage` from the last fill, the turn's elapsed time and
@@ -454,6 +474,18 @@ pub struct ThreadActor {
     rx: mpsc::UnboundedReceiver<Mail>,
     /// A `Compact` taken while idle runs after the mail loop yields.
     pending_compact: Option<oneshot::Sender<Response>>,
+    /// The idle start-up proposal waiting for an answer (issue #92):
+    /// its call id, the `decision_proposed` event, and the project it
+    /// offers. `None` when nothing is waiting.
+    idle_switch: Option<IdleSwitch>,
+}
+
+/// An idle start-up switch proposal and the answer `AnswerSwitch` must
+/// name to settle it (issue #92).
+struct IdleSwitch {
+    call_id: String,
+    proposal: Ulid,
+    project: String,
 }
 
 /// The sending side of an actor's mailbox. Cloned per session.
@@ -500,6 +532,7 @@ impl ThreadActor {
             reports,
             rx,
             pending_compact: None,
+            idle_switch: None,
         };
         actor.resume(torn)?;
         Ok((actor, tx))
@@ -569,7 +602,7 @@ impl ThreadActor {
             let Some(mail) = self.rx.recv().await else {
                 break;
             };
-            if let Some(start) = self.handle_idle(mail) {
+            if let Some(start) = self.handle_idle(mail).await {
                 self.turn(start).await;
             }
             if let Some(reply) = self.pending_compact.take() {
@@ -598,7 +631,11 @@ impl ThreadActor {
     }
 
     /// Mail while idle. Returns a turn to start, if the mail starts one.
-    fn handle_idle(&mut self, mail: Mail) -> Option<Start> {
+    ///
+    /// Async since issue #92: raising, answering and withdrawing a
+    /// start-up proposal goes through the async runtime and appends
+    /// events.
+    async fn handle_idle(&mut self, mail: Mail) -> Option<Start> {
         match mail {
             Mail::Post {
                 author,
@@ -606,6 +643,8 @@ impl ThreadActor {
                 reply,
                 ..
             } => {
+                self.withdraw_idle_switch("a message was sent instead")
+                    .await;
                 let _ = reply.send(Response::Ok);
                 Some(Start::Post(author, blocks))
             }
@@ -615,15 +654,33 @@ impl ThreadActor {
                 args,
                 reply,
             } => {
+                self.withdraw_idle_switch("a skill was run instead").await;
                 let _ = reply.send(Response::Ok);
                 Some(Start::Skill(author, name, args))
             }
-            Mail::Decide { call_id, reply, .. }
-            | Mail::Answer { call_id, reply, .. }
-            | Mail::AnswerSwitch { call_id, reply, .. } => {
+            Mail::Decide { call_id, reply, .. } | Mail::Answer { call_id, reply, .. } => {
                 let _ = reply.send(Response::Refused {
                     reason: format!("nothing is pending for call {call_id}"),
                 });
+                None
+            }
+            Mail::AnswerSwitch {
+                by,
+                call_id,
+                answer,
+                ctx,
+                reply,
+            } => {
+                self.answer_idle_switch(by, call_id, answer, ctx, reply)
+                    .await;
+                None
+            }
+            Mail::ProposeSwitch {
+                project,
+                reason,
+                reply,
+            } => {
+                self.propose_switch_idle(project, reason, reply).await;
                 None
             }
             Mail::Pin {
@@ -687,6 +744,8 @@ impl ThreadActor {
                 None
             }
             Mail::SwitchProject { ctx, by, reply } => {
+                self.withdraw_idle_switch("the project was switched by hand")
+                    .await;
                 let shared = self.shared.clone();
                 let sys = Author::System;
                 let sent = match self
@@ -752,6 +811,154 @@ impl ThreadActor {
                 None
             }
         }
+    }
+
+    /// Raise the start-up switch proposal while idle (issue #92), as
+    /// `Mail::ProposeSwitch` asks. Refused, writing nothing, when one is
+    /// already waiting, when a turn is running, or when `project` has
+    /// been declined at start-up before. The proposal goes through the
+    /// real observer, so the thread's events and its subscribers learn
+    /// of it as they would of any write.
+    async fn propose_switch_idle(
+        &mut self,
+        project: String,
+        reason: String,
+        reply: oneshot::Sender<Response>,
+    ) {
+        if self.idle_switch.is_some() {
+            let _ = reply.send(Response::Refused {
+                reason: "a proposal is already waiting".into(),
+            });
+            return;
+        }
+        if !matches!(self.shared.state(), ThreadState::Idle) {
+            let _ = reply.send(Response::Refused {
+                reason: "a turn is running".into(),
+            });
+            return;
+        }
+        let declined = declined_at_startup(
+            &self.shared.events.lock().unwrap_or_else(|e| e.into_inner()),
+            &project,
+        );
+        if declined {
+            let _ = reply.send(Response::Refused {
+                reason: "declined before".into(),
+            });
+            return;
+        }
+        let shared = self.shared.clone();
+        let sys = Author::System;
+        let proposed = self
+            .runtime
+            .propose_switch_idle(&project, &reason, &mut |s| shared.observe(s, &sys))
+            .await;
+        match proposed {
+            Ok(IdleProposal { call_id, proposal }) => {
+                let waiting = IdleSwitch {
+                    call_id,
+                    proposal,
+                    project,
+                };
+                // The waiting proposal drives the state it raises: its
+                // own call id and project, not the mail's copy.
+                let state = ThreadState::AwaitingSwitch {
+                    call_id: waiting.call_id.clone(),
+                    project: waiting.project.clone(),
+                    workspace: (self.shared.labels)(&waiting.project),
+                    reason,
+                };
+                self.idle_switch = Some(waiting);
+                self.shared.set_state(state);
+                let _ = reply.send(Response::Ok);
+            }
+            Err(e) => {
+                let _ = reply.send(Response::Error {
+                    message: e.to_string(),
+                });
+            }
+        }
+    }
+
+    /// Settle the waiting start-up proposal (issue #92), as
+    /// `Mail::AnswerSwitch` asks while idle. A `call_id` that names no
+    /// waiting proposal keeps the old refusal.
+    async fn answer_idle_switch(
+        &mut self,
+        by: Author,
+        call_id: String,
+        answer: SwitchAnswer,
+        ctx: SwitchCtx,
+        reply: oneshot::Sender<Response>,
+    ) {
+        let matches = self
+            .idle_switch
+            .as_ref()
+            .is_some_and(|w| w.call_id == call_id);
+        if !matches {
+            let _ = reply.send(Response::Refused {
+                reason: format!("nothing is pending for call {call_id}"),
+            });
+            return;
+        }
+        let proposal = self
+            .idle_switch
+            .as_ref()
+            .map(|w| w.proposal)
+            .expect("checked above");
+        let shared = self.shared.clone();
+        let sys = Author::System;
+        let settled = self
+            .runtime
+            .answer_switch_idle(proposal, answer, by, ctx, &mut |s| shared.observe(s, &sys))
+            .await;
+        // The proposal is no longer waiting whatever the outcome: clear
+        // it and return to idle, releasing the keep-awake hold the way
+        // `after_turn` would (#47), since no turn runs here.
+        self.idle_switch = None;
+        self.shared.set_state(ThreadState::Idle);
+        self.shared.take_switched();
+        self.shared.drop_guard();
+        match settled {
+            Ok(Settled::Switched) => {
+                // The project changed with no turn to announce it.
+                self.announce_identity();
+                let _ = reply.send(Response::Ok);
+            }
+            Ok(_) => {
+                let _ = reply.send(Response::Ok);
+            }
+            Err(e) => {
+                let _ = reply.send(Response::Error {
+                    message: e.to_string(),
+                });
+            }
+        }
+    }
+
+    /// Withdraw a waiting start-up proposal before a mail that would
+    /// otherwise leave it unanswered (issue #92). Always clears it: a
+    /// withdrawal that fails, because another path already answered,
+    /// only loses the note, never the mail that withdrew it.
+    async fn withdraw_idle_switch(&mut self, note: &str) {
+        let Some(waiting) = self.idle_switch.take() else {
+            return;
+        };
+        let shared = self.shared.clone();
+        let sys = Author::System;
+        let _ = self
+            .runtime
+            .answer_switch_idle(
+                waiting.proposal,
+                SwitchAnswer::Withdrawn(note.to_owned()),
+                Author::System,
+                SwitchCtx::none(),
+                &mut |s| shared.observe(s, &sys),
+            )
+            .await;
+        self.shared.set_state(ThreadState::Idle);
+        self.shared.take_switched();
+        self.shared.drop_guard();
     }
 
     fn subscribe(
@@ -1069,6 +1276,7 @@ impl ThreadActor {
             | Mail::Remember { reply, .. }
             | Mail::Rename { reply, .. }
             | Mail::SwitchProject { reply, .. }
+            | Mail::ProposeSwitch { reply, .. }
             | Mail::Compact { reply }
             | Mail::SetMode { reply, .. }
             | Mail::Report { reply, .. } => {

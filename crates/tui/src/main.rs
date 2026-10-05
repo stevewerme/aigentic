@@ -596,8 +596,16 @@ async fn main() -> anyhow::Result<()> {
     // One pick serves the REPL, plain mode and `exec` (issue #89):
     // `--thread X` opens X; `exec` creates a thread in the folder's
     // project; anything else resumes (or starts) the front thread.
-    let picked =
-        front::pick_thread(&client, cli.thread, exec_args.is_some(), &project_name).await?;
+    // `here` is the folder's project, sent on `Front` only (issue #92).
+    let here = front::here_project(cli.project.as_deref(), opened.as_ref());
+    let picked = front::pick_thread(
+        &client,
+        cli.thread,
+        exec_args.is_some(),
+        &project_name,
+        here.as_deref(),
+    )
+    .await?;
     let thread_id = picked.id;
     let (state, events, mode, identity) = match client
         .request(Request::Open {

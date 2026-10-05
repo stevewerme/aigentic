@@ -5215,7 +5215,7 @@ mod tests {
             .iter()
             .find(|p| p.name == "b")
             .and_then(|p| p.role.clone());
-        let front = crate::front::pick_thread(&client, None, false, "b")
+        let front = crate::front::pick_thread(&client, None, false, "b", None)
             .await
             .unwrap();
         let (old, state, mode) = open(&client, "b", Some(front.id)).await;
@@ -5266,7 +5266,7 @@ mod tests {
         // A second client: the new thread is the front one, in `a`, in
         // auto, and both threads are listed there.
         let (second, _) = Client::connect(&addr, "t").await.unwrap();
-        let resumed = crate::front::pick_thread(&second, None, false, "a")
+        let resumed = crate::front::pick_thread(&second, None, false, "a", None)
             .await
             .unwrap();
         assert_eq!(resumed.info.as_ref().unwrap().id, new);
