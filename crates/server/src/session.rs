@@ -6,8 +6,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use aigentic_api::{
-    Body, CheckpointAnswer, Frame, Notice, PROTOCOL_VERSION, ProjectInfo, Request, Response,
-    SwitchReply, ThreadState, Welcome, decode, encode,
+    Body, CheckpointAnswer, Frame, FrontOutcome, Notice, PROTOCOL_VERSION, ProjectInfo, Request,
+    Response, SwitchReply, ThreadInfo, ThreadState, Welcome, decode, encode,
 };
 use aigentic_runtime::aigentic_core::{AgentId, Author, UserId};
 use aigentic_runtime::aigentic_policy::Role;
@@ -263,6 +263,116 @@ fn project_for(threads: &ThreadTable, request: &Request) -> Option<String> {
     }
 }
 
+/// The reply to `Front` (issue #84): resume the user's front thread, or
+/// make one in `project`. The handler judges the roles, because a resume
+/// needs `read` where the front thread lives and a create needs `write`
+/// where the person stands, and the session's pre-check cannot know both.
+///
+/// A front thread that cannot be opened is not a refusal: the person gets
+/// a new one in `project`, and `Replaced` says why in words a banner can
+/// print. The old one stays listed.
+async fn front_thread(
+    config: &Arc<ServerConfig>,
+    threads: &Arc<ThreadTable>,
+    user: &str,
+    author: &Author,
+    project: &str,
+) -> FrontReply {
+    let replaced = match threads.latest_front(user) {
+        Some(front) => match resumable(config, threads, user, front) {
+            Ok(info) => return FrontReply::Open(Box::new(info), FrontOutcome::Resumed),
+            Err(reason) => Some(reason),
+        },
+        None => None,
+    };
+    match create_front(config, threads, user, author, project).await {
+        Ok(info) => FrontReply::Open(
+            Box::new(info),
+            match replaced {
+                None => FrontOutcome::First,
+                Some(reason) => FrontOutcome::Replaced { reason },
+            },
+        ),
+        Err(refusal) => FrontReply::Refused(refusal),
+    }
+}
+
+/// What `Front` gets back: a thread to open and how it was reached, or
+/// the refusal that stood in the way instead.
+enum FrontReply {
+    Open(Box<ThreadInfo>, FrontOutcome),
+    Refused(Box<Response>),
+}
+
+/// Whether the user's front thread can be opened, and its listing row if
+/// so; `Err` says why not, for `Replaced`.
+fn resumable(
+    config: &Arc<ServerConfig>,
+    threads: &Arc<ThreadTable>,
+    user: &str,
+    front: Ulid,
+) -> Result<ThreadInfo, String> {
+    if threads.run_thread(front) != RunThread::No {
+        return Err(format!("your front thread {front} belongs to a run"));
+    }
+    let Some(project) = threads.project_of(front) else {
+        return Err(format!(
+            "your front thread {front} has no project this daemon can open"
+        ));
+    };
+    let participants = match threads.participants(&project) {
+        Ok(p) => p,
+        Err(ThreadError::NoProject(_)) => {
+            return Err(format!(
+                "your front thread is in {project}, which this daemon does not know"
+            ));
+        }
+        Err(e) => {
+            return Err(format!("your front thread {front} cannot be opened: {e}"));
+        }
+    };
+    // A resume is an `Open` of the front thread, so that is the request
+    // `auth` judges: `read` where the front thread lives.
+    let open = Request::Open {
+        thread: front,
+        from_seq: 0,
+    };
+    if auth::allowed(user, config.owner(), &participants, &open).is_err() {
+        return Err(format!("you no longer have a role in {project}"));
+    }
+    threads
+        .info(front)
+        .ok_or_else(|| format!("your front thread {front} has no project this daemon can open"))
+}
+
+/// A new front thread in `project`, or the refusal that stops it: the
+/// project's participants decide, and a denial reads like `AnswerSwitch`'s
+/// — `in {project}: ` and why.
+async fn create_front(
+    config: &Arc<ServerConfig>,
+    threads: &Arc<ThreadTable>,
+    user: &str,
+    author: &Author,
+    project: &str,
+) -> Result<ThreadInfo, Box<Response>> {
+    let participants = match threads.participants(project) {
+        Ok(p) => p,
+        Err(e) => return Err(Box::new(thread_error(e))),
+    };
+    let create = Request::CreateThread {
+        project: project.to_owned(),
+    };
+    if let Err(denied) = auth::allowed(user, config.owner(), &participants, &create) {
+        return Err(Box::new(Response::Refused {
+            reason: format!("in {project}: {}", denied.reason),
+        }));
+    }
+    threads
+        .create(project, author.clone(), true)
+        .await
+        .map_err(|e| Box::new(thread_error(e)))
+}
+
 async fn handle(
     config: &Arc<ServerConfig>,
     threads: &Arc<ThreadTable>,
@@ -316,9 +426,21 @@ async fn handle(
         Request::Hello { .. } => Response::Refused {
             reason: "already said hello".into(),
         },
-        // Issue #84, commit 2: the front thread's requests.
-        Request::Front { .. } | Request::NewFront { .. } => Response::Refused {
-            reason: "the front thread is not yet".into(),
+        // The front thread (issue #84): `Front` resumes one or makes
+        // the replacement, `NewFront` always makes one.
+        Request::Front { project } => {
+            match front_thread(config, threads, user, author, &project).await {
+                FrontReply::Open(thread, outcome) => Response::Front {
+                    thread: *thread,
+                    outcome,
+                },
+                FrontReply::Refused(refusal) => *refusal,
+            }
+        }
+        Request::NewFront { project } => match threads.create(&project, author.clone(), true).await
+        {
+            Ok(info) => Response::Thread { thread: info },
+            Err(e) => thread_error(e),
         },
         Request::ListProjects => Response::Projects {
             projects: project_infos(config, threads, user),

@@ -453,6 +453,22 @@ impl ThreadTable {
         aigentic_runtime::title::title_of(&events)
     }
 
+    /// The newest front thread `user` made (issue #84): over every id
+    /// this daemon knows — through `known_ids`, so a front thread
+    /// another daemon wrote is found too — the greatest whose entry is
+    /// `front` and whose creator is `user`. PLAN §2's `latest_for`
+    /// becomes this, in its neighbours' shape: `Option`, not `Result`.
+    pub fn latest_front(&self, user: &str) -> Option<Ulid> {
+        self.known_ids()
+            .into_iter()
+            .filter(|id| {
+                self.lookup(*id).is_some_and(|entry| {
+                    entry.front && entry.creator.as_ref().is_some_and(|c| c.0.as_str() == user)
+                })
+            })
+            .max()
+    }
+
     /// Every id this daemon knows: the index's, plus every log file on
     /// disk — the flat directory and each legacy one (issue #9). The
     /// names are a `read_dir` each; a file already indexed is not read
@@ -602,6 +618,15 @@ impl ThreadTable {
                 info
             })
             .collect())
+    }
+
+    /// A thread's listing row, from its log alone (issue #84): what
+    /// `Front`'s resumed answer carries. `None` for a thread this daemon
+    /// cannot place.
+    pub fn info(&self, thread: Ulid) -> Option<ThreadInfo> {
+        let project = self.project_of(thread)?;
+        let dir = self.dir_of(thread)?;
+        Some(summarise(&dir, thread, &project))
     }
 
     /// A new thread in `project`: its log starts with `thread_started`.
