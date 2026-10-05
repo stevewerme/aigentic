@@ -720,6 +720,7 @@ impl ClientRepl {
         {
             Response::Thread { thread } => thread,
             Response::Refused { reason } => {
+                let reason = crate::front::without_project(&reason, &project);
                 out.line(&format!("cannot start a new thread in {project}: {reason}"));
                 return;
             }

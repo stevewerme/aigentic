@@ -56,6 +56,7 @@ pub async fn pick_thread(
             outcome: Some(outcome),
         }),
         Response::Refused { reason } => {
+            let reason = without_project(&reason, project);
             anyhow::bail!("cannot start a thread in {project}: {reason}")
         }
         other => anyhow::bail!("unexpected reply starting a thread: {other:?}"),
@@ -137,6 +138,18 @@ pub fn front_line(
         }
     }
 }
+/// A refusal's reason without the `in {project}: ` the daemon may have
+/// put in front of it already (`Front`'s create check does; the generic
+/// pre-check does not), so the client's own prefix names the project
+/// once.
+pub fn without_project<'a>(reason: &'a str, project: &str) -> &'a str {
+    reason
+        .strip_prefix("in ")
+        .and_then(|rest| rest.strip_prefix(project))
+        .and_then(|rest| rest.strip_prefix(": "))
+        .unwrap_or(reason)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,5 +423,17 @@ mod tests {
             Response::Opened { events, .. } => events,
             other => panic!("{other:?}"),
         }
+    }
+
+    /// The project is named once, whether or not the daemon's reason
+    /// already carried it.
+    #[test]
+    fn a_refusal_names_the_project_once() {
+        let denied = "cara is read in this project; this needs write";
+        assert_eq!(without_project(&format!("in ro: {denied}"), "ro"), denied);
+        assert_eq!(without_project(denied, "ro"), denied);
+        // Another project's prefix is part of the reason, not ours.
+        let other = format!("in rw: {denied}");
+        assert_eq!(without_project(&other, "ro"), other);
     }
 }

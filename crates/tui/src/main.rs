@@ -55,7 +55,9 @@ struct Cli {
     /// Config file (default: ~/.config/aigentic/config.toml).
     #[arg(long, global = true)]
     config: Option<PathBuf>,
-    /// Thread to resume. Omit to start a new thread; its id is printed.
+    /// Thread to resume. Omit to resume your front thread (the first run
+    /// makes one; `/new` starts another). `exec` without it starts a new
+    /// thread and prints its id.
     #[arg(long, global = true)]
     thread: Option<Ulid>,
     /// Profile from the config file (default: the project's `[model]
