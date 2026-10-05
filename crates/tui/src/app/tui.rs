@@ -466,6 +466,20 @@ impl Shell {
         // How far the new viewport would run past the bottom of the
         // screen: 0 when it shrinks, or when the old top leaves room.
         let shortfall = old_top.saturating_add(rows).saturating_sub(height);
+        // A shrink on a full screen keeps the live area's bottom on the
+        // last row (issue #95): the composer and the status line stay
+        // where they are. The rows the live area gives up are taken by
+        // the transcript, scrolled down into them inside a scroll region
+        // that ends where the new live area begins, so its last line
+        // sits right above the pane again and the blank rows land at the
+        // top of the screen. Short of a full screen the live area keeps
+        // its top and follows the transcript, as before.
+        let full = old_top.saturating_add(self.rows) >= height;
+        let lowered = (rows < self.rows && full).then(|| self.rows - rows);
+        let new_top = match lowered {
+            Some(d) => old_top + d,
+            None => old_top.saturating_sub(shortfall),
+        };
         let mut backend = self.terminal.backend().rebuild();
         {
             use ratatui::backend::{Backend, ClearType};
@@ -473,7 +487,10 @@ impl Shell {
                 backend.set_cursor_position(Position::new(0, height.saturating_sub(1)))?;
                 backend.append_lines(shortfall)?;
             }
-            backend.set_cursor_position(Position::new(0, old_top.saturating_sub(shortfall)))?;
+            if let Some(d) = lowered {
+                backend.scroll_region_down(0..new_top, d)?;
+            }
+            backend.set_cursor_position(Position::new(0, new_top))?;
             backend.clear_region(ClearType::AfterCursor)?;
             Backend::flush(&mut backend)?;
         }
@@ -1257,31 +1274,59 @@ mod tests {
         }
     }
 
+    /// Issue #95: on a full screen a shrink keeps the live area's
+    /// bottom, so the composer and the status line do not move; the
+    /// transcript scrolls down into the rows it gave up, its last line
+    /// right above the pane, and nothing reaches the history.
     #[test]
-    fn a_shrinking_viewport_leaves_the_history_alone() {
+    fn a_shrink_on_a_full_screen_keeps_the_pane_at_the_bottom() {
         let (mut shell, lines, old_top) = anchored_shell(40, 15);
         let d = 2;
         shell.fit(MIN_ROWS + d).expect("a fit");
         let top_before = shell.frame_top();
+        assert_eq!(top_before, old_top - d, "the tall fit grew the live area");
+        let bottom = top_before + MIN_ROWS + d;
         let history_before = shell.history_lines();
 
         shell.fit(MIN_ROWS).expect("a fit");
 
         assert_eq!(shell.rows, MIN_ROWS);
         assert_eq!(
-            shell.frame_top(),
-            top_before,
-            "a shrink keeps the live area's top and pulls its bottom up"
+            shell.frame_top() + MIN_ROWS,
+            bottom,
+            "a shrink keeps the live area's bottom"
+        );
+        assert_eq!(shell.frame_top(), top_before + d);
+        assert_eq!(
+            shell.screen_lines()[usize::from(shell.frame_top()) - 1],
+            lines[lines.len() - 1],
+            "the transcript's last line sits directly above the pane"
         );
         assert_eq!(
             shell.history_lines(),
             history_before,
-            "a shrink scrolls nothing"
+            "the transcript moves down on screen; nothing goes to history"
         );
-        assert_eq!(top_before, old_top - d, "the tall fit grew the live area");
+        // The rows given up are blank at the top of the screen.
+        assert!(
+            shell.screen_lines()[..usize::from(d)]
+                .iter()
+                .all(String::is_empty)
+        );
+    }
+
+    /// Issue #95: short of a full screen a shrink keeps the live area's
+    /// top, as before: the pane follows the transcript.
+    #[test]
+    fn a_shrink_on_a_short_screen_keeps_the_top() {
+        let mut shell = Shell::test_inline(40, 30, MIN_ROWS + 3);
+        shell.commit(Line::raw("only line")).expect("a commit");
+        let top_before = shell.frame_top();
+        shell.fit(MIN_ROWS).expect("a fit");
+        assert_eq!(shell.frame_top(), top_before, "the pane follows the text");
         assert_eq!(
             shell.screen_lines()[usize::from(top_before) - 1],
-            lines[lines.len() - 1]
+            "only line"
         );
     }
 }
