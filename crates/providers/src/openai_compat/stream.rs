@@ -446,8 +446,17 @@ mod tests {
     }
 
     #[test]
+    fn a_reason_without_the_done_marker_is_still_a_clean_end() {
+        // The reason alone ends the reply (issue #96): a server that sends
+        // its `finish_reason` and then drops `[DONE]` is not a cut.
+        let (before_done, _) = LENGTH.rsplit_once("data: [DONE]").unwrap();
+        assert!(!before_done.contains("[DONE]"));
+        assert_eq!(translate(before_done), translate(LENGTH));
+    }
+
+    #[test]
     fn eof_without_done_marker_is_a_cut_stream() {
-        // The stream died inside the calls' arguments, before the chunk
+        // The stream died with the calls still open: before the chunk
         // that spells the reason: no reason, no marker. It used to be
         // flushed and run as two calls (issue #96).
         let cut = cut_after(TOOL_CALLS, 35);
