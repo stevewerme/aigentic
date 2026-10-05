@@ -13,27 +13,34 @@
 //! their `memory_extracted` usage, so the agent's turns keep their own
 //! calls and context. Since #49 a utility title call is on that same
 //! line, priced from its stamped `thread_renamed` usage.
+//!
+//! Since #83 the walk follows #9's layout: every log is
+//! `threads/<id>.jsonl`, and a legacy `threads/<project>/<id>.jsonl` is
+//! still read, with the thread attributed to its project from its own
+//! lines (`crate::threads_index`).
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use aigentic_runtime::Prices;
-use aigentic_runtime::aigentic_core::{Author, ContentBlock, EventKind};
+use aigentic_runtime::aigentic_core::{Author, ContentBlock, Event, EventKind};
 use aigentic_runtime::aigentic_log::{
     AssistantMessagePayload, DecisionAnswer, DecisionKind, DecisionRecord, Invoker,
-    MemoryExtractedPayload, SkillLoadedPayload, ThreadLog, ThreadRenamedPayload, ToolResultPayload,
+    MemoryExtractedPayload, SkillLoadedPayload, ThreadRenamedPayload, ToolResultPayload,
     TurnEndedPayload, Usage, UserMessagePayload, decision_records,
 };
 use aigentic_server::config::Config;
+use aigentic_server::workspaces::Workspace;
 use anyhow::{Context, bail};
 use serde::Serialize;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use ulid::Ulid;
 
 use crate::project_cmd::first_line_of;
+use crate::threads_index::{self, Found, NO_PROJECT};
 
 /// The whole report, and what `--json` prints.
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, PartialEq, Serialize)]
 pub struct Stats {
     /// The window's start, RFC 3339, when `--since` was given.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -49,7 +56,7 @@ pub struct Stats {
     pub unreadable: u32,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, PartialEq, Serialize)]
 pub struct DayStats {
     pub day: String,
     pub calls: u32,
@@ -103,7 +110,7 @@ pub struct DayStats {
     pub job_price_estimated_spent: Option<f64>,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, PartialEq, Serialize)]
 pub struct ProjectStats {
     pub project: String,
     pub calls: u32,
@@ -158,7 +165,7 @@ fn effective_report(t: &ThreadReport) -> Option<f64> {
     add(t.spent, t.price_estimated_spent)
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, PartialEq, Serialize)]
 pub struct ThreadSpend {
     pub id: String,
     pub project: String,
@@ -438,6 +445,7 @@ fn is_unstamped(u: &Usage) -> bool {
 /// `book` is the config's price tables (issue #40).
 pub fn run(
     base: &Path,
+    workspaces: &[Workspace],
     project: Option<&str>,
     since: Option<&str>,
     json: bool,
@@ -447,7 +455,7 @@ pub fn run(
         Some(arg) => Some(parse_since(arg, OffsetDateTime::now_utc())?),
         None => None,
     };
-    let stats = collect(base, project, cutoff, book)?;
+    let stats = collect(base, workspaces, project, cutoff, book)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&stats)?);
     } else {
@@ -475,44 +483,14 @@ pub fn parse_since(arg: &str, now: OffsetDateTime) -> anyhow::Result<OffsetDateT
     Ok(date.midnight().assume_utc())
 }
 
-/// Every project directory under `base`, `--project` narrowing to one.
-/// `_none` is the directory for work outside a project: it is a real
-/// group, not something to hide. A named project with no threads is an
-/// empty group, not an error.
-fn groups(base: &Path, project: Option<&str>) -> anyhow::Result<Vec<(String, PathBuf)>> {
-    let mut groups: Vec<(String, PathBuf)> = Vec::new();
-    match std::fs::read_dir(base) {
-        Ok(entries) => {
-            for entry in entries.filter_map(Result::ok) {
-                let path = entry.path();
-                if !path.is_dir() {
-                    continue;
-                }
-                let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                    continue;
-                };
-                if project.is_some_and(|want| want != name) {
-                    continue;
-                }
-                groups.push((name.to_owned(), path));
-            }
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e).with_context(|| format!("reading {}", base.display())),
-    }
-    if let Some(want) = project
-        && !groups.iter().any(|(name, _)| name == want)
-    {
-        groups.push((want.to_owned(), base.join(want)));
-    }
-    groups.sort();
-    Ok(groups)
-}
-
-/// Walk every project directory under `base` and fold each thread's
-/// events into the day, project and top-thread totals.
+/// Walk every log under `base` — the flat directory and any legacy
+/// project directory a migration left behind (#9, #83) — and fold each
+/// thread into the totals of the project its own lines name. A log that
+/// can be read but says nothing about its project is `(no project)`:
+/// a real group, not something to hide.
 pub fn collect(
     base: &Path,
+    workspaces: &[Workspace],
     project: Option<&str>,
     cutoff: Option<OffsetDateTime>,
     book: &PriceBook,
@@ -523,32 +501,38 @@ pub fn collect(
     };
 
     let mut days: BTreeMap<String, Accum> = BTreeMap::new();
-    let mut projects: Vec<ProjectStats> = Vec::new();
+    let mut by_project: BTreeMap<String, Accum> = BTreeMap::new();
     let mut threads: Vec<ThreadSpend> = Vec::new();
 
-    for (name, dir) in groups(base, project)? {
-        let mut acc = Accum::default();
-        for id in thread_ids(&dir) {
-            match ThreadLog::open(&dir, id).and_then(|log| log.read_all()) {
-                Ok(events) => {
-                    let mut thread = Accum::default();
-                    let meta = absorb(&mut acc, &mut thread, &events, cutoff, &mut days, book);
-                    // #40: a thread with no call inside the window is not
-                    // a row. Its title is a label, but a row is a total.
-                    // #46: an extraction inside the window is a total
-                    // too, so a thread that only extracted is still a
-                    // row — with 0 calls and its side-job money.
-                    if thread.calls > 0 || thread.job_calls > 0 {
-                        threads.push(thread.into_spend(id.to_string(), &name, meta.title));
-                    }
-                }
-                Err(_) => stats.unreadable += 1,
+    for found in threads_index::catalogue(base) {
+        let Ok(events) = found.read() else {
+            // An unreadable log has no lines to attribute it by, so it
+            // counts whenever the filter cannot be shown to exclude it:
+            // with no `--project`, or when its legacy directory is the
+            // requested project.
+            if project.is_none() || found.legacy.as_deref() == project {
+                stats.unreadable += 1;
             }
+            continue;
+        };
+        let name = attributed(&found, &events, workspaces);
+        if project.is_some_and(|want| want != name) {
+            continue;
         }
-        projects.push(ProjectStats {
-            project: name,
-            ..acc.into_project()
-        });
+        let acc = by_project.entry(name.clone()).or_default();
+        let mut thread = Accum::default();
+        let meta = absorb(acc, &mut thread, &events, cutoff, &mut days, book);
+        // #40: a thread with no call inside the window is not a row. Its
+        // title is a label, but a row is a total. #46: an extraction
+        // inside the window is a total too, so a thread that only
+        // extracted is still a row — with 0 calls and its side-job money.
+        if thread.calls > 0 || thread.job_calls > 0 {
+            threads.push(thread.into_spend(found.id.to_string(), &name, meta.title));
+        }
+    }
+    // A named project with no threads is an empty group, not an error.
+    if let Some(want) = project {
+        by_project.entry(want.to_owned()).or_default();
     }
 
     // Dearest first on the *effective* spend (stamped + retro-priced),
@@ -574,16 +558,37 @@ pub fn collect(
     });
     threads.truncate(5);
     stats.threads = threads;
-    stats.projects = projects;
+    stats.projects = project_rows(by_project);
     stats.days = days.into_iter().map(|(day, a)| a.into_day(day)).collect();
     Ok(stats)
 }
 
-/// `aigentic stats --thread <id>` (issue #40): one thread read on its
-/// own, under the same `--since` window as the report. `--project`
-/// narrows the search; the global `--thread` supplies the id.
+/// The project name a found log's events give it, as the label: never an
+/// empty string.
+fn attributed(found: &Found, events: &[Event], workspaces: &[Workspace]) -> String {
+    let name = threads_index::project_of(events, found.legacy.as_deref(), workspaces);
+    threads_index::label(name.as_deref()).to_owned()
+}
+
+/// One row per project, by name, with `(no project)` last.
+fn project_rows(by_project: BTreeMap<String, Accum>) -> Vec<ProjectStats> {
+    let mut rows: Vec<(String, Accum)> = by_project.into_iter().collect();
+    rows.sort_by(|(a, _), (b, _)| {
+        (a == NO_PROJECT)
+            .cmp(&(b == NO_PROJECT))
+            .then_with(|| a.cmp(b))
+    });
+    rows.into_iter()
+        .map(|(name, acc)| ProjectStats {
+            project: name,
+            ..acc.into_project()
+        })
+        .collect()
+}
+
 pub fn run_thread(
     base: &Path,
+    workspaces: &[Workspace],
     project: Option<&str>,
     id: Ulid,
     since: Option<&str>,
@@ -594,7 +599,7 @@ pub fn run_thread(
         Some(arg) => Some(parse_since(arg, OffsetDateTime::now_utc())?),
         None => None,
     };
-    let report = collect_thread(base, project, id, cutoff, book)?;
+    let report = collect_thread(base, workspaces, project, id, cutoff, book)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -607,6 +612,7 @@ pub fn run_thread(
 /// own-user message names that issue, costliest first, with a total.
 pub fn run_issue(
     base: &Path,
+    workspaces: &[Workspace],
     project: Option<&str>,
     issue: u64,
     since: Option<&str>,
@@ -617,7 +623,7 @@ pub fn run_issue(
         Some(arg) => Some(parse_since(arg, OffsetDateTime::now_utc())?),
         None => None,
     };
-    let report = collect_issue(base, project, issue, cutoff, book)?;
+    let report = collect_issue(base, workspaces, project, issue, cutoff, book)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -626,22 +632,32 @@ pub fn run_issue(
     Ok(())
 }
 
-/// Read one thread's log and fold it. An id that no project holds is an
-/// error naming it, so a typo never reads as an empty report.
+/// Read one thread's log and fold it: the id is looked for flat first,
+/// then in the legacy project directories. An id no log holds is an
+/// error naming it, so a typo never reads as an empty report. A thread
+/// attributed to another project than `--project` asks for is an error
+/// naming both.
 fn collect_thread(
     base: &Path,
+    workspaces: &[Workspace],
     project: Option<&str>,
     id: Ulid,
     cutoff: Option<OffsetDateTime>,
     book: &PriceBook,
 ) -> anyhow::Result<ThreadReport> {
-    for (name, dir) in groups(base, project)? {
-        if !dir.join(format!("{id}.jsonl")).is_file() {
+    for found in threads_index::catalogue(base) {
+        if found.id != id {
             continue;
         }
-        let events = ThreadLog::open(&dir, id)
-            .and_then(|log| log.read_all())
-            .with_context(|| format!("reading {}/{id}.jsonl", dir.display()))?;
+        let events = found
+            .read()
+            .with_context(|| format!("reading {}", found.path().display()))?;
+        let name = attributed(&found, &events, workspaces);
+        if let Some(want) = project
+            && want != name
+        {
+            bail!("thread {id} is in {name}, not {want}");
+        }
         let mut thread = Accum::default();
         let mut dropped = Accum::default();
         let mut dropped_days = BTreeMap::new();
@@ -662,39 +678,42 @@ fn collect_thread(
 /// `--thread`'s walk, one project at a time.
 fn collect_issue(
     base: &Path,
+    workspaces: &[Workspace],
     project: Option<&str>,
     issue: u64,
     cutoff: Option<OffsetDateTime>,
     book: &PriceBook,
 ) -> anyhow::Result<IssueReport> {
     let mut threads: Vec<ThreadReport> = Vec::new();
-    for (name, dir) in groups(base, project)? {
-        for id in thread_ids(&dir) {
-            let Ok(events) = ThreadLog::open(&dir, id).and_then(|log| log.read_all()) else {
-                continue;
-            };
-            let mut thread = Accum::default();
-            let mut dropped = Accum::default();
-            let mut dropped_days = BTreeMap::new();
-            let meta = absorb(
-                &mut dropped,
-                &mut thread,
-                &events,
-                cutoff,
-                &mut dropped_days,
-                book,
-            );
-            if !names_issue(&meta, issue) {
-                continue;
-            }
-            // The window applies here too: a matched thread with no call
-            // inside it has no row, exactly as in the main report (and,
-            // since #46, no extraction inside it either).
-            if thread.calls == 0 && thread.job_calls == 0 {
-                continue;
-            }
-            threads.push(thread.into_report(id.to_string(), &name, meta));
+    for found in threads_index::catalogue(base) {
+        let Ok(events) = found.read() else {
+            continue;
+        };
+        let name = attributed(&found, &events, workspaces);
+        if project.is_some_and(|want| want != name) {
+            continue;
         }
+        let mut thread = Accum::default();
+        let mut dropped = Accum::default();
+        let mut dropped_days = BTreeMap::new();
+        let meta = absorb(
+            &mut dropped,
+            &mut thread,
+            &events,
+            cutoff,
+            &mut dropped_days,
+            book,
+        );
+        if !names_issue(&meta, issue) {
+            continue;
+        }
+        // The window applies here too: a matched thread with no call
+        // inside it has no row, exactly as in the main report (and,
+        // since #46, no extraction inside it either).
+        if thread.calls == 0 && thread.job_calls == 0 {
+            continue;
+        }
+        threads.push(thread.into_report(found.id.to_string(), &name, meta));
     }
     threads.sort_by(|a, b| match (effective_report(a), effective_report(b)) {
         (Some(x), Some(y)) => y
@@ -713,20 +732,6 @@ fn collect_issue(
         threads,
         total,
     })
-}
-
-fn thread_ids(dir: &Path) -> Vec<Ulid> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut ids: Vec<Ulid> = entries
-        .filter_map(Result::ok)
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"))
-        .filter_map(|p| p.file_stem()?.to_str()?.parse().ok())
-        .collect();
-    ids.sort_unstable_by(|a, b| b.cmp(a));
-    ids
 }
 
 /// The side jobs a log can carry (issues #46, #49): the line names its
@@ -1690,6 +1695,7 @@ pub fn render(stats: &Stats) -> String {
 /// machine built today this prints `no decisions recorded`.
 pub fn run_decisions(
     base: &Path,
+    workspaces: &[Workspace],
     project: Option<&str>,
     since: Option<&str>,
     json: bool,
@@ -1698,7 +1704,7 @@ pub fn run_decisions(
         Some(arg) => Some(parse_since(arg, OffsetDateTime::now_utc())?),
         None => None,
     };
-    let report = collect_decisions(base, project, cutoff)?;
+    let report = collect_decisions(base, workspaces, project, cutoff)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -1754,6 +1760,7 @@ pub struct DecisionKindStats {
 /// proposal before it is left out.
 pub fn collect_decisions(
     base: &Path,
+    workspaces: &[Workspace],
     project: Option<&str>,
     cutoff: Option<OffsetDateTime>,
 ) -> anyhow::Result<DecisionReport> {
@@ -1762,17 +1769,22 @@ pub fn collect_decisions(
         ..DecisionReport::default()
     };
     let mut records: Vec<DecisionRecord> = Vec::new();
-    for (_, dir) in groups(base, project)? {
-        for id in thread_ids(&dir) {
-            match ThreadLog::open(&dir, id).and_then(|log| log.read_all()) {
-                Ok(events) => {
-                    let fold = decision_records(&events);
-                    report.orphans += fold.orphans as u32;
-                    records.extend(fold.records);
-                }
-                Err(_) => report.unreadable += 1,
+    for found in threads_index::catalogue(base) {
+        let Ok(events) = found.read() else {
+            // The same rule `collect` counts by: an unreadable log has
+            // no lines to attribute it by, so it counts unless the
+            // filter can be shown to exclude it.
+            if project.is_none() || found.legacy.as_deref() == project {
+                report.unreadable += 1;
             }
+            continue;
+        };
+        if project.is_some_and(|want| want != attributed(&found, &events, workspaces)) {
+            continue;
         }
+        let fold = decision_records(&events);
+        report.orphans += fold.orphans as u32;
+        records.extend(fold.records);
     }
     if let Some(cutoff) = cutoff {
         records.retain(|r| r.at >= cutoff);
@@ -1943,6 +1955,12 @@ pub fn render_decisions(report: &DecisionReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::threads_index::LEGACY_NONE_PROJECT;
+    use std::path::PathBuf;
+
+    use aigentic_runtime::aigentic_core::UserId;
+    use aigentic_runtime::aigentic_log::{ProjectSwitchedPayload, ThreadStartedPayload};
     use serde_json::json;
     use time::macros::datetime;
 
@@ -2373,7 +2391,7 @@ api_key_env = "TENSORX_API_KEY"
         let base = f.dir.path();
         // Only the first thread is priced, so the check has a spent sum
         // and a mixture to prove both branches.
-        let stats = collect(base, None, None, &no_prices()).unwrap();
+        let stats = collect(base, &[], None, None, &no_prices()).unwrap();
 
         let calls: u32 = stats.days.iter().map(|d| d.calls).sum();
         let priced: u32 = stats.days.iter().map(|d| d.priced_calls).sum();
@@ -2449,7 +2467,7 @@ api_key_env = "TENSORX_API_KEY"
         // The fixture's second day is 2026-09-23: a cutoff inside it
         // drops 2026-09-22's day.
         let cutoff = parse_since("2026-09-23", datetime!(2026-09-24 00:00:00 UTC)).unwrap();
-        let stats = collect(f.dir.path(), None, Some(cutoff), &no_prices()).unwrap();
+        let stats = collect(f.dir.path(), &[], None, Some(cutoff), &no_prices()).unwrap();
         let days: Vec<&str> = stats.days.iter().map(|d| d.day.as_str()).collect();
         assert_eq!(days, vec!["2026-09-23"], "{stats:?}");
         assert_eq!(stats.days[0].calls, 1);
@@ -2482,7 +2500,7 @@ api_key_env = "TENSORX_API_KEY"
         // `Nd` is now minus N whole days; a week back keeps both days.
         let week = parse_since("7d", datetime!(2026-09-24 12:00:00 UTC)).unwrap();
         assert_eq!(week, datetime!(2026-09-17 12:00:00 UTC));
-        let stats = collect(f.dir.path(), None, Some(week), &no_prices()).unwrap();
+        let stats = collect(f.dir.path(), &[], None, Some(week), &no_prices()).unwrap();
         assert_eq!(stats.days.len(), 2);
         assert_eq!(
             stats.projects.iter().map(|p| p.calls).sum::<u32>(),
@@ -2504,7 +2522,7 @@ api_key_env = "TENSORX_API_KEY"
     #[test]
     fn costliest_threads_rank_by_effective_spend_then_calls_with_titles() {
         let f = fixture();
-        let stats = collect(f.dir.path(), None, None, &no_prices()).unwrap();
+        let stats = collect(f.dir.path(), &[], None, None, &no_prices()).unwrap();
         // The fixture sorted in-test by spend, unpriced last.
         let mut expected: Vec<(String, Option<f64>, u32)> = vec![
             ("alpha".to_owned(), Some(0.75), 2),
@@ -2588,7 +2606,7 @@ api_key_env = "TENSORX_API_KEY"
         write_thread(&base, guessy, &guessy_lines);
         write_thread(&base, stamped, &stamped_lines);
 
-        let stats = collect(dir.path(), None, None, &book_of(PRICED_CONFIG)).unwrap();
+        let stats = collect(dir.path(), &[], None, None, &book_of(PRICED_CONFIG)).unwrap();
         let mixed_retro = expected_cost(PRICED_CONFIG, "tensorx", &mixed_lines[2]);
         let guessy_retro = expected_cost(PRICED_CONFIG, "flash", &guessy_lines[1]);
         assert!(
@@ -2688,7 +2706,7 @@ api_key_env = "TENSORX_API_KEY"
             ],
         );
 
-        let stats = collect(dir.path(), None, None, &no_prices()).unwrap();
+        let stats = collect(dir.path(), &[], None, None, &no_prices()).unwrap();
         let title = |id: Ulid| {
             stats
                 .threads
@@ -2745,7 +2763,7 @@ api_key_env = "TENSORX_API_KEY"
     fn one_thread_reads_back_every_field_from_its_lines() {
         let (dir, id, lines) = single_thread_fixture();
         let book = book_of(PRICED_CONFIG);
-        let report = collect_thread(dir.path(), None, id, None, &book).unwrap();
+        let report = collect_thread(dir.path(), &[], None, id, None, &book).unwrap();
 
         assert_eq!(report.id, id.to_string());
         assert_eq!(report.project, "alpha");
@@ -2806,7 +2824,7 @@ api_key_env = "TENSORX_API_KEY"
         // The window gates the report too: a cutoff past the thread
         // leaves its labels but no calls.
         let cutoff = Some(datetime!(2026-09-28 00:00:00 UTC));
-        let after = collect_thread(dir.path(), None, id, cutoff, &book).unwrap();
+        let after = collect_thread(dir.path(), &[], None, id, cutoff, &book).unwrap();
         assert_eq!(after.calls, 0);
         assert_eq!(after.sweeps, 0);
         assert_eq!(after.tool_errors, 0);
@@ -2815,14 +2833,14 @@ api_key_env = "TENSORX_API_KEY"
         // An id no project holds is an error naming it, never an empty
         // report.
         let missing = Ulid::generate();
-        let err = collect_thread(dir.path(), None, missing, None, &book)
+        let err = collect_thread(dir.path(), &[], None, missing, None, &book)
             .unwrap_err()
             .to_string();
         assert!(err.contains(&missing.to_string()), "{err}");
 
         // `--project` narrows the search: the same id is not in `beta`.
-        assert!(collect_thread(dir.path(), Some("beta"), id, None, &book).is_err());
-        assert!(collect_thread(dir.path(), Some("alpha"), id, None, &book).is_ok());
+        assert!(collect_thread(dir.path(), &[], Some("beta"), id, None, &book).is_err());
+        assert!(collect_thread(dir.path(), &[], Some("alpha"), id, None, &book).is_ok());
     }
 
     /// T15 (issue #47): a thread whose turns measured themselves reports
@@ -2855,7 +2873,7 @@ api_key_env = "TENSORX_API_KEY"
                 measured_turn_ended("2026-09-27T12:40:20Z", "done", second_wall, 0, 0, "on"),
             ],
         );
-        let report = collect_thread(dir.path(), None, measured, None, &book).unwrap();
+        let report = collect_thread(dir.path(), &[], None, measured, None, &book).unwrap();
         let wall = first_wall + second_wall;
         assert_eq!(report.wall_secs, Some(wall));
         assert_eq!(report.slept_secs, Some(slept));
@@ -2884,7 +2902,7 @@ api_key_env = "TENSORX_API_KEY"
                 turn_ended("2026-09-27T12:00:00Z", "done"),
             ],
         );
-        let report = collect_thread(dir.path(), None, old, None, &book).unwrap();
+        let report = collect_thread(dir.path(), &[], None, old, None, &book).unwrap();
         assert_eq!(report.wall_secs, None);
         assert_eq!(report.slept_secs, None);
         let text = render_thread(&report);
@@ -2901,7 +2919,7 @@ api_key_env = "TENSORX_API_KEY"
                 measured_turn_ended("2026-09-27T12:12:00Z", "done", 120, 0, 0, "on"),
             ],
         );
-        let report = collect_thread(dir.path(), None, awake, None, &book).unwrap();
+        let report = collect_thread(dir.path(), &[], None, awake, None, &book).unwrap();
         assert_eq!(report.wall_secs, Some(120));
         assert_eq!(report.slept_secs, Some(0));
         let text = render_thread(&report);
@@ -3027,7 +3045,7 @@ api_key_env = "TENSORX_API_KEY"
         };
 
         // (a) `#40` anywhere in the first message matches.
-        let report = collect_issue(dir.path(), None, 40, None, &book).unwrap();
+        let report = collect_issue(dir.path(), &[], None, 40, None, &book).unwrap();
         assert!(
             ids(&report).contains(&plain.to_string()),
             "{:?}",
@@ -3079,7 +3097,7 @@ api_key_env = "TENSORX_API_KEY"
             ],
         );
         assert!(
-            collect_issue(dir2.path(), None, 40, None, &book)
+            collect_issue(dir2.path(), &[], None, 40, None, &book)
                 .unwrap()
                 .threads
                 .is_empty()
@@ -3087,14 +3105,14 @@ api_key_env = "TENSORX_API_KEY"
         // `#400` names 400, not 40 — the digits are one reference, so
         // the boundary rule can never split them into 4 and 00.
         assert_eq!(
-            collect_issue(dir2.path(), None, 400, None, &book)
+            collect_issue(dir2.path(), &[], None, 400, None, &book)
                 .unwrap()
                 .threads
                 .len(),
             1
         );
         assert!(
-            collect_issue(dir.path(), None, 4, None, &book)
+            collect_issue(dir.path(), &[], None, 4, None, &book)
                 .unwrap()
                 .threads
                 .is_empty(),
@@ -3135,14 +3153,14 @@ api_key_env = "TENSORX_API_KEY"
         write_thread(&dir.path().join("alpha"), first, &lines);
         let book = no_prices();
         assert_eq!(
-            collect_issue(dir.path(), None, 40, None, &book)
+            collect_issue(dir.path(), &[], None, 40, None, &book)
                 .unwrap()
                 .threads
                 .len(),
             1
         );
         assert!(
-            collect_issue(dir.path(), None, 44, None, &book)
+            collect_issue(dir.path(), &[], None, 44, None, &book)
                 .unwrap()
                 .threads
                 .is_empty(),
@@ -3169,7 +3187,7 @@ api_key_env = "TENSORX_API_KEY"
             ],
         );
         assert_eq!(
-            collect_issue(dir2.path(), None, 40, None, &book)
+            collect_issue(dir2.path(), &[], None, 40, None, &book)
                 .unwrap()
                 .threads
                 .len(),
@@ -3180,7 +3198,7 @@ api_key_env = "TENSORX_API_KEY"
     #[test]
     fn json_round_trips_the_same_totals() {
         let f = fixture();
-        let stats = collect(f.dir.path(), None, None, &no_prices()).unwrap();
+        let stats = collect(f.dir.path(), &[], None, None, &no_prices()).unwrap();
         let text = serde_json::to_string(&stats).unwrap();
         let back: serde_json::Value = serde_json::from_str(&text).unwrap();
         let day = &back["days"][0];
@@ -3200,12 +3218,12 @@ api_key_env = "TENSORX_API_KEY"
     #[test]
     fn one_project_narrows_the_walk() {
         let f = fixture();
-        let stats = collect(f.dir.path(), Some("beta"), None, &no_prices()).unwrap();
+        let stats = collect(f.dir.path(), &[], Some("beta"), None, &no_prices()).unwrap();
         assert_eq!(stats.projects.len(), 1);
         assert_eq!(stats.projects[0].project, "beta");
         assert_eq!(stats.projects[0].calls, 1);
         // A project with no threads is an empty report, not an error.
-        let none = collect(f.dir.path(), Some("gamma"), None, &no_prices()).unwrap();
+        let none = collect(f.dir.path(), &[], Some("gamma"), None, &no_prices()).unwrap();
         assert_eq!(none.projects[0].calls, 0);
     }
 
@@ -3218,7 +3236,7 @@ api_key_env = "TENSORX_API_KEY"
             b"{not json",
         )
         .unwrap();
-        let stats = collect(f.dir.path(), None, None, &no_prices()).unwrap();
+        let stats = collect(f.dir.path(), &[], None, None, &no_prices()).unwrap();
         assert_eq!(stats.unreadable, 1, "{stats:?}");
         // And the readable thread is still fully counted.
         assert_eq!(stats.projects.iter().map(|p| p.calls).sum::<u32>(), 3);
@@ -3276,7 +3294,7 @@ api_key_env = "TENSORX_API_KEY"
         ];
         let project = dir.path().join("alpha");
         write_thread(&project, id, &lines);
-        let stats = collect(dir.path(), None, None, &book_of(PRICED_CONFIG)).unwrap();
+        let stats = collect(dir.path(), &[], None, None, &book_of(PRICED_CONFIG)).unwrap();
         let day = &stats.days[0];
 
         assert_eq!(day.calls, 5);
@@ -3321,7 +3339,7 @@ api_key_env = "TENSORX_API_KEY"
         );
 
         // No table at all: nothing is guessed, and nothing is claimed.
-        let none = collect(dir.path(), None, None, &no_prices()).unwrap();
+        let none = collect(dir.path(), &[], None, None, &no_prices()).unwrap();
         assert_eq!(none.days[0].price_estimated_calls, 0, "{:?}", none.days[0]);
         assert!(none.days[0].price_estimated_spent.is_none());
         assert_eq!(none.days[0].priced_calls, 1);
@@ -3343,6 +3361,7 @@ api_key_env = "TENSORX_API_KEY"
         // Without the flag: unpriced, and said to predate model stamping.
         let stats = collect(
             dir.path(),
+            &[],
             None,
             None,
             &PriceBook::from_config(&config, None).unwrap(),
@@ -3360,7 +3379,7 @@ api_key_env = "TENSORX_API_KEY"
         // With it: the named profile's table prices it, flagged estimated,
         // and the unstamped line goes away.
         let book = PriceBook::from_config(&config, Some("tensorx")).unwrap();
-        let stats = collect(dir.path(), None, None, &book).unwrap();
+        let stats = collect(dir.path(), &[], None, None, &book).unwrap();
         let expected = expected_cost(PRICED_CONFIG, "tensorx", &lines[1]);
         assert_eq!(stats.days[0].price_estimated_calls, 1);
         assert_eq!(stats.days[0].unstamped_calls, 0);
@@ -3415,7 +3434,7 @@ api_key_env = "TENSORX_API_KEY"
             ),
         ];
         write_thread(&dir.path().join("alpha"), id, &lines);
-        let stats = collect(dir.path(), None, None, &book_of(PRICED_CONFIG)).unwrap();
+        let stats = collect(dir.path(), &[], None, None, &book_of(PRICED_CONFIG)).unwrap();
         let day = &stats.days[0];
 
         assert_eq!(day.calls, 1);
@@ -3462,7 +3481,7 @@ api_key_env = "TENSORX_API_KEY"
             payload_only_extraction("2026-09-28T10:00:02Z", "some/other-model", 900, 90),
         ];
         write_thread(&dir.path().join("alpha"), id, &lines);
-        let stats = collect(dir.path(), None, None, &book_of(PRICED_CONFIG)).unwrap();
+        let stats = collect(dir.path(), &[], None, None, &book_of(PRICED_CONFIG)).unwrap();
         let day = &stats.days[0];
 
         let retro = expected_memory_cost(PRICED_CONFIG, &lines[1]);
@@ -3525,7 +3544,7 @@ api_key_env = "TENSORX_API_KEY"
             payload_only_extraction("2026-09-28T11:00:03Z", "z-ai/glm-5.3", 800, 100),
         ];
         write_thread(&dir.path().join("alpha"), id, &lines);
-        let stats = collect(dir.path(), None, None, &book_of(PRICED_CONFIG)).unwrap();
+        let stats = collect(dir.path(), &[], None, None, &book_of(PRICED_CONFIG)).unwrap();
         let retro = expected_memory_cost(PRICED_CONFIG, &lines[3]);
         let day = &stats.days[0];
         let side_jobs = [&lines[2], &lines[3]];
@@ -3576,7 +3595,7 @@ api_key_env = "TENSORX_API_KEY"
                 lines[1].clone(),
             ],
         );
-        let none = collect(plain.path(), None, None, &book_of(PRICED_CONFIG)).unwrap();
+        let none = collect(plain.path(), &[], None, None, &book_of(PRICED_CONFIG)).unwrap();
         let text = render(&none);
         assert!(!text.contains("side jobs"), "{text}");
         assert!(!text.contains("total "), "{text}");
@@ -3624,7 +3643,7 @@ api_key_env = "TENSORX_API_KEY"
                 ),
             ],
         );
-        let stats = collect(dir.path(), None, None, &book_of(PRICED_CONFIG)).unwrap();
+        let stats = collect(dir.path(), &[], None, None, &book_of(PRICED_CONFIG)).unwrap();
 
         // Dearest first: the side-job-only thread's 0.30 beats the
         // turn's 0.05, and its `calls` still says 0.
@@ -3687,7 +3706,7 @@ api_key_env = "TENSORX_API_KEY"
         write_thread(&dir.path().join("alpha"), id, &lines);
         let book = book_of(PRICED_CONFIG);
 
-        let report = collect_thread(dir.path(), None, id, None, &book).unwrap();
+        let report = collect_thread(dir.path(), &[], None, id, None, &book).unwrap();
         assert_eq!((report.calls, report.job_calls), (1, 1));
         assert_eq!(report.job_spent, Some(0.03));
         let u = extraction_usage(&lines[2]);
@@ -3701,7 +3720,7 @@ api_key_env = "TENSORX_API_KEY"
             "{text}"
         );
 
-        let issue = collect_issue(dir.path(), None, 46, None, &book).unwrap();
+        let issue = collect_issue(dir.path(), &[], None, 46, None, &book).unwrap();
         assert_eq!(issue.total.calls, 1);
         assert_eq!(issue.total.job_calls, 1);
         assert_eq!(issue.total.job_spent, Some(0.03));
@@ -3752,7 +3771,7 @@ api_key_env = "TENSORX_API_KEY"
         write_thread(&dir.path().join("alpha"), id, &lines);
         let book = book_of(PRICED_CONFIG);
         let cutoff = parse_since("2026-09-28", datetime!(2026-09-28 12:00:00 UTC)).unwrap();
-        let stats = collect(dir.path(), None, Some(cutoff), &book).unwrap();
+        let stats = collect(dir.path(), &[], None, Some(cutoff), &book).unwrap();
 
         assert_eq!(stats.days.iter().map(|d| d.job_calls).sum::<u32>(), 1);
         let inside = extraction_usage(&lines[3]);
@@ -3803,7 +3822,7 @@ api_key_env = "TENSORX_API_KEY"
             ),
         ];
         write_thread(&dir.path().join("alpha"), id, &lines);
-        let stats = collect(dir.path(), None, None, &book_of(PRICED_CONFIG)).unwrap();
+        let stats = collect(dir.path(), &[], None, None, &book_of(PRICED_CONFIG)).unwrap();
         let day = &stats.days[0];
 
         // The call's own arithmetic, untouched by the title call.
@@ -3887,7 +3906,7 @@ api_key_env = "TENSORX_API_KEY"
             ),
         ];
         write_thread(&dir.path().join("alpha"), id, &lines);
-        let stats = collect(dir.path(), None, None, &book_of(PRICED_CONFIG)).unwrap();
+        let stats = collect(dir.path(), &[], None, None, &book_of(PRICED_CONFIG)).unwrap();
         let day = &stats.days[0];
         assert_eq!(day.job_calls, 2);
         assert_eq!((day.extractions, day.titles), (1, 1));
@@ -3925,7 +3944,7 @@ api_key_env = "TENSORX_API_KEY"
             ),
         ];
         write_thread(&dir.path().join("alpha"), id, &lines);
-        let stats = collect(dir.path(), None, None, &book_of(PRICED_CONFIG)).unwrap();
+        let stats = collect(dir.path(), &[], None, None, &book_of(PRICED_CONFIG)).unwrap();
         let day = &stats.days[0];
 
         let retro = expected_memory_cost(PRICED_CONFIG, &lines[1]);
@@ -3968,7 +3987,7 @@ api_key_env = "TENSORX_API_KEY"
             renamed("2026-09-28T17:00:02Z", "An old title"),
         ];
         write_thread(&dir.path().join("alpha"), id, &lines);
-        let stats = collect(dir.path(), None, None, &book_of(PRICED_CONFIG)).unwrap();
+        let stats = collect(dir.path(), &[], None, None, &book_of(PRICED_CONFIG)).unwrap();
         let day = &stats.days[0];
 
         assert_eq!(day.job_calls, 0);
@@ -4017,7 +4036,7 @@ api_key_env = "TENSORX_API_KEY"
         write_thread(&dir.path().join("alpha"), id, &lines);
         let book = book_of(PRICED_CONFIG);
 
-        let issue = collect_issue(dir.path(), None, 49, None, &book).unwrap();
+        let issue = collect_issue(dir.path(), &[], None, 49, None, &book).unwrap();
         assert_eq!(issue.total.calls, 1);
         assert_eq!(issue.total.job_calls, 1);
         assert_eq!((issue.total.extractions, issue.total.titles), (0, 1));
@@ -4097,6 +4116,11 @@ api_key_env = "TENSORX_API_KEY"
             .enumerate()
             .map(|(seq, line)| {
                 let mut e = line.clone();
+                // A proposal keeps the id its answer points at; any other
+                // line gets one, since every event carries an id.
+                if e["id"].is_null() {
+                    e["id"] = json!(Ulid::generate().to_string());
+                }
                 e["thread_id"] = json!(id.to_string());
                 e["seq"] = json!(seq);
                 format!("{e}\n")
@@ -4225,7 +4249,7 @@ api_key_env = "TENSORX_API_KEY"
         decision_thread(&dir.path().join("beta"), &beta);
         let all: Vec<DecisionLine> = alpha.iter().chain(beta.iter()).copied().collect();
 
-        let report = collect_decisions(dir.path(), None, None).unwrap();
+        let report = collect_decisions(dir.path(), &[], None, None).unwrap();
         let names: Vec<&str> = report.kinds.iter().map(|k| kind_name(k.kind)).collect();
         assert_eq!(
             names,
@@ -4330,7 +4354,7 @@ api_key_env = "TENSORX_API_KEY"
         ));
         write_decisions(&dir.path().join("alpha"), Ulid::generate(), &lines);
 
-        let report = collect_decisions(dir.path(), None, None).unwrap();
+        let report = collect_decisions(dir.path(), &[], None, None).unwrap();
         let row = &report.kinds[0];
         assert_eq!(kind_name(row.kind), "project");
         let person_yes = later + 1;
@@ -4383,7 +4407,7 @@ api_key_env = "TENSORX_API_KEY"
         write_decisions(&dir.path().join("beta"), Ulid::generate(), &beta);
         let cutoff = datetime!(2026-09-23 00:00:00 UTC);
 
-        let report = collect_decisions(dir.path(), None, Some(cutoff)).unwrap();
+        let report = collect_decisions(dir.path(), &[], None, Some(cutoff)).unwrap();
         let names: Vec<&str> = report.kinds.iter().map(|k| kind_name(k.kind)).collect();
         assert_eq!(
             names,
@@ -4391,13 +4415,13 @@ api_key_env = "TENSORX_API_KEY"
             "the proposal before the window is out, its answer inside it does not pull it in"
         );
 
-        let narrowed = collect_decisions(dir.path(), Some("alpha"), Some(cutoff)).unwrap();
+        let narrowed = collect_decisions(dir.path(), &[], Some("alpha"), Some(cutoff)).unwrap();
         let names: Vec<&str> = narrowed.kinds.iter().map(|k| kind_name(k.kind)).collect();
         assert_eq!(names, vec!["job"], "`--project` narrows the walk");
 
         // Without the window the proposal is back, answered: pairing is by
         // the whole thread, whatever the window says.
-        let all = collect_decisions(dir.path(), Some("alpha"), None).unwrap();
+        let all = collect_decisions(dir.path(), &[], Some("alpha"), None).unwrap();
         let project = all
             .kinds
             .iter()
@@ -4437,7 +4461,7 @@ api_key_env = "TENSORX_API_KEY"
         )
         .unwrap();
 
-        let report = collect_decisions(dir.path(), None, None).unwrap();
+        let report = collect_decisions(dir.path(), &[], None, None).unwrap();
         assert_eq!((report.orphans, report.unreadable), (1, 1));
         let text = render_decisions(&report);
         assert!(text.contains("1 orphan answers"), "{text}");
@@ -4496,16 +4520,430 @@ api_key_env = "TENSORX_API_KEY"
             Ulid::generate(),
             &[user("2026-09-24T09:00:00Z", "no decisions here")],
         );
-        let report = collect_decisions(dir.path(), None, None).unwrap();
+        let report = collect_decisions(dir.path(), &[], None, None).unwrap();
         assert!(report.kinds.is_empty());
         let text = render_decisions(&report);
         assert!(text.contains("all threads"), "{text}");
         assert!(text.contains("no decisions recorded"), "{text}");
 
-        let windowed =
-            collect_decisions(dir.path(), None, Some(datetime!(2026-09-23 00:00:00 UTC))).unwrap();
+        let windowed = collect_decisions(
+            dir.path(),
+            &[],
+            None,
+            Some(datetime!(2026-09-23 00:00:00 UTC)),
+        )
+        .unwrap();
         let text = render_decisions(&windowed);
         assert!(text.contains("2026-09-23T00:00:00Z"), "{text}");
         assert!(text.contains("no decisions recorded"), "{text}");
+    }
+
+    // ---- the flat threads directory (issue #83) ----
+
+    /// A `thread_started` line, built from the payload type: `created_by`
+    /// is required, and a hand-written payload that failed to parse
+    /// would be skipped silently, passing a test for the wrong reason.
+    fn thread_started(at: &str, project: Option<&str>, root: &Path) -> serde_json::Value {
+        json!({
+            "kind": "thread_started",
+            "author": {"kind": "agent", "id": "runtime"},
+            "payload": serde_json::to_value(ThreadStartedPayload {
+                project: project.map(str::to_owned),
+                root: root.to_path_buf(),
+                created_by: Author::User(UserId("steve".into())),
+                parent_thread: None,
+                step: None,
+            })
+            .unwrap(),
+            "created_at": at,
+        })
+    }
+
+    /// A `project_switched` line, built from the payload type.
+    fn project_switched(at: &str, to: &str, root: &Path) -> serde_json::Value {
+        json!({
+            "kind": "project_switched",
+            "author": {"kind": "agent", "id": "runtime"},
+            "payload": serde_json::to_value(ProjectSwitchedPayload {
+                from: None,
+                to: Some(to.to_owned()),
+                root: root.to_path_buf(),
+                workspace: None,
+            })
+            .unwrap(),
+            "created_at": at,
+        })
+    }
+
+    /// A directory to name in a fixture's `thread_started.root`.
+    fn root_dir(base: &Path, name: &str) -> PathBuf {
+        let root = base.join(name);
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    /// An id the tests can order: `1_700_000_000_000` plus `n` seconds.
+    fn id_at(n: u64) -> Ulid {
+        Ulid::from_parts(1_700_000_000_000 + n * 1_000, n as u128 + 1)
+    }
+
+    /// T1 (issue #83): the flat layout #9 wrote reads exactly like the
+    /// legacy project directories, given logs that name their project.
+    #[test]
+    fn the_flat_layout_reads_like_the_legacy_one() {
+        let flat = tempfile::tempdir().unwrap();
+        let legacy = tempfile::tempdir().unwrap();
+        let root = flat.path().join("work");
+        std::fs::create_dir_all(&root).unwrap();
+        let alpha = id_at(0);
+        let beta = id_at(1);
+        // One fixture, built twice: flat with a `thread_started` naming
+        // the project, and in `alpha/` and `beta/` with the same lines.
+        let build = |base: &Path, named: bool| {
+            for (project, id) in [("alpha", alpha), ("beta", beta)] {
+                let dir = if named {
+                    base.to_path_buf()
+                } else {
+                    base.join(project)
+                };
+                let mut lines = vec![
+                    user("2026-09-28T12:00:00Z", "a prompt"),
+                    call("2026-09-28T12:00:01Z", 100, 0, 50, Some(0.25), None, None),
+                ];
+                if named {
+                    lines.insert(
+                        0,
+                        thread_started("2026-09-28T11:59:00Z", Some(project), &root),
+                    );
+                }
+                write_thread(&dir, id, &lines);
+            }
+        };
+        build(flat.path(), true);
+        build(legacy.path(), false);
+
+        let named = collect(flat.path(), &[], None, None, &no_prices()).unwrap();
+        let by_dir = collect(legacy.path(), &[], None, None, &no_prices()).unwrap();
+        assert_eq!(named, by_dir);
+        assert_eq!(
+            named
+                .projects
+                .iter()
+                .map(|p| p.project.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "beta"]
+        );
+
+        // A base that is not there is an empty report, not an error.
+        let missing = collect(&flat.path().join("nope"), &[], None, None, &no_prices()).unwrap();
+        assert_eq!(missing, Stats::default());
+        assert_eq!(missing.unreadable, 0);
+    }
+
+    /// T2 (issue #83): a thread that switched projects counts under the
+    /// last project it switched to — in the report, in an issue's rows
+    /// and in the narrowed decision record.
+    #[test]
+    fn a_switched_thread_counts_under_its_last_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = root_dir(dir.path(), "work");
+        let id = id_at(0);
+        let proposal = Ulid::generate();
+        write_decisions(
+            dir.path(),
+            id,
+            &[
+                thread_started("2026-09-28T09:00:00Z", Some("alpha"), &root),
+                user("2026-09-28T09:00:01Z", "work on #83"),
+                project_switched("2026-09-28T09:01:00Z", "beta", &root),
+                project_switched("2026-09-28T09:02:00Z", "gamma", &root),
+                proposed(proposal, "2026-09-28T09:03:00Z", "project", "a decision"),
+                call("2026-09-28T09:04:00Z", 100, 0, 50, Some(0.25), None, None),
+            ],
+        );
+
+        let stats = collect(dir.path(), &[], None, None, &no_prices()).unwrap();
+        assert_eq!(
+            stats
+                .projects
+                .iter()
+                .map(|p| p.project.as_str())
+                .collect::<Vec<_>>(),
+            vec!["gamma"],
+            "the last switch wins, not the thread_started root"
+        );
+        assert_eq!(stats.projects[0].calls, 1);
+        assert_eq!(stats.threads[0].project, "gamma");
+
+        let issue = collect_issue(dir.path(), &[], None, 83, None, &no_prices()).unwrap();
+        assert_eq!(issue.threads.len(), 1);
+        assert_eq!(issue.threads[0].project, "gamma");
+
+        let target = collect_decisions(dir.path(), &[], Some("gamma"), None).unwrap();
+        assert_eq!(target.kinds.len(), 1);
+        assert_eq!(target.kinds[0].proposed, 1);
+        let origin = collect_decisions(dir.path(), &[], Some("alpha"), None).unwrap();
+        assert!(origin.kinds.is_empty(), "{:?}", origin.kinds);
+        assert_eq!(origin.orphans, 0);
+    }
+
+    /// T3 (issue #83): a mixed tree — flat and legacy, a canary whose
+    /// `thread_started` disagrees with its directory, two logs that can
+    /// be attributed to no project, and an id written twice.
+    #[test]
+    fn a_mixed_tree_is_attributed_from_the_logs() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let outside = root_dir(base, "x");
+        let flat = id_at(0);
+        let legacy = id_at(1);
+        let canary = id_at(2);
+        let outside_named = id_at(3);
+        let outside_bare = id_at(4);
+        let old = id_at(5);
+        let twice = id_at(6);
+
+        write_thread(
+            base,
+            flat,
+            &[
+                thread_started("2026-09-28T08:00:00Z", Some("alpha"), base),
+                user("2026-09-28T08:00:01Z", "flat"),
+                call("2026-09-28T08:00:02Z", 100, 0, 50, Some(0.25), None, None),
+            ],
+        );
+        // The legacy log says nothing about its project: the directory
+        // names it.
+        write_thread(
+            &base.join("alpha"),
+            legacy,
+            &[
+                user("2026-09-28T08:01:00Z", "legacy"),
+                call("2026-09-28T08:01:01Z", 100, 0, 50, None, None, None),
+            ],
+        );
+        // The canary: filed under `alpha/`, its own line says `beta`.
+        write_thread(
+            &base.join("alpha"),
+            canary,
+            &[
+                thread_started("2026-09-28T08:02:00Z", Some("beta"), base),
+                user("2026-09-28T08:02:01Z", "filed under alpha, working in beta"),
+                call("2026-09-28T08:02:02Z", 100, 0, 50, None, None, None),
+            ],
+        );
+        // An old `_none` log whose root is a folder named `x`.
+        write_thread(
+            &base.join(LEGACY_NONE_PROJECT),
+            outside_named,
+            &[
+                thread_started("2026-09-28T08:03:00Z", Some(LEGACY_NONE_PROJECT), &outside),
+                user("2026-09-28T08:03:01Z", "outside, but its root has a name"),
+                call("2026-09-28T08:03:02Z", 100, 0, 50, None, None, None),
+            ],
+        );
+        // And one with no `thread_started` at all: no project.
+        write_thread(
+            &base.join(LEGACY_NONE_PROJECT),
+            outside_bare,
+            &[
+                user("2026-09-28T08:04:00Z", "outside, unnamed"),
+                call("2026-09-28T08:04:01Z", 100, 0, 50, None, None, None),
+            ],
+        );
+        // A pre-phase-4 flat log: no thread_started, no root, no project.
+        write_thread(
+            base,
+            old,
+            &[
+                user("2026-09-28T08:05:00Z", "before phase 4"),
+                call("2026-09-28T08:05:01Z", 100, 0, 50, None, None, None),
+            ],
+        );
+        // One id both flat and in `alpha/`: the flat copy is the one read,
+        // and the two copies differ, so the call count shows which.
+        write_thread(
+            base,
+            twice,
+            &[
+                thread_started("2026-09-28T08:06:00Z", Some("alpha"), base),
+                call("2026-09-28T08:06:01Z", 100, 0, 50, None, None, None),
+                call("2026-09-28T08:06:02Z", 200, 0, 60, None, None, None),
+            ],
+        );
+        write_thread(
+            &base.join("alpha"),
+            twice,
+            &[
+                user("2026-09-28T08:06:00Z", "the copy under alpha/"),
+                call("2026-09-28T08:06:01Z", 100, 0, 50, None, None, None),
+                call("2026-09-28T08:06:02Z", 200, 0, 60, None, None, None),
+                call("2026-09-28T08:06:03Z", 300, 0, 70, None, None, None),
+                call("2026-09-28T08:06:04Z", 400, 0, 80, None, None, None),
+                call("2026-09-28T08:06:05Z", 500, 0, 90, None, None, None),
+            ],
+        );
+
+        let stats = collect(base, &[], None, None, &no_prices()).unwrap();
+        assert_eq!(
+            stats
+                .projects
+                .iter()
+                .map(|p| p.project.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "beta", "x", "(no project)"],
+            "the canary counts in beta, and (no project) sorts last"
+        );
+        assert_eq!(stats.unreadable, 0);
+        let calls =
+            |s: &Stats, name: &str| s.projects.iter().find(|p| p.project == name).unwrap().calls;
+        // One call per fixture log, except the id written twice: its flat
+        // copy holds two calls and its `alpha/` copy five, so the count
+        // shows which one was read.
+        assert_eq!(
+            calls(&stats, "alpha"),
+            4,
+            "the flat log, the legacy-named log and the flat copy"
+        );
+        assert_eq!(calls(&stats, "beta"), 1, "the canary follows its own line");
+        assert_eq!(calls(&stats, "x"), 1, "the old root's basename names it");
+        assert_eq!(
+            calls(&stats, NO_PROJECT),
+            2,
+            "the two logs nothing attributes"
+        );
+
+        // `--project "(no project)"` selects exactly those two.
+        let none = collect(base, &[], Some(NO_PROJECT), None, &no_prices()).unwrap();
+        assert_eq!(none.projects.len(), 1);
+        assert_eq!(none.projects[0].project, NO_PROJECT);
+        assert_eq!(none.projects[0].calls, 2);
+        assert_eq!(none.threads.len(), 2);
+        assert_eq!(none.days.len(), 1, "both logs are from the same day");
+        // Nothing is counted twice: the per-project sums are the day's.
+        let total: u32 = stats.projects.iter().map(|p| p.calls).sum();
+        assert_eq!(stats.days.iter().map(|d| d.calls).sum::<u32>(), total);
+    }
+
+    /// T4 (issue #83): `--thread` finds an id in either layout, and a
+    /// `--project` that names another project says which project the
+    /// thread is in.
+    #[test]
+    fn collect_thread_finds_flat_and_legacy_and_names_the_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let flat = id_at(0);
+        let legacy = id_at(1);
+        let outside = id_at(2);
+        write_thread(
+            base,
+            flat,
+            &[
+                thread_started("2026-09-28T08:00:00Z", Some("alpha"), base),
+                call("2026-09-28T08:00:01Z", 100, 0, 50, Some(0.25), None, None),
+            ],
+        );
+        write_thread(
+            &base.join("alpha"),
+            legacy,
+            &[call(
+                "2026-09-28T08:01:00Z",
+                100,
+                0,
+                50,
+                Some(0.25),
+                None,
+                None,
+            )],
+        );
+        write_thread(
+            base,
+            outside,
+            &[call(
+                "2026-09-28T08:02:00Z",
+                100,
+                0,
+                50,
+                Some(0.25),
+                None,
+                None,
+            )],
+        );
+
+        let book = no_prices();
+        assert_eq!(
+            collect_thread(base, &[], None, flat, None, &book)
+                .unwrap()
+                .project,
+            "alpha"
+        );
+        assert_eq!(
+            collect_thread(base, &[], None, legacy, None, &book)
+                .unwrap()
+                .project,
+            "alpha",
+            "a legacy id is found too, named by its directory"
+        );
+
+        let err = collect_thread(base, &[], Some("beta"), flat, None, &book)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, format!("thread {flat} is in alpha, not beta"));
+
+        let err = collect_thread(base, &[], Some("alpha"), outside, None, &book)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            format!("thread {outside} is in {NO_PROJECT}, not alpha")
+        );
+
+        let missing = Ulid::generate();
+        let err = collect_thread(base, &[], None, missing, None, &book)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            format!("no thread {missing} found under {}", base.display())
+        );
+    }
+
+    /// T5 (issue #83): a log that cannot be read has no lines to
+    /// attribute it by, so it counts unless the filter can be shown to
+    /// exclude it.
+    #[test]
+    fn unreadable_logs_count_by_what_can_be_shown() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let good = id_at(0);
+        write_thread(
+            base,
+            good,
+            &[
+                thread_started("2026-09-28T08:00:00Z", Some("alpha"), base),
+                call("2026-09-28T08:00:01Z", 100, 0, 50, Some(0.25), None, None),
+            ],
+        );
+        // A corrupt flat log, and a corrupt `alpha/` one.
+        std::fs::write(base.join(format!("{}.jsonl", id_at(1))), b"{not json").unwrap();
+        std::fs::create_dir_all(base.join("alpha")).unwrap();
+        std::fs::write(
+            base.join("alpha").join(format!("{}.jsonl", id_at(2))),
+            b"{not json",
+        )
+        .unwrap();
+
+        let book = no_prices();
+        let all = collect(base, &[], None, None, &book).unwrap();
+        assert_eq!(all.unreadable, 2, "neither log can be attributed");
+        let alpha = collect(base, &[], Some("alpha"), None, &book).unwrap();
+        assert_eq!(
+            alpha.unreadable, 1,
+            "only the log in alpha/ can be shown to be alpha's"
+        );
+        let beta = collect(base, &[], Some("beta"), None, &book).unwrap();
+        assert_eq!(beta.unreadable, 0);
+        let decisions = collect_decisions(base, &[], Some("alpha"), None).unwrap();
+        assert_eq!(decisions.unreadable, 1, "the same rule for the record");
     }
 }

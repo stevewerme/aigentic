@@ -14,6 +14,7 @@ mod project_cmd;
 mod run_view;
 mod skills_cmd;
 mod stats;
+mod threads_index;
 
 use std::path::PathBuf;
 
@@ -92,7 +93,7 @@ enum Command {
         #[command(subcommand)]
         command: ProjectCommand,
     },
-    /// List this project's threads, newest first.
+    /// List this folder's project's threads, newest first.
     Threads,
     /// What the thread logs spent: cost, calls, context, cache and
     /// retries, by day and project. Reads local logs only. With the
@@ -312,7 +313,9 @@ async fn main() -> anyhow::Result<()> {
         .threads_dir
         .clone()
         .unwrap_or_else(config::default_threads_dir);
-    let threads_dir = project_cmd::threads_dir_for(&threads_base, opened.as_ref());
+    // The embedded daemon's workspaces, as the daemon reads them; an
+    // unreadable file is none, since a local read never needs them.
+    let workspaces = aigentic_server::workspaces::load_all(&config_dir).unwrap_or_default();
     let global_instructions = config
         .global_instructions
         .clone()
@@ -352,8 +355,12 @@ async fn main() -> anyhow::Result<()> {
             std::process::exit(0);
         }
         Some(Command::Threads) => {
-            let threads = project_cmd::list_threads(&threads_dir)?;
-            println!("{}", project_cmd::render_threads(&threads, &threads_dir));
+            let project = threads_index::folder_project(&cwd, opened.as_ref(), &workspaces);
+            let threads = project_cmd::list_threads(&threads_base, &project, &workspaces);
+            println!(
+                "{}",
+                project_cmd::render_threads(&threads, &project, &threads_base)
+            );
             std::process::exit(0);
         }
         // Stats read this machine's logs: a daemon holds threads of other
@@ -377,6 +384,7 @@ async fn main() -> anyhow::Result<()> {
             match (cli.thread, issue) {
                 (Some(id), _) => stats::run_thread(
                     &threads_base,
+                    &workspaces,
                     cli.project.as_deref(),
                     id,
                     since.as_deref(),
@@ -385,6 +393,7 @@ async fn main() -> anyhow::Result<()> {
                 )?,
                 (None, Some(n)) => stats::run_issue(
                     &threads_base,
+                    &workspaces,
                     cli.project.as_deref(),
                     n,
                     since.as_deref(),
@@ -393,12 +402,14 @@ async fn main() -> anyhow::Result<()> {
                 )?,
                 (None, None) if decisions => stats::run_decisions(
                     &threads_base,
+                    &workspaces,
                     cli.project.as_deref(),
                     since.as_deref(),
                     json,
                 )?,
                 (None, None) => stats::run(
                     &threads_base,
+                    &workspaces,
                     cli.project.as_deref(),
                     since.as_deref(),
                     json,

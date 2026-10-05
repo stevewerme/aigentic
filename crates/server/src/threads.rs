@@ -1513,7 +1513,10 @@ pub fn project_name_at(root: &Path, workspaces: &[Workspace]) -> String {
 }
 
 /// Is `name` a workspace project's, at a root that is not `root`?
-fn name_clashes(name: &str, root: &Path, workspaces: &[Workspace]) -> bool {
+///
+/// Public so a local reader — `aigentic stats`, `aigentic threads` — can
+/// apply the same rule the daemon's `home_of` does (#83).
+pub fn name_clashes(name: &str, root: &Path, workspaces: &[Workspace]) -> bool {
     workspaces
         .iter()
         .flat_map(|w| w.projects.iter())

@@ -1,20 +1,18 @@
-//! `aigentic project init | setup`, `aigentic threads` and the threads
-//! directory per project. The `project show` report lives in the daemon
-//! crate's `reports` since phase 5 step 9. See `docs/PLAN-phase4.md`
-//! sections 5, 7 and 8.
+//! `aigentic project init | setup` and the local `aigentic threads`. The
+//! `project show` report lives in the daemon crate's `reports` since
+//! phase 5 step 9. See `docs/PLAN-phase4.md` sections 5, 7 and 8.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use aigentic_runtime::Project;
-use aigentic_runtime::aigentic_core::{ContentBlock, EventKind};
-use aigentic_runtime::aigentic_log::{ThreadLog, UserMessagePayload};
+use aigentic_runtime::aigentic_core::{ContentBlock, Event, EventKind};
+use aigentic_runtime::aigentic_log::UserMessagePayload;
 use aigentic_runtime::project::{DOT_DIR, FILE_NAME, INSTRUCTIONS_FILE, KNOWLEDGE_DIR, MEMORY_DIR};
+use aigentic_server::workspaces::Workspace;
 use anyhow::{Context, bail};
 use time::format_description::well_known::Rfc3339;
 use ulid::Ulid;
 
-/// Threads of a run outside any project.
-pub const NO_PROJECT_DIR: &str = "_none";
+use crate::threads_index::{Found, catalogue, label, project_of};
 
 #[derive(Debug, clap::Subcommand)]
 pub enum ProjectCommand {
@@ -24,11 +22,6 @@ pub enum ProjectCommand {
     Setup,
     /// The layers, the knowledge mode and every tool's fate.
     Show,
-}
-
-/// `threads_dir/<project name>/`, or `threads_dir/_none/` outside a project.
-pub fn threads_dir_for(base: &Path, project: Option<&Project>) -> PathBuf {
-    base.join(project.map_or(NO_PROJECT_DIR, |p| p.name.as_str()))
 }
 
 /// `aigentic project init`: refuses to nest inside an existing project.
@@ -100,25 +93,35 @@ pub struct ThreadSummary {
     pub first_line: String,
 }
 
-/// Every `<ulid>.jsonl` in `dir`, newest first. A missing directory lists
-/// nothing.
-pub fn list_threads(dir: &Path) -> anyhow::Result<Vec<ThreadSummary>> {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
-    };
-    let mut ids: Vec<Ulid> = entries
-        .filter_map(Result::ok)
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"))
-        .filter_map(|p| p.file_stem()?.to_str()?.parse().ok())
-        .collect();
-    ids.sort_unstable_by(|a, b| b.cmp(a));
-    Ok(ids.into_iter().map(|id| summarise(dir, id)).collect())
+/// Every thread whose attributed project is `project`, newest first. The
+/// walk is `stats`' own (`crate::threads_index`): the flat directory
+/// first, then any legacy project directory (#83). A thread with no
+/// project of its own is not listed under any name.
+pub fn list_threads(base: &Path, project: &str, workspaces: &[Workspace]) -> Vec<ThreadSummary> {
+    let mut out: Vec<ThreadSummary> = Vec::new();
+    for found in catalogue(base) {
+        match found.read() {
+            Ok(events) => {
+                let attributed = project_of(&events, found.legacy.as_deref(), workspaces);
+                if label(attributed.as_deref()) == project {
+                    out.push(summarise(&found, Some(&events)));
+                }
+            }
+            // A log nothing can read says nothing about its project, so
+            // its legacy directory is all it has: it is listed under
+            // that name, with `?` for its line count, rather than
+            // hidden.
+            Err(_) if found.legacy.as_deref() == Some(project) => {
+                out.push(summarise(&found, None));
+            }
+            Err(_) => {}
+        }
+    }
+    out
 }
 
-fn summarise(dir: &Path, id: Ulid) -> ThreadSummary {
+fn summarise(found: &Found, events: Option<&[Event]>) -> ThreadSummary {
+    let id = found.id;
     let fallback_date = || {
         time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(id.timestamp_ms()) * 1_000_000)
             .ok()
@@ -126,8 +129,7 @@ fn summarise(dir: &Path, id: Ulid) -> ThreadSummary {
             .map(|s| s[..10].to_owned())
             .unwrap_or_default()
     };
-    let events = ThreadLog::open(dir, id).and_then(|log| log.read_all());
-    let Ok(events) = events else {
+    let Some(events) = events else {
         return ThreadSummary {
             id,
             date: fallback_date(),
@@ -175,10 +177,11 @@ pub fn first_line_of(text: &str) -> String {
     out
 }
 
-/// `id  date  events  first line`, one per thread; a note when empty.
-pub fn render_threads(threads: &[ThreadSummary], dir: &Path) -> String {
+/// `id  date  events  first line`, one per thread; a note naming the
+/// project and the base when there are none.
+pub fn render_threads(threads: &[ThreadSummary], project: &str, base: &Path) -> String {
     if threads.is_empty() {
-        return format!("no threads under {}", dir.display());
+        return format!("no threads in {project} under {}", base.display());
     }
     let mut out = String::new();
     for t in threads {
@@ -194,9 +197,19 @@ pub fn render_threads(threads: &[ThreadSummary], dir: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::threads_index::{LEGACY_NONE_PROJECT, NO_PROJECT};
+    use aigentic_runtime::Project;
     use aigentic_runtime::aigentic_core::{AgentId, Author, UserId};
-    use aigentic_runtime::aigentic_log::NewEvent;
+    use aigentic_runtime::aigentic_log::{
+        NewEvent, ProjectSwitchedPayload, ThreadLog, ThreadStartedPayload,
+    };
+    use aigentic_server::threads::project_name_at;
+    use aigentic_server::workspaces::Workspace;
     use serde_json::json;
+
+    use crate::stats::{PriceBook, collect};
+    use crate::threads_index::folder_project;
 
     fn user_message(text: &str) -> NewEvent {
         NewEvent {
@@ -207,18 +220,53 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_threads_directory_is_per_project_name() {
-        let base = Path::new("/t");
-        assert_eq!(threads_dir_for(base, None), PathBuf::from("/t/_none"));
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join(FILE_NAME),
-            "[project]\nname = \"vendela\"\n",
-        )
-        .unwrap();
-        let p = Project::open_root(dir.path()).unwrap();
-        assert_eq!(threads_dir_for(base, Some(&p)), PathBuf::from("/t/vendela"));
+    /// `thread_started` as the daemon writes it, built from the payload
+    /// type: a hand-written payload missing `created_by` would be
+    /// skipped silently, and a test would pass for the wrong reason.
+    fn thread_started(project: Option<&str>, root: &Path) -> NewEvent {
+        NewEvent {
+            kind: EventKind::ThreadStarted,
+            author: Author::Agent(AgentId("runtime".into())),
+            payload: serde_json::to_value(ThreadStartedPayload {
+                project: project.map(str::to_owned),
+                root: root.to_path_buf(),
+                created_by: Author::User(UserId("steve".into())),
+                parent_thread: None,
+                step: None,
+            })
+            .unwrap(),
+            parent_event: None,
+        }
+    }
+
+    /// `project_switched`, built from the payload type.
+    fn project_switched(from: &str, to: &str, root: &Path) -> NewEvent {
+        NewEvent {
+            kind: EventKind::ProjectSwitched,
+            author: Author::Agent(AgentId("runtime".into())),
+            payload: serde_json::to_value(ProjectSwitchedPayload {
+                from: Some(from.to_owned()),
+                to: Some(to.to_owned()),
+                root: root.to_path_buf(),
+                workspace: None,
+            })
+            .unwrap(),
+            parent_event: None,
+        }
+    }
+
+    /// One log under `dir`: `id` seconds after a fixed instant, so the
+    /// listing's order is the fixture's.
+    fn write_thread(dir: &Path, id: Ulid, events: &[NewEvent]) {
+        std::fs::create_dir_all(dir).unwrap();
+        let mut log = ThreadLog::open(dir, id).unwrap();
+        for event in events {
+            log.append(event.clone()).unwrap();
+        }
+    }
+
+    fn id_at(n: u64) -> Ulid {
+        Ulid::from_parts(1_700_000_000_000 + n * 1_000, n as u128 + 1)
     }
 
     #[test]
@@ -237,48 +285,146 @@ mod tests {
         assert!(init(&root).is_err());
     }
 
+    /// T6 (issue #83): the local `aigentic threads` lists the threads
+    /// whose own logs name the folder's project — flat and legacy alike —
+    /// newest first, with each one's date, line count and first line.
     #[test]
-    fn threads_list_newest_first_with_date_count_and_first_line() {
+    fn the_local_listing_follows_the_flat_directory() {
         let dir = tempfile::tempdir().unwrap();
-        let older = Ulid::from_parts(1_700_000_000_000, 1);
-        let newer = Ulid::from_parts(1_700_000_100_000, 2);
-        let mut log = ThreadLog::open(dir.path(), older).unwrap();
-        log.append(user_message("  \nFix the off-by-one in cost.rs\nmore"))
-            .unwrap();
-        log.append(NewEvent {
-            kind: EventKind::TurnEnded,
-            author: Author::Agent(AgentId("a".into())),
-            payload: json!({"reason": "done"}),
-            parent_event: None,
-        })
-        .unwrap();
-        let mut log = ThreadLog::open(dir.path(), newer).unwrap();
-        log.append(user_message(&"x".repeat(100))).unwrap();
-        std::fs::write(dir.path().join("notes.txt"), "ignored").unwrap();
-        std::fs::write(dir.path().join("not-a-ulid.jsonl"), "").unwrap();
+        let base = dir.path();
+        let started = id_at(0);
+        let switched_in = id_at(1);
+        let switched_away = id_at(2);
+        let legacy = id_at(3);
 
-        let threads = list_threads(dir.path()).unwrap();
+        write_thread(
+            base,
+            started,
+            &[
+                thread_started(Some("alpha"), base),
+                user_message("  \nFix the off-by-one in cost.rs\nmore"),
+            ],
+        );
+        write_thread(
+            base,
+            switched_in,
+            &[
+                thread_started(Some("beta"), base),
+                project_switched("beta", "alpha", base),
+                user_message("started in beta"),
+            ],
+        );
+        write_thread(
+            base,
+            switched_away,
+            &[
+                thread_started(Some("alpha"), base),
+                project_switched("alpha", "beta", base),
+                user_message("left it"),
+            ],
+        );
+        // A legacy `alpha/<id>.jsonl`, which names nothing itself.
+        write_thread(&base.join("alpha"), legacy, &[user_message("legacy log")]);
+        std::fs::write(base.join("not-a-ulid.jsonl"), "").unwrap();
+
+        let threads = list_threads(base, "alpha", &[]);
         assert_eq!(
             threads.iter().map(|t| t.id).collect::<Vec<_>>(),
-            vec![newer, older]
+            vec![legacy, switched_in, started],
+            "started here, switched in and the legacy log; never the one switched away"
         );
-        assert_eq!(threads[1].events, Some(2));
-        assert_eq!(threads[1].first_line, "Fix the off-by-one in cost.rs");
-        assert_eq!(threads[0].events, Some(1));
-        assert_eq!(threads[0].first_line, format!("{}…", "x".repeat(72)));
-        assert_eq!(threads[0].date.len(), 10);
-        let text = render_threads(&threads, dir.path());
+        assert_eq!(threads[2].events, Some(2));
+        assert_eq!(threads[2].first_line, "Fix the off-by-one in cost.rs");
+        assert_eq!(threads[2].date.len(), 10);
+        let text = render_threads(&threads, "alpha", base);
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 2);
+        assert_eq!(lines.len(), 3);
         assert!(
-            lines[1].starts_with(&format!("{older}  {}      2  Fix the", threads[1].date)),
+            lines[2].starts_with(&format!("{started}  {}      2  Fix the", threads[2].date)),
             "{text}"
         );
         assert!(
-            list_threads(&dir.path().join("missing"))
-                .unwrap()
-                .is_empty()
+            list_threads(&base.join("missing"), "alpha", &[]).is_empty(),
+            "a base that is not there lists nothing"
         );
-        assert!(render_threads(&[], dir.path()).starts_with("no threads under"));
+
+        // The empty message names the project and the base.
+        let empty = render_threads(&[], "alpha", base);
+        assert_eq!(
+            empty,
+            format!("no threads in alpha under {}", base.display())
+        );
+    }
+
+    /// T6 (issue #83): the folder's name is the daemon's own — the
+    /// project file's name, else `project_name_at` — and an old `_none`
+    /// log in a folder whose basename a workspace project holds is not
+    /// listed there, and is `(no project)` in stats.
+    #[test]
+    fn the_folder_name_follows_the_daemon() {
+        // A project file names the folder.
+        let named = tempfile::tempdir().unwrap();
+        std::fs::write(
+            named.path().join(FILE_NAME),
+            "[project]\nname = \"vendela\"\n",
+        )
+        .unwrap();
+        let opened = Project::open_root(named.path()).unwrap();
+        assert_eq!(folder_project(named.path(), Some(&opened), &[]), "vendela");
+
+        // A bare folder takes the daemon's name for it, with and without
+        // a workspace project holding that name at another root.
+        let holder = tempfile::tempdir().unwrap();
+        let empty: &[Workspace] = &[];
+        assert_eq!(
+            folder_project(holder.path(), None, empty),
+            project_name_at(holder.path(), empty)
+        );
+        let other = tempfile::tempdir().unwrap();
+        let elsewhere = other.path().join(holder.path().file_name().unwrap());
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let ws = Workspace {
+            name: "w".to_owned(),
+            shared: None,
+            projects: vec![elsewhere],
+        };
+        let name = folder_project(holder.path(), None, std::slice::from_ref(&ws));
+        assert_eq!(
+            name,
+            project_name_at(holder.path(), std::slice::from_ref(&ws))
+        );
+        assert_ne!(
+            name,
+            project_name_at(holder.path(), empty),
+            "the clash renames it"
+        );
+
+        // Its old `_none` log: not under that name, and attributed to no
+        // project, exactly as the daemon lists it.
+        write_thread(
+            &holder.path().join(LEGACY_NONE_PROJECT),
+            id_at(4),
+            &[
+                thread_started(Some(LEGACY_NONE_PROJECT), holder.path()),
+                user_message("outside any project"),
+            ],
+        );
+        assert!(list_threads(holder.path(), &name, std::slice::from_ref(&ws)).is_empty());
+        let stats = collect(
+            holder.path(),
+            std::slice::from_ref(&ws),
+            None,
+            None,
+            &PriceBook::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            stats
+                .projects
+                .iter()
+                .map(|p| p.project.as_str())
+                .collect::<Vec<_>>(),
+            vec![NO_PROJECT]
+        );
     }
 }
