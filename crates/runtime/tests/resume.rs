@@ -31,6 +31,7 @@ fn assistant_ev(blocks: Vec<ContentBlock>) -> NewEvent {
     let p = AssistantMessagePayload {
         blocks,
         usage: None,
+        finish_reason: None,
     };
     new_event(
         EventKind::AssistantMessage,

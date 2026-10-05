@@ -68,6 +68,14 @@ pub enum ProviderEvent {
     Error(ProviderError),
 }
 
+/// The `Done` reason both adapters report when a stream ended with no
+/// completion reason from the provider at all (issue #96): the
+/// connection dropped, and neither a reason nor its marker arrived, so
+/// the reply may stop mid-sentence or mid tool call. The runtime turns
+/// it into [`ProviderError::Cut`] rather than a finished reply, and the
+/// adapters likewise never flush a tool call it cut off.
+pub const CUT_STREAM: &str = "end_of_stream";
+
 /// Errors a provider adapter can surface.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, Serialize, Deserialize)]
 pub enum ProviderError {
@@ -81,6 +89,14 @@ pub enum ProviderError {
     RateLimited,
     #[error("unsupported: {0}")]
     Unsupported(String),
+    /// The stream ended before the reply finished (issue #96): the
+    /// provider closed it with no completion marker and no reason, so
+    /// nothing about the reply can be trusted — a tool call it was still
+    /// writing may have half its arguments. Its own variant, not a
+    /// `Protocol`: nothing the provider sent is unreadable, there is
+    /// simply no end to the reply.
+    #[error("the stream ended before the reply finished")]
+    Cut,
 }
 
 impl ProviderError {
@@ -93,7 +109,7 @@ impl ProviderError {
         match self {
             Self::Transport(_) | Self::RateLimited => true,
             Self::Http { status, .. } => *status == 429 || (500..600).contains(status),
-            Self::Protocol(_) | Self::Unsupported(_) => false,
+            Self::Protocol(_) | Self::Unsupported(_) | Self::Cut => false,
         }
     }
 
@@ -132,6 +148,7 @@ impl ProviderError {
             Self::Unsupported(_) => {
                 "this request is unsupported by the provider; check the configuration".to_owned()
             }
+            Self::Cut => "the model's reply was cut off; type continue to retry".to_owned(),
         }
     }
 
@@ -149,6 +166,9 @@ impl ProviderError {
             Self::Protocol(m) => Self::Protocol(prefix + &m),
             Self::RateLimited => Self::Transport(format!("{prefix}rate limited")),
             Self::Unsupported(m) => Self::Unsupported(m),
+            // Nothing was retried: a cut is not an `Error` the adapter
+            // sees, so there are no attempts to report (issue #96).
+            Self::Cut => Self::Cut,
         }
     }
 }
@@ -291,5 +311,27 @@ mod tests {
         for e in refused {
             assert!(!e.is_transient(), "{e:?} is not transient");
         }
+    }
+
+    /// T5 (issue #96): a cut reply round-trips through serde, never
+    /// retries, and keeps its identity through `with_attempts` — no
+    /// adapter retried it, so there is nothing to prefix.
+    #[test]
+    fn a_cut_reply_round_trips_and_never_retries() {
+        let cut = ProviderError::Cut;
+        let json = serde_json::to_string(&cut).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ProviderError>(&json).unwrap(),
+            ProviderError::Cut
+        );
+        assert!(!cut.is_transient());
+        assert_eq!(
+            ProviderError::Cut.with_attempts(4, Duration::from_millis(70_800)),
+            ProviderError::Cut
+        );
+        assert_eq!(
+            cut.plain_line(),
+            "the model's reply was cut off; type continue to retry"
+        );
     }
 }

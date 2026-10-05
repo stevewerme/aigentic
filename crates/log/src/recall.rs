@@ -358,6 +358,7 @@ mod tests {
                     args,
                 })],
                 usage: None,
+                finish_reason: None,
             })
             .unwrap(),
         )

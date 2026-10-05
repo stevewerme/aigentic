@@ -757,6 +757,7 @@ mod tests {
                     args,
                 })],
                 usage: None,
+                finish_reason: None,
             })
             .unwrap(),
         )
@@ -886,6 +887,7 @@ mod tests {
                     }),
                 ],
                 usage: None,
+                finish_reason: None,
             })
             .unwrap(),
         )
@@ -1215,6 +1217,7 @@ mod tests {
                         }),
                     ],
                     usage: None,
+                    finish_reason: None,
                 })
                 .unwrap(),
             ),
@@ -1350,6 +1353,7 @@ mod tests {
                         args: json!({}),
                     })],
                     usage: None,
+                    finish_reason: None,
                 })
                 .unwrap(),
             ),

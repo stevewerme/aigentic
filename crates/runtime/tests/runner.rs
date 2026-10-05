@@ -18,7 +18,7 @@ use aigentic_runtime::runner::{
     RunnerHost, WriteGuard,
 };
 use aigentic_runtime::workflow::{LoadedWorkflow, WorkflowFile, WorkflowOrigin};
-use aigentic_runtime::{Answer, Approver, Prices, Runtime};
+use aigentic_runtime::{Answer, Approver, LENGTH_STOP, Prices, Runtime};
 use aigentic_runtime::{
     STEP_REPORTED,
     runner::{CALL_FINISH_STEP, CONTINUE_PROMPT},
@@ -1759,6 +1759,53 @@ async fn t7_a_second_missing_report_escalates() {
         }
     );
     assert_eq!(step_started(&fx.lead_events()).len(), 3);
+}
+
+/// T7 (#96): a child whose turn ended at the model's output limit is
+/// `Partial` — a budget-style stop, like `max_tokens` — not `Failed`, and
+/// nothing escalates: the step is continued in the same child.
+#[tokio::test]
+async fn t7_a_length_stop_is_partial_and_does_not_escalate() {
+    let brief_child = Ulid::generate();
+    let implementer_child = Ulid::generate();
+    let fx = Fixture::new(vec![
+        (brief_child, vec![report("r1", brief_report())]),
+        (
+            implementer_child,
+            // The first reply runs out of output room mid-answer; the
+            // continue's reply reports.
+            vec![stop(LENGTH_STOP), report("r2", implementer_report())],
+        ),
+    ]);
+
+    let mut committed = false;
+    let run = trace_between(&fx, |_| {
+        commit_what_the_brief_named(&fx, implementer_child, &mut committed)
+    })
+    .await;
+
+    let finished = step_finished(run.lead());
+    assert_eq!(
+        finished[1].status,
+        StepStatus::Partial,
+        "a length stop is Partial, like a budget stop"
+    );
+    assert_eq!(finished[1].end_reason, LENGTH_STOP);
+    assert_eq!(finished[1].reported_event, None);
+    assert!(
+        !checkpoints(run.lead())
+            .iter()
+            .any(|c| c.shown.iter().any(|g| g == "step_stop")),
+        "nothing escalated: no step_stop gate"
+    );
+    // The step is continued in the same child, as t4's cap is.
+    let started = step_started(run.lead());
+    assert_eq!(started.len(), 3);
+    assert_eq!(started[2].step, "implement-alone");
+    assert_eq!(started[2].attempt, 2);
+    assert_eq!(started[2].child_thread, implementer_child);
+    let messages = prompts(&fx.child_events_of(implementer_child));
+    assert_eq!(messages[1], CONTINUE_PROMPT);
 }
 
 /// T13: `resumed` treated as `done`.

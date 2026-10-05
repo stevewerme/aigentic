@@ -281,6 +281,7 @@ async fn an_old_log_with_the_single_question_shape_replays() {
         serde_json::to_value(AssistantMessagePayload {
             blocks: vec![ContentBlock::ToolCall(asked)],
             usage: None,
+            finish_reason: None,
         })
         .unwrap(),
     );

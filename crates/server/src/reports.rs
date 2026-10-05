@@ -607,6 +607,7 @@ mod cost_tests {
                 ttft_ms: None,
                 cost_usd: None,
             }),
+            finish_reason: None,
         };
         event(
             EventKind::AssistantMessage,

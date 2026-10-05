@@ -935,6 +935,17 @@ pub const ASKED_HUMAN: &str = "asked_human";
 /// bookkeeping can tell a report from a turn that simply stopped.
 pub const STEP_REPORTED: &str = "step_reported";
 
+/// The `turn_ended` reason when the model's own output limit stopped the
+/// reply (issue #96). The provider says `length` or `max_tokens`; the
+/// turn ends `length`, and no tool call of that reply runs, because the
+/// arguments arrived mid-sentence. Distinct from our budget stop, whose
+/// reason stays `max_tokens`: the model ran out of room for this reply,
+/// not the turn out of tokens.
+pub const LENGTH_STOP: &str = "length";
+
+/// The provider's other name for the same stop (issue #96).
+pub const MAX_TOKENS_STOP: &str = "max_tokens";
+
 /// How a turn ended. The same information is in the `turn_ended` event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnOutcome {

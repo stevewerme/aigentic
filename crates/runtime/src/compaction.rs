@@ -3,7 +3,8 @@
 //! `compacted` event; the projection applies it.
 
 use aigentic_core::{
-    Author, CompletionRequest, ContentBlock, Event, EventKind, Message, ProviderEvent, Role, Usage,
+    Author, CUT_STREAM, CompletionRequest, ContentBlock, Event, EventKind, Message, ProviderError,
+    ProviderEvent, Role, Usage,
 };
 use aigentic_log::{
     CompactedPayload, CompactionStrategy, PinnedPayload, ToolResultPayload, project,
@@ -230,6 +231,12 @@ impl Runtime {
                 ProviderEvent::TextDelta(t) => text.push_str(&t),
                 ProviderEvent::Usage(u) => usage = u,
                 ProviderEvent::Error(e) => return Err(RuntimeError::Provider(e)),
+                // A summary cut off mid-way says less than the originals
+                // and would be appended in their place (issue #96), so it
+                // is a provider failure like any other.
+                ProviderEvent::Done { finish_reason } if finish_reason == CUT_STREAM => {
+                    return Err(RuntimeError::Provider(ProviderError::Cut));
+                }
                 _ => {}
             }
         }

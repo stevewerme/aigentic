@@ -36,7 +36,7 @@ use ulid::Ulid;
 use crate::checks::git::{read_commits_between, read_uncommitted};
 use crate::checks::{CheckInput, run_checks};
 use crate::workflow::{LoadedWorkflow, Step, WorkflowError};
-use crate::{Runtime, RuntimeError, STEP_REPORTED, Signal};
+use crate::{LENGTH_STOP, Runtime, RuntimeError, STEP_REPORTED, Signal};
 
 /// The author id of the lead's own events, and of the messages a runner
 /// posts into a child.
@@ -1297,7 +1297,11 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
             .map_err(|_| RunnerError::Host(format!("child {child}: unreadable turn_ended")))?;
         match end.reason.as_str() {
             STEP_REPORTED => Err(RunnerError::Host(format!("child {child} reported nothing"))),
-            "done" | "resumed" | "max_iterations" | "max_tokens" | "max_wall_time" => {
+            // `LENGTH_STOP` is a budget-style stop like `max_tokens`: the
+            // step is Partial, not Failed, and nothing escalates (issue
+            // #96).
+            "done" | "resumed" | LENGTH_STOP | "max_iterations" | "max_tokens"
+            | "max_wall_time" => {
                 let finished = finish(StepStatus::Partial, end.reason, None);
                 self.append(EventKind::StepFinished, &finished)?;
                 Ok(())

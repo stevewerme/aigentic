@@ -922,6 +922,7 @@ fn killed_while_parked_log(dir: &std::path::Path, thread: Ulid) -> ThreadLog {
                     "belongs there",
                 ))],
                 usage: None,
+                finish_reason: None,
             })
             .unwrap(),
             parent_event: None,

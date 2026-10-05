@@ -184,6 +184,11 @@ pub struct AssistantMessagePayload {
     pub blocks: Vec<ContentBlock>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
+    /// The provider's own reason the reply ended (issue #96): `"stop"`,
+    /// `"tool_calls"`, `"length"`, `"end_of_stream"`, and whatever else a
+    /// backend sends. Absent on lines written before it was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
 }
 
 /// What let a tool call run (or refused it). Recorded on every
@@ -259,8 +264,8 @@ impl ToolResultPayload {
 /// Payload of a `turn_ended` event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnEndedPayload {
-    /// `"done"`, `"resumed"`, `"asked_human"`, the budget that was hit,
-    /// or `provider_error: ...`.
+    /// `"done"`, `"resumed"`, `"asked_human"`, `"length"`, the budget
+    /// that was hit, or `provider_error: ...`.
     pub reason: String,
     /// The `path` of every `write_file` and `edit_file` call in the turn
     /// that returned without error, in order, each once; so a stop on a
@@ -2186,6 +2191,37 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<ThreadStartedPayload>(value).unwrap(),
             front
+        );
+    }
+
+    /// T5 (issue #96): an `assistant_message` line written before the
+    /// finish reason existed reads back with none, and a `None` never
+    /// writes the key.
+    #[test]
+    fn an_old_assistant_message_reads_without_a_finish_reason() {
+        let old = json!({
+            "blocks": [{"type": "text", "text": "hi"}],
+        });
+        let read: AssistantMessagePayload = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(read.finish_reason, None);
+        assert_eq!(serde_json::to_value(&read).unwrap(), old);
+        assert!(
+            !serde_json::to_value(&read)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("finish_reason"),
+            "no reason is written when there is none"
+        );
+
+        // A recorded reason is written and reads back.
+        let mut recorded = read.clone();
+        recorded.finish_reason = Some("length".to_owned());
+        let value = serde_json::to_value(&recorded).unwrap();
+        assert_eq!(value["finish_reason"], json!("length"));
+        assert_eq!(
+            serde_json::from_value::<AssistantMessagePayload>(value).unwrap(),
+            recorded
         );
     }
 }

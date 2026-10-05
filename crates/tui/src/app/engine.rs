@@ -21,7 +21,7 @@ use aigentic_runtime::aigentic_log::{
     MemoryRememberedPayload, PermissionDecidedPayload, RunFinishedPayload, SkillLoadedPayload,
     ToolResultPayload, TurnEndedPayload, UserMessagePayload,
 };
-use aigentic_runtime::{ASKED_HUMAN, INTERRUPTED};
+use aigentic_runtime::{ASKED_HUMAN, INTERRUPTED, LENGTH_STOP};
 
 use crate::app::cells::full_command;
 use tokio::sync::mpsc;
@@ -2021,6 +2021,14 @@ pub(crate) fn why_line(last_stop: Option<&str>) -> String {
     }
 }
 
+/// The line for a reply the model's own output limit stopped (issue
+/// #96): the model ran out of room mid-reply, no tool call of it ran,
+/// and nothing failed — `continue` picks the thread up where it
+/// stopped. Named here so a test asserts the constant, not a retyped
+/// copy.
+pub(crate) const LENGTH_STOP_TEXT: &str =
+    "the reply hit the model's output limit; type continue to go on";
+
 /// The lines a `turn_ended` payload prints after the turn's summary: the
 /// slept line (issue #47), then the stop line for a turn that ended on
 /// anything but `done`/`asked_human`/`interrupted`. A provider failure
@@ -2033,6 +2041,9 @@ pub(crate) fn turn_end_lines(p: &TurnEndedPayload) -> Vec<String> {
     }
     let message = match (reason_head(&p.reason), &p.error) {
         ("provider_error", Some(e)) => format!("{} (/why shows the raw error)", e.plain_line()),
+        // A reply the model's own output limit stopped (issue #96): no
+        // tool ran, and nothing failed, so it says what to do next.
+        (LENGTH_STOP, None) => LENGTH_STOP_TEXT.to_owned(),
         _ => p.reason.clone(),
     };
     if p.touched.is_empty() {
@@ -2174,8 +2185,8 @@ mod tests {
     use crate::app::rig::{config, open, project};
     use aigentic_api::client::Addr;
     use aigentic_runtime::aigentic_core::{
-        Capabilities, CompletionRequest, Event, Message, Provider, ProviderError, ProviderEvent,
-        RiskClass, ToolCall as CoreToolCall, Usage,
+        CUT_STREAM, Capabilities, CompletionRequest, Event, Message, Provider, ProviderError,
+        ProviderEvent, RiskClass, ToolCall as CoreToolCall, Usage,
     };
     use aigentic_server::build::{BuildError, ProviderFactory};
     use aigentic_server::{DefaultReports, Server};
@@ -3693,6 +3704,37 @@ mod tests {
             turn_end_lines(&p),
             vec!["[turn ended: provider_error: transport error: connection closed]".to_owned()],
             "an unreadable error shape degrades to the raw reason"
+        );
+    }
+
+    /// T6 (issue #96): a cut reply reads as the `Cut` plain line plus the
+    /// `/why` pointer, and a length stop reads as its named constant —
+    /// never the raw reason either way.
+    #[test]
+    fn a_cut_reply_and_a_length_stop_each_read_as_their_line() {
+        let cut = TurnEndedPayload {
+            reason: format!("provider_error: {CUT_STREAM}"),
+            error: Some(ProviderError::Cut),
+            ..TurnEndedPayload::new("")
+        };
+        let expected_cut = format!(
+            "[turn ended: {} (/why shows the raw error)]",
+            ProviderError::Cut.plain_line()
+        );
+        let cut_lines = turn_end_lines(&cut);
+        assert_eq!(cut_lines, vec![expected_cut], "{cut_lines:#?}");
+        assert!(!cut_lines[0].contains("provider_error"), "{cut_lines:#?}");
+
+        let length = TurnEndedPayload::new(LENGTH_STOP);
+        let length_lines = turn_end_lines(&length);
+        assert_eq!(
+            length_lines,
+            vec![format!("[turn ended: {LENGTH_STOP_TEXT}]")],
+            "a length stop names what to do next"
+        );
+        assert!(
+            !length_lines[0].contains(LENGTH_STOP),
+            "and not the raw reason: {length_lines:#?}"
         );
     }
 

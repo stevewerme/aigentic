@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Display;
 use std::pin::Pin;
 
-use aigentic_core::{ProviderBlob, ProviderError, ProviderEvent, ToolCall, Usage};
+use aigentic_core::{CUT_STREAM, ProviderBlob, ProviderError, ProviderEvent, ToolCall, Usage};
 use bytes::Bytes;
 use futures_core::Stream;
 use futures_util::StreamExt;
@@ -115,6 +115,9 @@ pub struct Translator {
     reasoning: String,
     finish_reason: Option<String>,
     done: bool,
+    /// Set when the stream closed with a completion marker or a reason,
+    /// so an EOF after it is a clean end rather than a cut (issue #96).
+    saw_end: bool,
 }
 
 impl Translator {
@@ -128,6 +131,8 @@ impl Translator {
             return Vec::new();
         }
         if data.trim() == "[DONE]" {
+            // The marker is a clean end even with no reason recorded.
+            self.saw_end = true;
             return self.finish();
         }
         let chunk: Chunk = match serde_json::from_str(data) {
@@ -172,6 +177,9 @@ impl Translator {
                 }
             }
             if let Some(reason) = choice.finish_reason {
+                // A reason counts as an end even if the marker never
+                // arrives: the server said how the reply stopped.
+                self.saw_end = true;
                 out.extend(self.flush_calls());
                 self.finish_reason = Some(reason);
             }
@@ -182,13 +190,26 @@ impl Translator {
         out
     }
 
-    /// End of stream, whether by `[DONE]`, EOF or a transport error.
+    /// End of stream, by `[DONE]` or at EOF; a transport error emits
+    /// `Error` instead (`parse_stream`) and never calls this.
+    ///
+    /// A stream that ended without a reason is a cut (issue #96): the
+    /// reply was still being written, so its open tool calls are dropped
+    /// rather than flushed with half their arguments. A marker gives the
+    /// clean default, and a reason seen earlier is kept. Text already
+    /// streamed is emitted as before.
     pub fn finish(&mut self) -> Vec<ProviderEvent> {
         if self.done {
             return Vec::new();
         }
         self.done = true;
-        let mut out = self.flush_calls();
+        let cut = self.finish_reason.is_none() && !self.saw_end;
+        let mut out = if cut {
+            self.calls.clear();
+            Vec::new()
+        } else {
+            self.flush_calls()
+        };
         if !self.reasoning.is_empty() {
             out.push(ProviderEvent::Blob(ProviderBlob {
                 provider: PROVIDER_NAME.to_owned(),
@@ -196,10 +217,13 @@ impl Translator {
             }));
         }
         out.push(ProviderEvent::Done {
-            finish_reason: self
-                .finish_reason
-                .take()
-                .unwrap_or_else(|| "end_of_stream".to_owned()),
+            finish_reason: self.finish_reason.take().unwrap_or_else(|| {
+                if self.saw_end {
+                    "stop".to_owned()
+                } else {
+                    CUT_STREAM.to_owned()
+                }
+            }),
         });
         out
     }
@@ -291,6 +315,14 @@ mod tests {
     const TEXT: &str = include_str!("../../fixtures/openai_compat/text.sse");
     const TOOL_CALLS: &str = include_str!("../../fixtures/openai_compat/tool_calls.sse");
     const LENGTH: &str = include_str!("../../fixtures/openai_compat/length.sse");
+
+    /// The fixture's first `lines` lines: the stream dying there, its
+    /// last event left without the blank line that terminates it.
+    fn cut_after(fixture: &str, lines: usize) -> String {
+        let mut out = fixture.lines().take(lines).collect::<Vec<_>>().join("\n");
+        out.push('\n');
+        out
+    }
 
     /// Run a fixture through the parser and translator as one chunk.
     fn translate(fixture: &str) -> Vec<ProviderEvent> {
@@ -414,10 +446,24 @@ mod tests {
     }
 
     #[test]
-    fn eof_without_done_marker_completes_the_same_way() {
-        let cut = LENGTH.rsplit_once("data: [DONE]").unwrap().0;
-        assert!(!cut.contains("[DONE]"));
-        assert_eq!(translate(cut), translate(LENGTH));
+    fn eof_without_done_marker_is_a_cut_stream() {
+        // The stream died inside the calls' arguments, before the chunk
+        // that spells the reason: no reason, no marker. It used to be
+        // flushed and run as two calls (issue #96).
+        let cut = cut_after(TOOL_CALLS, 35);
+        let events = translate(&cut);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ProviderEvent::ToolCall(_))),
+            "a cut flushed a tool call: {events:#?}"
+        );
+        assert_eq!(
+            events.last(),
+            Some(&ProviderEvent::Done {
+                finish_reason: CUT_STREAM.into()
+            })
+        );
     }
 
     #[test]

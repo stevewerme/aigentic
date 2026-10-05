@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Display;
 use std::pin::Pin;
 
-use aigentic_core::{ProviderBlob, ProviderError, ProviderEvent, ToolCall, Usage};
+use aigentic_core::{CUT_STREAM, ProviderBlob, ProviderError, ProviderEvent, ToolCall, Usage};
 use bytes::Bytes;
 use futures_core::Stream;
 use futures_util::StreamExt;
@@ -41,6 +41,9 @@ pub struct Translator {
     usage: Usage,
     stop_reason: Option<String>,
     done: bool,
+    /// Set by `message_stop`, so an EOF after it is a clean end rather
+    /// than a cut (issue #96).
+    saw_end: bool,
 }
 
 fn str_of(v: &Value, key: &str) -> String {
@@ -138,7 +141,11 @@ impl Translator {
                     v["usage"]["output_tokens_details"]["thinking_tokens"].as_u64();
                 vec![ProviderEvent::Usage(self.usage)]
             }
-            "message_stop" => self.finish(),
+            "message_stop" => {
+                // The marker is a clean end even with no reason recorded.
+                self.saw_end = true;
+                self.finish()
+            }
             "error" => {
                 self.done = true;
                 vec![ProviderEvent::Error(ProviderError::Protocol(
@@ -174,28 +181,39 @@ impl Translator {
         }
     }
 
-    /// End of stream by `message_stop`, EOF or a transport error. On a
-    /// `refusal` an unfinished tool call is dropped rather than run.
+    /// End of stream, by `message_stop` or at EOF; a transport error emits
+    /// `Error` instead (`parse_stream`) and never calls this.
+    ///
+    /// A stream that ended without a reason is a cut (issue #96): the
+    /// reply was still being written, so an open tool call is dropped
+    /// rather than run with half its arguments. A marker gives the clean
+    /// default, and a reason seen earlier is kept. On a `refusal` an
+    /// unfinished tool call is dropped too.
     pub fn finish(&mut self) -> Vec<ProviderEvent> {
         if self.done {
             return Vec::new();
         }
         self.done = true;
         let refused = self.stop_reason.as_deref() == Some("refusal");
+        let cut = self.stop_reason.is_none() && !self.saw_end;
         let indices: Vec<usize> = self.open.keys().copied().collect();
         let mut out = Vec::new();
         for i in indices {
-            if refused && matches!(self.open.get(&i), Some(Open::ToolUse { .. })) {
+            let tool_use = matches!(self.open.get(&i), Some(Open::ToolUse { .. }));
+            if tool_use && (cut || refused) {
                 self.open.remove(&i);
                 continue;
             }
             out.extend(self.close(i));
         }
         out.push(ProviderEvent::Done {
-            finish_reason: self
-                .stop_reason
-                .take()
-                .unwrap_or_else(|| "end_of_stream".to_owned()),
+            finish_reason: self.stop_reason.take().unwrap_or_else(|| {
+                if self.saw_end {
+                    "end_turn".to_owned()
+                } else {
+                    CUT_STREAM.to_owned()
+                }
+            }),
         });
         out
     }
@@ -272,6 +290,14 @@ mod tests {
     const TEXT: &str = include_str!("../../fixtures/anthropic/text.sse");
     const TOOL_CALLS: &str = include_str!("../../fixtures/anthropic/tool_calls.sse");
     const MAX_TOKENS: &str = include_str!("../../fixtures/anthropic/max_tokens.sse");
+
+    /// The fixture's first `lines` lines: the stream dying there, its
+    /// last event left without the blank line that terminates it.
+    fn cut_after(fixture: &str, lines: usize) -> String {
+        let mut out = fixture.lines().take(lines).collect::<Vec<_>>().join("\n");
+        out.push('\n');
+        out
+    }
 
     fn translate(fixture: &str) -> Vec<ProviderEvent> {
         let mut parser = SseParser::new();
@@ -396,9 +422,24 @@ mod tests {
     }
 
     #[test]
-    fn eof_without_message_stop_completes_the_same_way() {
-        let cut = TOOL_CALLS.rsplit_once("event: message_stop").unwrap().0;
-        assert_eq!(translate(cut), translate(TOOL_CALLS));
+    fn eof_without_message_stop_is_a_cut_stream() {
+        // The stream died inside the first call's arguments, before the
+        // `message_delta` that carries the reason. A cut, so the call is
+        // not flushed (issue #96).
+        let cut = cut_after(TOOL_CALLS, 35);
+        let events = translate(&cut);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ProviderEvent::ToolCall(_))),
+            "a cut flushed a tool call: {events:#?}"
+        );
+        assert_eq!(
+            events.last(),
+            Some(&ProviderEvent::Done {
+                finish_reason: CUT_STREAM.into()
+            })
+        );
     }
 
     #[test]

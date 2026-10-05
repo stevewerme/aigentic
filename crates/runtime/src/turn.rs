@@ -4,8 +4,8 @@
 use std::time::Instant;
 
 use aigentic_core::{
-    Author, CompletionRequest, ContentBlock, EventKind, ProviderEvent, ToolCall, ToolResult,
-    ToolSpec,
+    Author, CUT_STREAM, CompletionRequest, ContentBlock, EventKind, ProviderError, ProviderEvent,
+    ToolCall, ToolResult, ToolSpec,
 };
 use aigentic_log::{
     AssistantMessagePayload, InterruptedPayload, ProviderRetriedPayload, ToolResultPayload, Usage,
@@ -17,10 +17,10 @@ use aigentic_log::{Invoker, NewEvent, PolicyRecord};
 
 use crate::decisions::{CancelToken, Inbox, Queued};
 use crate::harness_tools::{
-    ASK_HUMAN, FINISH_STEP, HARNESS_CLASS, NOT_RUN_SIBLING, NOT_RUN_SOLO, SUGGEST_PROJECT,
-    harness_specs, is_harness_tool,
+    ASK_HUMAN, FINISH_STEP, HARNESS_CLASS, NOT_RUN_LENGTH, NOT_RUN_OVER_LIMIT, NOT_RUN_SIBLING,
+    NOT_RUN_SOLO, SUGGEST_PROJECT, harness_specs, is_harness_tool,
 };
-use crate::runtime::{ASKED_HUMAN, INTERRUPTED, STEP_REPORTED};
+use crate::runtime::{ASKED_HUMAN, INTERRUPTED, LENGTH_STOP, MAX_TOKENS_STOP, STEP_REPORTED};
 use crate::seams::{Verdict, author_name, denial_text};
 use crate::support::{Spent, append_queued, block_start, flush_text};
 use crate::{Runtime, RuntimeError, Signal, TurnOutcome, build_context};
@@ -224,6 +224,10 @@ impl Runtime {
 
             let (mut blocks, mut text, mut usage, mut error) =
                 (Vec::new(), String::new(), None, None);
+            // The provider's own reason the reply ended (issue #96): the
+            // difference between a reply that finished and one that was
+            // cut off or ran out of output tokens.
+            let mut finish_reason: Option<String> = None;
             // Issue #31: the call's waiting time, stamped on its usage
             // line. `ttft_ms` is the first streamed block, so a slow
             // model (thinking before any delta) reads separately from a
@@ -293,7 +297,21 @@ impl Runtime {
                     }
                     ProviderEvent::Blob(blob) => blocks.push(ContentBlock::ProviderBlob(blob)),
                     ProviderEvent::Usage(u) => usage = Some(Usage::reported(u)),
-                    ProviderEvent::Done { .. } => {}
+                    ProviderEvent::Done {
+                        finish_reason: reason,
+                    } => {
+                        // A stream that ended without a reason was cut
+                        // off mid-reply (issue #96): the text may stop
+                        // mid-sentence and a tool call mid-arguments, so
+                        // nothing about it can be trusted — the existing
+                        // error path below ends the turn, writes no
+                        // assistant message and runs no call.
+                        if reason == CUT_STREAM {
+                            error = Some(ProviderError::Cut);
+                            break;
+                        }
+                        finish_reason = Some(reason);
+                    }
                     ProviderEvent::Error(e) => {
                         error = Some(e);
                         break;
@@ -358,12 +376,49 @@ impl Runtime {
             let payload = serde_json::to_value(AssistantMessagePayload {
                 blocks,
                 usage: Some(usage),
+                finish_reason: finish_reason.clone(),
             })
             .expect("serialisable");
             let assistant =
                 self.append(EventKind::AssistantMessage, agent, payload, None, observe)?;
+            // A reply that hit the model's output limit was cut short by
+            // the model itself (issue #96): its calls were written by a
+            // reply that could not finish thinking, so none runs. Every
+            // call still gets a result — the invariant is that no call in
+            // the log is left unanswered — and the turn ends `length`.
+            let length_stop = finish_reason
+                .as_deref()
+                .is_some_and(|r| r == LENGTH_STOP || r == MAX_TOKENS_STOP);
+            if length_stop && !calls.is_empty() {
+                for call in &calls {
+                    let result = ToolResult {
+                        id: call.id.clone(),
+                        content: NOT_RUN_LENGTH.to_owned(),
+                        is_error: true,
+                    };
+                    let payload = serde_json::to_value(ToolResultPayload::new(
+                        result,
+                        PolicyRecord::rule(NOT_RUN_OVER_LIMIT, "deny"),
+                    ))
+                    .expect("serialisable");
+                    self.append(
+                        EventKind::ToolResult,
+                        Author::System,
+                        payload,
+                        Some(assistant.id),
+                        observe,
+                    )?;
+                }
+                return self.end_turn(LENGTH_STOP, None, &spent, &mut held, observe);
+            }
             if calls.is_empty() {
-                return self.end_turn("done", None, &spent, &mut held, observe);
+                return self.end_turn(
+                    if length_stop { LENGTH_STOP } else { "done" },
+                    None,
+                    &spent,
+                    &mut held,
+                    observe,
+                );
             }
 
             let mut answered = false;

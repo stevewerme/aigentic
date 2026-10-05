@@ -132,6 +132,16 @@ pub const NOT_RUN_SIBLING: &str =
 /// names its own.
 pub const NOT_RUN_SOLO: &str = "suggest_project must be the only call";
 
+/// The result every call in a reply gets when the model's own output
+/// limit stopped it (issue #96): the arguments arrived mid-sentence, so
+/// nothing runs. The shape is the interrupt path's. Named here so a
+/// client or a test asserts the constant, not a retyped copy.
+pub const NOT_RUN_LENGTH: &str = "not run: the reply hit the model's output limit";
+
+/// The policy record's rule text for that refusal, as the interrupt path
+/// names its own.
+pub const NOT_RUN_OVER_LIMIT: &str = "the reply hit the model's output limit";
+
 /// A `suggest_project` call's arguments, parsed. An unknown key, or a
 /// missing one, is `invalid arguments: …`.
 fn suggest_project_args(args: &serde_json::Value) -> Result<SuggestProjectArgs, String> {

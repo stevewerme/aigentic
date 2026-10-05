@@ -371,6 +371,7 @@ mod tests {
                     output_tokens: 5,
                     ..Default::default()
                 })),
+                finish_reason: None,
             })
             .unwrap(),
             parent_event: None,

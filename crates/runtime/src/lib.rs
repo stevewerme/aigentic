@@ -41,6 +41,7 @@ pub mod title;
 mod turn;
 pub mod workflow;
 
+pub use aigentic_core::CUT_STREAM;
 pub use approver::{Answer, Approver, DenyAll};
 pub use audit::audit_tool_results;
 pub use compaction::SUMMARY_PROMPT;
@@ -54,7 +55,7 @@ pub use evict::{
     Decision, EVICT_BLOCK_CALLS, EVICT_MIN_FREE_PERCENT, RATIO_MAX, RATIO_MIN, RATIO_SMOOTHING,
     calibrated, calibrated_delta, min_free, next_ratio, schemas_tokens,
 };
-pub use harness_tools::{IdleProposal, Settled};
+pub use harness_tools::{IdleProposal, NOT_RUN_LENGTH, NOT_RUN_OVER_LIMIT, Settled};
 pub use knowledge::{Knowledge, KnowledgeMode};
 pub use layers::{Decided, GlobalLayer, Layers, WorkspaceLayer};
 pub use memory::{MEMORY_FILES, MEMORY_PROMPT};
@@ -62,7 +63,8 @@ pub use mode::Mode;
 pub use project::{Project, ProjectError, ProjectFile};
 pub use resume::{DAEMON_RESTARTED, INTERRUPTED_RESULT, Resumed};
 pub use runtime::{
-    ASKED_HUMAN, CompactionSettings, DEFAULT_BUDGET, DEFAULT_COMPACTION, INTERRUPTED, Prices,
-    ProjectContext, Runtime, STEP_REPORTED, Signal, TurnOutcome, WindowUsage,
+    ASKED_HUMAN, CompactionSettings, DEFAULT_BUDGET, DEFAULT_COMPACTION, INTERRUPTED, LENGTH_STOP,
+    MAX_TOKENS_STOP, Prices, ProjectContext, Runtime, STEP_REPORTED, Signal, TurnOutcome,
+    WindowUsage,
 };
 pub use seams::{SessionGrant, Verdict};
