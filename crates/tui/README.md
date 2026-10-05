@@ -74,7 +74,7 @@ any non-empty value.
 ## Usage
 
 ```bash
-cargo run -p aigentic-tui --                                     # new thread over a daemon embedded for this directory
+cargo run -p aigentic-tui --                                     # resume the front thread over a daemon embedded for this directory; make a new one with /new
 cargo run -p aigentic-tui -- --server tcp:vm:7420 --project vendela   # the same client against a remote daemon; token in AIGENTIC_TOKEN
 cargo run -p aigentic-tui -- --thread <ULID>                     # resume by replaying the log
 cargo run -p aigentic-tui -- --thread <ULID> --profile anthropic # same thread, other backend (embedded daemon only)
@@ -202,7 +202,10 @@ The profile is `--profile`, else the project's `[model] profile`, else the
 config's `default_profile`; with `--server` the flag is refused, since the
 daemon picks each thread's profile from its project. The banner names the project, the layers it
 loaded (global, project, knowledge with its mode, memory), the skill and
-tool counts and how many threads the project has.
+tool counts and how many threads the project has, and its second line says
+which thread you are in: the front thread and its title, or the id you
+resumed with `--thread`. A plain run resumes the front thread; `/new`
+starts a new one and stays in the REPL.
 
 Since phase 5 the REPL is a client of the daemon: with no `--server` it
 starts one in the process for this directory over a private socket, so a
@@ -237,7 +240,8 @@ files with line counts, the `through_seq` of the last extraction, and
 the block as the prefix carries it), `/skills` (the enabled set), `/project`
 (the same report as `project show`, over the live registry so MCP tools are
 included), `/project use <name>` (move the thread to another project),
-`/threads`, `/<skill> [args]` for every enabled user-invoked
+`/threads`, `/new` (start a new front thread; the old one stays listed),
+`/<skill> [args]` for every enabled user-invoked
 skill, `/help`, `/quit`. Anything else starting with `/` prints `unknown
 command`. Ctrl-D quits; Ctrl-C clears the line.
 
@@ -414,7 +418,9 @@ adapter change.
 
 1. `cd` into a Rust repository with tests. Ensure the config and the key's
    environment variable are set.
-2. Start a new thread and note the id it prints:
+2. Start the client and read the second line. A plain run resumes the front
+   thread — the first time, it starts one and says so. `/threads` lists it
+   and prints the id:
 
    ```bash
    cargo run -p aigentic-tui --

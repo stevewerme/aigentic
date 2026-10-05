@@ -7,6 +7,7 @@ mod checks;
 mod config;
 mod doctor;
 mod exec;
+mod front;
 mod init_cmd;
 mod pocock;
 mod pocock_templates;
@@ -555,19 +556,24 @@ async fn main() -> anyhow::Result<()> {
             }
         );
     }
-    let project_name = cli
+    // The folder's project: what a client would have created in today,
+    // and `exec`'s project. A plain run resumes the front thread in
+    // whatever project that thread lives in, so this is only a fallback
+    // (issue #89).
+    let folder_project = cli
         .project
         .clone()
         .or_else(|| opened.as_ref().map(|p| p.name.clone()))
         .or_else(|| embedded.as_ref().map(|e| e.project.clone()))
         .or_else(|| welcome.projects.first().map(|p| p.name.clone()));
-    let Some(project_name) = project_name else {
+    let Some(folder_project) = folder_project else {
         bail!(
             "no project to work in: {} has no role anywhere on {}",
             welcome.user,
             welcome.server
         );
     };
+    let project_name = folder_project.clone();
     // `build` asks the daemon to run the issue and follows the run: it
     // never opens a thread of its own, so a run's lead is its one log.
     if let Some(args) = build_args {
@@ -585,26 +591,12 @@ async fn main() -> anyhow::Result<()> {
         drop(embedded);
         std::process::exit(outcome.code);
     }
-    let role = welcome
-        .projects
-        .iter()
-        .find(|p| p.name == project_name)
-        .and_then(|p| p.role.clone());
-    let thread_id = match cli.thread {
-        Some(id) => id,
-        None => match client
-            .request(Request::CreateThread {
-                project: project_name.clone(),
-            })
-            .await?
-        {
-            Response::Thread { thread } => thread.id,
-            Response::Refused { reason } => {
-                bail!("cannot start a thread in {project_name}: {reason}")
-            }
-            other => bail!("unexpected reply creating a thread: {other:?}"),
-        },
-    };
+    // One pick serves the REPL, plain mode and `exec` (issue #89):
+    // `--thread X` opens X; `exec` creates a thread in the folder's
+    // project; anything else resumes (or starts) the front thread.
+    let picked =
+        front::pick_thread(&client, cli.thread, exec_args.is_some(), &project_name).await?;
+    let thread_id = picked.id;
     let (state, events, mode, identity) = match client
         .request(Request::Open {
             thread: thread_id,
@@ -633,6 +625,23 @@ async fn main() -> anyhow::Result<()> {
         Response::Refused { reason } => bail!("cannot open thread {thread_id}: {reason}"),
         other => bail!("unexpected reply opening the thread: {other:?}"),
     };
+    // The REPL is in the thread's project, not the folder's (issue #89).
+    // `exec`'s thread was created in the folder's project, so it keeps it.
+    let thread_project = if exec_args.is_some() {
+        project_name.clone()
+    } else {
+        front::thread_project(&picked, &events, &project_name)
+    };
+    let role = front::role_for(&welcome.projects, &thread_project);
+    // The title the status line shows from the first frame: a `Front`
+    // reply carries one, a `--thread` resume has no reply, so the
+    // thread's own events name it.
+    let title = picked
+        .info
+        .as_ref()
+        .and_then(front::title_of)
+        .or_else(|| aigentic_runtime::title::title_of(&events));
+    let project_name = thread_project.clone();
     if cli.mode != Mode::Manual {
         client
             .request(Request::SetMode {
@@ -696,15 +705,20 @@ async fn main() -> anyhow::Result<()> {
                 format!(" · {where_}")
             }
         )];
-        if cli.thread.is_some() {
-            lines.push(format!("resumed {thread_id} · {} events", events.len()));
+        lines.push(front::front_line(
+            picked.outcome.as_ref(),
+            picked.info.as_ref(),
+            thread_id,
+            events.len(),
+            false,
+        ));
+        if matches!(
+            picked.outcome,
+            Some(aigentic_api::FrontOutcome::Resumed) | None
+        ) {
             for line in app::engine::recent_lines(&events, 3) {
                 lines.push(format!("  {line}"));
             }
-        } else {
-            lines.push(format!(
-                "new thread · resume later with --thread {thread_id}"
-            ));
         }
         if let Some(r) = &running {
             lines.push(r.clone());
@@ -721,13 +735,23 @@ async fn main() -> anyhow::Result<()> {
             welcome.user,
             role.as_deref().unwrap_or("no role"),
         );
-        if cli.thread.is_some() {
-            println!("thread {thread_id} resumed with {} events", events.len());
+        println!(
+            "{}",
+            front::front_line(
+                picked.outcome.as_ref(),
+                picked.info.as_ref(),
+                thread_id,
+                events.len(),
+                true,
+            )
+        );
+        if matches!(
+            picked.outcome,
+            Some(aigentic_api::FrontOutcome::Resumed) | None
+        ) {
             for line in app::engine::recent_lines(&events, 3) {
                 println!("  {line}");
             }
-        } else {
-            println!("new thread {thread_id} (resume with --thread {thread_id})");
         }
         if let Some(r) = &running {
             println!("[{r}]");
@@ -766,7 +790,8 @@ async fn main() -> anyhow::Result<()> {
         identity,
         &project_name,
     )
-    .with_skills(skills);
+    .with_skills(skills)
+    .with_title(title);
     app::run(repl, notices, history, project_name, project_root).await?;
     drop(embedded);
     Ok(())

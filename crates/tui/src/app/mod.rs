@@ -17,6 +17,8 @@ pub mod look;
 pub mod markdown;
 pub mod menu;
 pub mod pager;
+#[cfg(test)]
+pub(crate) mod rig;
 pub mod status;
 pub mod tui;
 
@@ -263,6 +265,20 @@ impl Printer for ShellOut {
         // The shell owns the terminal, so it is the one place the
         // transport can be chosen (issue #41).
         crate::app::copy::set_clipboard(text)
+    }
+
+    fn thread_changed(&mut self) {
+        // `/new` (issue #89): the live state belonged to the thread
+        // left behind, and it must never draw in the new thread's pane.
+        // The old cells already committed stay in the pager, with the
+        // `new front thread …` line drawn by `/new` between them and
+        // the next thread's.
+        self.running = None;
+        self.tail.clear();
+        self.explored.clear();
+        self.pending.clear();
+        self.fenced = false;
+        self.last = None;
     }
 
     fn tail(&mut self, text: &str) {
@@ -1006,6 +1022,25 @@ mod tests {
             RiskClass::Exec,
             "class exec: anything else in a shell",
         )
+    }
+
+    /// T6 (issue #89): `/new` tells the printer the thread changed, and
+    /// that clears the live state of the thread just left — the running
+    /// tool, the unfinished line, the folded reads, the fenced flag.
+    #[test]
+    fn thread_changed_clears_the_live_state_of_the_old_thread() {
+        let mut out = out_at(80);
+        out.running = Some(Cell::Note("a tool".into()));
+        out.tail = "half a sentence".into();
+        out.explored = vec!["a read".into()];
+        out.pending = vec![Line::from("a pending line")];
+        out.fenced = true;
+        out.thread_changed();
+        assert!(out.running.is_none(), "the old thread's tool is dropped");
+        assert!(out.tail.is_empty(), "and its unfinished line");
+        assert!(out.explored.is_empty(), "and its folded reads");
+        assert!(out.pending.is_empty(), "and its unflushed lines");
+        assert!(!out.fenced, "and the fence it was inside");
     }
 
     /// The pager opens with the whole checklist — the live block shows

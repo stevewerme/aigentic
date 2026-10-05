@@ -13,7 +13,7 @@
 use std::collections::{HashMap, VecDeque};
 
 use aigentic_api::client::Client;
-use aigentic_api::{Notice, ReportKind, Request, Response, SwitchReply, ThreadState};
+use aigentic_api::{Notice, ReportKind, Request, Response, SwitchReply, ThreadInfo, ThreadState};
 use aigentic_runtime::aigentic_core::{Author, ContentBlock, EventKind, ToolCall};
 use aigentic_runtime::aigentic_log::{
     AssistantMessagePayload, CheckpointAnsweredPayload, CheckpointAskedPayload, CompactedPayload,
@@ -31,6 +31,7 @@ use crate::app::cells::{Cell, ToolState, summarise_args};
 use crate::app::commands::{Command, HELP, parse_line, truncate_for_display};
 use crate::app::copy::Used;
 use crate::app::menu::{Keyed, Kind, Menu, Pick};
+use crate::front;
 
 /// What a key on the prompt menu came to, from `ClientRepl::menu_key`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,6 +153,10 @@ pub trait Printer {
     fn copy(&mut self, _text: &str) -> Result<Used, String> {
         Err("/copy needs the shell UI".into())
     }
+    /// The REPL moved to another thread (`/new`, issue #89). A shell
+    /// drops the live state that belonged to the old one; a pipe holds
+    /// none, so the default does nothing.
+    fn thread_changed(&mut self) {}
     fn cell(&mut self, cell: Cell, done: bool) {
         let lines = cell.plain();
         if done {
@@ -347,6 +352,14 @@ impl ClientRepl {
     /// The user-invoked skills, so `/<skill>` dispatches.
     pub fn with_skills(mut self, skills: Vec<String>) -> Self {
         self.skills = skills;
+        self
+    }
+
+    /// The whole part of the thread's name the status line shows
+    /// (issue #89): set at birth, so a resumed thread shows its title
+    /// from the first frame.
+    pub fn with_title(mut self, title: Option<String>) -> Self {
+        self.title = title;
         self
     }
 
@@ -550,6 +563,7 @@ impl ClientRepl {
                 self.show(r, "", out);
             }
             Command::Cost => self.report(ReportKind::Cost, out).await,
+            Command::New => self.new_front(out).await,
             Command::Build(arg) => self.build(arg, out).await,
             // The raw stop reason stays off the transcript (issue #22):
             // `/why` fetches it, engine-local, no daemon round-trip.
@@ -682,6 +696,145 @@ impl ClientRepl {
             }
             Command::Unknown(cmd) => out.line(&format!("unknown command: {cmd}")),
         }
+    }
+
+    /// `/new` (issue #89): start a new front thread and move this REPL
+    /// onto it. The old thread stays listed, and a turn running in it
+    /// keeps running in the daemon; this connection closes it last, so
+    /// a failure anywhere before that leaves the REPL where it was.
+    async fn new_front(&mut self, out: &mut dyn Printer) {
+        // The new thread is in the project this REPL is in; a thread
+        // that never switched is in the project it started in. The
+        // folder's project is not consulted.
+        let project = self
+            .project
+            .clone()
+            .unwrap_or_else(|| self.home_project.clone());
+        // 1. Ask for it. A refusal (`/new` needs `write` here) or any
+        //    other reply changes nothing.
+        let new = match self
+            .request(Request::NewFront {
+                project: project.clone(),
+            })
+            .await
+        {
+            Response::Thread { thread } => thread,
+            Response::Refused { reason } => {
+                out.line(&format!("cannot start a new thread in {project}: {reason}"));
+                return;
+            }
+            other => {
+                self.show(other, "", out);
+                return;
+            }
+        };
+        // 2. Open it. Until this succeeds the REPL is wholly on the old
+        //    thread, still subscribed to it: the stray new front thread
+        //    is what the next launch resumes, and the line says so.
+        let (state, mode, identity) = match self
+            .request(Request::Open {
+                thread: new.id,
+                from_seq: 0,
+            })
+            .await
+        {
+            Response::Opened {
+                state,
+                mode,
+                profile,
+                model,
+                effort,
+                ..
+            } => (
+                state,
+                mode,
+                Identity {
+                    profile,
+                    model,
+                    effort,
+                },
+            ),
+            Response::Refused { reason } => {
+                out.line(&format!("cannot open the new thread {}: {reason}", new.id));
+                return;
+            }
+            other => {
+                out.line(&format!("cannot open the new thread {}: {other:?}", new.id));
+                return;
+            }
+        };
+        self.land_new_front(new, state, mode, identity, out).await;
+    }
+
+    /// Move the REPL onto a thread that has just been opened (`/new`'s
+    /// steps 3-8). Split out from [`Self::new_front`] so the branch a
+    /// failed `Open` takes can be driven with a reply the daemon would
+    /// not send.
+    async fn land_new_front(
+        &mut self,
+        new: ThreadInfo,
+        state: ThreadState,
+        mode: String,
+        identity: Identity,
+        out: &mut dyn Printer,
+    ) {
+        let old = self.thread;
+        // 3. Every per-thread field goes; the per-session ones (`client`,
+        //    `user`, `role` below, `skills`, `quit`, `home_project`,
+        //    `following`, `checkpoint`) stay.
+        self.thread = new.id;
+        self.state = state;
+        self.identity = identity;
+        self.project = match new.project.as_deref() {
+            Some(p) if p != self.home_project => Some(p.to_owned()),
+            _ => None,
+        };
+        self.title = new.title.clone();
+        self.calls.clear();
+        self.partial.clear();
+        self.reply.clear();
+        self.prompted = None;
+        self.menu = None;
+        self.turn = None;
+        self.tasks.clear();
+        self.task_calls.clear();
+        self.usage = None;
+        self.last_turn = None;
+        self.last_stop = None;
+        self.awaiting_turn = false;
+        // The role is the new project's, and only the daemon knows it:
+        // `Welcome` named the project the client started in.
+        let project = self
+            .project
+            .clone()
+            .unwrap_or_else(|| self.home_project.clone());
+        if let Response::Projects { projects } = self.request(Request::ListProjects).await
+            && let Some(role) = front::role_for(&projects, &project)
+        {
+            self.role = Some(role);
+        }
+        // 4. This connection opened the old thread; let it go. `Close`
+        //    is per client, so another one on it is unaffected.
+        let _ = self.request(Request::Close { thread: old }).await;
+        // 5. A new thread is `manual`: a session in another mode keeps
+        //    it, as `main.rs` does at launch.
+        if self.mode != "manual" {
+            let keep = self.mode.clone();
+            let _ = self
+                .request(Request::SetMode {
+                    thread: new.id,
+                    mode: keep,
+                })
+                .await;
+        } else {
+            self.mode = mode;
+        }
+        // 6. The shell drops the live state the old thread left behind.
+        out.thread_changed();
+        out.line(&format!(
+            "new front thread {} · the old one stays listed in /threads",
+            new.id
+        ));
     }
 
     async fn post(&mut self, text: &str, interrupt: bool, out: &mut dyn Printer) {
@@ -2017,7 +2170,7 @@ mod tests {
     //! beyond the private socket.
 
     use super::*;
-    use crate::config::Config;
+    use crate::app::rig::{config, open, project};
     use aigentic_api::client::Addr;
     use aigentic_runtime::aigentic_core::{
         Capabilities, CompletionRequest, Event, Message, Provider, ProviderError, ProviderEvent,
@@ -2108,62 +2261,6 @@ mod tests {
             class: RiskClass::Exec,
             reason: "class exec: ask".into(),
         }
-    }
-
-    /// A config with a scripted profile, threads and skills under `dir`.
-    fn config(dir: &std::path::Path) -> Config {
-        Config::parse(&format!(
-            "default_profile = \"a\"\nthreads_dir = {:?}\nbundled_dir = {:?}\n[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n[profiles.b]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n",
-            dir.join("threads").display(),
-            dir.display()
-        ))
-        .unwrap()
-    }
-
-    fn project(dir: &std::path::Path, name: &str, participants: &str) -> std::path::PathBuf {
-        let root = dir.join(name);
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(
-            root.join("aigentic.toml"),
-            format!("[project]\nname = \"{name}\"\n{participants}"),
-        )
-        .unwrap();
-        root
-    }
-
-    /// Create a thread in `project`, open it, and hand back what a REPL
-    /// needs.
-    async fn open(
-        client: &Client,
-        project: &str,
-        thread: Option<Ulid>,
-    ) -> (Ulid, ThreadState, String) {
-        let id = match thread {
-            Some(id) => id,
-            None => {
-                let Response::Thread { thread } = client
-                    .request(Request::CreateThread {
-                        project: project.into(),
-                    })
-                    .await
-                    .unwrap()
-                else {
-                    panic!()
-                };
-                thread.id
-            }
-        };
-        let Response::Opened { state, mode, .. } = client
-            .request(Request::Open {
-                thread: id,
-                from_seq: 0,
-            })
-            .await
-            .unwrap()
-        else {
-            panic!()
-        };
-        (id, state, mode)
     }
 
     /// Notices until the state matches, with a moment for the other
@@ -5079,6 +5176,333 @@ mod tests {
         fn stop(self) {
             self.daemon.stop();
         }
+    }
+
+    /// Lines plus how often `thread_changed` was called, for `/new`
+    /// (issue #89, T5).
+    #[derive(Default)]
+    struct Recording {
+        lines: Vec<String>,
+        changed: usize,
+    }
+
+    impl Printer for Recording {
+        fn line(&mut self, text: &str) {
+            self.lines.push(text.to_owned());
+        }
+
+        fn thread_changed(&mut self) {
+            self.changed += 1;
+        }
+    }
+
+    /// T5 and T7: `/new` starts a new front thread, the REPL follows it
+    /// into the project the old thread had moved to, and the session's
+    /// mode comes with it.
+    #[tokio::test]
+    async fn new_moves_the_repl_to_a_new_front_thread_in_the_threads_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = project(dir.path(), "a", "[participants]\nsteve = \"admin\"\n");
+        let b = project(dir.path(), "b", "[participants]\nsteve = \"admin\"\n");
+        let addr =
+            crate::app::rig::daemon(dir.path(), &[("steve", "t")], &[("a", a), ("b", b)]).await;
+        let (client, welcome) = Client::connect(&addr, "t").await.unwrap();
+        // The folder is in `b`: the thread is born there, and the REPL's
+        // home project is `b`.
+        let role = welcome
+            .projects
+            .iter()
+            .find(|p| p.name == "b")
+            .and_then(|p| p.role.clone());
+        let front = crate::front::pick_thread(&client, None, false, "b")
+            .await
+            .unwrap();
+        let (old, state, mode) = open(&client, "b", Some(front.id)).await;
+        let notices = client.take_notices().unwrap();
+        let mut repl = ClientRepl::new(
+            client,
+            old,
+            "steve",
+            role,
+            state,
+            mode,
+            Identity::default(),
+            "b",
+        );
+        // A session in auto, as `--mode auto` or `/mode auto` leaves it.
+        repl.mode = "auto".to_owned();
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let feeder = async move {
+            tx.send("/project use a".into()).unwrap();
+            // The switch is the thread's own event, seen as a notice: the
+            // REPL only knows its new project once that lands.
+            tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+            tx.send("/new".into()).unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+            tx.send("/quit".into()).unwrap();
+        };
+        let mut out = Recording::default();
+        tokio::join!(repl.run(rx, notices, &mut out), feeder);
+
+        let new = repl.thread;
+        assert_ne!(new, old, "the REPL moved to a new thread");
+        assert_eq!(
+            repl.project(),
+            Some("a"),
+            "the new thread is in the project the old one had moved to"
+        );
+        assert_eq!(repl.mode(), "auto", "the session's mode came with it");
+        assert_eq!(out.changed, 1, "the printer was told once");
+        assert!(
+            out.lines.contains(&format!(
+                "new front thread {new} · the old one stays listed in /threads"
+            )),
+            "the line names the new id: {:?}",
+            out.lines
+        );
+
+        // A second client: the new thread is the front one, in `a`, in
+        // auto, and both threads are listed there.
+        let (second, _) = Client::connect(&addr, "t").await.unwrap();
+        let resumed = crate::front::pick_thread(&second, None, false, "a")
+            .await
+            .unwrap();
+        assert_eq!(resumed.info.as_ref().unwrap().id, new);
+        let Response::Opened { mode, .. } = second
+            .request(Request::Open {
+                thread: new,
+                from_seq: 0,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(mode, "auto");
+        let Response::Threads { threads } = second
+            .request(Request::ListThreads {
+                project: "a".into(),
+            })
+            .await
+            .unwrap()
+        else {
+            panic!()
+        };
+        let info = threads
+            .iter()
+            .find(|t| t.id == new)
+            .expect("the new thread");
+        assert!(
+            threads.iter().any(|t| t.id == old),
+            "the old thread stays listed"
+        );
+        // What the thread moved to: `None` when it is the home project.
+        assert_eq!(
+            repl.project(),
+            info.project.as_deref().filter(|p| *p != "b")
+        );
+        assert_eq!(
+            repl.title().map(str::to_owned),
+            info.title.clone().filter(|t| !t.is_empty())
+        );
+    }
+
+    /// T6: `/new` clears the old thread's per-thread state, and the old
+    /// thread's notices stop drawing.
+    #[tokio::test]
+    async fn new_clears_the_old_threads_approval_state_and_its_notes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = project(dir.path(), "p", "[participants]\nsteve = \"admin\"\n");
+        let addr = crate::app::rig::daemon(dir.path(), &[("steve", "t")], &[("p", root)]).await;
+        let (client, welcome) = Client::connect(&addr, "t").await.unwrap();
+        let role = welcome.projects[0].role.clone();
+        let (old, state, mode) = open(&client, "p", None).await;
+        let mut repl = ClientRepl::new(
+            client,
+            old,
+            "steve",
+            role,
+            state,
+            mode,
+            Identity::default(),
+            "p",
+        );
+        // A gate up: the id of the call it waits on, and the menu drawn.
+        repl.prompted = Some("c1".to_owned());
+        repl.menu = Some(Menu::checkpoint("c1", &["ls".to_owned()]));
+
+        let mut out = Recording::default();
+        repl.handle_line("/new", &mut out).await;
+        assert_ne!(repl.thread, old);
+        assert!(repl.prompted.is_none(), "the old thread's gate is dropped");
+        assert!(repl.menu.is_none(), "and its menu with it");
+        assert_eq!(out.changed, 1);
+
+        // The old thread is no longer subscribed: its note draws nothing,
+        // the new thread's does.
+        let drawn = out.lines.len();
+        repl.render(
+            Notice::Note {
+                thread: old,
+                text: "old news".into(),
+            },
+            &mut out,
+        );
+        assert_eq!(out.lines.len(), drawn, "the old thread's note is dropped");
+        repl.render(
+            Notice::Note {
+                thread: repl.thread,
+                text: "new news".into(),
+            },
+            &mut out,
+        );
+        assert_eq!(out.lines.last().unwrap(), "[new news]");
+    }
+
+    /// T8a: a read-only user's `/new` is refused and nothing changes.
+    #[tokio::test]
+    async fn a_refused_new_leaves_the_repl_on_the_old_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = project(
+            dir.path(),
+            "p",
+            "[participants]\nsteve = \"admin\"\nmagnus = \"read\"\n",
+        );
+        let addr = crate::app::rig::daemon(
+            dir.path(),
+            &[("steve", "t-steve"), ("magnus", "t-magnus")],
+            &[("p", root)],
+        )
+        .await;
+        let (steve, _) = Client::connect(&addr, "t-steve").await.unwrap();
+        let (thread, ..) = open(&steve, "p", None).await;
+        let (magnus, welcome) = Client::connect(&addr, "t-magnus").await.unwrap();
+        let role = welcome.projects[0].role.clone();
+        let (_, state, mode) = open(&magnus, "p", Some(thread)).await;
+        let mut repl = ClientRepl::new(
+            magnus,
+            thread,
+            "magnus",
+            role,
+            state,
+            mode,
+            Identity::default(),
+            "p",
+        );
+        let mut out = Recording::default();
+        repl.handle_line("/new", &mut out).await;
+        assert_eq!(repl.thread, thread, "the REPL stays where it was");
+        assert_eq!(out.changed, 0);
+        let printed = out.lines.last().unwrap();
+        assert!(
+            printed.starts_with("cannot start a new thread in p: "),
+            "{printed}"
+        );
+        assert!(
+            printed.contains("read"),
+            "the daemon's reason is printed: {printed}"
+        );
+        // Still subscribed: a note for the old thread draws.
+        repl.render(
+            Notice::Note {
+                thread,
+                text: "still here".into(),
+            },
+            &mut out,
+        );
+        assert_eq!(out.lines.last().unwrap(), "[still here]");
+    }
+
+    /// T8b: when `Open` of the new front thread fails, the REPL stays
+    /// wholly on the old one. No real daemon refuses that `Open` — a
+    /// fresh thread in a project this client may write is always
+    /// openable — so a scripted daemon answers `NewFront` and refuses
+    /// `Open`.
+    #[tokio::test]
+    async fn a_failed_open_says_so_and_leaves_the_repl_alone() {
+        use aigentic_api::{Body, Frame, ProjectInfo, Response, Welcome, decode, encode};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("f.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let old = Ulid::from_parts(1, 1);
+        let new = Ulid::from_parts(1, 2);
+        let info = |id: Ulid| aigentic_api::ThreadInfo {
+            id,
+            project: Some("p".into()),
+            date: "2026-10-05".into(),
+            events: 0,
+            first_line: String::new(),
+            state: ThreadState::Idle,
+            title: None,
+        };
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut lines = BufReader::new(read).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let Ok(frame) = decode(&line) else { break };
+                let id = frame.id.unwrap_or(0);
+                let Body::Request(request) = frame.body else {
+                    break;
+                };
+                let response = match request {
+                    Request::Hello { .. } => Response::Welcome(Welcome {
+                        user: "steve".into(),
+                        projects: vec![ProjectInfo {
+                            name: "p".into(),
+                            root: dir.path().join("p"),
+                            role: Some("admin".into()),
+                            threads: 0,
+                        }],
+                        server: "scripted".into(),
+                    }),
+                    Request::NewFront { .. } => Response::Thread { thread: info(new) },
+                    Request::Open { .. } => Response::Refused {
+                        reason: "the thread is gone".into(),
+                    },
+                    other => panic!("unscripted: {other:?}"),
+                };
+                let frame = Frame::response(id, response);
+                write
+                    .write_all(format!("{}\n", encode(&frame)).as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        let addr = Addr::Unix(socket);
+        let (client, _) = Client::connect(&addr, "t").await.unwrap();
+        let mut repl = ClientRepl::new(
+            client,
+            old,
+            "steve",
+            Some("admin".into()),
+            ThreadState::Idle,
+            "manual".into(),
+            Identity::default(),
+            "p",
+        );
+        let mut out = Recording::default();
+        repl.handle_line("/new", &mut out).await;
+        assert_eq!(repl.thread, old, "the REPL stays on the old thread");
+        assert_eq!(out.changed, 0, "nothing was told the thread changed");
+        let printed = out.lines.last().unwrap();
+        assert!(
+            printed.starts_with(&format!("cannot open the new thread {new}: ")),
+            "{printed}"
+        );
+        assert!(printed.ends_with("the thread is gone"), "{printed}");
+        repl.render(
+            Notice::Note {
+                thread: old,
+                text: "still here".into(),
+            },
+            &mut out,
+        );
+        assert_eq!(out.lines.last().unwrap(), "[still here]");
     }
 
     /// A key by its code, for the menu and the keymap.

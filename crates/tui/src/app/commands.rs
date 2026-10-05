@@ -44,6 +44,8 @@ pub enum Command<'a> {
     Rename(&'a str),
     /// Move the thread to another project.
     ProjectUse(&'a str),
+    /// Start a new front thread, leaving the old one listed (issue #89).
+    New,
     Unknown(&'a str),
     Chat(&'a str),
     Empty,
@@ -74,6 +76,7 @@ pub fn parse_line<'a>(line: &'a str, skills: &[String]) -> Command<'a> {
         }
         ("project", _) => Command::Project,
         ("threads", _) => Command::Threads,
+        ("new", _) => Command::New,
         ("compact", _) => Command::Compact,
         ("interrupt", text) if !text.is_empty() => Command::Interrupt(text),
         ("who", _) => Command::Who,
@@ -131,6 +134,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "the layers, the knowledge mode and every tool's fate",
     ),
     ("threads", "this project's threads, newest first"),
+    ("new", "start a new front thread; the old one stays listed"),
     ("build", "follow a build of issue n here: /build <n>"),
     ("diff", "the project's working-tree diff, in the pager"),
     ("copy", "copy a code block of the last reply: /copy [n|all]"),
@@ -156,6 +160,7 @@ pub const HELP: &str = "\
 /project         the layers, the knowledge mode and every tool's fate
 /project use <n> move this thread to project <n>, keeping the conversation
 /threads         this project's threads, newest first
+/new             start a new front thread; the old one stays listed
 /build <n>       follow a build of issue n here, and answer its checkpoints
 /<skill> [args]  run a user-invoked skill
 /diff            the project's working-tree diff, untracked files included
@@ -325,6 +330,19 @@ mod tests {
             "{COMMANDS:#?}"
         );
         assert!(HELP.contains("/why"), "{HELP}");
+    }
+
+    /// `/new` is a command, and discoverable wherever the others are
+    /// (issue #89, T1).
+    #[test]
+    fn new_is_a_command_and_is_listed_in_commands_and_help() {
+        let none: Vec<String> = vec![];
+        assert_eq!(parse_line("/new", &none), Command::New);
+        assert!(
+            COMMANDS.iter().any(|(name, _)| *name == "new"),
+            "{COMMANDS:#?}"
+        );
+        assert!(HELP.contains("/new"), "{HELP}");
     }
 
     /// `/copy` is discoverable wherever the others are (issue #41).
