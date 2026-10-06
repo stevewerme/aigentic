@@ -271,7 +271,7 @@ impl Provider for OpenAiCompat {
         // Live retries (issue #31): the attempt loop runs in its own
         // task and sends each event into the channel, so a `Retried` is
         // observed *before* the backoff it announces — the client shows
-        // `retrying 2/14` while it waits, not after the wait is over.
+        // `retrying 2/15` while it waits, not after the wait is over.
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(async move {
             let mut attempt = 0;

@@ -104,24 +104,26 @@ impl RetryPolicy {
 
     /// The most retries the window could hold, counting waits alone: a
     /// ceiling, used as `Retried.retries`, so the turn line reads
-    /// `retrying k/N` with N as the most there could be (14 for the
-    /// default). A zero wait holds an unbounded number, so the walk
-    /// stops there rather than spin. The repeating tail is counted with
-    /// one division, so an absurdly long configured window cannot make
-    /// this loop.
+    /// `retrying k/N` with N as the most there could be (15 for the
+    /// default). It counts the waits that *start* inside the window, as
+    /// `next_wait` grants them, so the last retry of a full-window
+    /// outage reads `N/N`, never `N+1/N`. A zero wait holds an unbounded
+    /// number, so the walk stops there rather than spin. The repeating
+    /// tail is counted with one division, so an absurdly long configured
+    /// window cannot make this loop.
     pub fn retries_within(&self) -> u32 {
-        let mut left = self.window;
+        let mut start = std::time::Duration::ZERO;
         let mut n: u128 = 0;
         for &wait in &self.backoff {
-            if wait.is_zero() || wait > left {
+            if wait.is_zero() || start >= self.window {
                 return n.min(u32::MAX as u128) as u32;
             }
-            left -= wait;
+            start = start.saturating_add(wait);
             n += 1;
         }
         match self.backoff.last() {
-            Some(&last) if !last.is_zero() => {
-                n += left.as_nanos() / last.as_nanos();
+            Some(&last) if !last.is_zero() && start < self.window => {
+                n += (self.window - start).as_nanos().div_ceil(last.as_nanos());
             }
             _ => {}
         }
@@ -311,7 +313,7 @@ mod tests {
     }
 
     /// Issue #90: a policy that gives up in a fifth of a second, so a
-    /// test never waits real seconds. `retries_within` is 6 for it.
+    /// test never waits real seconds. `retries_within` is 7 for it.
     fn test_policy() -> RetryPolicy {
         RetryPolicy {
             window: ms(200),
@@ -382,26 +384,27 @@ mod tests {
         assert_eq!(p.next_wait(0, ms(50), Some(ms(150))), Some(ms(150)));
     }
 
-    /// Issue #90: the default's `retries_within` is the number of its
-    /// waits the window holds, derived from the backoff rather than
-    /// stated — the 14 the spec gives, and far past the fixed three
-    /// retries this replaced.
+    /// Issue #90: the default's `retries_within` is the number of waits
+    /// `next_wait` grants over a full-window outage, derived by walking
+    /// it rather than stated, so the turn line never reads `15/14`.
     #[test]
     fn retries_within_counts_the_waits_the_window_holds() {
-        assert_eq!(test_policy().retries_within(), 6);
-        let d = RetryPolicy::default();
-        let mut left = d.window;
-        let mut derived = 0u32;
-        for i in 0.. {
-            let wait = d.backoff[i.min(d.backoff.len() - 1)];
-            if wait > left {
-                break;
+        fn walk(p: &RetryPolicy) -> u32 {
+            let mut elapsed = std::time::Duration::ZERO;
+            let mut n = 0u32;
+            while let Some(wait) = p.next_wait(n as usize, elapsed, None) {
+                elapsed += wait;
+                n += 1;
             }
-            left -= wait;
-            derived += 1;
+            n
         }
+        let t = test_policy();
+        assert_eq!(t.retries_within(), walk(&t));
+        assert_eq!(t.retries_within(), 7);
+        let d = RetryPolicy::default();
+        let derived = walk(&d);
         assert_eq!(d.retries_within(), derived);
-        assert_eq!(derived, 14);
+        assert_eq!(derived, 15);
         assert!(
             d.retries_within() > 3,
             "the outage window is wider than before"
