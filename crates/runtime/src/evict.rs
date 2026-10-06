@@ -639,7 +639,10 @@ impl Runtime {
     /// `results_stubbed` (issue #76) gets one extra decision first, at
     /// its first iteration: the batch, re-decided against the log as it
     /// stood then, with the ratio the event recorded. A log with no batch
-    /// therefore replays exactly as it did before #76.
+    /// therefore replays exactly as it did before #76. The line and
+    /// `keep_turns` are *this* runtime's settings, not the run's: the log
+    /// records the ratio, not the target, so replay a batched log under
+    /// the config that wrote it to see its batches again.
     ///
     /// The ratio is learned from the log, by the same named rule the turn
     /// loop uses (issue #52): every call's own reported usage — read off

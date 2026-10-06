@@ -45,7 +45,7 @@ api_key_env = "ANTHROPIC_API_KEY"
 # max_result_bytes = 4096                 # truncation target for old tool results
 # summary_max_output_tokens = 2048
 # working_set_tokens = 120000             # what one call's context may cost; 0 = no target
-# context_ceiling_tokens = 128000         # its old name, still read
+# context_ceiling_tokens = 120000         # its old name, still read
 # evict_above_tokens = 64000              # sweep only above this line; 0 = sweep on call count alone
 # evict_min_free_percent = 25             # share of the target a sweep must free; 0 = sweep as soon as the floor advances
 
