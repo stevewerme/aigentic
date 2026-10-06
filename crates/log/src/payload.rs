@@ -420,6 +420,27 @@ pub struct ContextSaturatedPayload {
     pub ratio: Option<f64>,
 }
 
+/// Payload of a `results_stubbed` event (issue #76): every successful
+/// tool result of every turn closed at or before `through_seq` is stubbed
+/// in projection, with the handle to recall the original. A batch is
+/// appended at a turn's first loop iteration — the one boundary where
+/// changing the history does not break the prompt cache mid-turn — and
+/// reaches whole closed turns, never the open one. The originals stay in
+/// the log.
+///
+/// `ratio` (issue #52) is the calibration the sweep priced this move
+/// with, exactly as on a `context_evicted`; see
+/// [`ContextEvictedPayload::ratio`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResultsStubbedPayload {
+    /// A `turn_ended`'s seq, inclusive: every turn closed at or before
+    /// it loses its used results.
+    pub through_seq: u64,
+    /// The sweep's calibration, when one was applied (issue #52).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ratio: Option<f64>,
+}
+
 /// Payload of a `provider_retried` event (issue #31): which retry is
 /// starting, out of how many, why the call is quiet, and how long the
 /// backoff waits before the next attempt.
@@ -1355,6 +1376,35 @@ mod tests {
         let legacy = json!({"through_seq": 17, "tokens_at_floor": 5, "ceiling": 4});
         let p: ContextSaturatedPayload = serde_json::from_value(legacy).unwrap();
         assert_eq!(p.tokens_at_floor, 5);
+        assert_eq!(p.ratio, None);
+    }
+
+    /// T2 (issue #76): the batch payload round-trips with and without the
+    /// calibration, and a payload written without `ratio` reads back with
+    /// the ratio absent, not `null` (the `context_evicted` rule).
+    #[test]
+    fn results_stubbed_round_trips_with_and_without_the_calibration() {
+        let p = ResultsStubbedPayload {
+            through_seq: 41,
+            ratio: Some(1.39),
+        };
+        let value = serde_json::to_value(&p).unwrap();
+        assert_eq!(value, json!({"through_seq": 41, "ratio": 1.39}));
+        assert_eq!(
+            serde_json::from_value::<ResultsStubbedPayload>(value).unwrap(),
+            p
+        );
+
+        let value = serde_json::to_value(&ResultsStubbedPayload {
+            through_seq: 41,
+            ratio: None,
+        })
+        .unwrap();
+        assert_eq!(value, json!({"through_seq": 41}));
+
+        let legacy = json!({"through_seq": 17});
+        let p: ResultsStubbedPayload = serde_json::from_value(legacy).unwrap();
+        assert_eq!(p.through_seq, 17);
         assert_eq!(p.ratio, None);
     }
 

@@ -295,6 +295,9 @@ fn runner_kind(kind: EventKind) -> Option<RunnerKind> {
         | EventKind::ProjectSwitched
         | EventKind::ContextEvicted
         | EventKind::ContextSaturated
+        // A closed-turn batch (issue #76) is not a runner fact: it is
+        // eviction machinery, appended by the loop like any other.
+        | EventKind::ResultsStubbed
         | EventKind::ProviderRetried
         // A child thread's report, never on the lead thread.
         | EventKind::StepReported

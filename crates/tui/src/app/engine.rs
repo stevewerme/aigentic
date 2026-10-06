@@ -1991,6 +1991,10 @@ impl ClientRepl {
             | EventKind::PermissionRequested
             | EventKind::ThreadStarted
             | EventKind::ContextEvicted
+            // A closed-turn batch (issue #76) is eviction machinery, not
+            // a turn's own line: the status line that reports the
+            // working set is #99's.
+            | EventKind::ResultsStubbed
             // The build runner's events (issue #53): they belong to the
             // lead thread's run view, not to any turn, so a turn view
             // prints no line for them.

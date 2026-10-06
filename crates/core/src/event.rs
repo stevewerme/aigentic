@@ -61,6 +61,14 @@ pub enum EventKind {
     /// hand to a fresh one. Appended once per turn, in the turn it
     /// happened in, and never projected into model context.
     ContextSaturated,
+    /// A closed turn's used results are stubbed in a batch (issue #76):
+    /// every successful tool result of every turn closed at or before
+    /// `through_seq` is stubbed in projection, with the handle to recall
+    /// it. Appended at a turn's first loop iteration, so the history
+    /// changes once at a turn's start and the cached prefix breaks once
+    /// per batch rather than once per message. The originals stay in the
+    /// log.
+    ResultsStubbed,
     /// A provider retry (issue #31), appended live as the adapter starts
     /// waiting, so a turn that hangs on a dead endpoint reads as retries
     /// and not as a slow model. Author `system`; the payload carries the
@@ -353,6 +361,14 @@ mod tests {
         events[2].parent_event = Some(events[1].id);
         events[9].parent_event = Some(events[8].id);
         events[24].parent_event = Some(events[23].id);
+        // A closed-turn batch (issue #76) sits at the end so the indices
+        // the wire-shape test reads stay put.
+        events.push(event(
+            25,
+            EventKind::ResultsStubbed,
+            Author::System,
+            json!({"through_seq": 3}),
+        ));
         events
     }
 
@@ -464,6 +480,22 @@ mod tests {
             names.push(expected);
         }
         assert_eq!(names, vec!["decision_proposed", "decision_answered"]);
+    }
+
+    /// T2 (issue #76): the batch kind round-trips as a whole event and
+    /// lands on the wire under the enum's snake_case rule, derived from
+    /// the variant, never a hand-written pair.
+    #[test]
+    fn the_results_stubbed_kind_round_trips_under_the_snake_case_rule() {
+        let kind = EventKind::ResultsStubbed;
+        let wire = serde_json::to_value(kind).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::Value::String(snake_case(&format!("{kind:?}")))
+        );
+        let event = event(0, kind, Author::System, json!({"through_seq": 3}));
+        let line = serde_json::to_string(&event).unwrap();
+        assert_eq!(serde_json::from_str::<Event>(&line).unwrap(), event);
     }
 
     #[test]

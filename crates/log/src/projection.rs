@@ -7,7 +7,8 @@ use time::format_description::well_known::Rfc3339;
 
 use crate::payload::{
     AssistantMessagePayload, CompactedPayload, CompactionStrategy, ContextEvictedPayload,
-    InterruptedPayload, PinnedPayload, SkillLoadedPayload, ToolResultPayload, UserMessagePayload,
+    InterruptedPayload, PinnedPayload, ResultsStubbedPayload, SkillLoadedPayload,
+    ToolResultPayload, UserMessagePayload,
 };
 use crate::recall::{call_index, cut_chars, short_args};
 use crate::store::LogError;
@@ -71,6 +72,10 @@ struct CallResult {
 /// other top-level value over [`STUB_ARG_MAX_CHARS`] cut with a
 /// `… [+N chars]` marker — except failed results and the last result of
 /// each distinct tool, which stay whole;
+/// a `results_stubbed` event stubs every successful result of every turn
+/// already closed at or before its `through_seq` (issue #76), the last of
+/// a tool included, so a whole closed turn's material leaves the context
+/// in one batch;
 /// provider blobs are dropped from every assistant message
 /// that predates the latest summary compaction; an interrupted event
 /// becomes a short note; a loaded skill becomes a user-role message from
@@ -109,6 +114,9 @@ pub fn project(events: &[Event]) -> Result<Projection, LogError> {
     // decide what the `context_evicted` events stub. The call index is
     // `recall`'s, shared with the stub text and the `recall` tool.
     let mut evictions: Vec<Eviction> = Vec::new();
+    // Closed-turn batches (issue #76): each `results_stubbed` names a
+    // `turn_ended`; every successful result at or before it is stubbed.
+    let mut batches: Vec<u64> = Vec::new();
     let calls = call_index(events)?;
     let mut results: std::collections::HashMap<String, CallResult> =
         std::collections::HashMap::new();
@@ -163,6 +171,10 @@ pub fn project(events: &[Event]) -> Result<Projection, LogError> {
                     through: p.through_seq,
                 });
             }
+            EventKind::ResultsStubbed => {
+                let p: ResultsStubbedPayload = payload(event)?;
+                batches.push(p.through_seq);
+            }
             EventKind::ToolResult => {
                 let p: ToolResultPayload = payload(event)?;
                 let Some((name, _)) = calls.get(&p.result.id) else {
@@ -188,6 +200,17 @@ pub fn project(events: &[Event]) -> Result<Projection, LogError> {
         let Some((name, _)) = calls.get(id) else {
             continue;
         };
+        // A closed turn's used results go in a batch (issue #76): the
+        // rule is exactly "successful, closed, at or before the batch's
+        // boundary", with no exemption — the last-result-of-a-tool rule
+        // belongs to the open turn's sweep alone. `closure` is seq < the
+        // last `turn_ended`, the projection's own rule, so a result the
+        // batch reaches always sits in a closed turn.
+        let closed = last_turn_end.is_some_and(|end| r.seq < end);
+        if closed && batches.iter().any(|through| r.seq <= *through) {
+            stubbed.insert(id.clone());
+            continue;
+        }
         // The last result of each distinct tool stays, however old.
         if last_of_tool.get(&(r.turn, name.clone())) == Some(&r.seq) {
             continue;
@@ -421,6 +444,7 @@ pub fn project(events: &[Event]) -> Result<Projection, LogError> {
             | EventKind::Compacted
             | EventKind::Pinned
             | EventKind::ContextEvicted
+            | EventKind::ResultsStubbed
             | EventKind::PermissionRequested
             | EventKind::PermissionDecided
             | EventKind::MemoryExtracted
@@ -776,6 +800,27 @@ mod tests {
             EventKind::ContextEvicted,
             Author::System,
             json!({"through_seq": through}),
+        )
+    }
+    /// A closed-turn batch (issue #76): every successful result of every
+    /// turn closed at or before `through`.
+    fn batch(seq: u64, through: u64) -> Event {
+        ev(
+            seq,
+            EventKind::ResultsStubbed,
+            Author::System,
+            json!({"through_seq": through}),
+        )
+    }
+    /// The stub the projection builds for a successful result, from the
+    /// fixture's own seq, name, args and content (issues #30, #75): the
+    /// rule is restated here so a test never copies the stub text.
+    fn stub(seq: u64, name: &str, args: &serde_json::Value, content: &str) -> String {
+        format!(
+            "[result {seq} · {name} {} · {} lines · {} · dropped from context; recall {seq} to bring it back]",
+            short_args(args),
+            content.lines().count(),
+            first_line(content),
         )
     }
     /// Every tool result's content, oldest first, as `name:content`.
@@ -1872,6 +1917,140 @@ mod tests {
             call_args(&p)[1],
             json!({"path": "a.rs", "old_string": "x", "new_string": "y"})
         );
+    }
+
+    /// T3 (issue #76): three closed turns and an open one, with a
+    /// `results_stubbed` batch at the second turn's end.
+    ///
+    /// Turn 1 holds two `bash` results — the second is its last of that
+    /// tool — and one failure; turn 2 a `read_file`; turn 3 and the open
+    /// turn sit past the batch's boundary.
+    fn three_closed_turns_and_an_open_one() -> (Vec<Event>, String, String, String) {
+        let long = "line\n".repeat(200);
+        let read = "read\n".repeat(50);
+        let tail = "tail\n".repeat(30);
+        let events = vec![
+            user(0, "one"),
+            call(
+                1,
+                "c1",
+                "bash",
+                json!({"command": "cargo test --all\ncargo build\n"}),
+            ),
+            result(2, "c1", &long),
+            call(
+                3,
+                "c2",
+                "bash",
+                json!({"command": "cargo build --release\n"}),
+            ),
+            result(4, "c2", &long),
+            call(5, "c3", "grep", json!({"pattern": "x"})),
+            failed(6, "c3", "no matches"),
+            ended(7),
+            user(8, "two"),
+            call(9, "c4", "read_file", json!({"path": "a.rs"})),
+            result(10, "c4", &read),
+            ended(11),
+            // The batch, at the second turn's end.
+            batch(12, 11),
+            user(13, "three"),
+            call(14, "c5", "bash", json!({"command": "ls"})),
+            result(15, "c5", &tail),
+            ended(16),
+            user(17, "four"),
+            call(18, "c6", "read_file", json!({"path": "b.rs"})),
+            result(19, "c6", &tail),
+        ];
+        (events, long, read, tail)
+    }
+
+    #[test]
+    fn a_batch_stubs_a_closed_turns_used_results_and_leaves_the_rest_whole() {
+        let (events, long, read, tail) = three_closed_turns_and_an_open_one();
+        let p = project(&events).unwrap();
+        let c1_args = json!({"command": "cargo test --all\ncargo build\n"});
+        let c2_args = json!({"command": "cargo build --release\n"});
+        let c4_args = json!({"path": "a.rs"});
+        assert_eq!(
+            results(&p),
+            vec![
+                ("c1".into(), stub(2, "bash", &c1_args, &long)),
+                // The last bash of a closed turn goes in the batch too:
+                // the last-of-tool rule belongs to the open turn's sweep.
+                ("c2".into(), stub(4, "bash", &c2_args, &long)),
+                // A failure is information; it stays whole.
+                ("c3".into(), "no matches".into()),
+                ("c4".into(), stub(10, "read_file", &c4_args, &read)),
+                // Past the batch's boundary: turn 3's and the open turn's
+                // results are untouched.
+                ("c5".into(), tail.clone()),
+                ("c6".into(), tail.clone()),
+            ]
+        );
+        // A stubbed call's arguments shorten, exactly as in turn; from
+        // the fixture's own command and the cut the projection applies.
+        let args = call_args(&p);
+        let c1: String = first_line("cargo test --all\ncargo build\n");
+        let c1_removed = "cargo test --all\ncargo build\n".chars().count() - c1.chars().count();
+        assert_eq!(
+            args[0],
+            json!({"command": format!("{c1}… [+{c1_removed} chars]")})
+        );
+        let c2: String = first_line("cargo build --release\n");
+        let c2_removed = "cargo build --release\n".chars().count() - c2.chars().count();
+        assert_eq!(
+            args[1],
+            json!({"command": format!("{c2}… [+{c2_removed} chars]")})
+        );
+        // The failed call is not stubbed, so its arguments stay.
+        assert_eq!(args[2], json!({"pattern": "x"}));
+        // And calls past the boundary keep theirs.
+        assert_eq!(args[3], c4_args);
+        assert_eq!(args[4], json!({"command": "ls"}));
+        assert_eq!(args[5], json!({"path": "b.rs"}));
+    }
+
+    /// T3 (issue #76): with the batch event removed, every result projects
+    /// whole — nothing else stubs a closed turn, so a log with no
+    /// `results_stubbed` reads exactly as it did before #76.
+    #[test]
+    fn without_the_batch_the_same_log_projects_every_result_whole() {
+        let (events, long, read, tail) = three_closed_turns_and_an_open_one();
+        let without: Vec<Event> = events
+            .iter()
+            .filter(|e| e.kind != EventKind::ResultsStubbed)
+            .cloned()
+            .collect();
+        let plain = project(&without).unwrap();
+        assert_eq!(
+            results(&plain),
+            vec![
+                ("c1".into(), long.clone()),
+                ("c2".into(), long.clone()),
+                ("c3".into(), "no matches".into()),
+                ("c4".into(), read.clone()),
+                ("c5".into(), tail.clone()),
+                ("c6".into(), tail.clone()),
+            ]
+        );
+        assert_eq!(
+            call_args(&plain),
+            vec![
+                json!({"command": "cargo test --all\ncargo build\n"}),
+                json!({"command": "cargo build --release\n"}),
+                json!({"pattern": "x"}),
+                json!({"path": "a.rs"}),
+                json!({"command": "ls"}),
+                json!({"path": "b.rs"}),
+            ]
+        );
+        // The batch is the only other difference: the two projections share
+        // everything but the stubbed turns.
+        let with = project(&events).unwrap();
+        assert_ne!(results(&with), results(&plain));
+        assert_eq!(with.pinned, plain.pinned);
+        assert_eq!(with.compacted_through, plain.compacted_through);
     }
 
     #[test]
