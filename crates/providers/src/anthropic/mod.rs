@@ -55,6 +55,9 @@ pub struct AnthropicConfig {
     /// How long a started reply may produce no model output before it is
     /// treated as dead ([`crate::STALL`] by default; issue #42).
     pub stall: std::time::Duration,
+    /// How long a call that fails before any content keeps retrying
+    /// (issue #90).
+    pub retry: crate::RetryPolicy,
 }
 
 impl AnthropicConfig {
@@ -69,11 +72,18 @@ impl AnthropicConfig {
             effort: None,
             cache: true,
             stall: crate::STALL,
+            retry: crate::RetryPolicy::default(),
         }
     }
 
     pub fn with_stall(mut self, stall: std::time::Duration) -> Self {
         self.stall = stall;
+        self
+    }
+
+    /// How long a call that fails before any content keeps retrying.
+    pub fn with_retry(mut self, retry: crate::RetryPolicy) -> Self {
+        self.retry = retry;
         self
     }
 
@@ -162,6 +172,17 @@ fn is_overloaded(event: &ProviderEvent) -> bool {
     matches!(event, ProviderEvent::Error(ProviderError::Protocol(m)) if m.contains("overloaded_error"))
 }
 
+/// Whether a failure before any content is worth another attempt
+/// (issue #90): the connection failed or stalled, a retryable status
+/// arrived, or the stream opened with an `overloaded_error`.
+fn retryable_failure(failure: &ProviderEvent) -> bool {
+    match failure {
+        ProviderEvent::Error(ProviderError::Http { status, .. }) => retryable_status(*status),
+        ProviderEvent::Error(ProviderError::Transport(_)) => true,
+        other => is_overloaded(other),
+    }
+}
+
 impl Provider for Anthropic {
     fn complete(&self, request: &CompletionRequest<'_>) -> EventStream<'_> {
         let body = self.build_request(request);
@@ -170,6 +191,7 @@ impl Provider for Anthropic {
         let client = self.client.clone();
         let api_key = self.config.api_key.clone();
         let stall = self.config.stall;
+        let policy = self.config.retry.clone();
 
         // Live retries (issue #31), as in the OpenAI adapter: the loop
         // runs in its own task so a `Retried` reaches the caller before
@@ -179,37 +201,62 @@ impl Provider for Anthropic {
             let mut attempt = 0;
             let started = std::time::Instant::now();
             loop {
+                // Nobody is listening: stop before asking the provider
+                // again (issue #90).
+                if tx.is_closed() {
+                    return;
+                }
+                let mut retry_after = None;
                 let request = client
                     .post(&url)
                     .header("x-api-key", &api_key)
                     .header("anthropic-version", API_VERSION)
                     .json(&body);
-                let outcome: Result<EventStream<'static>, ProviderEvent> =
-                    match request.send().await {
-                        Err(e) => Err(ProviderEvent::Error(ProviderError::Transport(
-                            e.to_string(),
-                        ))),
-                        Ok(resp) if !resp.status().is_success() => {
-                            let status = resp.status().as_u16();
-                            let body = resp.text().await.unwrap_or_default();
-                            Err(ProviderEvent::Error(ProviderError::Http { status, body }))
-                        }
-                        Ok(resp) => {
-                            // Peek the first event: an overload arrives as an
-                            // `error` event on a 200 stream.
-                            // The wait for it is bounded by the stall, so a
-                            // byte-alive stream with no events cannot hang
-                            // here (issue #42).
-                            let mut events = Box::pin(parse_stream(resp.bytes_stream()).peekable());
-                            match tokio::time::timeout(stall, events.as_mut().peek()).await {
-                                Err(_) => Err(ProviderEvent::Error(ProviderError::Transport(
-                                    format!("no model output for {} s", stall.as_secs()),
-                                ))),
-                                Ok(Some(first)) if is_overloaded(first) => Err(first.clone()),
-                                Ok(_) => Ok(Box::pin(events) as EventStream<'static>),
+                let sent = tokio::select! {
+                    biased;
+                    // The turn dropped the stream while this request was
+                    // in flight: abandon it and close the connection now
+                    // (issue #90), as in the OpenAI adapter.
+                    _ = tx.closed() => return,
+                    sent = request.send() => sent,
+                };
+                let outcome: Result<EventStream<'static>, ProviderEvent> = match sent {
+                    Err(e) => Err(ProviderEvent::Error(ProviderError::Transport(
+                        e.to_string(),
+                    ))),
+                    Ok(resp) if !resp.status().is_success() => {
+                        let status = resp.status().as_u16();
+                        // The header is read before the body, which
+                        // consumes the response (issue #90).
+                        retry_after = crate::retry_after(resp.headers());
+                        let body = resp.text().await.unwrap_or_default();
+                        Err(ProviderEvent::Error(ProviderError::Http { status, body }))
+                    }
+                    Ok(resp) => {
+                        // Peek the first event: an overload arrives as an
+                        // `error` event on a 200 stream.
+                        // The wait for it is bounded by the stall, so a
+                        // byte-alive stream with no events cannot hang
+                        // here (issue #42), and a dropped stream ends it
+                        // at once (issue #90).
+                        let mut events = Box::pin(parse_stream(resp.bytes_stream()).peekable());
+                        let peeked = tokio::select! {
+                            biased;
+                            _ = tx.closed() => return,
+                            peeked = tokio::time::timeout(stall, events.as_mut().peek()) => {
+                                peeked
                             }
+                        };
+                        match peeked {
+                            Err(_) => Err(ProviderEvent::Error(ProviderError::Transport(format!(
+                                "no model output for {} s",
+                                stall.as_secs()
+                            )))),
+                            Ok(Some(first)) if is_overloaded(first) => Err(first.clone()),
+                            Ok(_) => Ok(Box::pin(events) as EventStream<'static>),
                         }
-                    };
+                    }
+                };
                 // A stream that stalls or breaks before passing anything on
                 // is retried like a refused request (issue #42).
                 let outcome = match outcome {
@@ -223,30 +270,33 @@ impl Provider for Anthropic {
                     Ok(()) => return,
                     Err(failure) => {
                         // Retries cover an overloaded or rate-limited reply before any
-                        // content: HTTP 429/503/529, or a first `overloaded_error` event.
-                        let retry = attempt < crate::RETRIES
-                            && match &failure {
-                                ProviderEvent::Error(ProviderError::Http { status, .. }) => {
-                                    retryable_status(*status)
-                                }
-                                // Nothing reached the caller (issue #42).
-                                ProviderEvent::Error(ProviderError::Transport(_)) => true,
-                                other => is_overloaded(other),
-                            };
-                        if !retry {
+                        // content: HTTP 429/503/529, or a first `overloaded_error` event
+                        // (issue #90 widens the count to the policy's window).
+                        let wait = if retryable_failure(&failure) {
+                            policy.next_wait(attempt, started.elapsed(), retry_after)
+                        } else {
+                            None
+                        };
+                        let Some(wait) = wait else {
                             let attempts = attempt as u32 + 1;
                             let _ = tx.send(ProviderEvent::Error(
                                 crate::error_of(failure).with_attempts(attempts, started.elapsed()),
                             ));
                             return;
-                        }
+                        };
                         let _ = tx.send(ProviderEvent::Retried {
                             attempt: attempt as u32 + 1,
-                            retries: crate::RETRIES as u32,
+                            retries: policy.retries_within(),
                             reason: crate::retry_reason(&failure),
-                            wait: crate::BACKOFF[attempt],
+                            wait,
                         });
-                        tokio::time::sleep(crate::BACKOFF[attempt]).await;
+                        // A dropped stream ends the wait at once
+                        // (issue #90): no `sleep` outlives the turn.
+                        tokio::select! {
+                            biased;
+                            _ = tx.closed() => return,
+                            _ = tokio::time::sleep(wait) => {}
+                        }
                         attempt += 1;
                     }
                 }
@@ -286,6 +336,94 @@ mod tests {
         )));
         assert!(!is_overloaded(&ProviderEvent::TextDelta("x".into())));
         assert!(retryable_status(529) && retryable_status(429) && !retryable_status(400));
+    }
+
+    /// A Messages-API stream with one word of text, as a complete HTTP
+    /// response (issue #90).
+    fn hi_sse_reply() -> String {
+        let body = concat!(
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3}}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        );
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// Issue #90 (T2, Anthropic): the same outage as the OpenAI harness —
+    /// more 503s than the adapter used to try — is ridden out, the reply
+    /// arrives, and each retry is reported with the policy's own wait.
+    #[tokio::test]
+    async fn an_outage_is_ridden_out_and_the_reply_arrives() {
+        use futures_util::StreamExt;
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        const DOWN: usize = 5;
+        std::thread::spawn(move || {
+            for i in 0..=DOWN {
+                let (mut conn, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 65536];
+                let _ = conn.read(&mut buf);
+                if i < DOWN {
+                    conn.write_all(
+                        b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 4\r\nconnection: close\r\n\r\nbusy",
+                    )
+                    .unwrap();
+                } else {
+                    conn.write_all(hi_sse_reply().as_bytes()).unwrap();
+                }
+            }
+        });
+        let policy = crate::RetryPolicy {
+            window: std::time::Duration::from_millis(200),
+            backoff: vec![
+                std::time::Duration::from_millis(10),
+                std::time::Duration::from_millis(20),
+                std::time::Duration::from_millis(40),
+            ],
+        };
+        let config = AnthropicConfig::new("k", "claude-opus-5")
+            .with_base_url(format!("http://{addr}"))
+            .with_retry(policy.clone());
+        let provider = Anthropic::new(config);
+        let request = CompletionRequest {
+            messages: &[],
+            tools: &[],
+            max_output_tokens: None,
+        };
+        let events: Vec<ProviderEvent> = provider.complete(&request).collect().await;
+        let retries: Vec<&ProviderEvent> = events
+            .iter()
+            .filter(|e| matches!(e, ProviderEvent::Retried { .. }))
+            .collect();
+        assert_eq!(retries.len(), DOWN, "{events:?}");
+        for (i, event) in retries.iter().enumerate() {
+            let expected = policy.next_wait(i, std::time::Duration::ZERO, None);
+            assert!(
+                matches!(event, ProviderEvent::Retried { attempt, retries, wait, .. }
+                    if *attempt == i as u32 + 1
+                        && *retries == policy.retries_within()
+                        && Some(*wait) == expected),
+                "{i}: {event:?}"
+            );
+        }
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ProviderEvent::TextDelta(t) if t == "hi")),
+            "{events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(e, ProviderEvent::Done { finish_reason } if finish_reason == "end_turn")),
+            "{events:?}"
+        );
+        assert!(!events.iter().any(|e| matches!(e, ProviderEvent::Error(_))));
     }
 
     #[test]

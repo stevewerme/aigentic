@@ -58,11 +58,40 @@ pub struct TurnStats {
     pub current: Option<String>,
     /// Text is streaming.
     pub writing: bool,
-    /// The retry the call is waiting on (issue #31): `(attempt, retries,
-    /// reason)`. Set when `provider_retried` arrives, so the turn line
-    /// says `retrying 2/3 · tensorx · not answering` while the backoff
-    /// runs instead of a bare `thinking`. Cleared by the first content.
-    pub retry: Option<(u32, u32, String)>,
+    /// The retry the call is waiting on (issue #31): attempt, retries,
+    /// reason and the instant the wait ends (issue #90). Set when
+    /// `provider_retried` arrives, so the turn line counts down
+    /// `retrying 2/3 · tensorx · not answering · next in 12s` while the
+    /// backoff runs, and says `trying now` once the attempt is in
+    /// flight, instead of a bare `thinking`. Cleared by the first
+    /// content.
+    pub retry: Option<RetryWait>,
+}
+
+/// The retry the call is waiting on (issue #31): the attempt, the most
+/// the call could make, why, and when the wait ends (issue #90).
+#[derive(Debug, Clone)]
+pub struct RetryWait {
+    /// Which attempt is waiting, 1-based.
+    pub attempt: u32,
+    /// The most retries the call could make.
+    pub retries: u32,
+    pub reason: String,
+    /// When the backoff ends and the next attempt starts. The turn line
+    /// counts down to it, and reads `trying now` once it has passed.
+    pub until: std::time::Instant,
+}
+
+/// `next in 12s` while the backoff runs, and `trying now` once it has
+/// passed and the attempt is in flight (issue #90). `None` is an instant
+/// already behind us.
+fn retry_countdown(left: Option<std::time::Duration>) -> String {
+    match left {
+        Some(left) if !left.is_zero() => {
+            format!("next in {}", crate::app::status::elapsed_short(left))
+        }
+        _ => "trying now".into(),
+    }
 }
 
 impl TurnStats {
@@ -107,10 +136,18 @@ impl TurnStats {
         match (&self.current, self.writing) {
             (Some(_), _) => "running".into(),
             // A retry outranks "thinking": the call is not thinking, it
-            // is waiting on a provider that has not answered (issue #31).
+            // is waiting on a provider that has not answered (issue #31),
+            // and the line counts the wait down (issue #90).
             (None, _) if self.retry.is_some() => {
-                let (attempt, retries, reason) = self.retry.as_ref().expect("checked");
-                format!("retrying {attempt}/{retries} · {reason}")
+                let r = self.retry.as_ref().expect("checked");
+                let until = r.until.checked_duration_since(std::time::Instant::now());
+                format!(
+                    "retrying {}/{} · {} · {}",
+                    r.attempt,
+                    r.retries,
+                    r.reason,
+                    retry_countdown(until)
+                )
             }
             (None, true) => "writing".into(),
             (None, false) => "thinking".into(),
@@ -1921,7 +1958,15 @@ impl ClientRepl {
                 >(event.payload.clone())
                     && let Some(t) = self.turn.as_mut()
                 {
-                    t.retry = Some((p.attempt, p.retries, p.reason));
+                    t.retry = Some(RetryWait {
+                        attempt: p.attempt,
+                        retries: p.retries,
+                        reason: p.reason,
+                        // The line counts down to the next attempt
+                        // (issue #90); the app ticks every 250 ms.
+                        until: std::time::Instant::now()
+                                + std::time::Duration::from_millis(p.wait_ms),
+                    });
                 }
             }
             // Saturation (issue #35): the sweep can stub no deeper, so the
@@ -3544,20 +3589,51 @@ mod tests {
         assert_eq!(crate::app::status::count_short(1_300_000), "1.3M");
     }
 
-    /// A retry outranks "thinking" on the turn line (issue #31): a call
-    /// waiting on a dead provider says so, with the attempt and the
-    /// profile that will be tried again, and content clears it.
+    /// A retry outranks "thinking" on the turn line (issue #31), and
+    /// counts its wait down (issue #90): a call waiting on a dead
+    /// provider says so, with the attempt, the profile that will be
+    /// tried again and the time left, then `trying now` once the wait is
+    /// over and the attempt is in flight.
     #[test]
     fn a_retry_shows_on_the_turn_line() {
         let mut t = TurnStats::new();
-        t.retry = Some((2, 3, "tensorx · not answering".into()));
-        assert_eq!(t.activity(), "retrying 2/3 · tensorx · not answering");
+        t.retry = Some(RetryWait {
+            attempt: 2,
+            retries: 3,
+            reason: "tensorx · not answering".into(),
+            until: std::time::Instant::now() + std::time::Duration::from_secs(90),
+        });
+        let line = t.activity();
+        assert!(
+            line.starts_with("retrying 2/3 · tensorx · not answering · next in "),
+            "{line}"
+        );
+        // The countdown itself, rendered by the same helper the line
+        // uses, and `trying now` once the wait is over.
+        let left = std::time::Duration::from_secs(90);
+        assert_eq!(
+            retry_countdown(Some(left)),
+            format!("next in {}", crate::app::status::elapsed_short(left))
+        );
+        assert_eq!(retry_countdown(None), "trying now");
+        t.retry = Some(RetryWait {
+            attempt: 2,
+            retries: 3,
+            reason: "tensorx · not answering".into(),
+            until: std::time::Instant::now(),
+        });
+        assert!(t.activity().ends_with("trying now"), "{}", t.activity());
         // Content arriving is the recovery: the reason goes away.
         t.writing = true;
         t.retry = None;
         assert_eq!(t.activity(), "writing");
         // And a running tool keeps the row above, not this line.
-        t.retry = Some((1, 3, "tensorx · not answering".into()));
+        t.retry = Some(RetryWait {
+            attempt: 1,
+            retries: 3,
+            reason: "tensorx · not answering".into(),
+            until: std::time::Instant::now() + std::time::Duration::from_secs(1),
+        });
         t.current = Some("bash cargo test".into());
         assert_eq!(t.activity(), "running");
     }

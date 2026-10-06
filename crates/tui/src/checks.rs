@@ -509,6 +509,9 @@ pub fn origin_url(root: &Path) -> Option<String> {
 /// this profile. The only check that uses the network. The key is taken
 /// from the environment and handed to the adapter; it never appears in
 /// the report.
+///
+/// The probe never retries (issue #90): a doctor reports the endpoint as
+/// it is, now, rather than sitting out a retry window before it answers.
 pub async fn check_probe(name: &str, profile: &Profile) -> Check {
     let check_name = format!("probe {name}");
     let key = match profile.api_key() {
@@ -517,7 +520,7 @@ pub async fn check_probe(name: &str, profile: &Profile) -> Check {
             return Check::skip(&check_name, format!("{} is not set", profile.api_key_env));
         }
     };
-    let provider = profile.build_provider(key);
+    let provider = profile.build_provider_no_retries(key);
     let messages = [Message {
         role: Role::User,
         author: Author::User(UserId("doctor".into())),
@@ -667,7 +670,8 @@ pub async fn compare_efforts(
     for effort in efforts {
         let label = effort.label();
         for attempt in 1..=SAMPLES {
-            let provider = profile.build_provider_with_effort(key.clone(), Some(effort.clone()));
+            let provider =
+                profile.build_provider_with_effort_no_retries(key.clone(), Some(effort.clone()));
             let messages = [Message {
                 role: Role::User,
                 author: Author::User(UserId("doctor".into())),
@@ -1346,6 +1350,47 @@ mod tests {
         assert_eq!(c.status, Status::Fail, "{}", c.message);
         assert!(c.message.contains("http 400"), "{}", c.message);
         assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    /// Issue #90 (T7): neither probe path waits out a retry window. The
+    /// stub answers every request 503, while the profile's window is ten
+    /// minutes: with a window's worth of backoff either call would sit
+    /// there, so the bounded wait below is the whole proof. Both are the
+    /// doctor's own entry points, not a config-level stand-in.
+    #[tokio::test]
+    async fn the_probes_report_the_first_failure_without_waiting_a_window() {
+        let (base, seen) = stub_endpoint(503, "busy");
+        let config = Config::parse(&format!(
+            "[profiles.a]\nbase_url = \"{base}\"\nmodel = \"m\"\napi_key_env = \"PATH\"\n\
+             retry_window_secs = 600\n"
+        ))
+        .unwrap();
+        let profile = config.profiles["a"].clone();
+
+        let c = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            check_probe("a", &profile),
+        )
+        .await
+        .expect("the probe reported at once, not after a window");
+        assert_eq!(c.status, Status::Fail, "{}", c.message);
+        assert!(c.message.contains("http 503"), "{}", c.message);
+
+        let efforts = [
+            aigentic_runtime::aigentic_providers::ReasoningEffort::Label("low".into()),
+            aigentic_runtime::aigentic_providers::ReasoningEffort::Label("high".into()),
+        ];
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            compare_efforts(&profile, efforts),
+        )
+        .await
+        .expect("the comparison failed at once, not after a window")
+        .unwrap_err();
+        assert!(err.contains("attempt 1"), "{err}");
+
+        // One request each: the first failure is the answer.
+        assert_eq!(seen.lock().unwrap().len(), 2);
     }
 
     /// Issue #44: an openai_compat profile may nest its effort

@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use aigentic_runtime::aigentic_core::{Budget, Provider};
 use aigentic_runtime::aigentic_providers::{
     Anthropic, AnthropicConfig, OpenAiCompat, OpenAiCompatConfig, REASONING_EFFORT_PARAM,
-    ReasoningEffort, Thinking,
+    ReasoningEffort, RetryPolicy, Thinking,
 };
 use aigentic_runtime::config_keys::Table;
 use aigentic_runtime::project::{
@@ -86,6 +86,11 @@ pub struct Profile {
     /// Absent means the endpoint is unpriced and calls carry no cost.
     #[serde(default)]
     pub prices: Option<PricesConfig>,
+    /// How long a call that fails before any content keeps retrying,
+    /// in seconds (issue #90). Absent means the default window (20
+    /// minutes); `0` means no retries at all.
+    #[serde(default)]
+    pub retry_window_secs: Option<u64>,
 }
 
 /// `[profiles.<name>.prices]`: USD per 1M tokens. `input` and `output`
@@ -257,6 +262,7 @@ pub const PROFILE_KEYS: &[&str] = &[
     "compaction",
     "budget",
     "prices",
+    "retry_window_secs",
 ];
 pub const PRICES_KEYS: &[&str] = &["input", "output", "cache_read", "cache_write"];
 pub const GLOBAL_KEYS: &[&str] = &["instructions"];
@@ -410,6 +416,9 @@ fn parse_config(text: &str) -> Result<Config, ConfigError> {
                     compaction: None,
                     budget: None,
                     prices: None,
+                    // A window is a profile key; the phase 0 flat form has
+                    // no profile to set it on (issue #90).
+                    retry_window_secs: None,
                 };
                 (
                     BTreeMap::from([("default".to_owned(), profile)]),
@@ -642,6 +651,19 @@ impl Profile {
         }
     }
 
+    /// The retry policy for this profile's calls (issue #90):
+    /// `retry_window_secs` as the window, or the default window when the
+    /// profile sets none. `0` gives a zero window, which retries nothing.
+    pub fn retry_policy(&self) -> RetryPolicy {
+        match self.retry_window_secs {
+            None => RetryPolicy::default(),
+            Some(secs) => RetryPolicy {
+                window: std::time::Duration::from_secs(secs),
+                ..RetryPolicy::default()
+            },
+        }
+    }
+
     /// Build the adapter. `api_key` is passed in so this stays testable
     /// without touching the environment.
     pub fn build_provider(&self, api_key: String) -> Box<dyn Provider> {
@@ -657,55 +679,96 @@ impl Profile {
         api_key: String,
         effort: Option<ReasoningEffort>,
     ) -> Box<dyn Provider> {
+        self.build_provider_with_retry(api_key, effort, self.retry_policy())
+    }
+
+    /// [`Self::build_provider`] that never retries (issue #90): the
+    /// doctor's probe reports the first failure as it is.
+    pub fn build_provider_no_retries(&self, api_key: String) -> Box<dyn Provider> {
+        self.build_provider_with_retry(api_key, None, RetryPolicy::no_retries())
+    }
+
+    /// [`Self::build_provider_with_effort`] that never retries (issue
+    /// #90): the doctor's effort comparison wants the endpoint's answer,
+    /// not a window's worth of waiting.
+    pub fn build_provider_with_effort_no_retries(
+        &self,
+        api_key: String,
+        effort: Option<ReasoningEffort>,
+    ) -> Box<dyn Provider> {
+        self.build_provider_with_retry(api_key, effort, RetryPolicy::no_retries())
+    }
+
+    /// `build_provider_with_effort` with the retry policy given too
+    /// (issue #90): the doctor's probes build with
+    /// [`RetryPolicy::no_retries`], so a probe reports the first failure
+    /// as it is instead of waiting out a window.
+    pub fn build_provider_with_retry(
+        &self,
+        api_key: String,
+        effort: Option<ReasoningEffort>,
+        retry: RetryPolicy,
+    ) -> Box<dyn Provider> {
         match self.provider {
-            ProviderKind::OpenaiCompat => {
-                let mut c =
-                    OpenAiCompatConfig::new(self.base_url.clone().unwrap_or_default(), &self.model)
-                        .with_api_key(api_key);
-                if let Some(n) = self.max_context_tokens {
-                    c = c.with_max_context_tokens(n);
-                }
-                let chosen = effort.or_else(|| self.reasoning_effort.clone());
-                if let Some(effort) = chosen {
-                    c = c.with_reasoning_effort(
-                        self.reasoning_effort_param
-                            .as_deref()
-                            .unwrap_or(REASONING_EFFORT_PARAM),
-                        effort,
-                    );
-                }
-                Box::new(OpenAiCompat::new(c))
+            ProviderKind::OpenaiCompat => Box::new(OpenAiCompat::new(
+                self.openai_config(api_key, effort, retry),
+            )),
+            ProviderKind::Anthropic => {
+                Box::new(Anthropic::new(self.anthropic_config(api_key, retry)))
             }
-            ProviderKind::Anthropic => self.build_anthropic(api_key),
         }
     }
 
-    fn build_anthropic(&self, api_key: String) -> Box<dyn Provider> {
-        match self.provider {
-            ProviderKind::OpenaiCompat => unreachable!("callers check the provider"),
-            ProviderKind::Anthropic => {
-                let mut c = AnthropicConfig::new(api_key, &self.model);
-                if let Some(u) = &self.base_url {
-                    c = c.with_base_url(u);
-                }
-                if let Some(n) = self.max_context_tokens {
-                    c = c.with_max_context_tokens(n);
-                }
-                if let Some(n) = self.max_output_tokens {
-                    c = c.with_max_output_tokens(n);
-                }
-                if self.thinking.as_deref() == Some("off") {
-                    c = c.with_thinking(Thinking::Off);
-                }
-                if let Some(e) = &self.effort {
-                    c = c.with_effort(e);
-                }
-                if let Some(cache) = self.cache {
-                    c = c.with_cache(cache);
-                }
-                Box::new(Anthropic::new(c))
-            }
+    /// The OpenAI-compatible adapter's config as this profile builds it,
+    /// kept apart from `build_provider_with_retry` so a test can read the
+    /// retry window and the effort override back out of it.
+    fn openai_config(
+        &self,
+        api_key: String,
+        effort: Option<ReasoningEffort>,
+        retry: RetryPolicy,
+    ) -> OpenAiCompatConfig {
+        let mut c = OpenAiCompatConfig::new(self.base_url.clone().unwrap_or_default(), &self.model)
+            .with_api_key(api_key)
+            .with_retry(retry);
+        if let Some(n) = self.max_context_tokens {
+            c = c.with_max_context_tokens(n);
         }
+        let chosen = effort.or_else(|| self.reasoning_effort.clone());
+        if let Some(effort) = chosen {
+            c = c.with_reasoning_effort(
+                self.reasoning_effort_param
+                    .as_deref()
+                    .unwrap_or(REASONING_EFFORT_PARAM),
+                effort,
+            );
+        }
+        c
+    }
+
+    /// The Anthropic adapter's config; see `openai_config`.
+    fn anthropic_config(&self, api_key: String, retry: RetryPolicy) -> AnthropicConfig {
+        debug_assert!(matches!(self.provider, ProviderKind::Anthropic));
+        let mut c = AnthropicConfig::new(api_key, &self.model).with_retry(retry);
+        if let Some(u) = &self.base_url {
+            c = c.with_base_url(u);
+        }
+        if let Some(n) = self.max_context_tokens {
+            c = c.with_max_context_tokens(n);
+        }
+        if let Some(n) = self.max_output_tokens {
+            c = c.with_max_output_tokens(n);
+        }
+        if self.thinking.as_deref() == Some("off") {
+            c = c.with_thinking(Thinking::Off);
+        }
+        if let Some(e) = &self.effort {
+            c = c.with_effort(e);
+        }
+        if let Some(cache) = self.cache {
+            c = c.with_cache(cache);
+        }
+        c
     }
 }
 
@@ -805,6 +868,7 @@ api_key_env = "TENSORX_API_KEY"
 max_context_tokens = 200000
 reasoning_effort = 50
 reasoning_effort_param = "deepseek_effort"
+retry_window_secs = 30
 
 [profiles.tensorx.budget]
 max_iterations = 5
@@ -884,6 +948,99 @@ transport = { stdio = { command = "npx" } }
             None,
             "no key of that table is close enough"
         );
+    }
+
+    /// Issue #90 (T7): `retry_window_secs` reaches the adapter's retry
+    /// policy, in both adapters, and `0` means no retries. The window
+    /// that arrives is the profile's own, so a profile can shorten it.
+    #[test]
+    fn the_retry_window_reaches_both_adapters() {
+        let openai = r#"
+[profiles.a]
+provider = "openai_compat"
+base_url = "https://example.test/v1"
+model = "m"
+api_key_env = "K"
+retry_window_secs = 30
+"#;
+        let c = Config::parse(openai).unwrap();
+        let (_, p) = c.select(Some("a")).unwrap();
+        let provider = p.openai_config("k".into(), None, p.retry_policy());
+        assert_eq!(provider.retry.window, std::time::Duration::from_secs(30));
+
+        // The same key on an Anthropic profile.
+        let anthropic = r#"
+[profiles.a]
+provider = "anthropic"
+model = "m"
+api_key_env = "K"
+retry_window_secs = 45
+"#;
+        let c = Config::parse(anthropic).unwrap();
+        let (_, p) = c.select(Some("a")).unwrap();
+        let provider = p.anthropic_config("k".into(), p.retry_policy());
+        assert_eq!(provider.retry.window, std::time::Duration::from_secs(45));
+
+        // Absent, the window is the policy's own default, not a second
+        // literal spelled here.
+        let plain = r#"
+[profiles.a]
+provider = "anthropic"
+model = "m"
+api_key_env = "K"
+"#;
+        let c = Config::parse(plain).unwrap();
+        let (_, p) = c.select(Some("a")).unwrap();
+        assert_eq!(
+            p.retry_policy().window,
+            aigentic_runtime::aigentic_providers::RetryPolicy::default().window
+        );
+
+        // Zero is the decision to retry nothing, not a default.
+        let zero = r#"
+[profiles.a]
+provider = "anthropic"
+model = "m"
+api_key_env = "K"
+retry_window_secs = 0
+"#;
+        let c = Config::parse(zero).unwrap();
+        let (_, p) = c.select(Some("a")).unwrap();
+        assert!(p.retry_policy().window.is_zero());
+        assert_eq!(
+            p.retry_policy()
+                .next_wait(0, std::time::Duration::ZERO, None),
+            None
+        );
+    }
+
+    /// The doctor's probes never wait a window (issue #90, T7): both the
+    /// probe and the effort comparison build their provider with no
+    /// retries, so a dead endpoint is reported at once.
+    #[test]
+    fn the_probes_build_with_no_retries() {
+        let text = r#"
+[profiles.a]
+provider = "openai_compat"
+base_url = "https://example.test/v1"
+model = "m"
+api_key_env = "K"
+retry_window_secs = 600
+"#;
+        let c = Config::parse(text).unwrap();
+        let (_, p) = c.select(Some("a")).unwrap();
+        let effort = ReasoningEffort::Label("high".into());
+        let no_retries = aigentic_runtime::aigentic_providers::RetryPolicy::no_retries();
+        let probe = p.openai_config("k".into(), None, RetryPolicy::no_retries());
+        let compare = p.openai_config("k".into(), Some(effort), RetryPolicy::no_retries());
+        assert_eq!(probe.retry.window, no_retries.window);
+        assert_eq!(compare.retry.window, no_retries.window);
+        // The profile's own provider still carries the profile's window.
+        let normal = p.openai_config("k".into(), None, p.retry_policy());
+        assert_eq!(normal.retry.window, std::time::Duration::from_secs(600));
+        // And the doctor's two entry points are the ones that build with
+        // no retries: both read `Profile` from the tui's `checks.rs`.
+        assert!(RetryPolicy::no_retries().window.is_zero());
     }
 
     /// A profile without a table is `None`, not a zero price: nothing is

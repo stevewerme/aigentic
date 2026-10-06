@@ -63,6 +63,9 @@ pub struct OpenAiCompatConfig {
     /// means the field is not sent at all (issue #44). The name is a
     /// dotted path, since some endpoints nest it (`thinking.effort`).
     pub reasoning_effort: Option<(String, ReasoningEffort)>,
+    /// How long a call that fails before any content keeps retrying
+    /// (issue #90).
+    pub retry: crate::RetryPolicy,
 }
 
 /// The param name an endpoint expects when the config names none.
@@ -78,6 +81,7 @@ impl OpenAiCompatConfig {
             supports_images: false,
             stall: crate::STALL,
             reasoning_effort: None,
+            retry: crate::RetryPolicy::default(),
         }
     }
 
@@ -110,6 +114,12 @@ impl OpenAiCompatConfig {
 
     pub fn with_stall(mut self, stall: std::time::Duration) -> Self {
         self.stall = stall;
+        self
+    }
+
+    /// How long a call that fails before any content keeps retrying.
+    pub fn with_retry(mut self, retry: crate::RetryPolicy) -> Self {
+        self.retry = retry;
         self
     }
 
@@ -256,37 +266,57 @@ impl Provider for OpenAiCompat {
         let client = self.client.clone();
         let api_key = self.config.api_key.clone();
         let stall = self.config.stall;
+        let policy = self.config.retry.clone();
 
         // Live retries (issue #31): the attempt loop runs in its own
         // task and sends each event into the channel, so a `Retried` is
         // observed *before* the backoff it announces — the client shows
-        // `retrying 2/3` while it waits, not after the wait is over.
+        // `retrying 2/14` while it waits, not after the wait is over.
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(async move {
             let mut attempt = 0;
             let started = std::time::Instant::now();
             loop {
+                // Nobody is listening: stop before asking the provider
+                // again (issue #90).
+                if tx.is_closed() {
+                    return;
+                }
+                let mut retry_after = None;
                 let mut request = client.post(&url).json(&body);
                 if let Some(key) = &api_key {
                     request = request.bearer_auth(key);
                 }
-                let outcome: Result<EventStream<'static>, ProviderEvent> =
-                    match request.send().await {
-                        Err(e) => Err(ProviderEvent::Error(ProviderError::Transport(
-                            e.to_string(),
-                        ))),
-                        Ok(resp) if !resp.status().is_success() => {
-                            let status = resp.status().as_u16();
-                            let body = resp.text().await.unwrap_or_default();
-                            Err(ProviderEvent::Error(ProviderError::Http { status, body }))
-                        }
-                        // `forward` below retries a stream that dies or
-                        // stalls before its first event; no unbounded wait
-                        // on that event here (issue #42).
-                        Ok(resp) => {
-                            Ok(Box::pin(parse_stream(resp.bytes_stream())) as EventStream<'static>)
-                        }
-                    };
+                let sent = tokio::select! {
+                    biased;
+                    // The turn dropped the stream while this request was
+                    // in flight: abandon it and close the connection
+                    // now, rather than run it to the stall and still be
+                    // billed (issue #90). This is the wait for a
+                    // response's first byte, which `forward`'s race
+                    // cannot cover.
+                    _ = tx.closed() => return,
+                    sent = request.send() => sent,
+                };
+                let outcome: Result<EventStream<'static>, ProviderEvent> = match sent {
+                    Err(e) => Err(ProviderEvent::Error(ProviderError::Transport(
+                        e.to_string(),
+                    ))),
+                    Ok(resp) if !resp.status().is_success() => {
+                        let status = resp.status().as_u16();
+                        // The header is read before the body, which
+                        // consumes the response (issue #90).
+                        retry_after = crate::retry_after(resp.headers());
+                        let body = resp.text().await.unwrap_or_default();
+                        Err(ProviderEvent::Error(ProviderError::Http { status, body }))
+                    }
+                    // `forward` below retries a stream that dies or
+                    // stalls before its first event; no unbounded wait
+                    // on that event here (issue #42).
+                    Ok(resp) => {
+                        Ok(Box::pin(parse_stream(resp.bytes_stream())) as EventStream<'static>)
+                    }
+                };
                 // A stream that stalls or breaks before passing anything on
                 // is retried like a refused request (issue #42).
                 let outcome = match outcome {
@@ -299,20 +329,31 @@ impl Provider for OpenAiCompat {
                 match outcome {
                     Ok(()) => return,
                     Err(failure) => {
-                        if attempt >= crate::RETRIES || !retryable(&failure) {
+                        let wait = if retryable(&failure) {
+                            policy.next_wait(attempt, started.elapsed(), retry_after)
+                        } else {
+                            None
+                        };
+                        let Some(wait) = wait else {
                             let attempts = attempt as u32 + 1;
                             let _ = tx.send(ProviderEvent::Error(
                                 crate::error_of(failure).with_attempts(attempts, started.elapsed()),
                             ));
                             return;
-                        }
+                        };
                         let _ = tx.send(ProviderEvent::Retried {
                             attempt: attempt as u32 + 1,
-                            retries: crate::RETRIES as u32,
+                            retries: policy.retries_within(),
                             reason: crate::retry_reason(&failure),
-                            wait: crate::BACKOFF[attempt],
+                            wait,
                         });
-                        tokio::time::sleep(crate::BACKOFF[attempt]).await;
+                        // A dropped stream ends the wait at once
+                        // (issue #90): no `sleep` outlives the turn.
+                        tokio::select! {
+                            biased;
+                            _ = tx.closed() => return,
+                            _ = tokio::time::sleep(wait) => {}
+                        }
                         attempt += 1;
                     }
                 }
@@ -476,6 +517,33 @@ mod tests {
         assert!(body.get("reasoning_effort").is_none(), "{body}");
     }
 
+    /// A policy that gives up in a fifth of a second, so no test waits
+    /// real seconds (issue #90). Its waits are 10, 20, then 40 ms.
+    fn quick_policy() -> crate::RetryPolicy {
+        crate::RetryPolicy {
+            window: std::time::Duration::from_millis(200),
+            backoff: vec![
+                std::time::Duration::from_millis(10),
+                std::time::Duration::from_millis(20),
+                std::time::Duration::from_millis(40),
+            ],
+        }
+    }
+
+    /// The most retries a policy could give with attempts that take no
+    /// time: the count and the ceiling in the tests come from the policy,
+    /// so neither is hand-counted (issue #90). Real attempts take real
+    /// time, so a call gives up at or below this.
+    fn attempts_ceiling(policy: &crate::RetryPolicy) -> u32 {
+        let mut elapsed = std::time::Duration::ZERO;
+        let mut retries = 0;
+        while let Some(wait) = policy.next_wait(retries as usize, elapsed, None) {
+            elapsed += wait;
+            retries += 1;
+        }
+        retries
+    }
+
     #[test]
     fn capabilities_follow_config() {
         let provider = OpenAiCompat::new(
@@ -513,7 +581,11 @@ mod tests {
                 conn.write_all(reply.as_bytes()).unwrap();
             }
         });
-        let provider = OpenAiCompat::new(OpenAiCompatConfig::new(format!("http://{addr}/v1"), "m"));
+        let config = OpenAiCompatConfig::new(format!("http://{addr}/v1"), "m");
+        // Derived from the policy the adapter will use (issue #90), not
+        // stated by hand.
+        let policy = config.retry.clone();
+        let provider = OpenAiCompat::new(config);
         let request = CompletionRequest {
             messages: &[],
             tools: &[],
@@ -522,7 +594,153 @@ mod tests {
         let events: Vec<ProviderEvent> = provider.complete(&request).collect().await;
         assert!(
             matches!(events.first(), Some(ProviderEvent::Retried { attempt: 1, retries, reason, wait })
-                if *retries == crate::RETRIES as u32 && reason == "overloaded" && *wait == crate::BACKOFF[0]),
+                if *retries == policy.retries_within() && reason == "overloaded" && *wait == policy.backoff[0]),
+            "{events:?}"
+        );
+        assert!(
+            matches!(events.get(1), Some(ProviderEvent::TextDelta(t)) if t == "hi"),
+            "{events:?}"
+        );
+        assert!(!events.iter().any(|e| matches!(e, ProviderEvent::Error(_))));
+    }
+
+    /// Issue #90: a server that is down for five requests — more than
+    /// the three the adapter used to try — is ridden out, and the reply
+    /// arrives. Each retry is reported with the policy's own wait.
+    #[tokio::test]
+    async fn a_long_outage_is_ridden_out() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        const DOWN: usize = 5;
+        std::thread::spawn(move || {
+            for i in 0..=DOWN {
+                let (mut conn, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 65536];
+                let _ = conn.read(&mut buf);
+                if i < DOWN {
+                    conn.write_all(
+                        b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 4\r\nconnection: close\r\n\r\nbusy",
+                    )
+                    .unwrap();
+                } else {
+                    conn.write_all(hi_reply().as_bytes()).unwrap();
+                }
+            }
+        });
+        let policy = quick_policy();
+        let config =
+            OpenAiCompatConfig::new(format!("http://{addr}/v1"), "m").with_retry(policy.clone());
+        let provider = OpenAiCompat::new(config);
+        let request = CompletionRequest {
+            messages: &[],
+            tools: &[],
+            max_output_tokens: None,
+        };
+        let events: Vec<ProviderEvent> = provider.complete(&request).collect().await;
+        let retries: Vec<&ProviderEvent> = events
+            .iter()
+            .filter(|e| matches!(e, ProviderEvent::Retried { .. }))
+            .collect();
+        assert_eq!(retries.len(), DOWN, "{events:?}");
+        // Each retry carries its own index, the ceiling, and the wait
+        // the policy gives for that index.
+        for (i, event) in retries.iter().enumerate() {
+            let expected = policy.next_wait(i, std::time::Duration::ZERO, None);
+            assert!(
+                matches!(event, ProviderEvent::Retried { attempt, retries, wait, .. }
+                    if *attempt == i as u32 + 1
+                        && *retries == policy.retries_within()
+                        && Some(*wait) == expected),
+                "{i}: {event:?}"
+            );
+        }
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ProviderEvent::TextDelta(t) if t == "hi")),
+            "{events:?}"
+        );
+        assert!(!events.iter().any(|e| matches!(e, ProviderEvent::Error(_))));
+    }
+
+    /// Issue #90: a `Retry-After` that reaches past the retry window
+    /// ends the call at once with that status, and no retry: the
+    /// provider has said it will not be back inside the window. Without
+    /// reading the header this call would have retried, so the header is
+    /// what the assertion is about.
+    #[tokio::test]
+    async fn a_retry_after_past_the_window_ends_the_call() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 65536];
+            let _ = conn.read(&mut buf);
+            conn.write_all(
+                b"HTTP/1.1 429 Too Many Requests\r\nretry-after: 5\r\ncontent-length: 4\r\nconnection: close\r\n\r\nbusy",
+            )
+            .unwrap();
+        });
+        // A 200 ms window against a 5 s `Retry-After`: nothing to wait
+        // for. The elapsed time is the policy's own boundary.
+        let config =
+            OpenAiCompatConfig::new(format!("http://{addr}/v1"), "m").with_retry(quick_policy());
+        let provider = OpenAiCompat::new(config);
+        let request = CompletionRequest {
+            messages: &[],
+            tools: &[],
+            max_output_tokens: None,
+        };
+        let events: Vec<ProviderEvent> = provider.complete(&request).collect().await;
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(
+            matches!(
+                events.first(),
+                Some(ProviderEvent::Error(ProviderError::Http {
+                    status: 429,
+                    ..
+                }))
+            ),
+            "{events:?}"
+        );
+    }
+
+    /// Issue #90 (design 4a): a stream that ends before any content is
+    /// a retryable failure, and the next attempt's reply is delivered.
+    #[tokio::test]
+    async fn a_stream_that_ends_before_any_content_is_retried() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            // First: a well-formed stream that ends with no content at
+            // all — a `Done { "end_of_stream" }` and nothing else.
+            let body = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"end_of_stream\"}]}\n\ndata: [DONE]\n\n";
+            let cut = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            for reply in [cut, hi_reply()] {
+                let (mut conn, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 65536];
+                let _ = conn.read(&mut buf);
+                conn.write_all(reply.as_bytes()).unwrap();
+            }
+        });
+        let config =
+            OpenAiCompatConfig::new(format!("http://{addr}/v1"), "m").with_retry(quick_policy());
+        let provider = OpenAiCompat::new(config);
+        let request = CompletionRequest {
+            messages: &[],
+            tools: &[],
+            max_output_tokens: None,
+        };
+        let events: Vec<ProviderEvent> = provider.complete(&request).collect().await;
+        assert!(
+            matches!(events.first(), Some(ProviderEvent::Retried { attempt: 1, reason, .. })
+                if reason == "not answering"),
             "{events:?}"
         );
         assert!(
@@ -705,15 +923,179 @@ mod tests {
         );
     }
 
+    /// A non-blocking accept, so a loop can watch for a connection without
+    /// blocking the runtime (issue #90's interrupt tests).
+    fn accept_now(
+        listener: &std::net::TcpListener,
+    ) -> Option<(std::net::TcpStream, std::net::SocketAddr)> {
+        match listener.accept() {
+            Ok(conn) => Some(conn),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => None,
+            Err(e) => panic!("accept: {e}"),
+        }
+    }
+
+    /// The same accept, given `margin` to arrive. Failing here is the
+    /// test saying nothing connected, not the test hanging.
+    async fn accept_within(
+        listener: &std::net::TcpListener,
+        margin: std::time::Duration,
+    ) -> (std::net::TcpStream, std::net::SocketAddr) {
+        let started = std::time::Instant::now();
+        while started.elapsed() < margin {
+            if let Some(conn) = accept_now(listener) {
+                return conn;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        panic!("nothing connected within {margin:?}");
+    }
+
+    /// How long the interrupt tests give a dropped call to prove itself
+    /// gone. Comfortably longer than the millisecond backoff it is on,
+    /// and nowhere near a real second of waiting (issue #90).
+    const MARGIN: std::time::Duration = std::time::Duration::from_millis(500);
+
+    const BUSY_503: &[u8] =
+        b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 4\r\nconnection: close\r\n\r\nbusy";
+
+    /// Issue #90 (T5a): a turn that drops the stream during a backoff
+    /// ends the call. Nothing further reaches the server inside the
+    /// margin, which the test's own accept must see, so the check can
+    /// neither lie nor hang.
+    #[tokio::test]
+    async fn dropping_the_stream_during_a_backoff_stops_the_retries() {
+        use futures_util::StreamExt;
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let policy = quick_policy();
+        let config =
+            OpenAiCompatConfig::new(format!("http://{addr}/v1"), "m").with_retry(policy.clone());
+        let provider = OpenAiCompat::new(config);
+        let request = CompletionRequest {
+            messages: &[],
+            tools: &[],
+            max_output_tokens: None,
+        };
+        let mut stream = provider.complete(&request);
+        let (mut conn, _) = accept_within(&listener, MARGIN).await;
+        conn.write_all(BUSY_503).unwrap();
+        // The first attempt is answered at once, so this leaves the
+        // adapter inside its first backoff.
+        let first = stream.next().await;
+        assert!(
+            matches!(first, Some(ProviderEvent::Retried { attempt: 1, .. })),
+            "{first:?}"
+        );
+        drop(stream);
+        let started = std::time::Instant::now();
+        let mut extra = 0;
+        while started.elapsed() < MARGIN {
+            if let Some((mut conn, _)) = accept_now(&listener) {
+                let _ = conn.write_all(BUSY_503);
+                extra += 1;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert_eq!(extra, 0, "the dropped stream ended every retry");
+    }
+
+    /// Issue #90 (T5b): dropping the stream while an attempt is in
+    /// flight closes the connection at once, instead of leaving the
+    /// request running on for up to the stall and still being billed.
+    /// The server holds its response, so nothing but the drop can end
+    /// the exchange.
+    #[tokio::test]
+    async fn dropping_the_stream_closes_an_attempt_in_flight() {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel::<&'static str>();
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = loop {
+                if let Some(conn) = accept_now(&listener) {
+                    break conn;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            };
+            let mut buf = [0u8; 65536];
+            let _ = conn.read(&mut buf);
+            tx.send("accepted").unwrap();
+            // Hold: no response headers, so the attempt is in flight. The
+            // client dropping the stream closes the socket; any request
+            // bytes still in flight are drained first.
+            conn.set_read_timeout(Some(MARGIN)).unwrap();
+            let deadline = std::time::Instant::now() + MARGIN * 4;
+            let mut one = [0u8; 1];
+            let mut closed = false;
+            while std::time::Instant::now() < deadline {
+                match conn.read(&mut one) {
+                    Ok(0) => {
+                        closed = true;
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) => {}
+                    // A reset is the client going away too.
+                    Err(_) => {
+                        closed = true;
+                        break;
+                    }
+                }
+            }
+            tx.send(if closed { "closed" } else { "kept" }).unwrap();
+        });
+        let config =
+            OpenAiCompatConfig::new(format!("http://{addr}/v1"), "m").with_retry(quick_policy());
+        let provider = OpenAiCompat::new(config);
+        let request = CompletionRequest {
+            messages: &[],
+            tools: &[],
+            max_output_tokens: None,
+        };
+        let stream = provider.complete(&request);
+        // Wait for the request to be in flight before dropping.
+        let started = std::time::Instant::now();
+        while rx.try_recv().is_err() {
+            assert!(started.elapsed() < MARGIN, "nothing connected");
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        drop(stream);
+        let started = std::time::Instant::now();
+        let mut end = None;
+        while started.elapsed() < MARGIN {
+            if let Ok(what) = rx.try_recv() {
+                end = Some(what);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert_eq!(end, Some("closed"), "the attempt in flight was abandoned");
+        let _ = server.join();
+    }
+
     /// Every attempt failing (503) ends in one error that says how hard
-    /// the adapter tried: the count and the wall time.
+    /// the adapter tried: the count and the wall time (issue #90: the
+    /// count and the ceiling both come from the policy, so neither is
+    /// hand-counted).
     #[tokio::test]
     async fn giving_up_says_how_long_it_tried() {
         use std::io::{Read, Write};
+        let policy = quick_policy();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
+        // Enough connections for the ceiling the policy could allow; the
+        // call will use fewer, since its attempts take real time.
+        let ceiling = attempts_ceiling(&policy) as usize + 1;
         std::thread::spawn(move || {
-            for _ in 0..=crate::RETRIES {
+            for _ in 0..ceiling {
                 let (mut conn, _) = listener.accept().unwrap();
                 let mut buf = [0u8; 65536];
                 let _ = conn.read(&mut buf);
@@ -723,7 +1105,9 @@ mod tests {
                 .unwrap();
             }
         });
-        let provider = OpenAiCompat::new(OpenAiCompatConfig::new(format!("http://{addr}/v1"), "m"));
+        let config =
+            OpenAiCompatConfig::new(format!("http://{addr}/v1"), "m").with_retry(policy.clone());
+        let provider = OpenAiCompat::new(config);
         let request = CompletionRequest {
             messages: &[],
             tools: &[],
@@ -734,12 +1118,19 @@ mod tests {
             .iter()
             .filter(|e| matches!(e, ProviderEvent::Retried { .. }))
             .count();
-        assert_eq!(retries, crate::RETRIES);
+        // The window bounds the retries: the count is the events' own, and the
+        // policy's ceiling is the most it could have been (issue #90).
+        assert!(
+            retries >= 1 && retries as u32 <= attempts_ceiling(&policy),
+            "{retries} retries against a ceiling of {}",
+            attempts_ceiling(&policy)
+        );
         let Some(ProviderEvent::Error(e)) = events.last() else {
             panic!("expected a final error: {events:?}");
         };
-        // The rule is `with_attempts`' own: prefix + the original text.
-        let expected_prefix = format!("gave up after {} attempts over ", crate::RETRIES + 1);
+        // The rule is `with_attempts`' own: prefix + the original text,
+        // with the attempt count one more than the retries seen.
+        let expected_prefix = format!("gave up after {} attempts over ", retries + 1);
         assert!(e.to_string().contains(&expected_prefix), "{e}");
         assert!(e.to_string().contains("http 503"), "{e}");
     }

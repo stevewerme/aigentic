@@ -427,7 +427,9 @@ pub struct ContextSaturatedPayload {
 pub struct ProviderRetriedPayload {
     /// 1-based: the retry that is starting.
     pub attempt: u32,
-    /// Total retries this call will make.
+    /// The most retries this call could make (issue #90): a ceiling
+    /// derived from the retry window, so a turn line reading `retrying
+    /// k/N` has N as the most there could be, not a promise.
     pub retries: u32,
     /// `not answering`, `http 503`, `overloaded`, prefixed with the
     /// profile label by the runtime.

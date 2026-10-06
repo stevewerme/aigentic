@@ -12,7 +12,7 @@ use aigentic_api::client::Client;
 use aigentic_api::{Notice, Request, Response, SwitchReply, ThreadState};
 use aigentic_runtime::aigentic_core::{ContentBlock, EventKind};
 use aigentic_runtime::aigentic_log::{
-    AssistantMessagePayload, ToolResultPayload, TurnEndedPayload,
+    AssistantMessagePayload, ProviderRetriedPayload, ToolResultPayload, TurnEndedPayload,
 };
 use anyhow::bail;
 use tokio::sync::mpsc;
@@ -252,6 +252,24 @@ impl Follow {
                 EventKind::TurnEnded => {
                     if let Ok(p) = serde_json::from_value::<TurnEndedPayload>(event.payload) {
                         self.reason = Some(p.reason);
+                    }
+                }
+                // A retry (issue #90): the turn is waiting out a
+                // provider outage, so a watcher sees it on stderr
+                // rather than a run that looks hung.
+                EventKind::ProviderRetried if !self.json => {
+                    self.end_line(err)?;
+                    if let Ok(p) = serde_json::from_value::<ProviderRetriedPayload>(event.payload) {
+                        writeln!(
+                            err,
+                            "[retrying {}/{} · {} · next in {}]",
+                            p.attempt,
+                            p.retries,
+                            p.reason,
+                            crate::app::status::elapsed_short(std::time::Duration::from_millis(
+                                p.wait_ms,
+                            ))
+                        )?;
                     }
                 }
                 _ => {}
@@ -582,6 +600,51 @@ mod tests {
         assert_eq!(last["kind"], "exec_summary");
         assert_eq!(last["exit"], 0);
         assert_eq!(last["denied"], 0);
+    }
+
+    /// Issue #90 (T8): a retry reaches a non-interactive watcher's stderr
+    /// as one line, so an `exec` run during an outage reads as waiting
+    /// rather than hung. The line's wait is rendered by the same helper
+    /// the tui's turn line uses.
+    #[tokio::test]
+    async fn a_retry_is_printed_on_stderr() {
+        let wait = Duration::from_secs(8);
+        let retried = ProviderEvent::Retried {
+            attempt: 2,
+            retries: 14,
+            reason: "overloaded".into(),
+            wait,
+        };
+        let (o, out, err) = exec(
+            vec![vec![retried, text("recovered"), finish("stop")]],
+            args(false),
+        )
+        .await;
+        assert_eq!(o.code, EXIT_OK);
+        assert_eq!(out, "recovered\n");
+        let rendered = crate::app::status::elapsed_short(wait);
+        assert!(err.contains("[retrying 2/14 · "), "{err}");
+        assert!(err.contains("overloaded"), "{err}");
+        assert!(err.contains(&format!("next in {rendered}]")), "{err}");
+
+        // `--json` already carries every notice, so the stderr line is
+        // for a person watching, not a parser.
+        let (o, _, err) = exec(
+            vec![vec![
+                ProviderEvent::Retried {
+                    attempt: 2,
+                    retries: 14,
+                    reason: "overloaded".into(),
+                    wait,
+                },
+                text("recovered"),
+                finish("stop"),
+            ]],
+            args(true),
+        )
+        .await;
+        assert_eq!(o.code, EXIT_OK);
+        assert!(!err.contains("[retrying"), "{err}");
     }
 
     #[tokio::test]
