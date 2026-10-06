@@ -637,20 +637,15 @@ impl ClientRepl {
                 }
             }),
             Command::Threads => {
-                // The thread's project is what the daemon told us on open;
-                // the listing needs the name, which `ListProjects` gives.
-                let r = self.request(Request::ListProjects).await;
-                let project = match r {
-                    Response::Projects { projects } => projects.into_iter().next().map(|p| p.name),
-                    _ => None,
-                };
-                match project {
-                    Some(project) => {
-                        let r = self.request(Request::ListThreads { project }).await;
-                        self.show(r, "", out);
-                    }
-                    None => out.line("[no project to list threads for]"),
-                }
+                // The project this thread is in: the one it moved to, else
+                // the one this REPL started in, as `/new` reads it. Not the
+                // first project the daemon knows (issue #86).
+                let project = self
+                    .project
+                    .clone()
+                    .unwrap_or_else(|| self.home_project.clone());
+                let r = self.request(Request::ListThreads { project }).await;
+                self.show(r, "", out);
             }
             Command::Pin(text) => {
                 let r = self
@@ -5313,6 +5308,47 @@ mod tests {
         fn thread_changed(&mut self) {
             self.changed += 1;
         }
+    }
+
+    /// Issue #86: `/threads` lists the project this thread is in, not
+    /// the first project the daemon knows.
+    #[tokio::test]
+    async fn threads_lists_the_threads_own_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = project(dir.path(), "a", "[participants]\nsteve = \"admin\"\n");
+        let b = project(dir.path(), "b", "[participants]\nsteve = \"admin\"\n");
+        let addr =
+            crate::app::rig::daemon(dir.path(), &[("steve", "t")], &[("a", a), ("b", b)]).await;
+        let (client, welcome) = Client::connect(&addr, "t").await.unwrap();
+        // Each project holds a thread, so listing the wrong one shows.
+        let (in_a, _, _) = open(&client, "a", None).await;
+        let (in_b, state, mode) = open(&client, "b", None).await;
+        let role = welcome
+            .projects
+            .iter()
+            .find(|p| p.name == "b")
+            .and_then(|p| p.role.clone());
+        let notices = client.take_notices().unwrap();
+        let mut repl = ClientRepl::new(
+            client,
+            in_b,
+            "steve",
+            role,
+            state,
+            mode,
+            Identity::default(),
+            "b",
+        );
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send("/threads".into()).unwrap();
+        tx.send("/quit".into()).unwrap();
+        let mut out = Recording::default();
+        repl.run(rx, notices, &mut out).await;
+
+        let listed = out.lines.join("\n");
+        assert!(listed.contains(&in_b.to_string()), "{listed}");
+        assert!(!listed.contains(&in_a.to_string()), "{listed}");
     }
 
     /// T5 and T7: `/new` starts a new front thread, the REPL follows it
