@@ -393,6 +393,11 @@ pub enum Notice {
         window: u64,
         turn_elapsed_ms: Option<u64>,
         queued: u32,
+        /// The whole thread, as if nothing had been stubbed or summarised
+        /// (issue #99): the status line's `thread` figure. `None` from a
+        /// daemon before #99, and an older client ignores it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thread_tokens: Option<u64>,
     },
     /// A remark for the person that is not an event (a rules file that
     /// could not be written).
@@ -851,7 +856,56 @@ mod tests {
                 model: "deepseek-v4.1-flash".into(),
                 effort: Some("50".into()),
             },
+            Notice::Usage {
+                thread: thread(),
+                tokens_in_window: 48_000,
+                window: 120_000,
+                turn_elapsed_ms: Some(1_200),
+                queued: 1,
+                thread_tokens: Some(2_100_000),
+            },
+            Notice::Usage {
+                thread: thread(),
+                tokens_in_window: 48_000,
+                window: 120_000,
+                turn_elapsed_ms: None,
+                queued: 0,
+                thread_tokens: None,
+            },
         ]
+    }
+
+    /// T3 (issue #99): `thread_tokens` is optional both ways. A `usage`
+    /// line from a daemon before #99 has no such key and decodes to
+    /// `None`, and `None` is left off the wire, so an older client reads
+    /// exactly the line it always did.
+    #[test]
+    fn usage_carries_the_thread_figure_when_there_is_one() {
+        let with = Notice::Usage {
+            thread: thread(),
+            tokens_in_window: 48_000,
+            window: 120_000,
+            turn_elapsed_ms: None,
+            queued: 0,
+            thread_tokens: Some(2_100_000),
+        };
+        let line = encode(&Frame::notice(with.clone()));
+        assert!(line.contains("\"thread_tokens\":2100000"), "{line}");
+        assert_eq!(decode(&line).unwrap(), Frame::notice(with));
+
+        let without = Notice::Usage {
+            thread: thread(),
+            tokens_in_window: 48_000,
+            window: 120_000,
+            turn_elapsed_ms: None,
+            queued: 0,
+            thread_tokens: None,
+        };
+        let line = encode(&Frame::notice(without.clone()));
+        assert!(!line.contains("thread_tokens"), "{line}");
+        // That is the line a daemon before #99 writes, and it decodes to
+        // `None`.
+        assert_eq!(decode(&line).unwrap(), Frame::notice(without));
     }
 
     #[test]

@@ -21,9 +21,8 @@ pub struct Status {
     /// The thread's title, when it has one.
     pub title: Option<String>,
     pub mode: String,
-    /// (tokens in the window, the ceiling — compaction's line), from
-    /// `Notice::Usage`.
-    pub usage: Option<(u64, u64)>,
+    /// The working and thread figures from `Notice::Usage`.
+    pub usage: Option<Figures>,
     /// How long the running turn has run; `None` when idle.
     pub elapsed: Option<Duration>,
     pub queued: u32,
@@ -33,7 +32,7 @@ pub struct Status {
 
 impl Status {
     /// `vendela · Crate count · flash (deepseek-v4.1-flash) · manual ·
-    /// 58k / 128k context · queued 1`
+    /// working 48k · thread 2.1M · queued 1`
     pub fn line(&self) -> String {
         let mut parts = vec![self.project.clone()];
         if let Some(t) = &self.title {
@@ -48,15 +47,23 @@ impl Status {
             parts.push(who);
         }
         parts.push(self.mode.clone());
-        // The last call's context against the ceiling (issue #21): not
-        // a percentage — the two sizes, read as a fraction.
+        // What the model sees and how big the thread really is (issue
+        // #99): information, not a warning, so no ceiling to read it
+        // against. A daemon before #99 sends no thread figure.
         match self.usage {
-            Some((used, ceiling)) => parts.push(format!(
-                "{} / {} context",
-                count_short(used),
-                count_short(ceiling)
+            Some(Figures {
+                working,
+                thread: Some(thread),
+            }) => parts.push(format!(
+                "working {} · thread {}",
+                count_short(working),
+                count_short(thread)
             )),
-            None => parts.push("context ?".into()),
+            Some(Figures {
+                working,
+                thread: None,
+            }) => parts.push(format!("working {}", count_short(working))),
+            None => parts.push("working ?".into()),
         }
         if let Some(elapsed) = self.elapsed {
             parts.push(elapsed_short(elapsed));
@@ -86,6 +93,15 @@ impl Status {
             ThreadState::AwaitingSwitch { .. } => self.waiting = Some("awaiting switch"),
         }
     }
+}
+
+/// The daemon's last `Notice::Usage` (issue #99): what the model sees
+/// this call, and the whole thread as if nothing had been stubbed or
+/// summarised — `None` from a daemon before #99.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Figures {
+    pub working: u64,
+    pub thread: Option<u64>,
 }
 
 /// How much of the title the footer shows.
@@ -129,25 +145,42 @@ mod tests {
             identity: None,
             title: None,
             mode: "manual".into(),
-            usage: Some((31_000, 100_000)),
+            usage: Some(Figures {
+                working: 31_000,
+                thread: Some(2_100_000),
+            }),
             elapsed: Some(Duration::from_secs(12)),
             queued: 1,
             waiting: None,
         };
-        // The two sizes, used against the ceiling, not a percentage.
+        // Working and thread (issue #99), each in the footer's one
+        // vocabulary, and no ceiling to read them against.
         assert_eq!(
             s.line(),
-            "vendela · manual · 31k / 100k context · 12s · queued 1"
+            format!(
+                "vendela · manual · working {} · thread {} · 12s · queued 1",
+                count_short(31_000),
+                count_short(2_100_000)
+            )
         );
         s.elapsed = None;
         s.queued = 0;
         s.usage = None;
-        assert_eq!(s.line(), "vendela · manual · context ?");
+        assert_eq!(s.line(), "vendela · manual · working ?");
         s.title = Some("A title".into());
-        assert_eq!(s.line(), "vendela · A title · manual · context ?");
-        // A fuller window than the ceiling still reads as itself.
-        s.usage = Some((250_000, 100_000));
-        assert_eq!(s.line(), "vendela · A title · manual · 250k / 100k context");
+        assert_eq!(s.line(), "vendela · A title · manual · working ?");
+        // A daemon before #99 sends no thread figure: working alone.
+        s.usage = Some(Figures {
+            working: 250_000,
+            thread: None,
+        });
+        assert_eq!(
+            s.line(),
+            format!(
+                "vendela · A title · manual · working {}",
+                count_short(250_000)
+            )
+        );
     }
 
     #[test]
@@ -161,30 +194,33 @@ mod tests {
             project: "vendela".into(),
             identity: Some(identity(Some("flash"), "deepseek-v4.1-flash", None)),
             mode: "auto".into(),
-            usage: Some((76_000, 128_000)),
+            usage: Some(Figures {
+                working: 76_000,
+                thread: Some(310_000),
+            }),
             ..Status::default()
         };
         assert_eq!(
             s.line(),
-            "vendela · flash (deepseek-v4.1-flash) · auto · 76k / 128k context"
+            "vendela · flash (deepseek-v4.1-flash) · auto · working 76k · thread 310k"
         );
         // The effort rides the model when the profile sets one.
         s.identity = Some(identity(Some("flash"), "deepseek-v4.1-flash", Some("50")));
         assert_eq!(
             s.line(),
-            "vendela · flash (deepseek-v4.1-flash) · effort 50 · auto · 76k / 128k context"
+            "vendela · flash (deepseek-v4.1-flash) · effort 50 · auto · working 76k · thread 310k"
         );
         // A thread with no profile names the model alone.
         s.identity = Some(identity(None, "deepseek-v4.1-flash", None));
         assert_eq!(
             s.line(),
-            "vendela · deepseek-v4.1-flash · auto · 76k / 128k context"
+            "vendela · deepseek-v4.1-flash · auto · working 76k · thread 310k"
         );
         // A daemon that knows no model leaves the line as it was.
         s.identity = Some(identity(None, "unknown", None));
-        assert_eq!(s.line(), "vendela · auto · 76k / 128k context");
+        assert_eq!(s.line(), "vendela · auto · working 76k · thread 310k");
         s.identity = None;
-        assert_eq!(s.line(), "vendela · auto · 76k / 128k context");
+        assert_eq!(s.line(), "vendela · auto · working 76k · thread 310k");
     }
 
     /// The model's own label: profile and model in one name, the effort

@@ -776,8 +776,15 @@ async fn usage_is_pushed_after_the_call_and_again_when_the_turn_ends() {
                 window,
                 turn_elapsed_ms,
                 queued,
+                thread_tokens,
                 ..
-            } => Some((*tokens_in_window, *window, *turn_elapsed_ms, *queued)),
+            } => Some((
+                *tokens_in_window,
+                *window,
+                *turn_elapsed_ms,
+                *queued,
+                *thread_tokens,
+            )),
             _ => None,
         })
         .collect();
@@ -786,6 +793,10 @@ async fn usage_is_pushed_after_the_call_and_again_when_the_turn_ends() {
     assert!(during[0].0 > 0);
     assert!(during[0].2.is_some());
     assert_eq!(during[0].3, 0);
+    // The thread figure (issue #99) rides along: the rig holds no
+    // runtime, so T1 pins the number; here it is present and non-zero.
+    let thread_during = during[0].4.expect("a #99 daemon sends the thread figure");
+    assert!(thread_during > 0);
     // After Idle: the same fill once more, untimed, so a status line
     // drops its clock.
     let last = tokio::time::timeout(Duration::from_secs(2), notices.recv())
@@ -803,6 +814,15 @@ async fn usage_is_pushed_after_the_call_and_again_when_the_turn_ends() {
         ),
         "{last:?}"
     );
+    // The turn-end push re-sends the last call's figure: never smaller.
+    let Notice::Usage {
+        thread_tokens: Some(thread_after),
+        ..
+    } = last
+    else {
+        panic!("{last:?}")
+    };
+    assert!(thread_after >= thread_during);
     drop(rig.mailbox);
     rig.task.await.unwrap();
 }

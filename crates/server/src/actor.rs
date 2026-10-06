@@ -273,6 +273,9 @@ impl Shared {
 
     /// `Notice::Usage` from the last fill, the turn's elapsed time and
     /// the queue; nothing until the first model call reported a fill.
+    /// The fill and the thread figure (issue #99) are the last model
+    /// call's: a queue change or a turn's end re-sends them, not a fresh
+    /// count, so `thread` can trail a message just queued by one push.
     fn push_usage(&self) {
         let Some(usage) = *self.last_usage.lock().unwrap_or_else(|e| e.into_inner()) else {
             return;
@@ -285,6 +288,7 @@ impl Shared {
             window: usage.window,
             turn_elapsed_ms: started.map(|t| t.elapsed().as_millis() as u64),
             queued,
+            thread_tokens: Some(usage.thread_tokens),
         });
     }
 

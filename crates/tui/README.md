@@ -93,7 +93,7 @@ cargo run -p aigentic-tui -- exec "prompt" [--json] [-o FILE]    # one turn, no 
 At a terminal the client is an inline shell (phase 6 step 3): it draws only
 the rows it needs, right under the transcript, growing for a popup or a
 prompt and shrinking back when the turn is over (the streaming reply, the composer, a status
-line with mode, project, context fill, the turn's clock and the queue), and
+line with mode, project, `working 48k · thread 2.1M` (what the model sees this call, and the whole thread), the turn's clock and the queue), and
 every finished line goes into the terminal's own scrollback, so the
 transcript scrolls, searches and copies like any other output and stays
 after quitting. Enter sends; Shift-Enter or Ctrl-J adds a line; a paste over

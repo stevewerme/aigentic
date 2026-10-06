@@ -325,9 +325,9 @@ pub struct ClientRepl {
     /// state change clearing `menu` never withdraws it, and a chat
     /// permission prompt comes first when both are up.
     checkpoint: Option<(Ulid, String, Menu)>,
-    /// The last `Notice::Usage`: window fill and the ceiling —
-    /// compaction's line — for the status line (phase 6 step 3).
-    usage: Option<(u64, u64)>,
+    /// The last `Notice::Usage`: the working and thread figures for the
+    /// status line (phase 6 step 3, issue #99).
+    usage: Option<crate::app::status::Figures>,
     /// The turn that ran last (issue #21): tokens written and calls,
     /// shown by `/cost` — the live line carries state and time only.
     last_turn: Option<(u64, u32)>,
@@ -1458,9 +1458,9 @@ impl ClientRepl {
         &self.identity
     }
 
-    /// The last window fill the daemon reported: tokens in the window
-    /// and the window itself.
-    pub fn usage(&self) -> Option<(u64, u64)> {
+    /// The last figures the daemon reported: what the model sees and
+    /// the whole thread (issue #99).
+    pub fn usage(&self) -> Option<crate::app::status::Figures> {
         self.usage
     }
 
@@ -1645,9 +1645,14 @@ impl ClientRepl {
             Notice::Event { event, .. } => self.render_event(&event, out),
             Notice::Usage {
                 tokens_in_window,
-                window,
+                thread_tokens,
                 ..
-            } => self.usage = Some((tokens_in_window, window)),
+            } => {
+                self.usage = Some(crate::app::status::Figures {
+                    working: tokens_in_window,
+                    thread: thread_tokens,
+                })
+            }
             Notice::Note { text, .. } => {
                 self.flush_partial(out);
                 out.line(&format!("[{text}]"));
@@ -5376,6 +5381,51 @@ mod tests {
 
     /// A REPL over a scripted daemon with one lead, for the tests that
     /// need the parts rather than the bundle.
+    /// T5 (issue #99): a `Notice::Usage` with the thread figure reaches
+    /// the status line as `working · thread`, and one from a daemon
+    /// before #99 leaves `working` alone.
+    #[tokio::test]
+    async fn the_usage_notice_feeds_working_and_thread() {
+        let (mut repl, mut out, daemon) = repl_for(Ulid::generate(), Vec::new()).await;
+        let usage = |thread_tokens| Notice::Usage {
+            thread: repl.thread,
+            tokens_in_window: 48_000,
+            window: 120_000,
+            turn_elapsed_ms: None,
+            queued: 0,
+            thread_tokens,
+        };
+        let with = usage(Some(2_100_000));
+        let without = usage(None);
+        repl.render(with, &mut out);
+        let figures = repl.usage().expect("the notice was applied");
+        assert_eq!(
+            figures,
+            crate::app::status::Figures {
+                working: 48_000,
+                thread: Some(2_100_000),
+            }
+        );
+        let status = crate::app::status::Status {
+            project: "proj".into(),
+            mode: "manual".into(),
+            usage: Some(figures),
+            ..crate::app::status::Status::default()
+        };
+        assert!(
+            status.line().ends_with(&format!(
+                "working {} · thread {}",
+                crate::app::status::count_short(48_000),
+                crate::app::status::count_short(2_100_000)
+            )),
+            "{}",
+            status.line()
+        );
+        repl.render(without, &mut out);
+        assert_eq!(repl.usage().and_then(|f| f.thread), None);
+        daemon.stop();
+    }
+
     async fn repl_for(lead: Ulid, backlog: Vec<Event>) -> (ClientRepl, Copies, GuardedLead) {
         let dir = tempfile::tempdir().unwrap();
         let script = crate::run_view::fake_daemon::Script {
