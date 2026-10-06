@@ -133,7 +133,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "project",
         "the layers, the knowledge mode and every tool's fate",
     ),
-    ("threads", "this project's threads, newest first"),
+    (
+        "threads",
+        "your threads in every project: front, builds, then by workspace",
+    ),
     ("new", "start a new front thread; the old one stays listed"),
     ("build", "follow a build of issue n here: /build <n>"),
     ("diff", "the project's working-tree diff, in the pager"),
@@ -159,7 +162,7 @@ pub const HELP: &str = "\
 /skills          list enabled skills; user-invoked ones are slash commands
 /project         the layers, the knowledge mode and every tool's fate
 /project use <n> move this thread to project <n>, keeping the conversation
-/threads         this project's threads, newest first
+/threads         your threads in every project: front, builds, then by workspace
 /new             start a new front thread; the old one stays listed
 /build <n>       follow a build of issue n here, and answer its checkpoints
 /<skill> [args]  run a user-invoked skill
@@ -282,6 +285,20 @@ mod tests {
             Command::Cost,
             "a built-in wins over a skill of the same name"
         );
+    }
+
+    /// T5 (issue #97): `/threads` is described as listing every project,
+    /// grouped, in both help texts.
+    #[test]
+    fn threads_is_listed_in_commands_and_help_as_every_project() {
+        const SAID: &str = "your threads in every project: front, builds, then by workspace";
+        assert!(
+            COMMANDS
+                .iter()
+                .any(|(name, said)| *name == "threads" && *said == SAID),
+            "{COMMANDS:#?}"
+        );
+        assert!(HELP.contains(SAID), "{HELP}");
     }
 
     #[test]

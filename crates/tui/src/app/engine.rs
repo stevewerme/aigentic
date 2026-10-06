@@ -639,15 +639,23 @@ impl ClientRepl {
             Command::Threads => {
                 // The project this thread is in: the one it moved to, else
                 // the one this REPL started in, as `/new` reads it. Not the
-                // first project the daemon knows (issue #86).
-                let project = self
+                // first project the daemon knows (issue #86). The listing
+                // itself is every project (`project: None`); `current` only
+                // decides which rows carry a project suffix (issue #97).
+                let current = self
                     .project
                     .clone()
                     .unwrap_or_else(|| self.home_project.clone());
-                let r = self.request(Request::ListThreads {
-                    project: Some(project),
-                }).await;
-                self.show(r, "", out);
+                let r = self.request(Request::ListThreads { project: None }).await;
+                match r {
+                    Response::Threads { threads } => {
+                        for l in render_thread_groups(&threads, &current).lines() {
+                            out.line(l);
+                        }
+                    }
+                    // A refusal or error prints as it always did.
+                    other => self.show(other, "", out),
+                }
             }
             Command::Pin(text) => {
                 let r = self
@@ -2132,6 +2140,104 @@ pub fn render_thread_infos(threads: &[aigentic_api::ThreadInfo]) -> String {
     out.trim_end().to_owned()
 }
 
+/// `/threads` (issue #97): every readable thread, drawn in the order the
+/// daemon sent it, under the headings its rows imply — the front thread,
+/// the builds, then the rest grouped by workspace. It never re-sorts, so
+/// `aigentic threads --server` still reaches for
+/// [`render_thread_infos`], which is unchanged.
+pub fn render_thread_groups(threads: &[aigentic_api::ThreadInfo], current: &str) -> String {
+    use aigentic_api::ThreadKind;
+    if threads.is_empty() {
+        return "no threads".into();
+    }
+    let of = |pick: fn(&ThreadKind) -> bool| -> Vec<&ThreadInfo> {
+        threads.iter().filter(|t| pick(&t.kind)).collect()
+    };
+    let front = of(|k| *k == ThreadKind::Front);
+    let builds = of(|k| matches!(k, ThreadKind::Run(_)));
+    let rest = of(|k| !matches!(k, ThreadKind::Front | ThreadKind::Run(_)));
+
+    let mut out = String::new();
+    if !front.is_empty() {
+        out.push_str("front thread\n");
+        for t in &front {
+            out.push_str(&thread_group_row(t, 0, current));
+        }
+    }
+    if !builds.is_empty() {
+        out.push_str("builds\n");
+        // The depth each run row was drawn at, so a child sits two spaces
+        // further in than the row it names as its lead. A child whose
+        // lead is not among the rows drawn is a root, at depth 0.
+        let mut depth: HashMap<Ulid, usize> = HashMap::new();
+        for t in &builds {
+            let d = match t.kind {
+                ThreadKind::Run(aigentic_api::RunThread::Child { lead, .. }) => {
+                    depth.get(&lead).map(|d| d + 1).unwrap_or(0)
+                }
+                _ => 0,
+            };
+            depth.insert(t.id, d);
+            out.push_str(&thread_group_row(t, d, current));
+        }
+    }
+    if !rest.is_empty() {
+        // One heading for the whole run when no workspace names any row,
+        // else one at each change of workspace as the daemon grouped
+        // them, contiguous.
+        if rest.iter().all(|t| t.workspace.is_none()) {
+            out.push_str("threads\n");
+            for t in &rest {
+                out.push_str(&thread_group_row(t, 0, current));
+            }
+        } else {
+            let mut seen: Option<Option<&str>> = None;
+            for t in &rest {
+                let workspace = t.workspace.as_deref();
+                if seen != Some(workspace) {
+                    match workspace {
+                        Some(w) => out.push_str(&format!("threads · {w}\n")),
+                        None => out.push_str("threads · no workspace\n"),
+                    }
+                    seen = Some(workspace);
+                }
+                out.push_str(&thread_group_row(t, 0, current));
+            }
+        }
+    }
+    out.trim_end().to_owned()
+}
+
+/// One row of a group: today's columns, indented under its heading (two
+/// spaces, plus two per build depth), with the `#issue` a lead carries,
+/// the `[step]` a child carries when it names one, and the ` · project`
+/// suffix for a row in another project (issue #97).
+fn thread_group_row(t: &ThreadInfo, depth: usize, current: &str) -> String {
+    use aigentic_api::{RunThread, ThreadKind};
+    let mut label = String::new();
+    match &t.kind {
+        ThreadKind::Run(RunThread::Lead { issue }) => label.push_str(&format!("#{issue} ")),
+        ThreadKind::Run(RunThread::Child {
+            step: Some(step), ..
+        }) => label.push_str(&format!("[{step}] ")),
+        // A child with no step gets no prefix.
+        ThreadKind::Run(RunThread::Child { step: None, .. }) => {}
+        _ => {}
+    }
+    label.push_str(t.title.as_deref().unwrap_or(&t.first_line));
+    let suffix = match &t.project {
+        Some(p) if p != current => format!(" · {p}"),
+        _ => String::new(),
+    };
+    format!(
+        "{}{}  {}  {:>5}  {label}{suffix}\n",
+        "  ".repeat(depth + 1),
+        t.id,
+        t.date,
+        t.events
+    )
+}
+
 /// `aigentic threads --server ...`: the project's threads over the API.
 pub async fn list_threads_over(client: &Client, project: &str) -> anyhow::Result<String> {
     match client
@@ -3129,6 +3235,25 @@ mod tests {
         let listing = list_threads_over(&client, "proj").await.unwrap();
         assert!(
             listing.starts_with(&thread.to_string()) && listing.ends_with("first words"),
+            "{listing}"
+        );
+        // T3 (issue #97): a per-project listing is still the flat
+        // `render_thread_infos`, with no group heading.
+        let Response::Threads { threads } = client
+            .request(Request::ListThreads {
+                project: Some("proj".into()),
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("a threads reply")
+        };
+        assert!(!threads.is_empty(), "non-empty, so a heading would show");
+        assert_eq!(listing, render_thread_infos(&threads));
+        assert!(
+            !listing.contains("front thread")
+                && !listing.contains("builds")
+                && !listing.contains("threads"),
             "{listing}"
         );
         let report = project_report_over(&client, "proj").await.unwrap();
@@ -5312,18 +5437,269 @@ mod tests {
         }
     }
 
-    /// Issue #86: `/threads` lists the project this thread is in, not
-    /// the first project the daemon knows.
+    /// A listing row for the group renderer's tests (issue #97): the
+    /// title is `{title}`, so an expected label reads as written.
+    fn thread_info(
+        id: Ulid,
+        project: Option<&str>,
+        workspace: Option<&str>,
+        kind: aigentic_api::ThreadKind,
+        title: &str,
+    ) -> aigentic_api::ThreadInfo {
+        aigentic_api::ThreadInfo {
+            id,
+            project: project.map(str::to_owned),
+            date: "2026-10-05".into(),
+            events: 3,
+            first_line: format!("{title} first"),
+            state: ThreadState::Idle,
+            title: Some(title.into()),
+            workspace: workspace.map(str::to_owned),
+            kind,
+        }
+    }
+
+    /// T1 (issue #97): the renderer walks the daemon's order, writes a
+    /// heading at each boundary, and builds every row from its own
+    /// fields — the `#issue`/`[step]` label, the build indent, and the
+    /// ` · project` suffix a row earns against `current`.
+    #[test]
+    fn thread_groups_draw_every_section_from_the_daemons_order() {
+        use aigentic_api::{RunThread, ThreadKind};
+
+        let front = thread_info(
+            Ulid::from_parts(1, 1),
+            Some("b"),
+            Some("w"),
+            ThreadKind::Front,
+            "front",
+        );
+        let lead1 = thread_info(
+            Ulid::from_parts(1, 2),
+            Some("b"),
+            None,
+            ThreadKind::Run(RunThread::Lead { issue: 42 }),
+            "lead one",
+        );
+        let child1 = thread_info(
+            Ulid::from_parts(1, 3),
+            Some("a"),
+            None,
+            ThreadKind::Run(RunThread::Child {
+                lead: lead1.id,
+                step: Some("build".into()),
+            }),
+            "child one",
+        );
+        let grand1 = thread_info(
+            Ulid::from_parts(1, 4),
+            Some("b"),
+            None,
+            ThreadKind::Run(RunThread::Child {
+                lead: child1.id,
+                step: Some("verify".into()),
+            }),
+            "grand one",
+        );
+        let lead2 = thread_info(
+            Ulid::from_parts(1, 5),
+            Some("b"),
+            None,
+            ThreadKind::Run(RunThread::Lead { issue: 7 }),
+            "lead two",
+        );
+        let step_less = thread_info(
+            Ulid::from_parts(1, 6),
+            Some("b"),
+            None,
+            ThreadKind::Run(RunThread::Child {
+                lead: lead2.id,
+                step: None,
+            }),
+            "no step",
+        );
+        let orphan = thread_info(
+            Ulid::from_parts(1, 7),
+            Some("b"),
+            None,
+            ThreadKind::Run(RunThread::Child {
+                lead: Ulid::from_parts(9, 9),
+                step: Some("check".into()),
+            }),
+            "orphan",
+        );
+        let p1 = thread_info(
+            Ulid::from_parts(1, 8),
+            Some("b"),
+            Some("w"),
+            ThreadKind::Thread,
+            "plain w here",
+        );
+        let p2 = thread_info(
+            Ulid::from_parts(1, 9),
+            Some("a"),
+            Some("w"),
+            ThreadKind::Thread,
+            "plain w there",
+        );
+        let p3 = thread_info(
+            Ulid::from_parts(1, 10),
+            Some("c"),
+            Some("v"),
+            ThreadKind::Thread,
+            "plain v",
+        );
+        let p4 = thread_info(
+            Ulid::from_parts(1, 11),
+            None,
+            Some("v"),
+            ThreadKind::Thread,
+            "no project",
+        );
+        let p5 = thread_info(
+            Ulid::from_parts(1, 12),
+            Some("a"),
+            None,
+            ThreadKind::Thread,
+            "loose there",
+        );
+        let p6 = thread_info(
+            Ulid::from_parts(1, 13),
+            Some("b"),
+            None,
+            ThreadKind::Thread,
+            "loose here",
+        );
+
+        // The daemon's order (#86): the front row, the build forest,
+        // then the rest grouped by workspace, groups contiguous.
+        let rows = vec![
+            front.clone(),
+            lead1.clone(),
+            child1.clone(),
+            grand1.clone(),
+            lead2.clone(),
+            step_less.clone(),
+            orphan.clone(),
+            p1.clone(),
+            p2.clone(),
+            p3.clone(),
+            p4.clone(),
+            p5.clone(),
+            p6.clone(),
+        ];
+
+        // The spec's line shape, written from each fixture row: two
+        // spaces under its heading plus two per depth, the row's own
+        // columns, the label, and the suffix its project earns against
+        // `current` (`b`, the REPL's project).
+        let row = |t: &aigentic_api::ThreadInfo, depth: usize, label: String| {
+            let suffix = match &t.project {
+                Some(p) if p != "b" => format!(" · {p}"),
+                _ => String::new(),
+            };
+            format!(
+                "{}{}  {}  {:>5}  {label}{suffix}",
+                "  ".repeat(depth + 1),
+                t.id,
+                t.date,
+                t.events
+            )
+        };
+        let expected = [
+            "front thread".to_owned(),
+            row(&front, 0, "front".into()),
+            "builds".to_owned(),
+            row(&lead1, 0, "#42 lead one".into()),
+            row(&child1, 1, "[build] child one".into()),
+            row(&grand1, 2, "[verify] grand one".into()),
+            row(&lead2, 0, "#7 lead two".into()),
+            row(&step_less, 1, "no step".into()),
+            row(&orphan, 0, "[check] orphan".into()),
+            "threads · w".to_owned(),
+            row(&p1, 0, "plain w here".into()),
+            row(&p2, 0, "plain w there".into()),
+            "threads · v".to_owned(),
+            row(&p3, 0, "plain v".into()),
+            row(&p4, 0, "no project".into()),
+            "threads · no workspace".to_owned(),
+            row(&p5, 0, "loose there".into()),
+            row(&p6, 0, "loose here".into()),
+        ];
+
+        assert_eq!(
+            render_thread_groups(&rows, "b"),
+            expected.join("\n"),
+            "every row keeps its place, its label and its indent"
+        );
+    }
+
+    /// T2 (issue #97): a heading appears only when its section has rows,
+    /// the no-workspace run collapses to `threads` when it is all there
+    /// is, and an empty listing still says so.
+    #[test]
+    fn thread_group_headings_appear_only_with_rows() {
+        use aigentic_api::ThreadKind;
+
+        let plain = |id: u128| {
+            thread_info(
+                Ulid::from_parts(2, id),
+                None,
+                None,
+                ThreadKind::Thread,
+                "plain",
+            )
+        };
+
+        // All of the rest in no workspace: one `threads` heading.
+        let no_workspace = vec![plain(1), plain(2)];
+        let drawn = render_thread_groups(&no_workspace, "b");
+        assert_eq!(drawn.matches("threads").count(), 1, "{drawn}");
+        assert!(!drawn.contains("no workspace"), "{drawn}");
+
+        // A front row and nothing else: only `front thread`.
+        let front_only = vec![thread_info(
+            Ulid::from_parts(2, 3),
+            Some("b"),
+            None,
+            ThreadKind::Front,
+            "front",
+        )];
+        let drawn = render_thread_groups(&front_only, "b");
+        assert_eq!(drawn.lines().next(), Some("front thread"), "{drawn}");
+        assert!(!drawn.contains("builds"), "{drawn}");
+        assert!(!drawn.contains("\nthreads"), "{drawn}");
+
+        // No front row and no runs: no `front thread`, no `builds`, but
+        // the rest still gets its heading.
+        let neither = vec![plain(4)];
+        let drawn = render_thread_groups(&neither, "b");
+        assert!(!drawn.contains("front thread"), "{drawn}");
+        assert!(!drawn.contains("builds"), "{drawn}");
+        assert_eq!(drawn.lines().next(), Some("threads"), "{drawn}");
+
+        // An empty listing is still `no threads`.
+        assert_eq!(render_thread_groups(&[], "b"), "no threads");
+    }
+
+    /// T4 (issue #97): `/threads` lists every project, grouped — the
+    /// front thread first, then the rest by workspace — and a row of
+    /// another project says which one. It replaces #86's
+    /// `threads_lists_the_threads_own_project`, whose rule is gone.
     #[tokio::test]
-    async fn threads_lists_the_threads_own_project() {
+    async fn threads_lists_every_project_grouped() {
         let dir = tempfile::tempdir().unwrap();
         let a = project(dir.path(), "a", "[participants]\nsteve = \"admin\"\n");
         let b = project(dir.path(), "b", "[participants]\nsteve = \"admin\"\n");
         let addr =
             crate::app::rig::daemon(dir.path(), &[("steve", "t")], &[("a", a), ("b", b)]).await;
         let (client, welcome) = Client::connect(&addr, "t").await.unwrap();
-        // Each project holds a thread, so listing the wrong one shows.
+        // A thread in each project, and this user's front thread in `b`.
         let (in_a, _, _) = open(&client, "a", None).await;
+        let front = crate::front::pick_thread(&client, None, false, "b", None)
+            .await
+            .unwrap();
+        // The REPL's own thread, in `b`, newer than `a`'s.
         let (in_b, state, mode) = open(&client, "b", None).await;
         let role = welcome
             .projects
@@ -5348,9 +5724,27 @@ mod tests {
         let mut out = Recording::default();
         repl.run(rx, notices, &mut out).await;
 
-        let listed = out.lines.join("\n");
-        assert!(listed.contains(&in_b.to_string()), "{listed}");
-        assert!(!listed.contains(&in_a.to_string()), "{listed}");
+        let lines = out.lines.join("\n");
+        // One entry per rendered line: the front heading, then its row.
+        assert_eq!(out.lines[0], "front thread", "{lines}");
+        assert!(
+            out.lines[1].contains(&front.id.to_string()),
+            "the front thread follows its heading: {lines}"
+        );
+        let at = |needle: &str| {
+            out.lines
+                .iter()
+                .position(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} is not listed: {lines}"))
+        };
+        let own = at(&in_b.to_string());
+        let other = at(&in_a.to_string());
+        // Both are in no workspace, so one `threads` group; inside it
+        // the newer row comes first, and only the other project's row
+        // carries a suffix (the REPL is in `b`).
+        assert!(own < other, "{lines}");
+        assert!(!out.lines[own].ends_with(" · b"), "{lines}");
+        assert!(out.lines[other].ends_with(" · a"), "{lines}");
     }
 
     /// T5 and T7: `/new` starts a new front thread, the REPL follows it
