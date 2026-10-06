@@ -2,7 +2,9 @@
 
 use std::time::{Duration, Instant, SystemTime};
 
-use aigentic_core::{Author, ContentBlock, Event, EventKind, Message, ProviderError, Role};
+use aigentic_core::{
+    Author, ContentBlock, Event, EventKind, Message, Provider, ProviderError, Role,
+};
 use aigentic_log::{NewEvent, TurnEndedPayload, Usage, UserMessagePayload};
 
 use crate::decisions::Queued;
@@ -104,7 +106,14 @@ impl Runtime {
         observe: &mut (dyn FnMut(Signal<'_>) + Send),
     ) -> Result<TurnOutcome, RuntimeError> {
         for queued in std::mem::take(held) {
-            append_queued(&mut self.log, queued, observe, false)?;
+            append_queued(
+                &*self.provider,
+                &mut self.log,
+                &mut self.thread_raw,
+                queued,
+                observe,
+                false,
+            )?;
         }
         let touched = self.touched_this_turn()?;
         let (now, wall_now) = (self.clock)();
@@ -203,6 +212,10 @@ impl Runtime {
             payload,
             parent_event,
         })?;
+        // The thread figure steps by the message this event adds (issue
+        // #99): counted the same way a full recount counts it. This seam
+        // and `append_queued` are the only two write paths.
+        self.thread_raw += event_tokens(&*self.provider, &event);
         observe(Signal::Event(&event));
         Ok(event)
     }
@@ -241,8 +254,15 @@ pub(crate) fn flush_text(text: &mut String, blocks: &mut Vec<ContentBlock>) {
 /// call that reads it — so the projection emits it where it sits; a
 /// call already in flight cannot be steered, so a message that arrives
 /// mid-stream waits, `steer` unset, for the turn that answers it.
+///
+/// This is the second of the two write paths (issue #99), the one the
+/// `Runtime::append` seam cannot see: every message a person types goes
+/// through here, so `thread_raw` is the caller's — the counter is
+/// stepped by the same [`event_tokens`] the seam uses.
 pub(crate) fn append_queued(
+    provider: &dyn Provider,
     log: &mut aigentic_log::ThreadLog,
+    thread_raw: &mut u64,
     queued: Queued,
     observe: &mut (dyn FnMut(Signal<'_>) + Send),
     steer: bool,
@@ -258,13 +278,115 @@ pub(crate) fn append_queued(
         payload: serde_json::to_value(payload).expect("serialisable"),
         parent_event: None,
     })?;
+    *thread_raw += event_tokens(provider, &event);
     observe(Signal::Event(&event));
     Ok(())
+}
+
+/// The whole thread as a log stands, uncalibrated (issue #99): the
+/// projection of every event except the three kinds that only restate
+/// what came before, with every provider blob dropped, counted by the
+/// provider. Body only — not the prefix, not the pins, not the tool
+/// schemas — so it is the conversation itself, however much of it the
+/// window holds.
+pub(crate) fn thread_baseline(provider: &dyn Provider, log: &aigentic_log::ThreadLog) -> u64 {
+    let events: Vec<&Event> = log
+        .events()
+        .iter()
+        .filter(|e| !restates_earlier(e.kind))
+        .collect();
+    body_tokens(provider, &events)
+}
+
+/// The estimate of the message one appended event adds to the thread,
+/// counted exactly as [`thread_baseline`] counts it: the projection of
+/// that event alone, blobs dropped, read through [`counted_event`] so a
+/// queued message counts where it was typed.
+pub(crate) fn event_tokens(provider: &dyn Provider, event: &Event) -> u64 {
+    let Some(counted) = counted_event(event) else {
+        return 0;
+    };
+    // A pin lands in the prefix, not the body, and the recount of the
+    // baseline is body only — so an event that adds no body message is
+    // not thread either.
+    let single = [counted];
+    let Ok(projection) = aigentic_log::project(&single) else {
+        return 0;
+    };
+    if !projection.pinned.is_empty() || projection.body.len() != 1 {
+        debug_assert!(
+            projection.body.is_empty(),
+            "an event that adds more than one message to the body would be \
+             half-counted: {:?}",
+            single[0].kind
+        );
+        return 0;
+    }
+    // The delta, not the message: a provider's count of a context is its
+    // own, and what the thread gains is what this event adds to it.
+    body_tokens(provider, &[&single[0]]).saturating_sub(body_tokens(provider, &[]))
+}
+
+/// The event as the thread's own count reads it, or `None` when it is
+/// nothing the thread holds: a restatement (the three kinds above), a
+/// pin, a turn's end, the runner's facts.
+///
+/// One deliberate difference from `project`: a queued message's payload
+/// says `mid_turn`, and the projection's horizon rule holds it out of
+/// the body until the turn that answers it ends. The thread's size has
+/// no horizon (issue #99) — every message a person types counts where
+/// they typed it — and the projection gives that very message back when
+/// that turn ends, so the flags are cleared and the message is counted
+/// once, now.
+fn counted_event(event: &Event) -> Option<Event> {
+    let mut counted = event.clone();
+    match counted.kind {
+        EventKind::UserMessage => {
+            let mut p: UserMessagePayload = serde_json::from_value(counted.payload).ok()?;
+            p.mid_turn = false;
+            p.steer = false;
+            counted.payload = serde_json::to_value(p).ok()?;
+        }
+        kind if restates_earlier(kind) => return None,
+        _ => {}
+    }
+    Some(counted)
+}
+
+/// The three kinds that only restate what came before them (issue #99):
+/// a sweep's `context_evicted`, a batch's `results_stubbed` and a
+/// `compacted` summary. Each carries its effect in its own event — the
+/// stub boundary and `TruncateResults` alike — so counting the originals
+/// and skipping the restatement is what keeps the thread figure from
+/// falling when one is appended.
+fn restates_earlier(kind: EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::ContextEvicted | EventKind::ResultsStubbed | EventKind::Compacted
+    )
+}
+
+fn body_tokens(provider: &dyn Provider, events: &[&Event]) -> u64 {
+    let events: Vec<Event> = events.iter().map(|e| (*e).clone()).collect();
+    let Ok(projection) = aigentic_log::project(&events) else {
+        return 0;
+    };
+    let mut body = projection.body;
+    // Reasoning blobs are never part of the figure: the projection drops a
+    // closed turn's own at `turn_ended`, so counting them while a turn is
+    // open would make the baseline fall at every turn end.
+    for message in &mut body {
+        message
+            .blocks
+            .retain(|b| !matches!(b, ContentBlock::ProviderBlob(_)));
+    }
+    provider.count_tokens(&body)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aigentic_providers::estimate::estimate_tokens;
 
     /// T7 (issue #47): the wall-minus-running split. The plan's numbers:
     /// 980 s of wall over 230 s of running time is 750 s of sleep, and a
@@ -335,5 +457,210 @@ mod tests {
             slept_split(running, running, wall_waited, waited),
             (None, None)
         );
+    }
+
+    /// A provider that counts with the estimator, so a test's expected
+    /// values are the runtime's own arithmetic and never a literal.
+    struct Counter;
+
+    impl Provider for Counter {
+        fn complete(
+            &self,
+            _request: &aigentic_core::CompletionRequest<'_>,
+        ) -> std::pin::Pin<
+            Box<dyn futures_core::Stream<Item = aigentic_core::ProviderEvent> + Send + '_>,
+        > {
+            Box::pin(futures_util::stream::empty())
+        }
+        fn count_tokens(&self, context: &[Message]) -> u64 {
+            aigentic_providers::estimate::estimate_tokens(context)
+        }
+        fn capabilities(&self) -> aigentic_core::Capabilities {
+            aigentic_core::Capabilities {
+                supports_tools: true,
+                supports_images: false,
+                supports_caching: false,
+                supports_structured_output: false,
+                max_context_tokens: 1_000,
+            }
+        }
+    }
+
+    /// The running sum the two write paths keep: `event_tokens` over every
+    /// event, in order — the one rule `append` and `append_queued` share.
+    fn running_sum(provider: &dyn Provider, log: &aigentic_log::ThreadLog) -> u64 {
+        log.events().iter().map(|e| event_tokens(provider, e)).sum()
+    }
+
+    fn append(
+        log: &mut aigentic_log::ThreadLog,
+        kind: aigentic_core::EventKind,
+        payload: serde_json::Value,
+    ) -> aigentic_core::Event {
+        log.append(aigentic_log::NewEvent {
+            kind,
+            author: aigentic_core::Author::System,
+            payload,
+            parent_event: None,
+        })
+        .unwrap()
+    }
+
+    /// T1 (issue #99): a test seam on the figure. Reasoning blobs are not
+    /// thread (`counted_event` clears them), and a message the projection
+    /// holds back — one typed mid-turn that does not steer — is ahead of
+    /// the recount until the turn ends, then the two agree.
+    #[test]
+    fn the_thread_count_skips_blobs_and_double_counts_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = aigentic_log::ThreadLog::open(dir.path(), ulid::Ulid::generate()).unwrap();
+        let counter = Counter;
+        append(
+            &mut log,
+            aigentic_core::EventKind::UserMessage,
+            serde_json::to_value(aigentic_log::UserMessagePayload::new(vec![
+                ContentBlock::Text("go".into()),
+            ]))
+            .unwrap(),
+        );
+        // A reply with a reasoning blob and a tool call, then the result of
+        // the call — the message with the blob is counted as if the blob
+        // were not there, since the projection drops it at the turn's end.
+        let assistant = append(
+            &mut log,
+            aigentic_core::EventKind::AssistantMessage,
+            serde_json::to_value(aigentic_log::AssistantMessagePayload {
+                blocks: vec![
+                    ContentBlock::Text("thinking out loud".into()),
+                    ContentBlock::ProviderBlob(aigentic_core::ProviderBlob {
+                        provider: "scripted".into(),
+                        data: serde_json::json!({ "thinking": "r".repeat(4_000) }),
+                    }),
+                    ContentBlock::ToolCall(aigentic_core::ToolCall {
+                        id: "c1".into(),
+                        name: "echo".into(),
+                        args: serde_json::json!({ "msg": "x".repeat(200) }),
+                    }),
+                ],
+                usage: None,
+                finish_reason: None,
+            })
+            .unwrap(),
+        );
+        assert_eq!(
+            event_tokens(&counter, &assistant),
+            estimate_tokens(&[Message {
+                role: Role::Assistant,
+                author: Author::System,
+                blocks: vec![
+                    ContentBlock::Text("thinking out loud".into()),
+                    ContentBlock::ToolCall(aigentic_core::ToolCall {
+                        id: "c1".into(),
+                        name: "echo".into(),
+                        args: serde_json::json!({ "msg": "x".repeat(200) }),
+                    }),
+                ],
+            }]),
+            "the blob is not part of the message's count"
+        );
+        // A person's message arriving while that call's result is still
+        // pending, and not steering: the projection holds it back, the
+        // running sum counts it where it was typed.
+        let typed = append(
+            &mut log,
+            aigentic_core::EventKind::UserMessage,
+            serde_json::to_value(aigentic_log::UserMessagePayload {
+                blocks: vec![ContentBlock::Text("also do this".into())],
+                mid_turn: true,
+                steer: false,
+            })
+            .unwrap(),
+        );
+        let ahead = running_sum(&counter, &log) - thread_baseline(&counter, &log);
+        let own = event_tokens(&counter, &typed);
+        assert!(
+            ahead.abs_diff(own) <= 1,
+            "mid-call the sum is {ahead} ahead of the recount, not the message's \
+             own {own} (the ceiling can differ by one)"
+        );
+        // The turn ends: the projection gives the message back, and the two
+        // counts agree to the last rounding.
+        append(
+            &mut log,
+            aigentic_core::EventKind::ToolResult,
+            serde_json::to_value(aigentic_log::ToolResultPayload {
+                result: aigentic_core::ToolResult {
+                    id: "c1".into(),
+                    content: "echo: x".into(),
+                    is_error: false,
+                },
+                policy: None,
+            })
+            .unwrap(),
+        );
+        append(
+            &mut log,
+            aigentic_core::EventKind::TurnEnded,
+            serde_json::json!({ "reason": "done" }),
+        );
+        let sum = running_sum(&counter, &log);
+        let recounted = thread_baseline(&counter, &log);
+        assert!(
+            sum >= recounted && sum - recounted <= log.events().len() as u64,
+            "a quiet sum ({sum}) and recount ({recounted}) differ past the \
+             per-message bound"
+        );
+    }
+
+    /// T1 (issue #99): the three kinds that restate the log are the only
+    /// ones the figure skips — the spec's "add no fourth filter".
+    #[test]
+    fn only_a_restatement_is_left_out_of_the_thread_count() {
+        use aigentic_core::EventKind::*;
+        for kind in [ContextEvicted, ResultsStubbed, Compacted] {
+            assert!(restates_earlier(kind), "{kind:?} restates the log");
+        }
+        for kind in [
+            UserMessage,
+            AssistantMessage,
+            ToolResult,
+            TurnEnded,
+            Pinned,
+            ProviderRetried,
+            MemoryExtracted,
+            ThreadStarted,
+        ] {
+            assert!(!restates_earlier(kind), "{kind:?} adds to the thread");
+        }
+    }
+
+    /// T1 (issue #99): a message that steers the running turn counts the
+    /// same as one typed between turns or queued mid-turn: what the person
+    /// typed is thread however it reached the log.
+    #[test]
+    fn a_steered_message_counts_as_any_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = aigentic_log::ThreadLog::open(dir.path(), ulid::Ulid::generate()).unwrap();
+        let counter = Counter;
+        let blocks = vec![ContentBlock::Text("also check the tests".into())];
+        let counts: Vec<u64> = [(false, false), (true, false), (true, true)]
+            .into_iter()
+            .map(|(mid_turn, steer)| {
+                let event = append(
+                    &mut log,
+                    aigentic_core::EventKind::UserMessage,
+                    serde_json::to_value(aigentic_log::UserMessagePayload {
+                        blocks: blocks.clone(),
+                        mid_turn,
+                        steer,
+                    })
+                    .unwrap(),
+                );
+                event_tokens(&counter, &event)
+            })
+            .collect();
+        assert!(counts[0] > 0, "a typed message is thread");
+        assert_eq!(counts[1], counts[0], "a queued message counts the same");
+        assert_eq!(counts[2], counts[0], "a steering message counts the same");
     }
 }

@@ -72,7 +72,14 @@ impl Runtime {
         observe: &mut (dyn FnMut(Signal<'_>) + Send),
     ) -> Result<(), RuntimeError> {
         for queued in inbox.drain() {
-            append_queued(&mut self.log, queued, observe, true)?;
+            append_queued(
+                &*self.provider,
+                &mut self.log,
+                &mut self.thread_raw,
+                queued,
+                observe,
+                true,
+            )?;
         }
         Ok(())
     }
@@ -196,7 +203,14 @@ impl Runtime {
             // promised `steer` to a call that never happens, and nothing
             // below can lose it.
             for queued in std::mem::take(&mut held) {
-                append_queued(&mut self.log, queued, observe, true)?;
+                append_queued(
+                    &*self.provider,
+                    &mut self.log,
+                    &mut self.thread_raw,
+                    queued,
+                    observe,
+                    true,
+                )?;
             }
             // Compaction, at an iteration boundary only: every tool call
             // already has its result, so no summary range splits a turn.
@@ -565,7 +579,9 @@ impl Runtime {
         let out = loop {
             tokio::select! {
                 out = &mut fut => break out,
-                queued = inbox.recv() => append_queued(&mut self.log, queued, observe, true)?,
+                queued = inbox.recv() => append_queued(
+                    &*self.provider, &mut self.log, &mut self.thread_raw, queued, observe, true,
+                )?,
                 by = cancel.cancelled() => {
                     return Ok(ToolResult {
                         id,
@@ -609,7 +625,14 @@ impl Runtime {
         observe: &mut (dyn FnMut(Signal<'_>) + Send),
     ) -> Result<TurnOutcome, RuntimeError> {
         for queued in std::mem::take(held) {
-            append_queued(&mut self.log, queued, observe, false)?;
+            append_queued(
+                &*self.provider,
+                &mut self.log,
+                &mut self.thread_raw,
+                queued,
+                observe,
+                false,
+            )?;
         }
         let after_seq = self.log.len().saturating_sub(1);
         let payload = serde_json::to_value(InterruptedPayload {

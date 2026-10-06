@@ -180,6 +180,19 @@ pub fn gated(script: Vec<Vec<Step>>) -> (Box<dyn Provider>, Seen) {
     (Box::new(p), seen)
 }
 
+/// `gated`, with the estimator and reported usage (`reporting_scripted`'s
+/// count): a test can park a stream *and* watch the thread figure (issue
+/// #99), which needs a double whose count grows with the messages.
+pub fn gated_reporting(script: Vec<Vec<Step>>, k: f64) -> (Box<dyn Provider>, Seen) {
+    let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+    let p = ScriptedProvider {
+        script: Mutex::new(script.into()),
+        seen: seen.clone(),
+        count: Count::Reported(k),
+    };
+    (Box::new(p), seen)
+}
+
 impl Provider for ScriptedProvider {
     fn complete(
         &self,

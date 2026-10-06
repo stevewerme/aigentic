@@ -150,6 +150,23 @@ pub struct Runtime {
     /// `ratio · (estimate + overhead)`. Measured once per turn from the
     /// specs the turn sends, so a registry change is picked up.
     pub(crate) overhead: u64,
+    /// The whole thread, uncalibrated (issue #99): the raw estimate of the
+    /// conversation in the log, as if nothing had been stubbed, swept or
+    /// summarised. Seeded once in `new` over the log as opened, then
+    /// stepped by each later append with that message's own estimate —
+    /// through both write paths, `Runtime::append` and `append_queued`.
+    ///
+    /// The bound: at any moment with no call awaiting its result this sum
+    /// equals the full recount `thread_baseline` performs then, up to the
+    /// estimator's per-message rounding.
+    /// Mid-call it may be ahead by the messages the projection holds back
+    /// between a call and its result. It never decreases: a sweep, a batch
+    /// and a summary are skipped, and reasoning blobs are excluded from
+    /// every message, so `turn_ended` cannot shrink it either.
+    ///
+    /// Stored raw and calibrated at read time in `window_usage`, so a
+    /// ratio change re-prices the whole thread with one rounding.
+    pub(crate) thread_raw: u64,
     /// The harness's standing instructions in the prefix; off unless the
     /// builder asks, so the library's own context stays exactly what its
     /// caller put in.
@@ -196,6 +213,10 @@ impl Runtime {
         log: ThreadLog,
         agent: AgentId,
     ) -> Self {
+        // The thread figure is seeded once, here, over the log as opened:
+        // this is the only constructor of a `Runtime` from a log. Every
+        // later append steps it (issue #99).
+        let thread_raw = crate::support::thread_baseline(&*provider, &log);
         Self {
             provider,
             registry,
@@ -221,6 +242,7 @@ impl Runtime {
             measured: None,
             ratio: 1.0,
             overhead: 0,
+            thread_raw,
             harness_instructions: None,
             projects: None,
             utility: None,
@@ -762,11 +784,15 @@ impl Runtime {
 
     /// The window fill for `context`, against the ceiling the client
     /// shows: compaction's line, not the provider's full length (the
-    /// number that matters since #30 — how close compaction is).
+    /// number that matters since #30 — how close compaction is) — plus
+    /// the whole thread (issue #99).
     pub fn window_usage(&self, context: &[Message]) -> WindowUsage {
         WindowUsage {
             tokens_in_window: self.fill(context),
             window: self.window_line(),
+            // Priced from the stored raw sum at read time, so a ratio
+            // change re-prices the whole thread with one rounding.
+            thread_tokens: crate::evict::calibrated_delta(self.thread_raw, self.ratio),
         }
     }
 
@@ -813,6 +839,15 @@ impl Runtime {
 
     pub fn log(&self) -> &ThreadLog {
         &self.log
+    }
+
+    /// A full recount of the thread figure, uncalibrated (issue #99): the
+    /// seeded baseline recomputed over the log as it stands now. Doc
+    /// hidden — it exists so a test can hold the running sum against the
+    /// definition it maintains, not as an API.
+    #[doc(hidden)]
+    pub fn raw_thread_tokens(&self) -> u64 {
+        crate::support::thread_baseline(&*self.provider, &self.log)
     }
 
     /// Whether the log's last event is a `turn_ended` with reason
@@ -917,8 +952,26 @@ impl std::fmt::Debug for ProjectContext {
 /// the ceiling a client shows, not the provider's raw length).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WindowUsage {
+    /// What the model sees this call: the fill of the window the context
+    /// has to fit in.
     pub tokens_in_window: u64,
+    /// Compaction's line, the ceiling `tokens_in_window` is against.
     pub window: u64,
+    /// The whole thread (issue #99): the raw estimate of everything the
+    /// log holds, as if nothing had been stubbed, swept or summarised,
+    /// calibrated by the estimator's `ratio`. "How big the conversation
+    /// really is", where `tokens_in_window` is "what the model sees".
+    ///
+    /// With no call awaiting its result it equals a full recount of the
+    /// thread; while a call is in flight it may be ahead by the messages
+    /// the projection holds back between that call and its result. It
+    /// never decreases — a sweep, a batch, a summary and a `turn_ended`'s
+    /// dropped reasoning all leave it alone.
+    ///
+    /// A short thread can report `tokens_in_window` (the prefix, the tool
+    /// schemas and the projection are all in it) larger than this: it is
+    /// information, not a warning.
+    pub thread_tokens: u64,
 }
 
 /// The `turn_ended` reason when a participant interrupted the turn; an
