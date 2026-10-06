@@ -236,9 +236,15 @@ fn project_infos(config: &ServerConfig, threads: &ThreadTable, user: &str) -> Ve
 /// The project a request is about, for the role check.
 fn project_for(threads: &ThreadTable, request: &Request) -> Option<String> {
     match request {
-        Request::ListThreads { project }
+        Request::ListThreads {
+            project: Some(project),
+        }
         | Request::CreateThread { project }
         | Request::Build { project, .. } => Some(project.clone()),
+        // Listed across projects (issue #86): there is no one project
+        // to check, so the handler judges each row's project. The arm
+        // keeps this match exhaustive.
+        Request::ListThreads { project: None } => None,
         // A checkpoint is answered in the project its run works in.
         Request::AnswerCheckpoint { lead, .. } => threads.project_of(*lead),
         Request::Open { thread, .. }
@@ -547,10 +553,28 @@ async fn handle(
         Request::ListProjects => Response::Projects {
             projects: project_infos(config, threads, user),
         },
-        Request::ListThreads { project } => match threads.list(&project) {
-            Ok(list) => Response::Threads { threads: list },
-            Err(e) => thread_error(e),
-        },
+        Request::ListThreads { project } => {
+            // A listing reads and parses a log per row — a whole tree
+            // of them with no project (issue #86) — so it runs off the
+            // session's async worker. The role rule is asked inside,
+            // against the same table: one rule, never a copy.
+            let table = Arc::clone(threads);
+            let config = Arc::clone(config);
+            let user = user.to_owned();
+            let listed = tokio::task::spawn_blocking(move || {
+                table.list(project.as_deref(), &user, |q| {
+                    role_in_project(&config, &table, q, &user).is_some()
+                })
+            })
+            .await;
+            match listed {
+                Ok(Ok(list)) => Response::Threads { threads: list },
+                Ok(Err(e)) => thread_error(e),
+                Err(e) => Response::Refused {
+                    reason: format!("the listing failed: {e}"),
+                },
+            }
+        }
         Request::CreateThread { project } => {
             match threads.create(&project, author.clone(), false).await {
                 Ok(info) => Response::Thread { thread: info },

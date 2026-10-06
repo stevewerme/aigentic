@@ -764,7 +764,7 @@ async fn t6_listings_and_counts_follow_the_log() {
     let holds = |threads: &[aigentic_api::ThreadInfo], id: Ulid| threads.iter().any(|t| t.id == id);
     let Response::Threads { threads } = steve
         .request(Request::ListThreads {
-            project: "p".into(),
+            project: Some("p".into()),
         })
         .await
         .unwrap()
@@ -776,7 +776,7 @@ async fn t6_listings_and_counts_follow_the_log() {
 
     let Response::Threads { threads } = steve
         .request(Request::ListThreads {
-            project: "q".into(),
+            project: Some("q".into()),
         })
         .await
         .unwrap()
@@ -837,7 +837,7 @@ async fn a_thread_made_behind_the_daemon_is_listed_and_counted() {
 
     let Response::Threads { threads } = steve
         .request(Request::ListThreads {
-            project: "p".into(),
+            project: Some("p".into()),
         })
         .await
         .unwrap()
@@ -850,7 +850,7 @@ async fn a_thread_made_behind_the_daemon_is_listed_and_counted() {
 
     let Response::Threads { threads } = steve
         .request(Request::ListThreads {
-            project: "q".into(),
+            project: Some("q".into()),
         })
         .await
         .unwrap()

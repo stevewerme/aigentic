@@ -200,7 +200,7 @@ async fn roles_are_checked_before_the_log_and_thread_started_comes_first() {
     assert!(matches!(
         reviewer
             .request(Request::ListThreads {
-                project: "p".into()
+                project: Some("p".into())
             })
             .await
             .unwrap(),
@@ -272,7 +272,7 @@ async fn roles_are_checked_before_the_log_and_thread_started_comes_first() {
     assert!(matches!(r, Response::Refused { .. }), "{r:?}");
     let r = magnus
         .request(Request::ListThreads {
-            project: "zzz".into(),
+            project: Some("zzz".into()),
         })
         .await
         .unwrap();
@@ -280,7 +280,7 @@ async fn roles_are_checked_before_the_log_and_thread_started_comes_first() {
     // Listed under its project once created.
     let Response::Threads { threads } = magnus
         .request(Request::ListThreads {
-            project: "p".into(),
+            project: Some("p".into()),
         })
         .await
         .unwrap()

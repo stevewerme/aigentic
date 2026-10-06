@@ -644,7 +644,9 @@ impl ClientRepl {
                     .project
                     .clone()
                     .unwrap_or_else(|| self.home_project.clone());
-                let r = self.request(Request::ListThreads { project }).await;
+                let r = self.request(Request::ListThreads {
+                    project: Some(project),
+                }).await;
                 self.show(r, "", out);
             }
             Command::Pin(text) => {
@@ -2134,7 +2136,7 @@ pub fn render_thread_infos(threads: &[aigentic_api::ThreadInfo]) -> String {
 pub async fn list_threads_over(client: &Client, project: &str) -> anyhow::Result<String> {
     match client
         .request(Request::ListThreads {
-            project: project.to_owned(),
+            project: Some(project.to_owned()),
         })
         .await?
     {
@@ -2151,7 +2153,7 @@ pub async fn list_threads_over(client: &Client, project: &str) -> anyhow::Result
 pub async fn project_report_over(client: &Client, project: &str) -> anyhow::Result<String> {
     let newest = match client
         .request(Request::ListThreads {
-            project: project.to_owned(),
+            project: Some(project.to_owned()),
         })
         .await?
     {
@@ -5437,7 +5439,7 @@ mod tests {
         assert_eq!(mode, "auto");
         let Response::Threads { threads } = second
             .request(Request::ListThreads {
-                project: "a".into(),
+                project: Some("a".into()),
             })
             .await
             .unwrap()
@@ -5593,6 +5595,8 @@ mod tests {
             first_line: String::new(),
             state: ThreadState::Idle,
             title: None,
+            workspace: None,
+            kind: aigentic_api::ThreadKind::Thread,
         };
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();

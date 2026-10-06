@@ -11,7 +11,8 @@ use std::time::Duration;
 
 use aigentic_api::client::{Addr, Client};
 use aigentic_api::{
-    FrontOutcome, Notice, PROTOCOL_VERSION, Request, Response, SwitchReply, ThreadState,
+    FrontOutcome, Notice, PROTOCOL_VERSION, Request, Response, RunThread, SwitchReply, ThreadInfo,
+    ThreadKind, ThreadState,
 };
 use aigentic_runtime::aigentic_core::{
     Author, Capabilities, CompletionRequest, ContentBlock, EventKind, Message, Provider,
@@ -418,6 +419,51 @@ fn append_run_started(log: &mut ThreadLog, issue: u64) {
     .unwrap();
 }
 
+/// A hand-written `thread_started` for a step child of `lead`: the
+/// parent makes the index call the log a run's child.
+#[allow(clippy::too_many_arguments)]
+fn append_child_started(
+    log: &mut ThreadLog,
+    project: Option<&str>,
+    root: &Path,
+    lead: Ulid,
+    step: &str,
+) {
+    log.append(NewEvent {
+        kind: EventKind::ThreadStarted,
+        author: Author::System,
+        payload: to_value(ThreadStartedPayload {
+            project: project.map(str::to_owned),
+            root: root.to_path_buf(),
+            created_by: Author::System,
+            parent_thread: Some(lead),
+            step: Some(step.to_owned()),
+            front: false,
+        })
+        .unwrap(),
+        parent_event: None,
+    })
+    .unwrap();
+}
+
+/// A hand-written `project_switched`, the other half of a thread's
+/// project: `to` is where it lives now.
+fn append_switch(log: &mut ThreadLog, to: &str, root: &Path) {
+    log.append(NewEvent {
+        kind: EventKind::ProjectSwitched,
+        author: Author::System,
+        payload: to_value(aigentic_runtime::aigentic_log::ProjectSwitchedPayload {
+            from: None,
+            to: Some(to.to_owned()),
+            root: root.to_path_buf(),
+            workspace: None,
+        })
+        .unwrap(),
+        parent_event: None,
+    })
+    .unwrap();
+}
+
 /// The owner's connection, for looking at what a refused user left
 /// behind.
 async fn steve(daemon: &Daemon) -> Client {
@@ -490,7 +536,7 @@ fn answered_of(base: &Path, id: Ulid) -> Vec<DecisionAnsweredPayload> {
 async fn listed(client: &mut Client, project_name: &str) -> Vec<Ulid> {
     match client
         .request(Request::ListThreads {
-            project: project_name.into(),
+            project: Some(project_name.into()),
         })
         .await
         .unwrap()
@@ -715,7 +761,7 @@ async fn t9a_losing_the_role_in_the_front_threads_project_replaces_it() {
     let reason = refusal(
         &mut cara,
         Request::ListThreads {
-            project: "p".into(),
+            project: Some("p".into()),
         },
     )
     .await;
@@ -2181,5 +2227,372 @@ async fn t5_c_a_hand_switch_withdraws_the_proposal() {
         "the withdrawal put the guard up, so bringing it down is the thing \
          under test: {:?}",
         guard.calls()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T4–T6 (issue #86): one listing across every project the caller can read
+// ---------------------------------------------------------------------------
+
+/// The listing with no project: every thread the caller can read, in the
+/// order `/threads` will show them.
+async fn across(client: &mut Client) -> Vec<ThreadInfo> {
+    match client
+        .request(Request::ListThreads { project: None })
+        .await
+        .unwrap()
+    {
+        Response::Threads { threads } => threads,
+        other => panic!("a cross-project listing: {other:?}"),
+    }
+}
+
+/// Newest first, the index's order: the ULID is the creation.
+fn newest_first(ids: &[Ulid]) -> Vec<Ulid> {
+    let mut ids = ids.to_vec();
+    ids.sort_unstable_by(|a, b| b.cmp(a));
+    ids
+}
+
+/// T4 — `None` lists every project the caller can read, and only those:
+/// the caller's front thread, then the builds, then the rest newest
+/// first.
+#[tokio::test]
+async fn t86_t4_a_listing_across_projects_through_a_daemon() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = project(
+        dir.path(),
+        "p",
+        "[participants]\nsteve = \"read\"\nanna = \"write\"\n",
+    );
+    let q = project(
+        dir.path(),
+        "q",
+        "[participants]\nsteve = \"write\"\nanna = \"write\"\n",
+    );
+    let r = project(dir.path(), "r", "[participants]\nanna = \"write\"\n");
+    let base = dir.path().join("threads");
+    // Hand-made ids, so the fixture's order does not depend on how fast
+    // the test runs; all of them are older than any thread the daemon
+    // makes below.
+    let mk = |n: u64| Ulid::from_parts(1_000 + n, 0);
+    let plain_p = mk(1);
+    let lead = mk(2);
+    let child = mk(3);
+    let switched_in = mk(4);
+    let switched_out = mk(5);
+    let annas_front = mk(6);
+
+    let mut log = hand_log(&base, plain_p);
+    append_started(&mut log, Some("p"), &p, "anna", false);
+    drop(log);
+
+    // A build in `q`: its lead, and the step child it leads.
+    let mut log = hand_log(&base, lead);
+    append_started(&mut log, Some("q"), &q, "steve", false);
+    append_run_started(&mut log, 86);
+    drop(log);
+    let mut log = hand_log(&base, child);
+    append_child_started(&mut log, Some("q"), &q, lead, "implement");
+    drop(log);
+
+    // Switched into `p` from a project he cannot read: listed, under `p`.
+    let mut log = hand_log(&base, switched_in);
+    append_started(&mut log, Some("r"), &r, "anna", false);
+    append_switch(&mut log, "p", &p);
+    drop(log);
+
+    // Switched the other way: out of his reach, so not listed at all.
+    let mut log = hand_log(&base, switched_out);
+    append_started(&mut log, Some("p"), &p, "anna", false);
+    append_switch(&mut log, "r", &r);
+    drop(log);
+
+    // Another person's front thread: for steve it is an ordinary row.
+    let mut log = hand_log(&base, annas_front);
+    append_started(&mut log, Some("q"), &q, "anna", true);
+    drop(log);
+
+    let daemon = Daemon::new(
+        dir.path(),
+        vec![pc("p", &p), pc("q", &q), pc("r", &r)],
+        &["steve", "anna"],
+        false,
+    )
+    .await;
+    let mut steve_client = daemon.connect("steve").await;
+    let (front_row, _) = front(&mut steve_client, "q").await;
+
+    let rows = across(&mut steve_client).await;
+    let ids: Vec<Ulid> = rows.iter().map(|r| r.id).collect();
+
+    assert!(
+        !ids.contains(&switched_out) && !rows.iter().any(|r| r.project.as_deref() == Some("r")),
+        "nothing from a project he cannot read: {rows:?}"
+    );
+    assert!(
+        rows.iter().all(|r| r.project.is_some()),
+        "every listed row has a project: {rows:?}"
+    );
+    assert_eq!(
+        rows.iter()
+            .find(|r| r.id == switched_in)
+            .unwrap()
+            .project
+            .as_deref(),
+        Some("p"),
+        "a switched thread is in its current project"
+    );
+
+    // The order, from the fixture: his front thread, the lead and the
+    // child it leads, then the plain rows newest first.
+    let mut expected = vec![front_row, lead, child];
+    expected.extend(newest_first(&[plain_p, switched_in, annas_front]));
+    assert_eq!(ids, expected, "{rows:?}");
+
+    assert_eq!(rows[0].kind, ThreadKind::Front);
+    assert_eq!(rows[1].kind, ThreadKind::Run(RunThread::Lead { issue: 86 }));
+    assert_eq!(
+        rows[2].kind,
+        ThreadKind::Run(RunThread::Child {
+            lead,
+            step: Some("implement".into()),
+        })
+    );
+    assert_eq!(
+        rows.iter().find(|r| r.id == annas_front).unwrap().kind,
+        ThreadKind::Thread,
+        "another person's front thread is not steve's"
+    );
+    assert!(
+        rows.iter()
+            .filter(|r| r.kind == ThreadKind::Front)
+            .all(|r| r.id == front_row),
+        "one front row, his own: {rows:?}"
+    );
+}
+
+/// T5a — a user with no role anywhere is listed nothing, and a user who
+/// reads one project sees exactly that project.
+#[tokio::test]
+async fn t86_t5a_users_without_a_role_see_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = project(
+        dir.path(),
+        "p",
+        "[participants]\nsteve = \"write\"\nreada = \"read\"\n",
+    );
+    let q = project(dir.path(), "q", "[participants]\nsteve = \"write\"\n");
+    let base = dir.path().join("threads");
+    let in_p = Ulid::from_parts(1_000, 0);
+    let in_q = Ulid::from_parts(1_001, 0);
+    let mut log = hand_log(&base, in_p);
+    append_started(&mut log, Some("p"), &p, "steve", false);
+    drop(log);
+    let mut log = hand_log(&base, in_q);
+    append_started(&mut log, Some("q"), &q, "steve", false);
+    drop(log);
+
+    let daemon = Daemon::new(
+        dir.path(),
+        vec![pc("p", &p), pc("q", &q)],
+        &["steve", "reada", "maggie"],
+        false,
+    )
+    .await;
+
+    // No role anywhere: nothing across projects, and one project refuses.
+    let mut maggie = daemon.connect("maggie").await;
+    assert!(across(&mut maggie).await.is_empty());
+    let reason = refusal(
+        &mut maggie,
+        Request::ListThreads {
+            project: Some("p".into()),
+        },
+    )
+    .await;
+    assert!(reason.contains("role"), "{reason}");
+
+    // A reader in `p` alone: exactly `p`'s threads, in both shapes.
+    let mut reada = daemon.connect("reada").await;
+    assert_eq!(
+        across(&mut reada)
+            .await
+            .iter()
+            .map(|r| r.id)
+            .collect::<Vec<_>>(),
+        vec![in_p]
+    );
+    assert_eq!(listed(&mut reada, "p").await, vec![in_p]);
+}
+
+/// T5b — a thread with no project is never listed, whoever asks: a
+/// pre-phase-4 log and a `_none` thread whose name another project
+/// holds at a different root.
+#[tokio::test]
+async fn t86_t5b_threads_with_no_project_are_never_listed() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = project(dir.path(), "p", "[participants]\nsteve = \"write\"\n");
+    // A project named `p` at another root: the clashing `_none` thread's
+    // home is not this daemon's `p`, so `project_of` cannot place it.
+    let elsewhere = tempfile::tempdir().unwrap();
+    let other_p = project(elsewhere.path(), "p", "");
+    let base = dir.path().join("threads");
+    let in_p = Ulid::from_parts(1_000, 0);
+    let pre_phase_4 = Ulid::from_parts(1_001, 0);
+    let clash = Ulid::from_parts(1_002, 0);
+
+    let mut log = hand_log(&base, in_p);
+    append_started(&mut log, Some("p"), &p, "steve", false);
+    drop(log);
+    // A pre-phase-4 log: a user message and nothing else.
+    let mut log = hand_log(&base, pre_phase_4);
+    log.append(NewEvent {
+        kind: EventKind::UserMessage,
+        author: Author::User(UserId("steve".into())),
+        payload: to_value(aigentic_runtime::aigentic_log::UserMessagePayload::new(
+            vec![ContentBlock::Text("hello".into())],
+        ))
+        .unwrap(),
+        parent_event: None,
+    })
+    .unwrap();
+    drop(log);
+    let mut log = hand_log(&base, clash);
+    append_started(&mut log, Some("_none"), &other_p, "steve", false);
+    drop(log);
+
+    let daemon = Daemon::new(dir.path(), vec![pc("p", &p)], &["steve"], false).await;
+    let mut steve_client = daemon.connect("steve").await;
+    assert_eq!(
+        daemon.threads().project_of(pre_phase_4),
+        None,
+        "the pre-phase-4 log has no project"
+    );
+    assert_eq!(
+        daemon.threads().project_of(clash),
+        None,
+        "the `_none` clash"
+    );
+
+    let ids: Vec<Ulid> = across(&mut steve_client)
+        .await
+        .iter()
+        .map(|r| r.id)
+        .collect();
+    assert_eq!(ids, vec![in_p], "neither unplaceable log is listed");
+}
+
+/// T5c — a front thread in a project whose role the caller has lost is
+/// not listed, and gives no `Front` row: `Front` replaces it, and the
+/// listing must not resurrect it.
+#[tokio::test]
+async fn t86_t5c_a_lost_role_leaves_no_front_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = project(dir.path(), "p", "[participants]\nsteve = \"write\"\n");
+    let q = project(dir.path(), "q", "[participants]\nsteve = \"write\"\n");
+    let base = dir.path().join("threads");
+    let in_q = Ulid::from_parts(1_000, 0);
+    let mut log = hand_log(&base, in_q);
+    append_started(&mut log, Some("q"), &q, "steve", false);
+    drop(log);
+
+    let daemon = Daemon::new(
+        dir.path(),
+        vec![pc("p", &p), pc("q", &q)],
+        &["steve"],
+        false,
+    )
+    .await;
+    let mut steve_client = daemon.connect("steve").await;
+    let (front_row, _) = front(&mut steve_client, "p").await;
+    // The file is edited under him: no role in `p` any more. It keeps a
+    // participant, or `p` would fall back to "the owner has a role".
+    participants(dir.path(), "p", "[participants]\nanna = \"write\"\n");
+
+    let rows = across(&mut steve_client).await;
+    assert!(
+        !rows.iter().any(|r| r.id == front_row),
+        "his old front thread is out of his sight: {rows:?}"
+    );
+    assert!(
+        rows.iter().all(|r| r.kind != ThreadKind::Front),
+        "and no row claims to be his front thread: {rows:?}"
+    );
+    assert_eq!(
+        rows.iter().map(|r| r.id).collect::<Vec<_>>(),
+        vec![in_q],
+        "the thread in the project he still writes in"
+    );
+}
+
+/// T6 — the workspace names group rows: the projects it names carry its
+/// name and sit together, and a project outside it is in the `None`
+/// group. The file is written before the daemon, because workspaces
+/// load once, at construction.
+#[tokio::test]
+async fn t86_t6_workspace_names_group_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = project(dir.path(), "p", "[participants]\nsteve = \"write\"\n");
+    let q = project(dir.path(), "q", "[participants]\nsteve = \"write\"\n");
+    let s = project(dir.path(), "s", "[participants]\nsteve = \"read\"\n");
+    let name = "w";
+    workspace_naming(dir.path(), name, &[&p, &q]);
+    let base = dir.path().join("threads");
+    let in_p = Ulid::from_parts(1_000, 0);
+    let in_q = Ulid::from_parts(1_001, 0);
+    let outside = Ulid::from_parts(1_002, 0);
+    for (id, project_name, root) in [(&in_p, "p", &p), (&in_q, "q", &q), (&outside, "s", &s)] {
+        let mut log = hand_log(&base, *id);
+        append_started(&mut log, Some(project_name), root, "steve", false);
+        drop(log);
+    }
+
+    let daemon = Daemon::new(
+        dir.path(),
+        vec![pc("p", &p), pc("q", &q), pc("s", &s)],
+        &["steve"],
+        false,
+    )
+    .await;
+    let mut steve_client = daemon.connect("steve").await;
+    let rows = across(&mut steve_client).await;
+
+    for row in &rows {
+        if row.project.as_deref() == Some("s") {
+            assert_eq!(row.workspace, None, "outside the workspace");
+        } else {
+            assert_eq!(row.workspace.as_deref(), Some(name));
+        }
+    }
+    // The group `w` is one run of rows, newest first, and so is the
+    // group of no workspace; the groups go by their newest row, newest
+    // first, so `in_p` and `in_q` stay adjacent.
+    let w_group = newest_first(&[in_p, in_q]);
+    let none_group = vec![outside];
+    let mut groups = [w_group, none_group];
+    groups.sort_by(|a, b| b[0].cmp(&a[0]));
+    let expected: Vec<Ulid> = groups.concat();
+    let ids: Vec<Ulid> = rows.iter().map(|r| r.id).collect();
+    assert_eq!(ids, expected, "{rows:?}");
+
+    // T7's new assertion: the `Some(p)` listing fills `kind` and
+    // `workspace` too.
+    let one_project = listed(&mut steve_client, "p").await;
+    assert_eq!(one_project, vec![in_p]);
+    let rows = match steve_client
+        .request(Request::ListThreads {
+            project: Some("p".into()),
+        })
+        .await
+        .unwrap()
+    {
+        Response::Threads { threads } => threads,
+        other => panic!("a listing: {other:?}"),
+    };
+    assert!(
+        rows.iter()
+            .all(|r| r.kind == ThreadKind::Thread && r.workspace.as_deref() == Some(name)),
+        "{rows:?}"
     );
 }

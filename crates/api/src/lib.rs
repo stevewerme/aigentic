@@ -19,8 +19,9 @@ use ulid::Ulid;
 /// version 3 adds `AnswerSwitch` and `ThreadState::AwaitingSwitch`
 /// (issue #7), so a version-2 client is refused rather than left never
 /// seeing the switch it is asked to answer; version 4 adds
-/// `Front`/`NewFront` and `Response::Front` (issue #84).
-pub const PROTOCOL_VERSION: u32 = 4;
+/// `Front`/`NewFront` and `Response::Front` (issue #84); version 5 lets
+/// `ListThreads` omit its project (issue #86).
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// One line on the wire.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -75,8 +76,14 @@ pub enum Request {
         token: String,
     },
     ListProjects,
+    /// Every thread of `project`, or — with no project (issue #86) —
+    /// every thread of every project the caller holds a role in, the
+    /// caller's front thread first, then each run's threads, then the
+    /// rest grouped by workspace. The daemon judges the roles of a
+    /// project-less listing per project.
     ListThreads {
-        project: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project: Option<String>,
     },
     CreateThread {
         project: String,
@@ -415,6 +422,19 @@ pub enum RunThread {
     },
 }
 
+/// What a listing row is (issue #86), so a client can draw the groups
+/// without asking again. A row is the caller's own front thread, a
+/// thread a run owns, or an ordinary one; another person's front thread
+/// is an ordinary one.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadKind {
+    #[default]
+    Thread,
+    Front,
+    Run(RunThread),
+}
+
 /// Where a thread is, for the state line and the listings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -516,6 +536,14 @@ pub struct ThreadInfo {
     /// The last `thread_renamed` title; absent before phase 6.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// The workspace naming this row's project (issue #86): absent when
+    /// no workspace names it, so a client groups by the `None` group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    /// What this row is (issue #86). A version-4 row has no `kind` and
+    /// decodes as an ordinary thread.
+    #[serde(default)]
+    pub kind: ThreadKind,
 }
 
 /// A line that could not be read.
@@ -588,6 +616,8 @@ mod tests {
             first_line: "What's next?".into(),
             state: ThreadState::Idle,
             title: None,
+            workspace: None,
+            kind: ThreadKind::Thread,
         }
     }
 
@@ -599,8 +629,11 @@ mod tests {
             },
             Request::ListProjects,
             Request::ListThreads {
-                project: "p".into(),
+                project: Some("p".into()),
             },
+            // Issue #86: no project means every project the caller may
+            // read, so the frame carries none.
+            Request::ListThreads { project: None },
             Request::CreateThread {
                 project: "p".into(),
             },
@@ -844,10 +877,10 @@ mod tests {
     }
 
     /// T2 (issue #84): the front thread's requests and reply are on the
-    /// wire at protocol 4, and the outcome is tagged by kind.
+    /// wire and the outcome is tagged by kind. The protocol's number is
+    /// pinned by T1 (issue #86), which raised it to 5.
     #[test]
-    fn the_front_requests_and_their_reply_are_at_protocol_four() {
-        assert_eq!(PROTOCOL_VERSION, 4);
+    fn the_front_requests_and_their_reply_are_on_the_wire() {
         let line = encode(&Frame::request(
             1,
             Request::Front {
@@ -933,6 +966,98 @@ mod tests {
                 here: None,
             })
         );
+    }
+
+    /// T1 (issue #86): `ListThreads` may omit its project, at protocol 5.
+    /// A frame with a project round-trips and carries it; one without is
+    /// serialised with no `project` key at all, and an old client's frame
+    /// (which always named one) still decodes.
+    #[test]
+    fn t1_list_threads_project_is_optional_on_the_wire() {
+        assert_eq!(PROTOCOL_VERSION, 5);
+        let some = Frame::request(
+            1,
+            Request::ListThreads {
+                project: Some("p".into()),
+            },
+        );
+        let line = encode(&some);
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["request"]["kind"], "list_threads");
+        assert_eq!(v["request"]["project"], "p");
+        assert_eq!(decode(&line).unwrap(), some, "{line}");
+
+        let none = Frame::request(2, Request::ListThreads { project: None });
+        let line = encode(&none);
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["request"]["kind"], "list_threads");
+        assert!(v["request"].get("project").is_none(), "{line}");
+        assert_eq!(decode(&line).unwrap(), none, "{line}");
+
+        // A version-4 client's frame, which always named a project.
+        let old = decode(r#"{"id":3,"request":{"kind":"list_threads","project":"p"}}"#).unwrap();
+        assert_eq!(
+            old.body,
+            Body::Request(Request::ListThreads {
+                project: Some("p".into()),
+            })
+        );
+    }
+
+    /// T1 (issue #86): a version-4 row, with no `workspace` and no
+    /// `kind`, decodes with `None` and an ordinary thread.
+    #[test]
+    fn t1_a_version_four_thread_row_decodes_with_defaults() {
+        let line = format!(
+            r#"{{"id":"{}","project":"p","date":"2026-09-22","events":9,"first_line":"What's next?","state":{{"state":"idle"}}}}"#,
+            thread()
+        );
+        let row: ThreadInfo = serde_json::from_str(&line).unwrap();
+        assert_eq!(row.workspace, None);
+        assert_eq!(row.kind, ThreadKind::Thread);
+        assert_eq!(row.id, thread());
+        assert_eq!(row.project.as_deref(), Some("p"));
+    }
+
+    /// T1 (issue #86): the three kinds' JSON, pinned. `Run` carries the
+    /// run's thread shapes, `Front` and `Thread` are plain strings, and a
+    /// row of each round-trips.
+    #[test]
+    fn t1_thread_kinds_on_the_wire() {
+        let lead = RunThread::Lead { issue: 86 };
+        let child = RunThread::Child {
+            lead: thread(),
+            step: Some("implement".into()),
+        };
+        for (kind, json) in [
+            (ThreadKind::Thread, serde_json::json!("thread")),
+            (ThreadKind::Front, serde_json::json!("front")),
+            (
+                ThreadKind::Run(lead.clone()),
+                serde_json::json!({"run": {"lead": {"issue": 86}}}),
+            ),
+            (
+                ThreadKind::Run(child.clone()),
+                serde_json::json!({"run": {"child": {"lead": thread().to_string(), "step": "implement"}}}),
+            ),
+        ] {
+            let value = serde_json::to_value(&kind).unwrap();
+            assert_eq!(value, json);
+            let back: ThreadKind = serde_json::from_value(json.clone()).unwrap();
+            assert_eq!(back, kind, "{json}");
+        }
+        // A row carrying one, through a whole frame.
+        let row = ThreadInfo {
+            kind: ThreadKind::Run(lead),
+            workspace: Some("w".into()),
+            ..info()
+        };
+        let frame = Frame::response(1, Response::Thread { thread: row });
+        let line = encode(&frame);
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["response"]["thread"]["kind"]["run"]["lead"]["issue"], 86);
+        assert_eq!(v["response"]["thread"]["workspace"], "w");
+        assert_eq!(decode(&line).unwrap(), frame, "{line}");
     }
 
     #[test]

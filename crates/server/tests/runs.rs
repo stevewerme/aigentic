@@ -1884,7 +1884,12 @@ async fn t9_build_and_answering_need_approve() {
         );
     }
     assert!(
-        daemon.server.threads.list("p").unwrap().is_empty(),
+        daemon
+            .server
+            .threads
+            .list(Some("p"), "steve", |_| true)
+            .unwrap()
+            .is_empty(),
         "no lead was created for a refused build"
     );
 

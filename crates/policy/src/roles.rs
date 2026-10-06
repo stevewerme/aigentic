@@ -111,10 +111,12 @@ pub fn needs(request: &Request) -> Option<Role> {
         // thread's project to resume, `write` in the requested project
         // to create.
         Request::Front { .. } => None,
-        Request::ListThreads { .. }
-        | Request::Open { .. }
-        | Request::Close { .. }
-        | Request::Report { .. } => Some(Role::Read),
+        // The `ListThreads` handler judges it (issue #86), per project:
+        // a named project needs `read` in it, while a listing with none
+        // is filtered to the projects the caller holds a role in.
+        Request::ListThreads { project: None } => None,
+        Request::ListThreads { project: Some(_) } => Some(Role::Read),
+        Request::Open { .. } | Request::Close { .. } | Request::Report { .. } => Some(Role::Read),
         Request::CreateThread { .. }
         | Request::NewFront { .. }
         | Request::Post { .. }
@@ -204,17 +206,21 @@ mod tests {
                 },
                 None,
             ),
+            // T2 (issue #86): a listing that names a project needs
+            // `read` in it; one that names none is judged by the
+            // handler, per project.
+            (
+                Request::ListThreads {
+                    project: Some("p".into()),
+                },
+                Some(Role::Read),
+            ),
+            (Request::ListThreads { project: None }, None),
             (
                 Request::NewFront {
                     project: "p".into(),
                 },
                 Some(Role::Write),
-            ),
-            (
-                Request::ListThreads {
-                    project: "p".into(),
-                },
-                Some(Role::Read),
             ),
             (
                 Request::Open {

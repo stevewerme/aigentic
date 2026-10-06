@@ -466,6 +466,8 @@ mod tests {
             first_line: first_line.into(),
             state: aigentic_api::ThreadState::Idle,
             title: title.map(str::to_owned),
+            workspace: None,
+            kind: aigentic_api::ThreadKind::Thread,
         }
     }
 

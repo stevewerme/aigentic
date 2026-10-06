@@ -2,13 +2,13 @@
 //! use, unloaded after an idle period with no open sessions and nothing
 //! waited for. The log is the state, so unloading loses nothing.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use aigentic_api::{CheckpointAnswer, Notice, ReportKind, ThreadInfo, ThreadState};
+use aigentic_api::{CheckpointAnswer, Notice, ReportKind, ThreadInfo, ThreadKind, ThreadState};
 use aigentic_runtime::ProjectFile;
 use aigentic_runtime::aigentic_core::{Author, ContentBlock, Event, EventKind, UserId};
 use aigentic_runtime::aigentic_log::{
@@ -628,31 +628,90 @@ impl ThreadTable {
     }
 
     /// Every thread of a project, newest first, with the state of the
-    /// ones that are open. From the index (issue #9): the ids whose
-    /// project is `project`, summarised from wherever their log lives.
-    pub fn list(&self, project: &str) -> Result<Vec<ThreadInfo>, ThreadError> {
-        // The project has to be one this daemon knows, as before.
-        self.root_of(project)?;
+    /// ones that are open — or, with no project (issue #86), every
+    /// thread of every project `readable` allows, in the order
+    /// `/threads` shows: the caller's front thread first, then the
+    /// builds, then everything else grouped by workspace.
+    ///
+    /// `readable` is the caller's one role rule (`role_in_project`, in
+    /// the session), asked per project: never a copy of it here. A
+    /// thread with no project at all — a pre-phase-4 log, or an
+    /// unplaceable `_none` one — has nothing to judge, so `None` never
+    /// lists it.
+    pub fn list(
+        &self,
+        project: Option<&str>,
+        user: &str,
+        readable: impl Fn(&str) -> bool,
+    ) -> Result<Vec<ThreadInfo>, ThreadError> {
+        // The caller's front thread (issue #84), asked once: `Front` on
+        // exactly that row.
+        let front = self.latest_front(user);
         // The index plus what is on disk: a thread another daemon made
         // since this one started is listed too (#9 review).
         let mut ids = self.known_ids();
-        ids.retain(|id| self.project_of(*id).as_deref() == Some(project));
-        ids.sort_unstable_by(|a, b| b.cmp(a));
-        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(ids
-            .into_iter()
-            .map(|id| {
-                let dir = self.dir_of(id).unwrap_or_else(|| self.threads_base.clone());
-                let mut info = summarise(&dir, id, project);
-                if entries.contains_key(&id) {
-                    // Open: the actor knows the live state; the session
-                    // asks it on Open. Listings show it as idle unless
-                    // asked, which is cheap and never wrong for long.
-                    info.state = ThreadState::Idle;
-                }
-                info
-            })
-            .collect())
+        match project {
+            Some(project) => {
+                // The project has to be one this daemon knows, as before.
+                self.root_of(project)?;
+                ids.retain(|id| self.project_of(*id).as_deref() == Some(project));
+                ids.sort_unstable_by(|a, b| b.cmp(a));
+                // Which threads have an actor, read under the lock and
+                // dropped before any log is read.
+                let open: HashSet<Ulid> = self
+                    .entries
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .keys()
+                    .copied()
+                    .collect();
+                Ok(ids
+                    .into_iter()
+                    .map(|id| {
+                        let dir = self.dir_of(id).unwrap_or_else(|| self.threads_base.clone());
+                        let mut info = self.row(id, project, &dir, front);
+                        if open.contains(&id) {
+                            // Open: the actor knows the live state; the
+                            // session asks it on Open. Listings show it
+                            // as idle unless asked, which is cheap and
+                            // never wrong for long.
+                            info.state = ThreadState::Idle;
+                        }
+                        info
+                    })
+                    .collect())
+            }
+            None => {
+                ids.retain(|id| self.project_of(*id).is_some_and(|q| readable(&q)));
+                let rows: Vec<ThreadInfo> = ids
+                    .into_iter()
+                    .filter_map(|id| {
+                        let project = self.project_of(id)?;
+                        let dir = self.dir_of(id).unwrap_or_else(|| self.threads_base.clone());
+                        Some(self.row(id, &project, &dir, front))
+                    })
+                    .collect();
+                Ok(order_across_projects(rows))
+            }
+        }
+    }
+
+    /// One row as `/threads` shows it (issue #86): `summarise`'s log
+    /// summary, plus the workspace naming its project and what the
+    /// thread is. `front` is the caller's own front thread, so another
+    /// person's front thread is an ordinary one.
+    fn row(&self, id: Ulid, project: &str, dir: &Path, front: Option<Ulid>) -> ThreadInfo {
+        let mut info = summarise(dir, id, project);
+        info.workspace = self.workspace_label(project);
+        info.kind = if Some(id) == front {
+            ThreadKind::Front
+        } else {
+            match self.lookup(id).and_then(|entry| entry.run.wire()) {
+                Some(run) => ThreadKind::Run(run),
+                None => ThreadKind::Thread,
+            }
+        };
+        info
     }
 
     /// A thread's listing row, from its log alone (issue #84): what
@@ -1507,7 +1566,115 @@ fn scan_index(base: &Path, server: &ServerConfig) -> HashMap<Ulid, Indexed> {
     index
 }
 
-/// A listing row from the log alone.
+/// The order `/threads` shows across projects (issue #86), as a pure
+/// function over the rows, so the rule is tested without a daemon:
+///
+/// 1. the caller's front thread — the row whose kind is `Front` — once,
+///    first, and not again in its workspace group;
+/// 2. the builds (`Run(..)`), as a forest: a root is a lead, or a child
+///    whose lead is not among the listed rows (an unreadable lead, a
+///    log gone, or a run started inside a step child, which the log
+///    makes a child of that step). Roots newest first, each followed by
+///    the rows whose lead is it, oldest first, recursively, so a
+///    grandchild follows its own parent;
+/// 3. everything else, grouped by workspace: newest first inside a
+///    group, groups by their newest row, newest first. A row in no
+///    workspace is a group like any other.
+///
+/// A torn lead is not here at all: `scan_log` leaves its kind `Thread`,
+/// so it sorts as a plain thread — its issue is unknown.
+fn order_across_projects(rows: Vec<ThreadInfo>) -> Vec<ThreadInfo> {
+    let mut ordered: Vec<ThreadInfo> = Vec::with_capacity(rows.len());
+    let mut builds: Vec<ThreadInfo> = Vec::new();
+    let mut rest: Vec<ThreadInfo> = Vec::new();
+    let mut front: Option<ThreadInfo> = None;
+    for row in rows {
+        if row.kind == ThreadKind::Front {
+            front = Some(row);
+        } else if matches!(row.kind, ThreadKind::Run(_)) {
+            builds.push(row);
+        } else {
+            rest.push(row);
+        }
+    }
+    if let Some(row) = front {
+        ordered.push(row);
+    }
+
+    if !builds.is_empty() {
+        let listed: HashSet<Ulid> = builds.iter().map(|row| row.id).collect();
+        let mut children: HashMap<Ulid, Vec<Ulid>> = HashMap::new();
+        let mut roots: Vec<Ulid> = Vec::new();
+        for row in &builds {
+            match row.kind {
+                ThreadKind::Run(aigentic_api::RunThread::Child { lead, .. })
+                    if listed.contains(&lead) =>
+                {
+                    children.entry(lead).or_default().push(row.id);
+                }
+                // A lead, and a child whose lead is nowhere here.
+                _ => roots.push(row.id),
+            }
+        }
+        // Roots newest first, each row's children oldest first.
+        roots.sort_unstable_by(|a, b| b.cmp(a));
+        for kids in children.values_mut() {
+            kids.sort_unstable();
+        }
+        let mut by_id: HashMap<Ulid, ThreadInfo> =
+            builds.into_iter().map(|row| (row.id, row)).collect();
+        for root in roots {
+            emit_build(root, &mut by_id, &children, &mut ordered);
+        }
+        // Nothing should be left — the tree is a forest — but a cycle a
+        // damaged log could describe must not drop rows.
+        let mut left: Vec<ThreadInfo> = by_id.into_values().collect();
+        left.sort_unstable_by_key(|r| std::cmp::Reverse(r.id));
+        ordered.extend(left);
+    }
+
+    // Newest first, so the first row of each workspace group is the
+    // group's newest and the groups come out by it.
+    rest.sort_unstable_by_key(|r| std::cmp::Reverse(r.id));
+    let mut groups: Vec<(Option<String>, Vec<ThreadInfo>)> = Vec::new();
+    for row in rest {
+        match groups
+            .iter_mut()
+            .find(|(workspace, _)| *workspace == row.workspace)
+        {
+            Some((_, group)) => group.push(row),
+            None => groups.push((row.workspace.clone(), vec![row])),
+        }
+    }
+    for (_, group) in groups {
+        ordered.extend(group);
+    }
+    ordered
+}
+
+/// A build root and its descendants, in order: the row, then the rows
+/// whose lead it is, oldest first, each of them the same way. A row is
+/// taken out of `by_id` as it is emitted, so a cycle cannot loop.
+fn emit_build(
+    id: Ulid,
+    by_id: &mut HashMap<Ulid, ThreadInfo>,
+    children: &HashMap<Ulid, Vec<Ulid>>,
+    out: &mut Vec<ThreadInfo>,
+) {
+    let Some(row) = by_id.remove(&id) else {
+        return;
+    };
+    out.push(row);
+    if let Some(kids) = children.get(&id) {
+        for kid in kids {
+            emit_build(*kid, by_id, children, out);
+        }
+    }
+}
+
+/// A listing row from the log alone. What the row is and which
+/// workspace groups it is the caller's to fill (issue #86), since a
+/// summary cannot know either.
 fn summarise(dir: &Path, id: Ulid, project: &str) -> ThreadInfo {
     let fallback_date = || {
         time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(id.timestamp_ms()) * 1_000_000)
@@ -1526,6 +1693,8 @@ fn summarise(dir: &Path, id: Ulid, project: &str) -> ThreadInfo {
             first_line: String::new(),
             state: ThreadState::Idle,
             title: None,
+            workspace: None,
+            kind: ThreadKind::Thread,
         };
     };
     let date = events
@@ -1553,6 +1722,8 @@ fn summarise(dir: &Path, id: Ulid, project: &str) -> ThreadInfo {
         first_line,
         state: ThreadState::Idle,
         title: aigentic_runtime::title::title_of(&events),
+        workspace: None,
+        kind: ThreadKind::Thread,
     }
 }
 
@@ -1765,5 +1936,128 @@ mod tests {
         // A switch whose root the log recorded gives it.
         let new = indexed(Some("c"), Some("/c"), Some("/a"));
         assert_eq!(root_of_indexed(&new, Some("c")), Some(PathBuf::from("/c")));
+    }
+
+    /// The rows under `lead`, oldest first, each the same way — the
+    /// rule's forest, over the fixture.
+    fn under(rows: &[ThreadInfo], lead: Ulid, out: &mut Vec<Ulid>) {
+        let mut kids: Vec<Ulid> = rows
+            .iter()
+            .filter(
+                |r| matches!(r.kind, ThreadKind::Run(aigentic_api::RunThread::Child { lead: l, .. }) if l == lead),
+            )
+            .map(|r| r.id)
+            .collect();
+        kids.sort_unstable();
+        for kid in kids {
+            out.push(kid);
+            under(rows, kid, out);
+        }
+    }
+
+    /// T3 (issue #86): the order across projects, as a pure function.
+    /// The fixture is a front row in a workspace group of its own (so it
+    /// must not appear in that group again), two leads, a run started
+    /// inside a step child, a child whose lead is unreadable (a child
+    /// root with a child of its own), the row of a torn lead — its kind
+    /// is `Thread` — and plain threads in two workspaces and none. The
+    /// expected order is built here from the fixture's own ids, by the
+    /// rule, not typed out.
+    #[test]
+    fn the_order_across_projects_is_built_from_the_rows() {
+        let id = |n: u64| Ulid::from_parts(1_000 + n, 0);
+        let row = |id: Ulid, workspace: Option<&str>, kind: ThreadKind| ThreadInfo {
+            id,
+            project: Some("p".to_owned()),
+            date: "2026-10-06".to_owned(),
+            events: 1,
+            first_line: String::new(),
+            state: ThreadState::Idle,
+            title: None,
+            workspace: workspace.map(str::to_owned),
+            kind,
+        };
+        let lead = |issue: u64| ThreadKind::Run(aigentic_api::RunThread::Lead { issue });
+        let step =
+            |lead: Ulid| ThreadKind::Run(aigentic_api::RunThread::Child { lead, step: None });
+
+        let lead_a = id(1);
+        let (child_a1, child_a2) = (id(2), id(3));
+        let (inner_lead, inner_child) = (id(4), id(5));
+        let (plain_alpha, lead_b, child_b1) = (id(6), id(7), id(8));
+        let (child_root, child_roots_child) = (id(9), id(10));
+        let (plain_none, front) = (id(11), id(12));
+        // A lead no row here holds: a log gone, or a lead in a project
+        // the caller cannot read.
+        let gone = id(99);
+        let rows = vec![
+            row(lead_a, Some("alpha"), lead(1)),
+            row(child_a1, Some("alpha"), step(lead_a)),
+            row(child_a2, Some("alpha"), step(lead_a)),
+            row(inner_lead, Some("alpha"), step(child_a2)),
+            row(inner_child, Some("alpha"), step(inner_lead)),
+            row(plain_alpha, Some("alpha"), ThreadKind::Thread),
+            row(lead_b, Some("beta"), lead(2)),
+            row(child_b1, Some("beta"), step(lead_b)),
+            row(child_root, Some("beta"), step(gone)),
+            row(child_roots_child, Some("beta"), step(child_root)),
+            row(plain_none, None, ThreadKind::Thread),
+            row(front, Some("beta"), ThreadKind::Front),
+        ];
+
+        // The rule, over the fixture: the front row, the forest, then
+        // the rest grouped by workspace.
+        let mut expected = vec![front];
+        let mut roots: Vec<Ulid> = rows
+            .iter()
+            .filter(|r| match r.kind {
+                ThreadKind::Run(aigentic_api::RunThread::Lead { .. }) => true,
+                ThreadKind::Run(aigentic_api::RunThread::Child { lead, .. }) => !rows
+                    .iter()
+                    .any(|o| o.id == lead && matches!(o.kind, ThreadKind::Run(_))),
+                _ => false,
+            })
+            .map(|r| r.id)
+            .collect();
+        roots.sort_unstable_by(|a, b| b.cmp(a));
+        for root in roots {
+            expected.push(root);
+            under(&rows, root, &mut expected);
+        }
+        let workspace_of = |tid: Ulid| -> Option<String> {
+            rows.iter()
+                .find(|r| r.id == tid)
+                .and_then(|r| r.workspace.clone())
+        };
+        let mut rest: Vec<Ulid> = rows
+            .iter()
+            .filter(|r| !matches!(r.kind, ThreadKind::Run(_) | ThreadKind::Front))
+            .map(|r| r.id)
+            .collect();
+        rest.sort_unstable_by(|a, b| b.cmp(a));
+        let mut groups: Vec<Option<String>> = Vec::new();
+        for tid in &rest {
+            let workspace = workspace_of(*tid);
+            if !groups.contains(&workspace) {
+                groups.push(workspace);
+            }
+        }
+        for group in groups {
+            expected.extend(rest.iter().filter(|tid| workspace_of(**tid) == group));
+        }
+
+        let got: Vec<Ulid> = order_across_projects(rows.clone())
+            .iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(got, expected);
+        // The front row is first and nowhere else; a child root leads
+        // its own child.
+        assert_eq!(got.iter().filter(|tid| **tid == front).count(), 1);
+        let at = |tid: Ulid| got.iter().position(|t| *t == tid).unwrap();
+        assert_eq!(at(child_root) + 1, at(child_roots_child));
+        assert!(at(lead_b) < at(child_b1));
+        assert!(at(child_a2) < at(inner_lead));
+        assert!(at(inner_lead) < at(inner_child));
     }
 }
