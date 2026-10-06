@@ -65,24 +65,25 @@ pub struct CompactionSettings {
     /// Calls of the running turn kept in full before in-turn eviction
     /// stubs the rest (issue #30). Failed results and the last result of
     /// each distinct tool always stay on top of these. Read only when
-    /// `context_ceiling_tokens = 0`: with a ceiling set the sweep's depth
+    /// `working_set_tokens = 0`: with a target set the sweep's depth
     /// is the floor instead — all but the last `EVICT_BLOCK_CALLS` calls —
     /// so this has no effect.
     pub keep_last_calls: usize,
-    /// What one call's context may cost, whatever the model's window:
-    /// compaction's trigger line and the in-turn sweep both aim under
-    /// it (issue #30). Zero means no ceiling, only the fraction.
-    pub context_ceiling_tokens: u64,
+    /// The working-set target (issue #76): the tokens one call's context
+    /// aims at, whatever the model's window. Compaction's trigger line,
+    /// the closed-turn batch and the in-turn sweep all aim under it
+    /// (issue #30). Zero means no target, only the fraction.
+    pub working_set_tokens: u64,
     /// The in-turn sweep runs only while the context is over this line
     /// (issue #32): under it nothing is stubbed, so a turn that is still
     /// reading keeps what it read. Zero sweeps on call count alone.
     pub evict_above_tokens: u64,
-    /// The share, in percent, of `context_ceiling_tokens` a sweep must
-    /// free to be worth breaking the cached prefix for (issue #35): a
-    /// quarter, 32k at the 128k default. A sweep frees only the material
-    /// between the current boundary and the floor, so this is what spaces
-    /// the sweeps. Zero moves the boundary as soon as the floor advances,
-    /// however little that frees.
+    /// The share, in percent, of `working_set_tokens` a sweep or a batch
+    /// must free to be worth breaking the cached prefix for (issue #35):
+    /// a quarter, 30k at the 120k default. A sweep frees only the
+    /// material between the current boundary and the floor, so this is
+    /// what spaces the sweeps. Zero moves the boundary as soon as the
+    /// floor advances, however little that frees.
     pub evict_min_free_percent: u32,
 }
 
@@ -92,7 +93,7 @@ pub const DEFAULT_COMPACTION: CompactionSettings = CompactionSettings {
     max_result_bytes: 4096,
     summary_max_output_tokens: 2048,
     keep_last_calls: 12,
-    context_ceiling_tokens: 128_000,
+    working_set_tokens: 120_000,
     evict_above_tokens: 64_000,
     evict_min_free_percent: crate::evict::EVICT_MIN_FREE_PERCENT,
 };

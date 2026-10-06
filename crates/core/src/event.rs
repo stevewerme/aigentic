@@ -56,7 +56,7 @@ pub enum EventKind {
     ContextEvicted,
     /// The eviction sweep cannot fit the turn (issue #35): the
     /// projection at the deepest legal boundary — the floor, the newest
-    /// calls — is still over `context_ceiling_tokens`, so no sweep the
+    /// calls — is still over the working-set target, so no sweep the
     /// turn could make would bring it down, and the thread is the one to
     /// hand to a fresh one. Appended once per turn, in the turn it
     /// happened in, and never projected into model context.

@@ -136,7 +136,7 @@ async fn two_hundred_turns_stay_under_budget() {
         max_result_bytes: 500,
         summary_max_output_tokens: 256,
         keep_last_calls: 12,
-        context_ceiling_tokens: 128_000,
+        working_set_tokens: 128_000,
         evict_above_tokens: 64_000,
         evict_min_free_percent: 25,
     };

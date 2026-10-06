@@ -506,6 +506,16 @@ impl Profile {
             )));
         }
         if let Some(c) = &self.compaction {
+            // `context_ceiling_tokens` is `working_set_tokens`'s old name
+            // (issue #76): reading either alone is fine, both at once is
+            // a mistake the file should say so about, not one name
+            // silently winning.
+            if c.working_set_tokens.is_some() && c.context_ceiling_tokens.is_some() {
+                return Err(ConfigError::msg(
+                    "compaction.working_set_tokens and compaction.context_ceiling_tokens are the \
+                     same setting under its old name; keep working_set_tokens",
+                ));
+            }
             if let Some(f) = c.trigger_fraction
                 && !(0.05..=0.95).contains(&f)
             {
@@ -513,11 +523,11 @@ impl Profile {
                     "compaction.trigger_fraction must be between 0.05 and 0.95, got {f}"
                 )));
             }
-            if let Some(n) = c.context_ceiling_tokens
+            if let Some(n) = c.working_set_tokens.or(c.context_ceiling_tokens)
                 && n < 8_192
             {
                 return Err(ConfigError::msg(
-                    "compaction.context_ceiling_tokens must be at least 8192",
+                    "compaction.working_set_tokens must be at least 8192",
                 ));
             }
             if let Some(p) = c.evict_min_free_percent
@@ -882,7 +892,7 @@ keep_turns = 2
 max_result_bytes = 100
 summary_max_output_tokens = 10
 keep_last_calls = 3
-context_ceiling_tokens = 90000
+working_set_tokens = 90000
 evict_above_tokens = 64000
 
 [profiles.tensorx.prices]
@@ -1117,7 +1127,7 @@ cache = false
 trigger_fraction = 0.5
 keep_turns = 3
 keep_last_calls = 20
-context_ceiling_tokens = 96_000
+working_set_tokens = 96_000
 "#,
         )
         .unwrap();
@@ -1126,7 +1136,7 @@ context_ceiling_tokens = 96_000
         assert!(!p.build_provider("k".into()).capabilities().supports_caching);
         let s = p.compaction_settings();
         assert_eq!((s.trigger_fraction, s.keep_turns), (0.5, 3));
-        assert_eq!((s.keep_last_calls, s.context_ceiling_tokens), (20, 96_000));
+        assert_eq!((s.keep_last_calls, s.working_set_tokens), (20, 96_000));
         assert_eq!(s.max_result_bytes, DEFAULT_COMPACTION.max_result_bytes);
         let bare = Config::parse(FLAT)
             .unwrap()
@@ -1135,10 +1145,10 @@ context_ceiling_tokens = 96_000
             .1
             .compaction_settings();
         assert_eq!(
-            (bare.keep_last_calls, bare.context_ceiling_tokens),
+            (bare.keep_last_calls, bare.working_set_tokens),
             (
                 DEFAULT_COMPACTION.keep_last_calls,
-                DEFAULT_COMPACTION.context_ceiling_tokens
+                DEFAULT_COMPACTION.working_set_tokens
             ),
             "an absent [compaction] keeps the defaults"
         );
@@ -1165,6 +1175,72 @@ context_ceiling_tokens = 96_000
         assert_eq!(b.max_wall_time, DEFAULT_BUDGET.max_wall_time);
         assert_eq!(b.cache_read_price_ratio, 0.19);
         assert_eq!(DEFAULT_BUDGET.cache_read_price_ratio, 0.25);
+    }
+
+    /// T1 (issue #76): `working_set_tokens` is the key, the old name
+    /// `context_ceiling_tokens` still maps onto it, and the range check
+    /// follows the value under either name.
+    #[test]
+    fn working_set_tokens_is_the_key_and_the_old_name_still_maps() {
+        // The new name, and the default when `[compaction]` says nothing.
+        let c = Config::parse(
+            "[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n[profiles.a.compaction]\nworking_set_tokens = 96_000\n",
+        )
+        .unwrap();
+        assert_eq!(
+            c.profiles["a"].compaction_settings().working_set_tokens,
+            96_000
+        );
+        let bare = Config::parse(FLAT)
+            .unwrap()
+            .select(None)
+            .unwrap()
+            .1
+            .compaction_settings();
+        assert_eq!(
+            bare.working_set_tokens, DEFAULT_COMPACTION.working_set_tokens,
+            "an absent [compaction] keeps the default"
+        );
+        assert_eq!(DEFAULT_COMPACTION.working_set_tokens, 120_000);
+
+        // The old name alone maps onto the same field, and is not an
+        // error: the file that still carries it keeps working.
+        let old = Config::parse(
+            "[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n[profiles.a.compaction]\ncontext_ceiling_tokens = 96_000\n",
+        )
+        .unwrap();
+        assert_eq!(
+            old.profiles["a"].compaction_settings().working_set_tokens,
+            96_000,
+            "the old name is the same setting"
+        );
+
+        // The range check reads whichever name carried the value.
+        let err = Config::parse(
+            "[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n[profiles.a.compaction]\nworking_set_tokens = 8191\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("compaction.working_set_tokens must be at least 8192"),
+            "the message must name the key: {err}"
+        );
+    }
+
+    /// T1 (issue #76): settling both names at once is refused, naming
+    /// both, rather than one name silently winning.
+    #[test]
+    fn both_compaction_names_at_once_are_a_config_error() {
+        let err = Config::parse(
+            "[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n[profiles.a.compaction]\nworking_set_tokens = 96_000\ncontext_ceiling_tokens = 90_000\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("compaction.working_set_tokens")
+                && err.contains("compaction.context_ceiling_tokens"),
+            "the message must name both keys: {err}"
+        );
     }
 
     /// Issue #35, review item 3: the new key's upper bound. The check is

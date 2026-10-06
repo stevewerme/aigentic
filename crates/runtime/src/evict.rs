@@ -16,13 +16,19 @@
 //! the newest thing the turn is working on, plus the prefix and the open
 //! turn's own part, which stubbing cannot reach — so `floor` is the
 //! deepest legal boundary and the most a sweep can ever free. When that
-//! is less than `EVICT_MIN_FREE_PERCENT` of the ceiling, the boundary
-//! stays where it is: the cache break costs more than the relief. It
-//! moves again once the turn has added that much evictable material
-//! behind the boundary, which is once per `min_free` of new material
-//! instead of once per block of calls.
+//! is less than `EVICT_MIN_FREE_PERCENT` of the working-set target, the
+//! boundary stays where it is: the cache break costs more than the
+//! relief. It moves again once the turn has added that much evictable
+//! material behind the boundary, which is once per `min_free` of new
+//! material instead of once per block of calls.
 //!
-//! When even the floor is over `context_ceiling_tokens` the turn cannot
+//! The sweep only ever stubs the open turn. A closed turn's used results
+//! are stubbed by the batch (issue #76), which runs at a turn's first
+//! loop iteration and appends one `results_stubbed` naming the last
+//! `turn_ended`'s seq: the whole history changes at once, at a boundary
+//! the cache was going to break at anyway, and never mid-turn.
+//!
+//! When even the floor is over `working_set_tokens` the turn cannot
 //! be fitted by eviction at all, and only the handoff to a fresh thread
 //! can help. The sweep says so once per turn — a spell and a turn
 //! coincide, since the floor only grows within a turn, so a later
@@ -32,7 +38,8 @@
 
 use aigentic_core::{Author, ContentBlock, Event, EventKind, ToolSpec};
 use aigentic_log::{
-    AssistantMessagePayload, ContextEvictedPayload, ContextSaturatedPayload, ToolResultPayload,
+    AssistantMessagePayload, ContextEvictedPayload, ContextSaturatedPayload, ResultsStubbedPayload,
+    ToolResultPayload,
 };
 
 use crate::{CompactionSettings, Runtime, RuntimeError, Signal};
@@ -42,14 +49,15 @@ use crate::{CompactionSettings, Runtime, RuntimeError, Signal};
 /// deepest legal boundary is this many calls from the end.
 pub const EVICT_BLOCK_CALLS: usize = 8;
 
-/// A sweep must free at least a quarter of the ceiling to be worth
-/// breaking the cached prefix for (issue #35): 32k at the 128k default.
+/// A sweep, or a batch, must free at least a quarter of the working-set
+/// target to be worth breaking the cached prefix for (issues #35, #76):
+/// 30k at the 120k default.
 pub const EVICT_MIN_FREE_PERCENT: u32 = 25;
 
-/// What a sweep must free from the projection to be worth its cache
-/// break: `percent` of the ceiling.
-pub const fn min_free(ceiling: u64, percent: u32) -> u64 {
-    ceiling * percent as u64 / 100
+/// What a sweep or a batch must free from the projection to be worth
+/// its cache break: `percent` of the working-set target.
+pub const fn min_free(target: u64, percent: u32) -> u64 {
+    target * percent as u64 / 100
 }
 
 /// How much of the distance to a new sample the calibration moves per
@@ -106,9 +114,16 @@ pub fn calibrated_delta(estimate: u64, ratio: f64) -> u64 {
 pub enum Decision {
     /// Move the boundary to `through_seq` — the deepest legal block —
     /// and record it as a `context_evicted`. `freed` is what the move
-    /// takes out of the projection, in reported tokens, the ceiling's
+    /// takes out of the projection, in reported tokens, the target's
     /// units (issue #52), and is at least [`min_free`].
     Sweep { through_seq: u64, freed: u64 },
+    /// The same move over the whole history (issue #76): stub every
+    /// successful result of every turn closed at or before `through_seq`
+    /// — the last `turn_ended`'s seq — and record it as one
+    /// `results_stubbed`, so the cached prefix breaks once for the batch
+    /// rather than once per message. `freed` is what that takes out of
+    /// the projection, in the target's units.
+    Batch { through_seq: u64, freed: u64 },
     /// Move nothing and append nothing: a sweep now would either free
     /// less than [`min_free`] or has nowhere to go.
     Hold,
@@ -131,6 +146,11 @@ pub enum Decision {
 struct Scan {
     calls: Vec<u64>,
     through: Option<u64>,
+    /// The deepest boundary a `results_stubbed` of the thread recorded
+    /// (issue #76): the batch only reaches past it, and never repeats
+    /// itself. It does not clear at a `turn_ended` — it is the history's
+    /// boundary, not the open turn's.
+    batched: Option<u64>,
     /// Whether the open turn already appended a `context_saturated`: set
     /// by any such event in the turn, cleared only by its `turn_ended`,
     /// so the event is once per turn.
@@ -148,6 +168,7 @@ impl Scan {
             .map_or(0, |i| i + 1);
         let mut scan = Scan {
             calls: completed_calls(&events[start..]),
+            batched: batched_through(events),
             ..Scan::default()
         };
         for e in &events[start..] {
@@ -170,6 +191,33 @@ impl Scan {
         }
         scan
     }
+}
+
+/// The deepest `results_stubbed` boundary in `events` (issue #76):
+/// `None` when the thread has never batched.
+fn batched_through(events: &[Event]) -> Option<u64> {
+    let mut through = None;
+    for e in events {
+        if e.kind == EventKind::ResultsStubbed
+            && let Ok(p) = serde_json::from_value::<ResultsStubbedPayload>(e.payload.clone())
+        {
+            through = Some(through.unwrap_or(0).max(p.through_seq));
+        }
+    }
+    through
+}
+
+/// The ratio a `results_stubbed` in this turn recorded (issue #76), or
+/// `fallback` when the turn has no batch, or its event carries none.
+fn recorded_batch(turn: &[Event], fallback: f64) -> Option<f64> {
+    turn.iter()
+        .find(|e| e.kind == EventKind::ResultsStubbed)
+        .map(|e| {
+            serde_json::from_value::<ResultsStubbedPayload>(e.payload.clone())
+                .ok()
+                .and_then(|p| p.ratio)
+                .unwrap_or(fallback)
+        })
 }
 
 /// The calls of `events` that have their result, in log order: the seq of
@@ -218,6 +266,26 @@ fn probe(calls: &[u64], stubbed: usize) -> Option<u64> {
     (stubbed > 0).then(|| calls[stubbed - 1])
 }
 
+/// A `results_stubbed` for `through_seq`, made to look like it follows
+/// `after`: the batch's probe, never appended to a log. Like
+/// [`synthetic`], its `ratio` stays `None`.
+fn synthetic_batch(after: &Event, through_seq: u64) -> Event {
+    Event {
+        id: ulid::Ulid::generate(),
+        thread_id: after.thread_id,
+        seq: after.seq + 1,
+        kind: EventKind::ResultsStubbed,
+        author: Author::System,
+        payload: serde_json::to_value(ResultsStubbedPayload {
+            through_seq,
+            ratio: None,
+        })
+        .expect("serialisable"),
+        parent_event: None,
+        created_at: after.created_at,
+    }
+}
+
 /// A `context_evicted` for `through_seq`, made to look like it follows
 /// `after`: the sweep's probe, never appended to a log. Its `ratio` stays
 /// `None`: the check writes its own probes and never appends, so only the
@@ -241,10 +309,108 @@ fn synthetic(after: &Event, through_seq: u64) -> Event {
 }
 
 impl Runtime {
+    /// Stub, in projection, every successful result of every turn
+    /// already closed, in one batch, when the context is over the
+    /// working-set target and the move frees enough to pay for the cache
+    /// break (issue #76). Considered only at a turn's first loop
+    /// iteration. Whether anything was appended.
+    pub(crate) fn batch_stale(
+        &mut self,
+        observe: &mut (dyn FnMut(Signal<'_>) + Send),
+    ) -> Result<bool, RuntimeError> {
+        let events = self.log.events();
+        let scan = Scan::of(events);
+        let Decision::Batch { through_seq, .. } =
+            self.decide_batch(self.compaction, events, &scan, self.ratio)?
+        else {
+            return Ok(false);
+        };
+        // Stubbing leaves the context's length alone, so `fill` would
+        // otherwise reuse the reported prompt from before the batch,
+        // which still counts the bytes it just dropped (issue #76).
+        self.measured = None;
+        let payload = serde_json::to_value(ResultsStubbedPayload {
+            through_seq,
+            ratio: Some(self.ratio),
+        })
+        .expect("serialisable");
+        self.append(
+            EventKind::ResultsStubbed,
+            Author::System,
+            payload,
+            None,
+            observe,
+        )?;
+        Ok(true)
+    }
+
+    /// Whether a batch may be considered at all (issue #76): only at the
+    /// first loop iteration of a turn, so the history changes once, at a
+    /// turn boundary, and never mid-turn. `evict_stale` still appends at
+    /// most one event per iteration, so a batch iteration does not also
+    /// sweep in-turn.
+    pub(crate) fn at_turn_start(&self) -> bool {
+        Scan::of(self.log.events()).calls.is_empty()
+    }
+
+    /// What the batch should do, given the thread as the log holds it
+    /// (issue #76). Pure, like [`Runtime::decide`]: the caller appends
+    /// what this decides, and a replay asks the same question.
+    fn decide_batch(
+        &self,
+        settings: CompactionSettings,
+        events: &[Event],
+        scan: &Scan,
+        ratio: f64,
+    ) -> Result<Decision, RuntimeError> {
+        let Some(through_seq) = events
+            .iter()
+            .rev()
+            .find_map(|e| (e.kind == EventKind::TurnEnded).then_some(e.seq))
+        else {
+            // Nothing is closed yet, so nothing is the batch's to stub.
+            return Ok(Decision::Hold);
+        };
+        if scan.batched.is_some_and(|b| through_seq <= b) {
+            return Ok(Decision::Hold);
+        }
+        let target = self.window_line();
+        if target == 0 {
+            return Ok(Decision::Hold);
+        }
+        if !self.over_the_ceiling(events, target, None, &mut None, ratio)? {
+            return Ok(Decision::Hold);
+        }
+        let freed = self.freed_by_batch(events, through_seq, ratio)?;
+        if freed < min_free(target, settings.evict_min_free_percent) {
+            return Ok(Decision::Hold);
+        }
+        Ok(Decision::Batch { through_seq, freed })
+    }
+
+    /// Estimated tokens a batch at `through_seq` would take out of the
+    /// projection: the log as it stands, priced by the same estimator as
+    /// the batch itself, against the log with a `results_stubbed` at
+    /// that boundary projected on the end.
+    fn freed_by_batch(
+        &self,
+        events: &[Event],
+        through_seq: u64,
+        ratio: f64,
+    ) -> Result<u64, RuntimeError> {
+        let before = self.context_tokens(events, None, &mut None, ratio)?;
+        let mut projected = events.to_vec();
+        let last = projected.last().cloned().expect("the log's first event");
+        projected.push(synthetic_batch(&last, through_seq));
+        let batch = self.context_tokens(&projected, None, &mut None, ratio)?;
+        Ok(before.saturating_sub(batch))
+    }
+
     /// Stub, in projection, the open turn's results and successful
     /// edit/write arguments older than the floor; hold the boundary when
     /// a sweep cannot free enough to pay for itself, and say so when the
-    /// floor itself is over the ceiling (issue #35). Whether anything was
+    /// floor itself is over the working-set target (issues #35, #76).
+    /// Whether anything was
     /// appended.
     pub(crate) fn evict_stale(
         &mut self,
@@ -254,6 +420,9 @@ impl Runtime {
         let scan = Scan::of(events);
         let (kind, payload) = match self.decide(self.compaction, events, &scan, self.ratio)? {
             Decision::Hold => return Ok(false),
+            // `decide` never batches: the batch is `decide_batch`'s call,
+            // and `batch_stale` appends it.
+            Decision::Batch { .. } => unreachable!("decide only sweeps or holds"),
             Decision::Sweep { through_seq, .. } => (
                 EventKind::ContextEvicted,
                 serde_json::to_value(ContextEvictedPayload {
@@ -293,7 +462,7 @@ impl Runtime {
     /// What the sweep should do with the open turn, given the turn as the
     /// log holds it (issue #35). Pure: the caller appends what this
     /// decides. `ratio` is the caller's calibration (issue #52): every
-    /// size it compares is an estimate in reported tokens, so the ceiling
+    /// size it compares is an estimate in reported tokens, so the target
     /// — which is stated in reported tokens — is a comparable number
     /// whether the caller is a live turn or a replay.
     fn decide(
@@ -312,17 +481,17 @@ impl Runtime {
         // Sweeping a small context saved a few thousand tokens, broke
         // the prompt cache each time, and made a reading turn forget
         // and re-read the same files (150 calls, 21 sweeps, no edit).
-        // A lower ceiling lowers the line with it.
-        let line = match (settings.evict_above_tokens, settings.context_ceiling_tokens) {
+        // A lower target lowers the line with it.
+        let line = match (settings.evict_above_tokens, settings.working_set_tokens) {
             (0, _) => 0,
             (line, 0) => line,
-            (line, ceiling) => line.min(ceiling),
+            (line, target) => line.min(target),
         };
         if line > 0 && !self.over_the_ceiling(events, line, None, &mut None, ratio)? {
             return Ok(Decision::Hold);
         }
-        let ceiling = settings.context_ceiling_tokens;
-        if ceiling == 0 {
+        let target = settings.working_set_tokens;
+        if target == 0 {
             // Nothing to measure against, so `keep_last_calls` sets the
             // depth as it always did: all but those calls, cut to the
             // block line so the next sweep lands on the next block.
@@ -337,15 +506,16 @@ impl Runtime {
                 freed,
             });
         }
-        // The ceiling (issue #30) is what we are willing to pay for per
-        // call, whatever the window. The sweep never stubs past the floor
-        // — the last `EVICT_BLOCK_CALLS` calls, the newest thing the turn
-        // is working on — and the floor is the deepest legal boundary, so
-        // it is the most a sweep can relieve, and the only relief worth
-        // measuring (issue #35). The ceiling, not the window, is what
-        // decides the depth: `keep_last_calls` protects more calls than
-        // the floor does, so with a ceiling set the floor is what keeps
-        // the newest calls whole.
+        // The working-set target (issues #30, #76) is what we are
+        // willing to pay for per call, whatever the window. The sweep
+        // never stubs past the floor — the last `EVICT_BLOCK_CALLS`
+        // calls, the newest thing the turn is working on — and the floor
+        // is the deepest legal boundary, so it is the most a sweep can
+        // relieve, and the only relief worth measuring (issue #35). The
+        // target, not the window, is what decides the depth:
+        // `keep_last_calls` protects more calls than the floor does, so
+        // with a target set the floor is what keeps the newest calls
+        // whole.
         let floor = calls.len().saturating_sub(EVICT_BLOCK_CALLS);
         if floor <= evicted {
             return Ok(Decision::Hold);
@@ -354,20 +524,20 @@ impl Runtime {
         let at_floor = self.context_tokens(events, probe(calls, floor), &mut scratch, ratio)?;
         let before = self.context_tokens(events, probe(calls, evicted), &mut scratch, ratio)?;
         let freed = before.saturating_sub(at_floor);
-        if freed < min_free(ceiling, settings.evict_min_free_percent) {
+        if freed < min_free(target, settings.evict_min_free_percent) {
             // The cache break costs more than the relief is worth: hold
             // the boundary where it is. The relief grows by exactly what
             // slides out of the last block, so the next sweep comes when
             // the turn has added that much evictable material — once per
             // `min_free` instead of once per block. Once the deepest legal
-            // boundary is itself over the ceiling the turn cannot be
+            // boundary is itself over the target the turn cannot be
             // fitted by eviction at all, and that is worth saying: the
             // right move there is a fresh thread, not another sweep.
-            if at_floor > ceiling {
+            if at_floor > target {
                 return Ok(Decision::Saturated {
                     through_seq: boundary(calls, floor),
                     tokens_at_floor: at_floor,
-                    ceiling,
+                    ceiling: target,
                 });
             }
             return Ok(Decision::Hold);
@@ -465,7 +635,11 @@ impl Runtime {
     /// never disagree with the runtime. Each probe projects the log as it
     /// stood at that call with *this* replay's boundary for the turn in
     /// hand — the earlier turns' own evictions stay, since a replay of the
-    /// last turn happens on top of them.
+    /// last turn happens on top of them. A turn whose log holds a
+    /// `results_stubbed` (issue #76) gets one extra decision first, at
+    /// its first iteration: the batch, re-decided against the log as it
+    /// stood then, with the ratio the event recorded. A log with no batch
+    /// therefore replays exactly as it did before #76.
     ///
     /// The ratio is learned from the log, by the same named rule the turn
     /// loop uses (issue #52): every call's own reported usage — read off
@@ -501,6 +675,23 @@ impl Runtime {
                 .map_or(events.len(), |i| start + i + 1);
             let turn = &events[start..end];
             let calls = completed_calls(turn);
+            // The batch (issue #76), re-decided at the turn's first
+            // iteration against the log as it stood then: exactly the
+            // events before this turn, since a replay of the turn happens
+            // on top of them. It is reported only when the log records a
+            // batch in this turn, so a log with none replays to the same
+            // decisions as before, and a recorded one is checked against
+            // what the rule would do with the ratio that event carries.
+            let mut replayed_batch: Option<u64> = None;
+            if let Some(recorded) = recorded_batch(turn, ratio) {
+                let probe: Vec<Event> = events[..start].to_vec();
+                let decision =
+                    self.decide_batch(self.compaction, &probe, &Scan::of(&probe), recorded)?;
+                if let Decision::Batch { through_seq, .. } = decision {
+                    replayed_batch = Some(through_seq);
+                }
+                out.push(decision);
+            }
             let mut through: Option<u64> = None;
             for n in 1..=calls.len() {
                 let at = events[start..end]
@@ -514,11 +705,20 @@ impl Runtime {
                         !(e.seq >= turn[0].seq
                             && matches!(
                                 e.kind,
-                                EventKind::ContextEvicted | EventKind::ContextSaturated
+                                EventKind::ContextEvicted
+                                    | EventKind::ContextSaturated
+                                    | EventKind::ResultsStubbed
                             ))
                     })
                     .cloned()
                     .collect();
+                // The batch this replay decided at the turn's start, put
+                // back where the live run had it: a recorded batch is
+                // never trusted into the per-call probes.
+                if let Some(through_seq) = replayed_batch {
+                    let last = probe.last().cloned().expect("the log's first event");
+                    probe.push(synthetic_batch(&last, through_seq));
+                }
                 if let Some(through_seq) = through {
                     probe.push(synthetic(
                         probe.last().expect("the log's first event"),
@@ -533,6 +733,7 @@ impl Runtime {
                 let scan = Scan {
                     calls: calls[..n].to_vec(),
                     through,
+                    batched: batched_through(&probe),
                     saturated: false,
                 };
                 let decision = self.decide(self.compaction, &probe, &scan, ratio)?;

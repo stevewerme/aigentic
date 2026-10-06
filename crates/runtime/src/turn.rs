@@ -202,18 +202,27 @@ impl Runtime {
             // already has its result, so no summary range splits a turn.
             // Eviction runs at the same boundary, and first: stubbing is
             // free where a summary costs a call (issue #30).
-            self.evict_stale(observe)?;
-            if let Err(e) = self.compact(observe).await {
-                if let RuntimeError::Provider(p) = &e {
-                    self.end_turn(
-                        &format!("provider_error: {p}"),
-                        Some(p.clone()),
-                        &spent,
-                        &mut held,
-                        observe,
-                    )?;
+            //
+            // The closed-turn batch comes before both, and only at a
+            // turn's first iteration (issue #76). A batch iteration does
+            // nothing else: the batch has already rewritten the history,
+            // so a sweep or a summary in the same iteration would either
+            // price the stale one or append a second cache break for no
+            // reason.
+            if !(self.at_turn_start() && self.batch_stale(observe)?) {
+                self.evict_stale(observe)?;
+                if let Err(e) = self.compact(observe).await {
+                    if let RuntimeError::Provider(p) = &e {
+                        self.end_turn(
+                            &format!("provider_error: {p}"),
+                            Some(p.clone()),
+                            &spent,
+                            &mut held,
+                            observe,
+                        )?;
+                    }
+                    return Err(e);
                 }
-                return Err(e);
             }
             let context = build_context(&self.prefix(), self.log.events())?;
             let request = CompletionRequest {

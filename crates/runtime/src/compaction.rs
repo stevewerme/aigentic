@@ -58,16 +58,19 @@ impl Runtime {
     }
 
     /// Tokens at which compaction triggers: the fraction of the window,
-    /// capped by the profile's absolute ceiling (issue #30). On a 1M
-    /// window the fraction alone would sit at 734k and never run; the
-    /// ceiling is what we are willing to pay for per call.
+    /// capped by the profile's working-set target (issues #30, #76). On a
+    /// 1M window the fraction alone would sit at 734k and never run; the
+    /// target is what we are willing to pay for per call. `trigger_fraction`
+    /// is the cap for small windows: the target is
+    /// `min(fraction × window, working_set_tokens)`, and the target is the
+    /// line the closed-turn batch aims at too.
     pub fn window_line(&self) -> u64 {
         let line = (self.provider.capabilities().max_context_tokens as f64
             * f64::from(self.compaction.trigger_fraction))
         .round() as u64;
-        match self.compaction.context_ceiling_tokens {
+        match self.compaction.working_set_tokens {
             0 => line,
-            ceiling => line.min(ceiling),
+            target => line.min(target),
         }
     }
 

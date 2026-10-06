@@ -43,6 +43,9 @@ pub const COMPACTION_KEYS: &[&str] = &[
     "max_result_bytes",
     "summary_max_output_tokens",
     "keep_last_calls",
+    "working_set_tokens",
+    // The old name of `working_set_tokens`, still read (issue #76): kept
+    // in the list so a file that still uses it parses with no warning.
     "context_ceiling_tokens",
     "evict_above_tokens",
     "evict_min_free_percent",
@@ -347,17 +350,23 @@ pub struct CompactionConfig {
     pub summary_max_output_tokens: Option<u64>,
     /// Calls of the running turn kept in full before in-turn eviction
     /// stubs the rest (issue #30). Read only when
-    /// `context_ceiling_tokens = 0`; with a ceiling set the depth is the
+    /// `working_set_tokens = 0`; with a target set the depth is the
     /// floor instead, so this has no effect.
     #[serde(default)]
     pub keep_last_calls: Option<usize>,
-    /// What one call's context may cost, whatever the window (issue #30).
+    /// The working-set target, in tokens (issue #76): what one call's
+    /// context may cost, whatever the model's window.
+    #[serde(default)]
+    pub working_set_tokens: Option<u64>,
+    /// The working-set target's old name (issue #30), still read. Settling
+    /// both names is a config error, not a silent last-one-wins
+    /// ([`Profile::validate`]).
     #[serde(default)]
     pub context_ceiling_tokens: Option<u64>,
     /// The sweep runs only over this many tokens (issue #32).
     #[serde(default)]
     pub evict_above_tokens: Option<u64>,
-    /// The share of the ceiling a sweep must free to be worth its cache
+    /// The share of the target a sweep must free to be worth its cache
     /// break (issue #35). Zero moves the boundary as soon as the floor
     /// advances, however little that frees — the sweep runs on nearly
     /// every call.
@@ -375,9 +384,14 @@ impl CompactionConfig {
                 .summary_max_output_tokens
                 .unwrap_or(base.summary_max_output_tokens),
             keep_last_calls: self.keep_last_calls.unwrap_or(base.keep_last_calls),
-            context_ceiling_tokens: self
-                .context_ceiling_tokens
-                .unwrap_or(base.context_ceiling_tokens),
+            // The old name maps onto the new field, and the new name wins
+            // if both are somehow set here: `Profile::validate` refuses
+            // that, so this is only reachable from a table nobody
+            // validated (issue #76).
+            working_set_tokens: self
+                .working_set_tokens
+                .or(self.context_ceiling_tokens)
+                .unwrap_or(base.working_set_tokens),
             evict_above_tokens: self.evict_above_tokens.unwrap_or(base.evict_above_tokens),
             evict_min_free_percent: self
                 .evict_min_free_percent
@@ -645,7 +659,7 @@ max_tokens = 3000000
 
 [compaction]
 keep_turns = 4
-context_ceiling_tokens = 96_000
+working_set_tokens = 96_000
 
 [tools]
 allow = ["read_file", "bash"]
@@ -699,11 +713,7 @@ enabled = ["implement"]
         );
         assert_eq!(p.compaction.as_ref().unwrap().settings().keep_turns, 4);
         assert_eq!(
-            p.compaction
-                .as_ref()
-                .unwrap()
-                .settings()
-                .context_ceiling_tokens,
+            p.compaction.as_ref().unwrap().settings().working_set_tokens,
             96_000
         );
         assert_eq!(p.tools.allow, vec!["read_file", "bash"]);
@@ -795,6 +805,7 @@ enabled = ["implement"]
             "budget.max_tokens",
             "budget.max_wall_time_secs",
             "compaction.context_ceiling_tokens",
+            "compaction.working_set_tokens",
             "compaction.evict_above_tokens",
             "compaction.evict_min_free_percent",
             "compaction.keep_last_calls",
@@ -851,7 +862,8 @@ keep_turns = 2
 max_result_bytes = 100
 summary_max_output_tokens = 10
 keep_last_calls = 3
-context_ceiling_tokens = 90000
+working_set_tokens = 90000
+context_ceiling_tokens = 80000
 evict_above_tokens = 64000
 [tools]
 allow = [\"bash\"]

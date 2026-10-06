@@ -308,7 +308,7 @@ async fn run_scripted(script: Vec<Vec<ProviderEvent>>, k: f64, ceiling: u64) -> 
     let mut runtime = Runtime::new(provider, registry, log, AgentId("worker".into()))
         .with_approver(Box::new(Yes))
         .with_compaction(aigentic_runtime::CompactionSettings {
-            context_ceiling_tokens: ceiling,
+            working_set_tokens: ceiling,
             ..DEFAULT_COMPACTION
         })
         .with_budget(aigentic_core::Budget {
@@ -621,7 +621,7 @@ async fn a_two_hundred_call_turn_with_large_results_and_edits_stays_under_128k()
     // once-per-eight-calls cadence is gone: that was the thrash.
     let bound = unswept_material(&ran.events)
         / min_free(
-            DEFAULT_COMPACTION.context_ceiling_tokens,
+            DEFAULT_COMPACTION.working_set_tokens,
             EVICT_MIN_FREE_PERCENT,
         )
         + 1;
@@ -696,7 +696,7 @@ async fn the_ceiling_drives_the_sweep_deeper_than_the_last_calls_window() {
         60,
         1_400,
         aigentic_runtime::CompactionSettings {
-            context_ceiling_tokens: 44_000,
+            working_set_tokens: 44_000,
             ..DEFAULT_COMPACTION
         },
     )
@@ -884,7 +884,7 @@ async fn a_turn_that_reports_no_usage_keeps_the_ratio_at_its_seed() {
 /// runtime.
 fn saturated() -> aigentic_runtime::CompactionSettings {
     aigentic_runtime::CompactionSettings {
-        context_ceiling_tokens: 30_000,
+        working_set_tokens: 30_000,
         ..DEFAULT_COMPACTION
     }
 }
@@ -902,7 +902,7 @@ async fn a_context_whose_floor_is_above_the_ceiling_sweeps_once_not_every_call()
     let ran = run_turn(60, 1_400, saturated()).await;
     let calls = turn_calls(&ran.events);
     assert_eq!(calls.len(), 60);
-    let ceiling = saturated().context_ceiling_tokens;
+    let ceiling = saturated().working_set_tokens;
     let must_free = min_free(ceiling, EVICT_MIN_FREE_PERCENT);
     let floor = calls[calls.len() - 8];
     let at_floor = tokens_with_boundary(&ran.events, floor);
@@ -1085,7 +1085,7 @@ async fn thread_01M3GS3QP6_replays_without_thrash() {
         counted > estimated,
         "this check is about a log the estimate under-counts: {counted} over {estimated}"
     );
-    let ceiling = DEFAULT_COMPACTION.context_ceiling_tokens;
+    let ceiling = DEFAULT_COMPACTION.working_set_tokens;
     let must_free = min_free(ceiling, EVICT_MIN_FREE_PERCENT);
 
     let dir = tempfile::tempdir().unwrap();
@@ -1399,5 +1399,616 @@ async fn thread_01M3GS3QP6_floor_shrinks_at_deepest_boundary() {
     assert!(
         bash_after < bash_before,
         "the bash share must shrink: {bash_after} vs {bash_before}"
+    );
+}
+
+// ------------------------------------------------------------ issue #76
+//
+// The working set aims at a fixed target, and a closed turn's used
+// results are stubbed in one batch at a turn's first iteration. These
+// tests measure the rule from the fixture's shape and the settings it
+// runs with — the provider reports the estimator's own count, so the
+// prompts it records are the numbers the runtime gates on.
+
+/// The window the multi-turn fixture reports: wide enough that
+/// `trigger_fraction` never caps the target, so the line *is* the
+/// setting these tests pass.
+const BATCH_WINDOW: u64 = 200_000;
+
+/// A multi-turn double: every turn answers with `calls` echo calls of
+/// `bytes` bytes each, then a text reply. Each reply reports the
+/// estimator's own count of the request plus the schemas that went with
+/// it, like [`Building`], so the ratio stays 1.0. `prompts` records that
+/// count per request, in order — the same number the runtime's own
+/// `fill` reads off the last usage.
+struct Turns {
+    seen: Seen,
+    prompts: Arc<Mutex<Vec<u64>>>,
+    calls: usize,
+    bytes: usize,
+}
+
+impl Provider for Turns {
+    fn complete(
+        &self,
+        request: &CompletionRequest<'_>,
+    ) -> Pin<Box<dyn Stream<Item = ProviderEvent> + Send + '_>> {
+        self.seen.lock().unwrap().push(request.messages.to_vec());
+        let reported = estimate(request.messages) + aigentic_runtime::schemas_tokens(request.tools);
+        self.prompts.lock().unwrap().push(reported);
+        // The calls this turn has already made: the tool results since
+        // the last user message, which is how the runtime reads the turn
+        // too (`completed_calls` over the events after the last
+        // `turn_ended`).
+        let made = request
+            .messages
+            .iter()
+            .rev()
+            .take_while(|m| m.role != Role::User)
+            .flat_map(|m| m.blocks.iter())
+            .filter(|b| matches!(b, ContentBlock::ToolResult(_)))
+            .count();
+        // Ids only have to be unique across the thread.
+        let calls_so_far = request
+            .messages
+            .iter()
+            .flat_map(|m| m.blocks.iter())
+            .filter(|b| matches!(b, ContentBlock::ToolCall(_)))
+            .count();
+        let usage = ProviderEvent::Usage(Usage {
+            input_tokens: reported,
+            output_tokens: 40,
+            ..Default::default()
+        });
+        let events = if made < self.calls {
+            vec![
+                ProviderEvent::ToolCall(ToolCall {
+                    id: format!("call_{calls_so_far}"),
+                    name: "echo".into(),
+                    // Unique per call, so a test can tell one result's
+                    // text from another's.
+                    args: serde_json::json!({
+                        "msg": format!("{calls_so_far}:{}", "x".repeat(self.bytes))
+                    }),
+                }),
+                usage,
+                ProviderEvent::Done {
+                    finish_reason: "tool_calls".into(),
+                },
+            ]
+        } else {
+            vec![
+                ProviderEvent::TextDelta("turn done".into()),
+                usage,
+                ProviderEvent::Done {
+                    finish_reason: "stop".into(),
+                },
+            ]
+        };
+        Box::pin(futures_util::stream::iter(events))
+    }
+
+    fn count_tokens(&self, context: &[Message]) -> u64 {
+        estimate(context)
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            supports_tools: true,
+            supports_images: false,
+            supports_caching: false,
+            supports_structured_output: false,
+            max_context_tokens: BATCH_WINDOW,
+        }
+    }
+}
+
+/// Runs `turns` complete turns of [`Turns`] on one runtime, and returns
+/// the log, the request lists and the prompts the double reported, in
+/// request order.
+async fn run_turns(
+    turns: usize,
+    calls: usize,
+    bytes: usize,
+    settings: aigentic_runtime::CompactionSettings,
+) -> (Ran, Vec<u64>) {
+    let dir = tempfile::tempdir().unwrap();
+    let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+    let prompts: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+    let provider = Turns {
+        seen: seen.clone(),
+        prompts: prompts.clone(),
+        calls,
+        bytes,
+    };
+    let echo = Arc::new(Mutex::new(Vec::new()));
+    let registry: aigentic_tools::ToolRegistry =
+        vec![Box::new(common::EchoTool(echo)) as Box<dyn aigentic_core::Tool>].into();
+    let log = ThreadLog::open(dir.path(), ulid::Ulid::generate()).unwrap();
+    let mut runtime = Runtime::new(Box::new(provider), registry, log, AgentId("worker".into()))
+        .with_approver(Box::new(Yes))
+        .with_compaction(settings)
+        .with_budget(aigentic_core::Budget {
+            max_iterations: 100,
+            max_tokens: u64::MAX,
+            max_wall_time: std::time::Duration::from_secs(300),
+            cache_read_price_ratio: 0.25,
+        })
+        .with_model_label("scripted");
+    let mut marks = Vec::new();
+    for turn in 0..turns {
+        let outcome = runtime
+            .run_turn(
+                Author::User(aigentic_core::UserId("steve".into())),
+                vec![ContentBlock::Text(format!("turn {turn}"))],
+                &mut |signal| {
+                    if let aigentic_runtime::Signal::Event(event) = signal {
+                        marks.push(event.kind);
+                    }
+                },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("turn {turn} runs: {e}"));
+        assert_eq!(
+            outcome.reason, "done",
+            "turn {turn} stopped after {} iterations",
+            outcome.iterations
+        );
+    }
+    let events = runtime.log().read_all().unwrap();
+    let prompts = prompts.lock().unwrap().clone();
+    assert!(
+        prompts.len()
+            == events
+                .iter()
+                .filter(|e| e.kind == EventKind::AssistantMessage)
+                .count(),
+        "one request per assistant message"
+    );
+    (
+        Ran {
+            seen,
+            events,
+            marks,
+            runtime,
+        },
+        prompts,
+    )
+}
+
+/// The settings the batch tests run with: the target `target`, the keep
+/// window wide enough that compaction never fires (#98 owns that rule),
+/// and the in-turn sweep's own pressure line derived from the same
+/// settings. The turns are shorter than `EVICT_BLOCK_CALLS`, so the
+/// sweep's floor is never above zero and it always holds: a batch is the
+/// only event these fixtures can add.
+fn batching(target: u64) -> aigentic_runtime::CompactionSettings {
+    aigentic_runtime::CompactionSettings {
+        working_set_tokens: target,
+        keep_turns: 50,
+        ..DEFAULT_COMPACTION
+    }
+}
+
+/// Every `results_stubbed` in the log, as `(its seq, its through_seq)`.
+fn batches(events: &[Event]) -> Vec<(u64, u64)> {
+    events
+        .iter()
+        .filter(|e| e.kind == EventKind::ResultsStubbed)
+        .map(|e| {
+            let p: aigentic_log::ResultsStubbedPayload =
+                serde_json::from_value(e.payload.clone()).expect("a batch payload");
+            (e.seq, p.through_seq)
+        })
+        .collect()
+}
+
+/// The seq of the last `turn_ended` before `seq`, if the thread has one.
+fn last_turn_ended_before(events: &[Event], seq: u64) -> Option<u64> {
+    events
+        .iter()
+        .filter(|e| e.kind == EventKind::TurnEnded && e.seq < seq)
+        .map(|e| e.seq)
+        .next_back()
+}
+
+/// Every kind in `events` with `from < seq <= to`, in log order.
+fn kinds_between(events: &[Event], from: u64, to: u64) -> Vec<EventKind> {
+    events
+        .iter()
+        .filter(|e| e.seq > from && e.seq <= to)
+        .map(|e| e.kind)
+        .collect()
+}
+
+/// The text of the whole projection of `events`.
+fn projected_text(events: &[Event]) -> String {
+    project_body(events)
+        .expect("the batch fixture projects")
+        .iter()
+        .flat_map(|m| m.blocks.iter())
+        .map(|b| match b {
+            ContentBlock::Text(t) => t.clone(),
+            ContentBlock::ToolResult(r) => r.content.clone(),
+            _ => String::new(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// T4, issue #76 (the batch decision and its relief). The gate's own
+/// numbers, never hand-counted: the target comes from the settings, the
+/// crossing point from the prompts the double reported, and the relief
+/// from `min_free` on the line the runtime itself prints.
+#[tokio::test]
+async fn a_batch_stubs_the_closed_turns_once_the_target_is_crossed() {
+    let (mut ran, prompts) = run_turns(7, 3, 1_200, batching(2_800)).await;
+    let line = ran.runtime.window_line();
+    assert_eq!(line, 2_800, "a wide window leaves the target as the line");
+
+    let recorded = batches(&ran.events);
+    assert!(
+        recorded.len() >= 2,
+        "the fixture must cross the target twice: {recorded:?}"
+    );
+    assert_eq!(
+        prompts.len(),
+        ran.events
+            .iter()
+            .filter(|e| e.kind == EventKind::AssistantMessage)
+            .count(),
+        "one request per assistant message"
+    );
+    // The fixture's own shape: one request per call, plus the reply that
+    // ends the turn.
+    let per_turn = 3 + 1;
+
+    for (n, (seq, through)) in recorded.iter().enumerate() {
+        let ended = last_turn_ended_before(&ran.events, *seq).expect("a batch has a closed turn");
+        assert_eq!(
+            *through, ended,
+            "batch {n}: the boundary is the last `turn_ended`"
+        );
+
+        // The turn's first iteration, and nothing else appended in it:
+        // the previous turn's end, the user's message, the batch, then
+        // the turn's first reply. No tool result is in there, so no
+        // batch lands mid-turn.
+        assert_eq!(
+            kinds_between(&ran.events, ended, *seq),
+            vec![EventKind::UserMessage, EventKind::ResultsStubbed],
+            "batch {n} sits at its turn's first iteration"
+        );
+        let after = ran
+            .events
+            .iter()
+            .find(|e| e.seq == seq + 1)
+            .expect("the log goes on after a batch");
+        assert_eq!(
+            after.kind,
+            EventKind::AssistantMessage,
+            "batch {n}: the batch iteration appends nothing else"
+        );
+
+        // The context it moved from was over the target and the one it
+        // moved to is under: the prompts the double reported are the
+        // numbers the runtime's own `fill` reads off the last usage. The
+        // turn a batch opens is the one after the closed turns it names.
+        let turn = ran
+            .events
+            .iter()
+            .filter(|e| e.kind == EventKind::TurnEnded && e.seq <= *through)
+            .count();
+        let first_of_turn = turn * per_turn;
+        assert!(
+            prompts[first_of_turn - 1] > line,
+            "batch {n}: the context was {} at the request before it, not over the {line} target",
+            prompts[first_of_turn - 1]
+        );
+        assert!(
+            prompts[first_of_turn] < line,
+            "batch {n}: the context after it is {} but the target is {line}",
+            prompts[first_of_turn]
+        );
+        // The relief the provider sees is the one the rule promised: the
+        // batch frees at least `min_free` of the line. The rule promises
+        // no more than that — a thread that keeps adding material no
+        // batch can stub can sit over the target — so this fixture is
+        // sized (seven turns) to be one where every batch also lands
+        // under the line, which is what the assertion above pins.
+        assert!(
+            prompts[first_of_turn - 1] - prompts[first_of_turn]
+                >= min_free(line, EVICT_MIN_FREE_PERCENT),
+            "batch {n}: freed only {} of the {} it must free",
+            prompts[first_of_turn - 1] - prompts[first_of_turn],
+            min_free(line, EVICT_MIN_FREE_PERCENT)
+        );
+    }
+
+    // No second batch before the thread crossed the target again: the
+    // requests between two batches all sit under the line right after a
+    // batch, and the next batch's own predecessor is over it (asserted
+    // above, one per batch).
+    for pair in recorded.windows(2) {
+        let (first, second) = (pair[0].0, pair[1].0);
+        assert!(
+            !ran.events
+                .iter()
+                .any(|e| e.kind == EventKind::ResultsStubbed && e.seq > first && e.seq < second),
+            "only the recorded batches are in the log"
+        );
+    }
+
+    // The replay reaches the same batches, priced with the ratio the
+    // event recorded, and each of them paid for its cache break.
+    let events = ran.events.clone();
+    let must_free = min_free(line, EVICT_MIN_FREE_PERCENT);
+    let decisions = ran.runtime.sweep_decisions(&events).unwrap();
+    let replayed: Vec<(u64, u64)> = decisions
+        .iter()
+        .filter_map(|d| match d {
+            Decision::Batch { through_seq, freed } => Some((*through_seq, *freed)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        replayed.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
+        recorded.iter().map(|(_, t)| *t).collect::<Vec<_>>(),
+        "the replay takes the same batches the run did"
+    );
+    for (through, freed) in &replayed {
+        assert!(
+            *freed >= must_free,
+            "the batch at {through} freed only {freed} of the {must_free} it must free"
+        );
+    }
+    // And a live run may not have swept in-turn: three calls a turn leave
+    // the sweep's floor at zero, so every `context_evicted` here would be
+    // a bug, and the log has none.
+    assert_eq!(ran.sweeps(), 0, "{:?}", ran.marks);
+    assert_eq!(
+        ran.events
+            .iter()
+            .filter(|e| e.kind == EventKind::Compacted)
+            .count(),
+        0,
+        "compaction never fires in this fixture"
+    );
+}
+
+/// T4, issue #76: `recall {seq}` on a result a batch stubbed returns the
+/// original, and the stub the projection shows carries that handle.
+#[tokio::test]
+async fn recall_by_handle_returns_a_closed_turns_stubbed_result() {
+    let (ran, _) = run_turns(7, 3, 1_200, batching(2_800)).await;
+    let (batch, through) = batches(&ran.events)
+        .into_iter()
+        .next()
+        .expect("the fixture batches");
+
+    // A successful result of a closed turn, and its original text.
+    let (seq, original) = ran
+        .events
+        .iter()
+        .filter(|e| e.kind == EventKind::ToolResult && e.seq < batch)
+        .take(1)
+        .map(|e| {
+            let p: aigentic_log::ToolResultPayload =
+                serde_json::from_value(e.payload.clone()).expect("a tool result");
+            (e.seq, p.result.content)
+        })
+        .next()
+        .expect("a closed turn's result");
+    assert!(
+        seq < through && through == batch - 2,
+        "the result is a closed turn's"
+    );
+
+    let shown = projected_text(&ran.events);
+    assert!(
+        shown.contains(&format!("recall {seq} to bring it back")),
+        "the stub must carry the handle: {shown}"
+    );
+    assert!(
+        !shown.contains(original.trim()),
+        "the projection must not show the original any more"
+    );
+    assert!(
+        ran.events.iter().any(|e| e.kind == EventKind::ToolResult
+            && e.seq == seq
+            && e.payload.to_string().contains(original.trim())),
+        "the log keeps the original in full"
+    );
+
+    let back = aigentic_runtime::recall_tool::output(
+        &ran.events,
+        &aigentic_runtime::recall_tool::Form::Handle {
+            handle: seq,
+            from_line: None,
+        },
+    )
+    .expect("the handle recall renders");
+    assert!(
+        back.contains(original.trim()),
+        "recall {seq} must return the original: {back}"
+    );
+}
+
+/// T5, issue #76: the provider's cached prefix. The rule pinned here is
+/// that a later context extends an earlier one whenever the log appended
+/// nothing between them that the projection consumes — and that at a
+/// turn's start a batch is the only such event.
+#[tokio::test]
+async fn the_prefix_changes_only_at_a_turn_boundary_or_a_batch() {
+    let (ran, _) = run_turns(7, 3, 1_200, batching(2_800)).await;
+    assert!(
+        batches(&ran.events).len() >= 2,
+        "the fixture must batch to test the rule"
+    );
+
+    // (a) Within each turn, consecutive calls extend one another: the log
+    // holds no eviction, batch or compaction between them.
+    let mut calls: Vec<u64> = ran
+        .events
+        .iter()
+        .filter(|e| e.kind == EventKind::ToolResult)
+        .map(|e| e.seq)
+        .collect();
+    calls.push(u64::MAX); // so the last call is checked too
+    for pair in calls.windows(2) {
+        let (before, after) = (pair[0], pair[1]);
+        let boundary = ran
+            .events
+            .iter()
+            .filter(|e| {
+                e.seq > before
+                    && e.seq <= after
+                    && matches!(
+                        e.kind,
+                        EventKind::TurnEnded
+                            | EventKind::ContextEvicted
+                            | EventKind::ResultsStubbed
+                            | EventKind::Compacted
+                    )
+            })
+            .count();
+        if boundary > 0 {
+            continue; // the rule says nothing across a boundary event
+        }
+        let at = |seq: u64| {
+            let end = ran
+                .events
+                .iter()
+                .position(|e| e.seq == seq)
+                .expect("the call")
+                + 1;
+            project_body(&ran.events[..end]).expect("projects")
+        };
+        let (earlier, later) = (at(before), at(after.min(ran.events.last().unwrap().seq)));
+        assert!(
+            later.len() >= earlier.len() && later[..earlier.len()] == earlier[..],
+            "the context after call {after} must extend the one after call {before}"
+        );
+    }
+
+    // (b) At every turn's start, the only event of those kinds is a
+    // batch: the history changes once, at a turn start, and never twice.
+    for (i, ended) in ran.events.iter().enumerate() {
+        if ended.kind != EventKind::TurnEnded {
+            continue;
+        }
+        let Some(reply) = ran.events[i + 1..]
+            .iter()
+            .find(|e| e.kind == EventKind::AssistantMessage)
+        else {
+            continue; // the thread ends with the last turn
+        };
+        let changes: Vec<EventKind> = kinds_between(&ran.events, ended.seq, reply.seq)
+            .into_iter()
+            .filter(|k| {
+                matches!(
+                    k,
+                    EventKind::ContextEvicted | EventKind::ResultsStubbed | EventKind::Compacted
+                )
+            })
+            .collect();
+        assert!(
+            changes.len() <= 1 && changes.iter().all(|k| *k == EventKind::ResultsStubbed),
+            "a turn start may change the history only by one batch, found {changes:?}"
+        );
+    }
+}
+
+/// T6, issue #76: the line is `min(trigger_fraction × window,
+/// working_set_tokens)`. With a window whose fraction is under the
+/// target the fraction is what binds, and a hand-built `0` means the
+/// fraction alone.
+#[tokio::test]
+async fn the_batch_gates_on_the_fraction_when_it_caps_the_target() {
+    let fraction = 0.05;
+    let settings = aigentic_runtime::CompactionSettings {
+        trigger_fraction: fraction,
+        ..batching(10_000_000)
+    };
+    let (ran, prompts) = run_turns(20, 3, 1_200, settings).await;
+    let line = ran.runtime.window_line();
+    let from_the_rule = (BATCH_WINDOW as f64 * f64::from(fraction)).round() as u64;
+    assert_eq!(
+        line, from_the_rule,
+        "the line is the fraction of the window when the target is out of reach"
+    );
+    assert!(line < settings.working_set_tokens, "the fraction must bind");
+
+    let recorded = batches(&ran.events);
+    assert!(
+        !recorded.is_empty(),
+        "the fixture must cross the fraction's line: {:?}",
+        ran.marks
+    );
+    let per_turn = 3 + 1;
+    for (n, (seq, through)) in recorded.iter().enumerate() {
+        assert_eq!(*through, last_turn_ended_before(&ran.events, *seq).unwrap());
+        let turn = ran
+            .events
+            .iter()
+            .filter(|e| e.kind == EventKind::TurnEnded && e.seq <= *through)
+            .count();
+        assert!(
+            prompts[turn * per_turn - 1] > line,
+            "batch {n}: the context was under the fraction's line"
+        );
+        assert!(
+            prompts[turn * per_turn] < line,
+            "batch {n}: still over the line after the batch"
+        );
+    }
+    // A `0` target cannot come from config (`>= 8192`), but
+    // `CompactionSettings` is public, and there it means the fraction
+    // alone (issue #76, decision 1).
+    let (zero, _) = run_turns(
+        1,
+        3,
+        1_200,
+        aigentic_runtime::CompactionSettings {
+            trigger_fraction: fraction,
+            ..batching(0)
+        },
+    )
+    .await;
+    assert_eq!(
+        zero.runtime.window_line(),
+        from_the_rule,
+        "a zero target is the fraction alone"
+    );
+}
+
+/// T7, issue #76: a log with no `results_stubbed` replays exactly as it
+/// did before — one decision per completed call, none of them a batch.
+#[tokio::test]
+async fn a_log_without_a_batch_replays_one_decision_per_call() {
+    let mut ran = run_turn(60, 900, saturated()).await;
+    assert!(
+        batches(&ran.events).is_empty(),
+        "the premise: this log has no batch"
+    );
+    let calls: usize = turn_call_counts(&ran.events).iter().sum();
+    let decisions = ran.runtime.sweep_decisions(&ran.events).unwrap();
+    assert_eq!(
+        decisions.len(),
+        calls,
+        "one decision per completed call, as before #76"
+    );
+    assert!(
+        !decisions
+            .iter()
+            .any(|d| matches!(d, Decision::Batch { .. })),
+        "a log with no batch decides none"
+    );
+    assert!(
+        decisions
+            .iter()
+            .any(|d| matches!(d, Decision::Sweep { .. })),
+        "the fixture must sweep: {:?}",
+        ran.marks
     );
 }
