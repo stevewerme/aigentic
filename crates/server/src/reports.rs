@@ -233,7 +233,10 @@ fn last_message_line(events: &[Event]) -> Option<String> {
     let mut parts = Vec::new();
     match spent {
         Some(usd) => parts.push(format!("${usd:.4}")),
-        None if calls > 0 => parts.push("unpriced".into()),
+        // A call the provider reported no usage for, or a stamped line
+        // with no dollars, counts as unpriced rather than as free. An
+        // estimated call is unpriced too: its dollars are a guess.
+        None if calls > 0 || cost.estimated_calls > 0 => parts.push("unpriced".into()),
         None => {}
     }
     if calls > 0 {
@@ -1187,6 +1190,17 @@ mod cost_tests {
                 "last msg   unpriced · 0 of 1 calls priced · {bare_share:.0}% cached"
             )),
             "unpriced"
+        );
+
+        // A slice whose only calls are estimated has measured nothing:
+        // the guessed dollars are not summed and the row says so, rather
+        // than calling a guessed cycle "no calls yet".
+        let mut guessed_only = assistant(100, 10, true);
+        guessed_only.payload["usage"]["cost_usd"] = json!(mid_usd);
+        assert_eq!(
+            last_message_line(&[person(0, false), guessed_only]),
+            Some("last msg   unpriced".into()),
+            "all estimated"
         );
 
         // A person message nothing has answered yet is a snapshot of a
