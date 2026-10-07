@@ -23,7 +23,7 @@ use crate::config::Config;
 /// A config with a scripted profile, threads and skills under `dir`.
 pub(crate) fn config(dir: &std::path::Path) -> Config {
     Config::parse(&format!(
-        "default_profile = \"a\"\nthreads_dir = {:?}\nbundled_dir = {:?}\n[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n[profiles.b]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n",
+        "default_profile = \"a\"\nthreads_dir = {:?}\nbundled_dir = {:?}\n[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n[profiles.a.prices]\ninput = 3.0\ncache_read = 0.3\noutput = 15.0\n[profiles.b]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n",
         dir.join("threads").display(),
         dir.display()
     ))

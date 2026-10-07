@@ -11,7 +11,7 @@ use aigentic_api::ReportKind;
 use aigentic_runtime::aigentic_core::{Author, Event, EventKind};
 use aigentic_runtime::aigentic_log::{
     AssistantMessagePayload, CompactedPayload, CompactionStrategy, MemoryExtractedPayload,
-    ThreadRenamedPayload,
+    ThreadRenamedPayload, UserMessagePayload,
 };
 use aigentic_runtime::aigentic_policy::Decision;
 use aigentic_runtime::project::{DOT_DIR, INSTRUCTIONS_FILE};
@@ -28,7 +28,10 @@ pub struct DefaultReports {
 impl Reports for DefaultReports {
     fn render(&self, runtime: &Runtime, events: &[Event], kind: ReportKind) -> String {
         match kind {
-            ReportKind::Cost => cost_of(events).to_string(),
+            ReportKind::Cost => match last_message_line(events) {
+                Some(row) => format!("{}\n{row}", cost_of(events)),
+                None => cost_of(events).to_string(),
+            },
             ReportKind::Project => project_report(runtime, &self.global_instructions),
             ReportKind::Policy => policy_report(runtime),
             ReportKind::Memory => memory_report(runtime, events),
@@ -191,6 +194,68 @@ pub fn cost_of(events: &[Event]) -> Cost {
         }
     }
     cost
+}
+
+/// The `/cost` `last msg` row (issue #110): what the person's most
+/// recent message cost, its whole cycle, side jobs included.
+///
+/// The slice is everything after the last turn-starting `user_message`
+/// that a person authored: `cost_of` over `events[start..]`. A turn
+/// start is a `user_message` that did not arrive mid-turn, as
+/// `progress.rs` reads it; in a build thread whose prompts are all the
+/// runner's there is no such message, and no row.
+///
+/// Every side job appended after `start` counts with this message — an
+/// extraction, a title, a summary — even one the previous turn asked
+/// for that landed after the person's next message: nothing in the
+/// side-job payloads ties one to the turn that caused it, and the index
+/// is the only attribution available. With the last turn still running
+/// the row is a snapshot of a partial cycle that grows. The priced and
+/// estimated split is `cost_of`'s own; the estimated calls stay out of
+/// the dollars and out of the call counts.
+fn last_message_line(events: &[Event]) -> Option<String> {
+    let start = events.iter().rposition(|e| {
+        e.kind == EventKind::UserMessage
+            && matches!(e.author, Author::User(_))
+            && serde_json::from_value::<UserMessagePayload>(e.payload.clone())
+                .is_ok_and(|p| !p.mid_turn)
+    })?;
+    let cost = cost_of(&events[start..]);
+    // The dollars of the whole cycle: the calls' own, then the side jobs'
+    // (a title's or an extraction's under `side_spent`, a summary's under
+    // `summary_spent`). A thread with no stamp at all shows `unpriced`,
+    // never `$0.0000`.
+    let spent: Option<f64> = [cost.spent, cost.side_spent, cost.summary_spent]
+        .into_iter()
+        .flatten()
+        .reduce(|a, b| a + b);
+    let calls = cost.priced_calls + cost.unpriced_calls;
+    let mut parts = Vec::new();
+    match spent {
+        Some(usd) => parts.push(format!("${usd:.4}")),
+        None if calls > 0 => parts.push("unpriced".into()),
+        None => {}
+    }
+    if calls > 0 {
+        parts.push(format!("{} of {calls} calls priced", cost.priced_calls));
+    }
+    let side = cost.extractions + cost.titles + cost.summaries;
+    if side > 0 {
+        parts.push(format!(
+            "{side} side job{}",
+            if side == 1 { "" } else { "s" }
+        ));
+    }
+    let cache_total = cost.cache_read + cost.cache_write;
+    if cache_total > 0 {
+        let prompt = cost.input + cost.cache_read + cost.cache_write;
+        let share = 100.0 * cost.cache_read as f64 / prompt as f64;
+        parts.push(format!("{share:.0}% cached"));
+    }
+    if parts.is_empty() {
+        parts.push("no calls yet".into());
+    }
+    Some(format!("last msg   {}", parts.join(" · ")))
 }
 
 /// What the side-jobs line says the jobs were, in its own wording:
@@ -966,6 +1031,181 @@ mod cost_tests {
         let estimated = cost_of(&[assistant(100, 10, true)]);
         assert_eq!(estimated.spent, None);
         assert!(!estimated.to_string().contains("cost "), "{estimated}");
+    }
+
+    /// T3 (issue #110): `/cost`'s `last msg` row covers the person's most
+    /// recent message and the side jobs that landed after it, and nothing
+    /// from the turns before.
+    #[test]
+    fn the_last_msg_row_covers_the_persons_last_message() {
+        use aigentic_runtime::aigentic_core::{AgentId, UserId};
+
+        fn person(seq: u64, mid_turn: bool) -> Event {
+            let mut e = event(
+                EventKind::UserMessage,
+                json!({"blocks": [], "mid_turn": mid_turn}),
+            );
+            e.seq = seq;
+            e.author = Author::User(UserId("steve".into()));
+            e
+        }
+        fn runner(seq: u64, mid_turn: bool) -> Event {
+            let mut e = event(
+                EventKind::UserMessage,
+                json!({"blocks": [], "mid_turn": mid_turn}),
+            );
+            e.seq = seq;
+            e.author = Author::Agent(AgentId("runner".into()));
+            e
+        }
+        fn costed(seq: u64, input: u64, cache: u64, usd: Option<f64>) -> Event {
+            let mut e = event(
+                EventKind::AssistantMessage,
+                json!({"blocks": [], "usage": {
+                    "input_tokens": input,
+                    "output_tokens": 10,
+                    "cache_read_tokens": cache,
+                    "cache_write_tokens": 0,
+                    "reasoning_tokens": null,
+                    "estimated": false,
+                    "cost_usd": usd,
+                }}),
+            );
+            e.seq = seq;
+            e
+        }
+        fn title_after(seq: u64, usd: f64) -> Event {
+            let mut e = event(
+                EventKind::ThreadRenamed,
+                json!({"title": "t", "model": "m",
+                       "usage": {"input_tokens": 100, "output_tokens": 5, "cost_usd": usd}}),
+            );
+            e.seq = seq;
+            e
+        }
+        fn extraction_after(seq: u64, usd: f64) -> Event {
+            let mut e = event(
+                EventKind::MemoryExtracted,
+                json!({"through_seq": 5, "written": [], "model": "m",
+                       "usage": {"input_tokens": 200, "output_tokens": 5, "cost_usd": usd}}),
+            );
+            e.seq = seq;
+            e
+        }
+
+        // Two person turns; the second is followed by a title and an
+        // extraction, both stamped. The first turn's own calls and its
+        // dollars are outside the slice.
+        let first_msg = 1000u64;
+        let first_call = 2000u64;
+        let first_usd = 0.5;
+        let second_msg = 3000u64;
+        let second_call = 4000u64;
+        let second_usd = 0.25;
+        let title_usd = 0.03;
+        let extraction_usd = 0.02;
+        let fixture = vec![
+            person(0, false),
+            costed(first_call, first_msg, 900, Some(first_usd)),
+            event(EventKind::TurnEnded, json!({"reason": "done"})),
+            person(1, false),
+            costed(second_call, second_msg, 500, Some(second_usd)),
+            event(EventKind::TurnEnded, json!({"reason": "done"})),
+            title_after(2, title_usd),
+            extraction_after(3, extraction_usd),
+        ];
+        let row = last_message_line(&fixture).expect("a person turn start");
+        let spent = second_usd + title_usd + extraction_usd;
+        let cache_read = 500u64;
+        let prompt = second_msg + 500; // input + cache read + cache write
+        let share = 100.0 * cache_read as f64 / prompt as f64;
+        assert_eq!(
+            row,
+            format!(
+                "last msg   ${spent:.4} · 1 of 1 calls priced · 2 side jobs · {share:.0}% cached"
+            ),
+            "{row}"
+        );
+        // The label is 11 wide and the dollars four decimals.
+        assert_eq!(row.get(..11), Some("last msg   "));
+        assert_eq!(row.chars().nth(11), Some('$'));
+
+        // A title appended after a third person message counts with the
+        // third: leaving only it in the slice.
+        let third_msg = 6000u64;
+        let third_usd = 0.1;
+        let title_usd_late = 0.04;
+        let mut late = fixture.clone();
+        late.push(person(2, false));
+        late.push(costed(5000, third_msg, 0, Some(third_usd)));
+        late.push(title_after(6, title_usd_late));
+        let third_row = last_message_line(&late).expect("a person turn start");
+        assert_eq!(
+            third_row,
+            format!(
+                "last msg   ${:.4} · 1 of 1 calls priced · 1 side job",
+                third_usd + title_usd_late
+            ),
+            "{third_row}"
+        );
+
+        // A message that arrived mid-turn does not move `start`: the
+        // earlier turn's dollars stay in the slice beside the mid-turn
+        // call, and the cache share is the earlier turn's.
+        let mid_usd = 9.99;
+        let mut mid = fixture.clone();
+        mid.push(person(4, true));
+        mid.push(costed(6000, 0, 0, Some(mid_usd)));
+        assert_eq!(
+            last_message_line(&mid),
+            Some(format!(
+                "last msg   ${:.4} · 2 of 2 calls priced · 2 side jobs · {share:.0}% cached",
+                spent + mid_usd
+            )),
+            "mid-turn"
+        );
+
+        // An estimated call in the slice stays out of the dollars, and
+        // out of the call counts: the report keeps it in its own
+        // `estimated` row.
+        let mut guessed = fixture.clone();
+        let mut estimated = assistant(400, 20, true);
+        estimated.payload["usage"]["cost_usd"] = json!(mid_usd);
+        guessed.push(estimated);
+        assert_eq!(last_message_line(&guessed), Some(row.clone()), "estimated");
+
+        // A call with no stamp at all: the row says `unpriced`, and the
+        // cache share is still there. The bare call's fields come from
+        // the `assistant` fixture.
+        let (bare_input, bare_read, bare_write) = (100u64, 50u64, 5u64);
+        let bare = vec![person(0, false), assistant(bare_input, 10, false)];
+        let bare_prompt = bare_input + bare_read + bare_write;
+        let bare_share = 100.0 * bare_read as f64 / bare_prompt as f64;
+        assert_eq!(
+            last_message_line(&bare),
+            Some(format!(
+                "last msg   unpriced · 0 of 1 calls priced · {bare_share:.0}% cached"
+            )),
+            "unpriced"
+        );
+
+        // A person message nothing has answered yet is a snapshot of a
+        // cycle that has not started.
+        assert_eq!(
+            last_message_line(&[person(0, false)]),
+            Some("last msg   no calls yet".into())
+        );
+
+        // A thread whose turn starts are all the runner's has no row, and
+        // neither does a thread with no turn start.
+        let runner_only = vec![
+            runner(0, false),
+            costed(1000, 100, 0, Some(0.5)),
+            event(EventKind::TurnEnded, json!({"reason": "done"})),
+        ];
+        assert_eq!(last_message_line(&runner_only), None);
+        assert_eq!(last_message_line(&[costed(1000, 100, 0, Some(0.5))]), None);
+        assert_eq!(last_message_line(&[]), None);
     }
 }
 

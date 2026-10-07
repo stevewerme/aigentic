@@ -54,6 +54,22 @@ pub struct TurnStats {
     /// Output across the turn's calls, reasoning included: the turn's
     /// cost in tokens, shown by `/cost`.
     pub output: u64,
+    /// Dollars the turn's calls were stamped with, summed by the
+    /// `classify_cost` rule (issue #110): only a call that is not
+    /// estimated and carries a `cost_usd` adds here.
+    spent: f64,
+    /// The turn's calls that were priced, and those that were not
+    /// (estimated, or with no stamp).
+    priced: u32,
+    unpriced: u32,
+    /// Prompt tokens across the turn: input, cache read and cache
+    /// write.
+    prompt: u64,
+    /// Cache reads across the turn, the numerator of the cache share.
+    cached: u64,
+    /// Whether any call reported a cache read or write at all, so a
+    /// backend that has no caching stays quiet instead of showing `0%`.
+    cache_seen: bool,
     /// The running tool, `name argument`.
     pub current: Option<String>,
     /// Text is streaming.
@@ -111,15 +127,46 @@ impl TurnStats {
             started: std::time::Instant::now(),
             tools: 0,
             output: 0,
+            spent: 0.0,
+            priced: 0,
+            unpriced: 0,
+            prompt: 0,
+            cached: 0,
+            cache_seen: false,
             current: None,
             writing: false,
             retry: None,
         }
     }
 
+    /// Fold one call's usage into the turn (issue #110). The pricing
+    /// rule is `stats::classify_cost`'s: an estimated call, or one the
+    /// runtime stamped no price on, adds no dollars and counts as
+    /// unpriced, so this line and `/cost` agree on the same calls.
+    fn add_usage(&mut self, u: &aigentic_runtime::aigentic_log::Usage) {
+        self.output += u.output_tokens;
+        self.prompt += u.input_tokens + u.cache_read_tokens + u.cache_write_tokens;
+        self.cached += u.cache_read_tokens;
+        if u.cache_read_tokens > 0 || u.cache_write_tokens > 0 {
+            self.cache_seen = true;
+        }
+        if !u.estimated
+            && let Some(usd) = u.cost_usd
+        {
+            self.spent += usd;
+            self.priced += 1;
+        } else {
+            self.unpriced += 1;
+        }
+    }
+
     /// `1m 12s · 4 tools`: how long the turn has run and how many
-    /// calls it took. Sizes live in the footer, costs in `/cost`
-    /// (issue #21); this line says neither, so it says one thing.
+    /// calls it took. Sizes live in the footer, and the running line
+    /// carries state and time only, so it stays one thing (issue #21).
+    /// The finished summary appends the turn's own cost on top of this
+    /// (`summary`, issue #110): §15 of the phase 6 plan puts the
+    /// message's dollars on that line, which reverses #21's "costs in
+    /// `/cost` … this line says neither" for the summary alone.
     pub fn figures(&self) -> String {
         let mut parts = vec![crate::app::status::elapsed_short(self.started.elapsed())];
         match self.tools {
@@ -128,6 +175,33 @@ impl TurnStats {
             n => parts.push(format!("{n} tools")),
         }
         parts.join(" · ")
+    }
+
+    /// The finished turn's summary (issue #110): `figures()` plus what
+    /// the message cost, how many of its calls went unpriced, and how
+    /// much of its prompt was cached. Each part appears only when it
+    /// has something to say, so a thread whose calls carry no price
+    /// reads exactly as it did before. The live line keeps `figures()`,
+    /// so a running turn still shows only state and time.
+    pub fn summary(&self) -> String {
+        let mut out = self.figures();
+        if self.priced > 0 {
+            out.push_str(&format!(
+                " · {}",
+                crate::stats::money(Some(self.spent), None)
+            ));
+        }
+        if self.unpriced > 0 {
+            out.push_str(&format!(" · {} unpriced", self.unpriced));
+        }
+        // `stats`' cache share over every call, estimated included; a
+        // backend that reports no cache fields drops the part rather
+        // than showing `0%` every turn.
+        if self.prompt > 0 && self.cache_seen {
+            let share = 100.0 * self.cached as f64 / self.prompt as f64;
+            out.push_str(&format!(" · {share:.0}% cached"));
+        }
+        out
     }
 
     /// What the turn is doing now — the verb only. The in-flight row
@@ -1886,7 +1960,7 @@ impl ClientRepl {
                     if let Ok(AssistantMessagePayload { usage: Some(u), .. }) =
                         serde_json::from_value(event.payload.clone())
                     {
-                        t.output += u.output_tokens;
+                        t.add_usage(&u);
                     }
                 }
             }
@@ -1992,7 +2066,7 @@ impl ClientRepl {
             EventKind::TurnEnded => {
                 self.flush_partial(out);
                 if let Some(t) = self.turn.take() {
-                    out.cell(Cell::Summary(format!("─ {}", t.figures())), true);
+                    out.cell(Cell::Summary(format!("─ {}", t.summary())), true);
                     // The turn's cost, for `/cost` (issue #21): the live
                     // line no longer carries it.
                     if t.output > 0 || t.tools > 0 {
@@ -3829,6 +3903,102 @@ mod tests {
         drop(embedded);
     }
 
+    /// The turn's summary line carries what the message cost, the way
+    /// the rig's `[profiles.a.prices]` prices it (issue #110): the
+    /// engine folds the usages the runtime stamped, and the last
+    /// summary cell in the transcript says the dollars and the cache
+    /// share the fixture's numbers give.
+    #[tokio::test]
+    async fn the_turn_summary_line_shows_the_turns_dollars_and_cache_share() {
+        use aigentic_runtime::aigentic_log::Usage as LogUsage;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = project(dir.path(), "proj", "");
+        let cfg_dir = dir.path().join("cfg");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        let usage = |input: u64, cache_read: u64, output: u64| Usage {
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_tokens: cache_read,
+            cache_write_tokens: 0,
+            reasoning_tokens: None,
+        };
+        let first = usage(1_000, 3_000, 200);
+        let second = usage(2_000, 0, 400);
+        let script = vec![
+            vec![
+                call("b1", "bash", serde_json::json!({"command": "echo one"})),
+                call("b2", "bash", serde_json::json!({"command": "echo two"})),
+                ProviderEvent::Usage(first),
+                tool_use(),
+            ],
+            vec![text("Both done.\n"), ProviderEvent::Usage(second), done()],
+        ];
+        let embedded = Server::embed_with(
+            config(dir.path()),
+            cfg_dir.clone(),
+            root,
+            "steve",
+            None,
+            Factory::scripted(script),
+            Arc::new(DefaultReports {
+                global_instructions: cfg_dir.join("instructions.md"),
+            }),
+        )
+        .await
+        .unwrap();
+        let (client, welcome) =
+            Client::connect(&Addr::Unix(embedded.socket.clone()), &embedded.token)
+                .await
+                .unwrap();
+        let role = welcome.projects[0].role.clone();
+        let (thread, state, mode) = open(&client, "proj", None).await;
+        let notices = client.take_notices().unwrap();
+        let mut repl = ClientRepl::new(
+            client,
+            thread,
+            "steve",
+            role,
+            state,
+            mode,
+            Identity::default(),
+            "proj",
+        );
+        let (tx, rx) = mpsc::unbounded_channel();
+        let feeder = async move {
+            tx.send("go".into()).unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+            tx.send("/quit".into()).unwrap();
+        };
+        let mut out = Lines::default();
+        let ((), ()) = tokio::join!(repl.run(rx, notices, &mut out), feeder);
+        let lines = out.0;
+        // The rig's `[profiles.a.prices]`, the same table the runtime
+        // stamped the calls with; the expected dollars come from it and
+        // the fixture's usages, never by hand.
+        let prices = aigentic_runtime::Prices {
+            input: 3.0,
+            cache_read: 0.3,
+            cache_write: 3.0,
+            output: 15.0,
+        };
+        let spent = prices.cost_usd(&LogUsage::reported(first))
+            + prices.cost_usd(&LogUsage::reported(second));
+        let prompt = 1_000 + 3_000 + 2_000;
+        let share = 100.0 * 3_000.0 / prompt as f64;
+        let expected = format!(
+            "· {} · {share:.0}% cached",
+            crate::stats::money(Some(spent), None)
+        );
+        let summary = lines
+            .iter()
+            .rev()
+            .find(|l| l.trim_start().starts_with("─ "))
+            .unwrap_or_else(|| panic!("a turn summary in {lines:#?}"));
+        assert!(summary.ends_with(&expected), "{summary:?}");
+        drop(embedded);
+    }
+
     #[test]
     fn turn_figures_read_short() {
         let mut t = TurnStats::new();
@@ -3851,6 +4021,99 @@ mod tests {
         assert!(t.figures().ends_with("1 tool"), "{}", t.figures());
         assert_eq!(crate::app::status::count_short(950), "950");
         assert_eq!(crate::app::status::count_short(1_300_000), "1.3M");
+    }
+
+    /// The finished summary (issue #110) adds what the message cost,
+    /// how many of its calls went unpriced and the cached share to the
+    /// `figures()` text; the running line keeps `figures()` alone.
+    #[test]
+    fn the_turn_summary_adds_the_cost_the_unpriced_calls_and_the_cache_share() {
+        use aigentic_runtime::aigentic_log::Usage as LogUsage;
+
+        let stamp =
+            |input: u64, cache_read: u64, cache_write: u64, output: u64, usd: Option<f64>| {
+                LogUsage {
+                    input_tokens: input,
+                    output_tokens: output,
+                    cache_read_tokens: cache_read,
+                    cache_write_tokens: cache_write,
+                    reasoning_tokens: None,
+                    estimated: false,
+                    profile: None,
+                    model: None,
+                    effort: None,
+                    latency_ms: None,
+                    ttft_ms: None,
+                    cost_usd: usd,
+                }
+            };
+        // Two priced calls, one call the runtime stamped no price on,
+        // and an estimated call that carries a fabricated `cost_usd`:
+        // the estimated stamp must stay out of the dollars.
+        let usages = vec![
+            stamp(1_000, 0, 0, 500, Some(0.25)),
+            stamp(2_000, 3_000, 1_000, 200, Some(0.50)),
+            stamp(100, 0, 0, 10, None),
+            LogUsage {
+                estimated: true,
+                ..stamp(50, 0, 0, 5, Some(9.99))
+            },
+        ];
+        let mut t = TurnStats::new();
+        t.tools = 2;
+        for u in &usages {
+            t.add_usage(u);
+        }
+        // Expected values from the fixture, never by hand.
+        let spent: f64 = usages
+            .iter()
+            .filter(|u| !u.estimated && u.cost_usd.is_some())
+            .map(|u| u.cost_usd.unwrap())
+            .sum();
+        let unpriced = usages
+            .iter()
+            .filter(|u| u.estimated || u.cost_usd.is_none())
+            .count();
+        let prompt: u64 = usages
+            .iter()
+            .map(|u| u.input_tokens + u.cache_read_tokens + u.cache_write_tokens)
+            .sum();
+        let cached: u64 = usages.iter().map(|u| u.cache_read_tokens).sum();
+        let share = 100.0 * cached as f64 / prompt as f64;
+        let expected = format!(
+            " · {} · {unpriced} unpriced · {share:.0}% cached",
+            crate::stats::money(Some(spent), None)
+        );
+        assert!(t.summary().ends_with(&expected), "{}", t.summary());
+        // The running line is unchanged: state, clock and calls only.
+        assert!(t.figures().ends_with(" · 2 tools"), "{}", t.figures());
+        assert!(!t.figures().contains('$'), "{}", t.figures());
+        assert!(!t.figures().contains("cached"), "{}", t.figures());
+        assert!(!t.figures().contains("unpriced"), "{}", t.figures());
+
+        // No priced call: no dollar part at all.
+        let mut free = TurnStats::new();
+        free.add_usage(&stamp(100, 0, 0, 10, None));
+        assert!(!free.summary().contains('$'), "{}", free.summary());
+        assert!(free.summary().ends_with("1 unpriced"), "{}", free.summary());
+
+        // A backend reporting no cache fields drops the cache part
+        // rather than claiming `0%`.
+        let mut plain = TurnStats::new();
+        plain.add_usage(&stamp(100, 0, 0, 10, Some(0.01)));
+        assert!(
+            !plain.summary().contains("cached"),
+            "no cache fields, no share: {}",
+            plain.summary()
+        );
+        // And a cache write alone counts as seen, so the share shows.
+        let mut writer = TurnStats::new();
+        writer.add_usage(&stamp(100, 0, 50, 10, Some(0.01)));
+        assert!(
+            writer.summary().ends_with("0% cached"),
+            "{}",
+            writer.summary()
+        );
     }
 
     /// A retry outranks "thinking" on the turn line (issue #31), and
