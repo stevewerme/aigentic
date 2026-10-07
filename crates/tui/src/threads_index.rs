@@ -1,8 +1,8 @@
 //! The flat threads directory (issue #9) and what a log says about its
-//! project (issue #83). Every local reader — `aigentic stats`, the local
-//! `aigentic threads` — walks the same catalogue and attributes a thread
-//! by the embedded daemon's own rules, so the two never name one thread
-//! two ways.
+//! project (issue #83). Every local reader — `aigentic stats`,
+//! `aigentic status`, the local `aigentic threads` — walks the same
+//! catalogue and attributes a thread by the embedded daemon's own rules,
+//! so the two never name one thread two ways.
 //!
 //! The layout: every log is `threads/<id>.jsonl`. A directory made
 //! before #9 left a `threads/<project>/<id>.jsonl` behind; a log there is

@@ -11,6 +11,7 @@ mod front;
 mod init_cmd;
 mod pocock;
 mod pocock_templates;
+mod progress;
 mod project_cmd;
 mod run_view;
 mod skills_cmd;
@@ -27,6 +28,7 @@ use aigentic_runtime::aigentic_tools::{ToolRegistry, Workdir};
 use aigentic_runtime::{GlobalLayer, Layers, Mode, Project, ProjectFile, Runtime};
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
+use time::OffsetDateTime;
 use ulid::Ulid;
 
 use crate::app::engine::{ClientRepl, Identity};
@@ -126,6 +128,24 @@ enum Command {
         #[arg(long, conflicts_with_all = ["thread", "issue"])]
         decisions: bool,
     },
+    /// What the running threads are doing right now: one line per live
+    /// thread, from its log. Reads local logs only. A turn whose last
+    /// event is over half an hour old is `stale` unless it is waiting on
+    /// a person (an unanswered question, approval or checkpoint): a log
+    /// cannot tell a crash from a long tool call, so a stale thread is
+    /// listed only with `--all` and only a resume clears it. A log not
+    /// written in the last day is not read at all, so a turn parked for
+    /// longer than that is missed.
+    Status {
+        /// Also list stale threads, and threads whose last turn ended
+        /// within the hour.
+        #[arg(long)]
+        all: bool,
+        /// The same report as one JSON array, one object per thread.
+        /// The shape is stable.
+        #[arg(long)]
+        json: bool,
+    },
     /// Guided setup: config, project file and AGENTS.md, GitHub issues
     /// and labels through `gh`, knowledge links. Shows every file first.
     Init,
@@ -224,6 +244,12 @@ async fn connect_remote(
         .or_else(|| welcome.projects.first().map(|p| p.name.clone()))
         .context("no project: pass --project, or run in a checkout with aigentic.toml")?;
     Ok((client, project))
+}
+
+/// A log reader's refusal of `--server`: the wording `stats` has always
+/// used, adapted to the command's own name (#109).
+fn local_only(command: &str) -> String {
+    format!("{command} reads this machine's logs; drop --server and run it locally")
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -369,7 +395,7 @@ async fn main() -> anyhow::Result<()> {
         // Stats read this machine's logs: a daemon holds threads of other
         // users and other projects, and would answer about its own disk.
         Some(Command::Stats { .. }) if cli.server.is_some() => {
-            bail!("stats reads this machine's logs; drop --server and run it locally");
+            bail!("{}", local_only("stats"));
         }
         Some(Command::Stats {
             since,
@@ -419,6 +445,26 @@ async fn main() -> anyhow::Result<()> {
                     &book,
                 )?,
             }
+            std::process::exit(0);
+        }
+        // Status reads this machine's logs too: a daemon's answer would
+        // be about its own disk and its own threads.
+        Some(Command::Status { .. }) if cli.server.is_some() => {
+            bail!("{}", local_only("status"));
+        }
+        Some(Command::Status { all, json }) => {
+            // The same price tables `stats` uses, so both answer one way.
+            let book = stats::PriceBook::from_config(&config, None)?;
+            // One clock for every age on the line, and both windows.
+            progress::run(
+                &threads_base,
+                &workspaces,
+                cli.project.as_deref(),
+                all,
+                json,
+                OffsetDateTime::now_utc(),
+                &book,
+            )?;
             std::process::exit(0);
         }
         Some(Command::Project {
@@ -888,6 +934,52 @@ mod tests {
             .unwrap();
         assert_eq!(cli.project.as_deref(), Some("alpha"));
         assert!(matches!(cli.command, Some(Command::Stats { .. })));
+    }
+
+    /// Issue #109: `status` takes `--all` and `--json`, and the global
+    /// `--project` still reaches it, exactly like `stats`.
+    #[test]
+    fn status_parses_all_json_and_project() {
+        let cli = Cli::try_parse_from(["aigentic", "status", "--all", "--json"]).unwrap();
+        match cli.command {
+            Some(Command::Status { all, json }) => {
+                assert!(all);
+                assert!(json);
+            }
+            other => panic!("expected status: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["aigentic", "status"]).unwrap();
+        match cli.command {
+            Some(Command::Status { all, json }) => {
+                assert!(!all, "the default is the live threads");
+                assert!(!json);
+            }
+            other => panic!("expected status: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["aigentic", "status", "--project", "alpha"]).unwrap();
+        assert_eq!(cli.project.as_deref(), Some("alpha"));
+        assert!(matches!(cli.command, Some(Command::Status { .. })));
+    }
+
+    /// Issue #109: a log reader refuses `--server`, with `stats`' wording
+    /// adapted to its own name. The guard is what the `Status` arm uses.
+    #[test]
+    fn status_refuses_server_with_the_log_reader_wording() {
+        let cli =
+            Cli::try_parse_from(["aigentic", "status", "--server", "tcp:127.0.0.1:7777"]).unwrap();
+        assert!(cli.server.is_some(), "the guard's own condition");
+        assert!(matches!(cli.command, Some(Command::Status { .. })));
+        assert_eq!(
+            local_only("status"),
+            "status reads this machine's logs; drop --server and run it locally"
+        );
+        // `stats`' own words are untouched (#109 leaves `stats` alone).
+        assert_eq!(
+            local_only("stats"),
+            "stats reads this machine's logs; drop --server and run it locally"
+        );
     }
 
     /// Issue #40: the drill-downs. A thread id is the *global* `--thread`

@@ -329,7 +329,7 @@ impl IssueTotals {
 
 /// What one call's dollars are (issue #40).
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum Cost {
+pub(crate) enum Cost {
     /// The runtime's `cost_usd` stamp, exact.
     Stamped(f64),
     /// No stamp, but the config's table knows the call's model or
@@ -397,7 +397,7 @@ impl PriceBook {
     /// The table for one call: its `model` (exact) first, then its
     /// `profile` name, then — only for a call that carries neither — the
     /// `--assume-profile` table. `None` means unpriced.
-    fn table(&self, u: &Usage) -> Option<Prices> {
+    pub(crate) fn table(&self, u: &Usage) -> Option<Prices> {
         if let Some(model) = u.model.as_deref()
             && let Some(prices) = self.by_model.get(model)
         {
@@ -419,7 +419,7 @@ impl PriceBook {
 /// dollars from guessed tokens are fiction, whatever the table says. A
 /// stamped cost is kept exactly as it is. Otherwise the config's current
 /// table prices the call, and the result is marked estimated.
-fn classify_cost(u: &Usage, book: &PriceBook) -> Cost {
+pub(crate) fn classify_cost(u: &Usage, book: &PriceBook) -> Cost {
     if u.estimated {
         return Cost::Unpriced;
     }
@@ -765,14 +765,14 @@ fn collect_issue(
 /// parts, and both feed one count because both are calls the loop made
 /// for its own bookkeeping, not steps of a turn.
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum SideJob {
+pub(crate) enum SideJob {
     Extraction,
     Title,
 }
 
 /// One group's running totals — a day or a project, folded the same way.
-#[derive(Default)]
-struct Accum {
+#[derive(Debug, Default)]
+pub(crate) struct Accum {
     /// The thread's summed `wall_secs` and `slept_secs` over the
     /// `turn_ended` lines that carried them (issue #47).
     wall_secs: Option<u64>,
@@ -807,7 +807,7 @@ struct Accum {
 }
 
 impl Accum {
-    fn add_call(&mut self, context: u64, cache_read: u64, cost: Cost) {
+    pub(crate) fn add_call(&mut self, context: u64, cache_read: u64, cost: Cost) {
         self.calls += 1;
         self.context_total += context;
         self.cache_read += cache_read;
@@ -831,19 +831,19 @@ impl Accum {
     /// ranks by it. The day and project tables print the two separately,
     /// so their `spent` stays the calls' and a reader can still see what
     /// the main loop cost on its own.
-    fn row_spent(&self) -> Option<f64> {
+    pub(crate) fn row_spent(&self) -> Option<f64> {
         add(self.spent, self.job_spent)
     }
 
     /// The same sum for the retro-priced dollars.
-    fn row_estimated(&self) -> Option<f64> {
+    pub(crate) fn row_estimated(&self) -> Option<f64> {
         add(self.price_estimated_spent, self.job_price_estimated_spent)
     }
 
     /// One side-job line — a `memory_extracted`, or a `thread_renamed`
     /// with a usage since #49 — the same three price outcomes as a call,
     /// into the job counters.
-    fn add_job(&mut self, job: SideJob, context: u64, output: u64, cost: Cost) {
+    pub(crate) fn add_job(&mut self, job: SideJob, context: u64, output: u64, cost: Cost) {
         self.job_calls += 1;
         match job {
             SideJob::Extraction => self.extractions += 1,
@@ -1279,7 +1279,7 @@ fn hashed_issue_number(text: &str) -> Option<u64> {
 
 /// A cost cell: stamped, estimated, both, or `-`. A guessed dollar is
 /// never dressed up as a measured one (`$` vs `~$`, issue #40).
-fn money(stamped: Option<f64>, estimated: Option<f64>) -> String {
+pub(crate) fn money(stamped: Option<f64>, estimated: Option<f64>) -> String {
     match (stamped, estimated) {
         (Some(a), Some(b)) => format!("${a:.4}+~${b:.4}"),
         (Some(a), None) => format!("${a:.4}"),
