@@ -267,6 +267,7 @@ impl Runtime {
             from_seq: from,
             to_seq: to,
             strategy,
+            continuous: false,
         })
         .expect("serialisable");
         self.measured = None;

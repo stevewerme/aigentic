@@ -748,6 +748,7 @@ mod tests {
                 model: "m".into(),
                 usage: Box::new(Usage::reported(aigentic_core::Usage::default())),
             },
+            continuous: false,
         };
         ev(
             seq,
@@ -761,6 +762,7 @@ mod tests {
             from_seq: from,
             to_seq: to,
             strategy: CompactionStrategy::TruncateResults { max_bytes: max },
+            continuous: false,
         };
         ev(
             seq,

@@ -413,6 +413,7 @@ mod tests {
                     aigentic_core::Usage::default(),
                 )),
             },
+            continuous: false,
         };
         ev(
             seq,

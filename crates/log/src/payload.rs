@@ -360,6 +360,13 @@ pub struct CompactedPayload {
     /// Inclusive; always a turn boundary.
     pub to_seq: u64,
     pub strategy: CompactionStrategy,
+    /// `true` when this compaction is the continuous link (issue #98):
+    /// older turns summarised a few at a time as the thread runs, rather
+    /// than a `/compact` or a sweep nested over the whole thread. Absent
+    /// on every older line, so a nested or truncating compaction reads
+    /// back as `false`, and a fresh one writes no key.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub continuous: bool,
 }
 
 /// Payload of a `pinned` event; the event's author is who pinned it.
@@ -2244,6 +2251,46 @@ mod tests {
             serde_json::from_value::<ThreadStartedPayload>(value).unwrap(),
             front
         );
+    }
+
+    /// T1 (issue #98): a continuous compaction round-trips with
+    /// `continuous: true`, an old line written without the key reads back
+    /// as `false`, and `false` is never written.
+    #[test]
+    fn a_continuous_compaction_round_trips_and_old_lines_read_false() {
+        let mut payload = CompactedPayload {
+            from_seq: 3,
+            to_seq: 9,
+            strategy: CompactionStrategy::Summary {
+                text: "so far".into(),
+                model: "utility".into(),
+                usage: Box::new(Usage::reported(aigentic_core::Usage::default())),
+            },
+            continuous: true,
+        };
+        let value = serde_json::to_value(&payload).unwrap();
+        assert_eq!(value["continuous"], json!(true));
+        assert_eq!(
+            serde_json::from_value::<CompactedPayload>(value.clone()).unwrap(),
+            payload
+        );
+
+        // A line written before the field existed reads as false: the
+        // same line with the key taken out.
+        let mut old = value.clone();
+        old.as_object_mut().unwrap().remove("continuous");
+        let read: CompactedPayload = serde_json::from_value(old.clone()).unwrap();
+        assert!(!read.continuous);
+        payload.continuous = false;
+        assert_eq!(read, payload);
+
+        // And a fresh non-continuous line writes no key at all.
+        let written = serde_json::to_value(&read).unwrap();
+        assert!(
+            !written.as_object().unwrap().contains_key("continuous"),
+            "false is not written"
+        );
+        assert_eq!(written, old);
     }
 
     /// T5 (issue #96): an `assistant_message` line written before the
