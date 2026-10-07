@@ -19,15 +19,16 @@
 //! still read, with the thread attributed to its project from its own
 //! lines (`crate::threads_index`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 use aigentic_runtime::Prices;
 use aigentic_runtime::aigentic_core::{Author, ContentBlock, Event, EventKind};
 use aigentic_runtime::aigentic_log::{
     AssistantMessagePayload, DecisionAnswer, DecisionKind, DecisionRecord, Invoker,
-    MemoryExtractedPayload, SkillLoadedPayload, ThreadRenamedPayload, ToolResultPayload,
-    TurnEndedPayload, Usage, UserMessagePayload, decision_records,
+    MemoryExtractedPayload, RunStartedPayload, SkillLoadedPayload, ThreadRenamedPayload,
+    ThreadStartedPayload, ToolResultPayload, TurnEndedPayload, Usage, UserMessagePayload,
+    decision_records,
 };
 use aigentic_server::config::Config;
 use aigentic_server::workspaces::Workspace;
@@ -235,8 +236,7 @@ pub struct ThreadReport {
     pub slept_secs: Option<u64>,
 }
 
-/// `stats --issue <n>` (issue #40): every thread whose first own-user
-/// message names that issue, with a total over them.
+/// `stats --issue <n>`: threads that name the issue or belong to its run.
 #[derive(Debug, Serialize)]
 pub struct IssueReport {
     pub issue: u64,
@@ -608,8 +608,8 @@ pub fn run_thread(
     Ok(())
 }
 
-/// `aigentic stats --issue <n>` (issue #40): every thread whose first
-/// own-user message names that issue, costliest first, with a total.
+/// `aigentic stats --issue <n>`: manually named threads, plus matching
+/// run leads and their step threads, costliest first, with a total.
 pub fn run_issue(
     base: &Path,
     workspaces: &[Workspace],
@@ -674,8 +674,8 @@ fn collect_thread(
     bail!("no thread {id} found under {}", base.display())
 }
 
-/// Every thread whose first own-user message names `issue`, folded.
-/// `--thread`'s walk, one project at a time.
+/// Every manually named thread, run lead, and child of a matching run,
+/// folded with the same totals as the other stats views.
 fn collect_issue(
     base: &Path,
     workspaces: &[Workspace],
@@ -685,10 +685,27 @@ fn collect_issue(
     book: &PriceBook,
 ) -> anyhow::Result<IssueReport> {
     let mut threads: Vec<ThreadReport> = Vec::new();
+    let mut run_leads = HashSet::new();
+    let mut candidates = Vec::new();
     for found in threads_index::catalogue(base) {
         let Ok(events) = found.read() else {
             continue;
         };
+        let run_issue = events.iter().find_map(|event| {
+            (event.kind == EventKind::RunStarted)
+                .then(|| serde_json::from_value::<RunStartedPayload>(event.payload.clone()).ok())
+                .flatten()
+                .map(|payload| payload.issue)
+        });
+        if run_issue == Some(issue) {
+            run_leads.insert(found.id);
+        }
+        let parent_thread = events.iter().find_map(|event| {
+            (event.kind == EventKind::ThreadStarted)
+                .then(|| serde_json::from_value::<ThreadStartedPayload>(event.payload.clone()).ok())
+                .flatten()
+                .and_then(|payload| payload.parent_thread)
+        });
         let name = attributed(&found, &events, workspaces);
         if project.is_some_and(|want| want != name) {
             continue;
@@ -704,7 +721,8 @@ fn collect_issue(
             &mut dropped_days,
             book,
         );
-        if !names_issue(&meta, issue) {
+        let direct_match = run_issue == Some(issue) || names_issue(&meta, issue);
+        if !direct_match && parent_thread.is_none() {
             continue;
         }
         // The window applies here too: a matched thread with no call
@@ -713,7 +731,16 @@ fn collect_issue(
         if thread.calls == 0 && thread.job_calls == 0 {
             continue;
         }
-        threads.push(thread.into_report(found.id.to_string(), &name, meta));
+        candidates.push((
+            thread.into_report(found.id.to_string(), &name, meta),
+            parent_thread,
+            direct_match,
+        ));
+    }
+    for (thread, parent_thread, direct_match) in candidates {
+        if direct_match || parent_thread.is_some_and(|parent| run_leads.contains(&parent)) {
+            threads.push(thread);
+        }
     }
     threads.sort_by(|a, b| match (effective_report(a), effective_report(b)) {
         (Some(x), Some(y)) => y
@@ -2007,7 +2034,9 @@ mod tests {
     use std::path::PathBuf;
 
     use aigentic_runtime::aigentic_core::UserId;
-    use aigentic_runtime::aigentic_log::{ProjectSwitchedPayload, ThreadStartedPayload};
+    use aigentic_runtime::aigentic_log::{
+        ProjectSwitchedPayload, RunStartedPayload, ThreadStartedPayload,
+    };
     use serde_json::json;
     use time::macros::datetime;
 
@@ -3077,6 +3106,140 @@ api_key_env = "TENSORX_API_KEY"
             ],
         );
         (dir, plain, skill, model_skill, next_line, bare)
+    }
+
+    fn issue_run_started(at: &str, issue: u64) -> serde_json::Value {
+        json!({
+            "kind": "run_started",
+            "author": {"kind": "agent", "id": "runner"},
+            "payload": serde_json::to_value(RunStartedPayload {
+                issue,
+                workflow: "test".into(),
+                version: 1,
+                content_hash: "test".into(),
+                budget_usd: 10.0,
+            })
+            .unwrap(),
+            "created_at": at,
+        })
+    }
+
+    fn issue_thread_started(at: &str, parent_thread: Option<Ulid>) -> serde_json::Value {
+        json!({
+            "kind": "thread_started",
+            "author": {"kind": "agent", "id": "runner"},
+            "payload": serde_json::to_value(ThreadStartedPayload {
+                project: Some("alpha".into()),
+                root: PathBuf::from("alpha"),
+                created_by: Author::User(UserId("steve".into())),
+                parent_thread,
+                step: parent_thread.map(|_| "implement".into()),
+                front: false,
+            })
+            .unwrap(),
+            "created_at": at,
+        })
+    }
+
+    #[test]
+    fn an_issue_search_includes_run_leads_and_their_step_threads() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("alpha");
+        let lead = id_at(1);
+        let first_child = id_at(2);
+        let second_child = id_at(3);
+        let other_lead = id_at(4);
+        let other_child = id_at(5);
+
+        // The catalogue visits newer ULIDs first, so both children are
+        // read before their lead. Association must not depend on order.
+        write_thread(
+            &base,
+            lead,
+            &[
+                issue_thread_started("2026-09-27T09:00:00Z", None),
+                issue_run_started("2026-09-27T09:00:01Z", 71),
+                call(
+                    "2026-09-27T09:00:02Z",
+                    10,
+                    0,
+                    10,
+                    Some(0.25),
+                    Some("z-ai/glm-5.3"),
+                    None,
+                ),
+            ],
+        );
+        for (id, cost, at) in [
+            (first_child, 0.5, "2026-09-27T09:10:00Z"),
+            (second_child, 0.75, "2026-09-27T09:20:00Z"),
+        ] {
+            write_thread(
+                &base,
+                id,
+                &[
+                    issue_thread_started(at, Some(lead)),
+                    call(at, 10, 0, 10, Some(cost), Some("z-ai/glm-5.3"), None),
+                ],
+            );
+        }
+
+        write_thread(
+            &base,
+            other_lead,
+            &[
+                issue_thread_started("2026-09-27T09:30:00Z", None),
+                issue_run_started("2026-09-27T09:30:01Z", 72),
+                call(
+                    "2026-09-27T09:30:02Z",
+                    10,
+                    0,
+                    10,
+                    Some(4.0),
+                    Some("z-ai/glm-5.3"),
+                    None,
+                ),
+            ],
+        );
+        write_thread(
+            &base,
+            other_child,
+            &[
+                issue_thread_started("2026-09-27T09:40:00Z", Some(other_lead)),
+                call(
+                    "2026-09-27T09:40:01Z",
+                    10,
+                    0,
+                    10,
+                    Some(8.0),
+                    Some("z-ai/glm-5.3"),
+                    None,
+                ),
+            ],
+        );
+
+        let report = collect_issue(dir.path(), &[], None, 71, None, &no_prices()).unwrap();
+        assert_eq!(report.total.threads, 3, "{:?}", report.threads);
+        assert_eq!(report.total.calls, 3, "{:?}", report.threads);
+        assert_eq!(report.total.spent, Some(1.5), "{:?}", report.threads);
+        for (id, spent) in [(lead, 0.25), (first_child, 0.5), (second_child, 0.75)] {
+            let thread = report
+                .threads
+                .iter()
+                .find(|thread| thread.id == id.to_string())
+                .unwrap_or_else(|| panic!("missing run thread {id}"));
+            assert_eq!(thread.calls, 1);
+            assert_eq!(thread.spent, Some(spent));
+        }
+        assert!(
+            !report
+                .threads
+                .iter()
+                .any(|thread| thread.id == other_lead.to_string()
+                    || thread.id == other_child.to_string()),
+            "another issue's run must stay out of the report: {:?}",
+            report.threads
+        );
     }
 
     #[test]

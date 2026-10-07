@@ -116,8 +116,8 @@ enum Command {
         /// profile guesses their cost.
         #[arg(long, value_name = "NAME")]
         assume_profile: Option<String>,
-        /// Every thread whose first user message names `#<n>`, with a
-        /// total: the cost of one issue's build cycle.
+        /// Threads naming `#<n>`, plus that issue's run leads and step
+        /// threads. Costs are totalled across all matching threads.
         #[arg(long, value_name = "N", conflicts_with = "thread")]
         issue: Option<u64>,
         /// The decision record (issue #74): per kind, how many proposals
