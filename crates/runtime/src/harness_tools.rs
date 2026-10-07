@@ -1444,6 +1444,9 @@ mod tests {
     }
 
     /// T1: a failed later update neither replaces the checklist nor counts.
+    /// The refusal is one that parses (an empty list, which the handler
+    /// refuses with "send at least one task"), so the rule under test is
+    /// the `is_error` check, not the parser's `deny_unknown_fields`.
     #[test]
     fn a_later_failed_update_tasks_resets_nothing_and_counts_nothing() {
         let mut events = Vec::new();
@@ -1451,7 +1454,7 @@ mod tests {
         push_result(&mut events, "u1", false);
         push_others(&mut events, 0, K);
 
-        push_tasks(&mut events, vec![("u2", json!({"bogus": true}))]);
+        push_tasks(&mut events, vec![("u2", json!({"tasks": []}))]);
         push_result(&mut events, "u2", true);
         assert_eq!(
             stale_tasks_reminder(&events),
@@ -1461,13 +1464,14 @@ mod tests {
     }
 
     /// T1: one message with two calls — the failed sibling is no checklist
-    /// and its result is no call.
+    /// and its result is no call. The sibling is a parseable refusal (an
+    /// empty list), as in the test above.
     #[test]
     fn a_failed_sibling_call_is_neither_the_checklist_nor_progress() {
         let mut events = Vec::new();
         push_tasks(
             &mut events,
-            vec![("u1", tasks_json(1, 3)), ("u2", json!({"bogus": true}))],
+            vec![("u1", tasks_json(1, 3)), ("u2", json!({"tasks": []}))],
         );
         push_result(&mut events, "u1", false);
         push_result(&mut events, "u2", true);
