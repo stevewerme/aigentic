@@ -10,7 +10,8 @@ use aigentic_runtime::aigentic_core::{AgentId, Provider};
 use aigentic_runtime::aigentic_log::{Repair, ThreadLog};
 use aigentic_runtime::aigentic_tools::{ToolRegistry, Workdir};
 use aigentic_runtime::{
-    GlobalLayer, Layers, Project, ProjectContext, ProjectFile, Runtime, WorkspaceLayer,
+    DEFAULT_COMPACTION, GlobalLayer, Layers, Project, ProjectContext, ProjectFile, Runtime,
+    WorkspaceLayer,
 };
 use ulid::Ulid;
 
@@ -226,6 +227,17 @@ pub async fn build_thread(
     )
     .await?;
     let profile: Option<&Profile> = config.profiles.get(&profile_name);
+    let profile_compaction = profile
+        .map(Profile::compaction_settings)
+        .unwrap_or(DEFAULT_COMPACTION);
+    let compaction = ctx
+        .layers
+        .project
+        .as_ref()
+        .and_then(|project| project.file.compaction.as_ref())
+        .map_or(profile_compaction, |project| {
+            project.over(profile_compaction)
+        });
 
     std::fs::create_dir_all(&root.threads_dir)?;
     let (log, torn) = ThreadLog::open_with(&root.threads_dir, thread, Repair::TruncateTornTail)?;
@@ -241,7 +253,8 @@ pub async fn build_thread(
         .with_policy(ctx.policy)
         .with_skills(ctx.skills)
         .with_projects(projects)
-        .with_harness_instructions();
+        .with_harness_instructions()
+        .with_compaction(compaction);
     if let Some(utility) = &config.utility_profile
         && *utility != profile_name
     {
@@ -259,9 +272,7 @@ pub async fn build_thread(
         }
     }
     if let Some(p) = profile {
-        runtime = runtime
-            .with_compaction(p.compaction_settings())
-            .with_budget(p.budget());
+        runtime = runtime.with_budget(p.budget());
     }
     Ok(Built {
         runtime,
@@ -438,6 +449,103 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(plain.runtime.identity().2, None);
+    }
+
+    #[tokio::test]
+    async fn a_built_thread_overlays_project_compaction_on_profile_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::parse(
+            "default_profile = \"main\"\n\
+             [profiles.main]\nprovider = \"anthropic\"\nmodel = \"m\"\napi_key_env = \"K\"\n\
+             [profiles.main.compaction]\ntrigger_fraction = 0.8\nkeep_turns = 4\n\
+             max_result_bytes = 2048\nsummary_max_output_tokens = 4096\nkeep_last_calls = 8\n\
+             working_set_tokens = 65536\nevict_above_tokens = 48000\nevict_min_free_percent = 50\n",
+        )
+        .unwrap();
+        let profile_settings = config.select(Some("main")).unwrap().1.compaction_settings();
+
+        let project_dir = dir.path().join("project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(
+            project_dir.join(aigentic_runtime::project::FILE_NAME),
+            "[project]\nname = \"project\"\n[compaction]\ntrigger_fraction = 0.6\n\
+             summary_max_output_tokens = 256\n\
+             keep_last_calls = 3\nworking_set_tokens = 32768\n\
+             evict_above_tokens = 12000\nevict_min_free_percent = 30\n",
+        )
+        .unwrap();
+        let project_root = Root {
+            name: "project".into(),
+            root: project_dir,
+            threads_dir: dir.path().join("threads"),
+        };
+        let project = build_thread(
+            &config,
+            dir.path(),
+            &Stub,
+            &project_root,
+            &[],
+            Ulid::from_datetime(std::time::SystemTime::now()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let settings = project.runtime.compaction();
+        assert_eq!(settings.trigger_fraction, 0.6);
+        assert_eq!(settings.keep_turns, profile_settings.keep_turns);
+        assert_eq!(settings.max_result_bytes, 2048);
+        assert_eq!(settings.summary_max_output_tokens, 256);
+        assert_eq!(settings.keep_last_calls, 3);
+        assert_eq!(settings.working_set_tokens, 32768);
+        assert_eq!(settings.evict_above_tokens, 12000);
+        assert_eq!(settings.evict_min_free_percent, 30);
+
+        let profile_only_dir = dir.path().join("profile-only");
+        std::fs::create_dir_all(&profile_only_dir).unwrap();
+        std::fs::write(
+            profile_only_dir.join(aigentic_runtime::project::FILE_NAME),
+            "[project]\nname = \"profile-only\"\n",
+        )
+        .unwrap();
+        let profile_only_root = Root {
+            name: "profile-only".into(),
+            root: profile_only_dir,
+            threads_dir: dir.path().join("threads"),
+        };
+        let profile_only = build_thread(
+            &config,
+            dir.path(),
+            &Stub,
+            &profile_only_root,
+            &[],
+            Ulid::from_datetime(std::time::SystemTime::now()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(profile_only.runtime.compaction(), &profile_settings);
+
+        let bare_root = Root {
+            name: "bare".into(),
+            root: dir.path().join("bare"),
+            threads_dir: dir.path().join("threads"),
+        };
+        std::fs::create_dir_all(&bare_root.root).unwrap();
+        let bare = build_thread(
+            &config,
+            dir.path(),
+            &Stub,
+            &bare_root,
+            &[],
+            Ulid::from_datetime(std::time::SystemTime::now()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(bare.runtime.compaction(), &profile_settings);
     }
 
     /// Names each profile's model after the profile, so a test can tell
