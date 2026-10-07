@@ -1286,16 +1286,25 @@ async fn the_emergency_net_fires_only_past_its_gate() {
     assert_eq!(gate, 7_200, "the net's gate is 0.9 × 8000");
     drop(h);
 
-    // Six turns: fill is over the line the batch aims at and under the
-    // net's gate. Nothing compacts — not here, not mid-turn.
+    // Smaller turns until fill passes the line the batch aims at, then
+    // two more that both *start* in the band between the line and the
+    // net's gate: a net gated at the line would fire there, so this half
+    // proves the gate, not only the fixture (#98's judge, note 1).
+    // Nothing compacts — not here, not mid-turn.
     let mut below = link_harness(
         Arc::new(Mutex::new(Vec::new())),
         Arc::new(Mutex::new(Vec::new())),
-        400,
+        200,
         0,
         settings,
     );
-    driven_turns(&mut below.runtime, 6, "turn").await;
+    let mut grown = 0;
+    while fill_of(&below.runtime) <= line {
+        driven_turns(&mut below.runtime, 1, &format!("grow {grown}")).await;
+        grown += 1;
+        assert!(grown < 100, "the fixture never reaches the line");
+    }
+    driven_turns(&mut below.runtime, 2, "in the band").await;
     let fill = fill_of(&below.runtime);
     assert!(
         fill > line && fill < gate,

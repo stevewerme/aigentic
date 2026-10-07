@@ -381,7 +381,7 @@ impl Runtime {
             loop {
                 tokio::select! {
                     () = &mut deadline => {
-                        skipped = Some(format!("timed out after {}s", limit.as_secs()));
+                        skipped = Some(format!("timed out after {limit:?}"));
                         break;
                     }
                     _ = cancel.cancelled() => {

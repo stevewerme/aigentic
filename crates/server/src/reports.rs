@@ -76,6 +76,11 @@ pub struct Cost {
     /// #46, #49), the same stamping rule as `spent`. `/cost` does no
     /// retro pricing: a line without a stamp puts no dollars here.
     pub side_spent: Option<f64>,
+    /// Sum of `cost_usd` over the summaries that carry one: a continuous
+    /// link on the utility profile (issue #98), or a nest. Printed on the
+    /// `compactions` line beside the summaries' own tokens, so a thread
+    /// whose only side calls are links still shows what they cost.
+    pub summary_spent: Option<f64>,
     /// Sum of `cost_usd` over the calls that carry one.
     pub spent: Option<f64>,
     /// Calls that carried a price / calls that did not.
@@ -101,11 +106,11 @@ pub fn cost_of(events: &[Event]) -> Cost {
                 cost.summary_input +=
                     usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens;
                 cost.summary_output += usage.output_tokens;
-                // A continuous summary runs on the utility profile inside
-                // the turn, so its spend is side spend the way memory's
-                // and a title's is (issue #98, design 8).
+                // A summary's dollars sit with its tokens on the
+                // `compactions` line (issue #98): under side jobs they
+                // showed nowhere for a thread with no title or extraction.
                 if let Some(usd) = usage.cost_usd {
-                    cost.side_spent = Some(cost.side_spent.unwrap_or(0.0) + usd);
+                    cost.summary_spent = Some(cost.summary_spent.unwrap_or(0.0) + usd);
                 }
             }
         }
@@ -234,12 +239,16 @@ impl fmt::Display for Cost {
         if self.truncations + self.summaries > 0 {
             writeln!(
                 f,
-                "compactions {} ({} truncate, {} summary)   summary tokens in {} out {}",
+                "compactions {} ({} truncate, {} summary)   summary tokens in {} out {}{}",
                 self.truncations + self.summaries,
                 self.truncations,
                 self.summaries,
                 self.summary_input,
-                self.summary_output
+                self.summary_output,
+                match self.summary_spent {
+                    Some(usd) => format!("   ${usd:.4} priced"),
+                    None => String::new(),
+                }
             )?;
         }
         if self.extractions + self.titles > 0 {
@@ -667,6 +676,7 @@ mod cost_tests {
                 side_input: 300,
                 side_output: 20,
                 side_spent: None,
+                summary_spent: None,
                 // No usage line in this fixture carries a model or a
                 // price, so nothing is claimed about spend (issue #31)
                 // and the text report stays what it always was. The two
@@ -780,9 +790,19 @@ mod cost_tests {
             (link.summaries, link.summary_input, link.summary_output),
             (1, 300, 20)
         );
-        assert_eq!(link.side_spent, Some(stamped));
-        assert_eq!((nest.summaries, nest.side_spent), (1, Some(stamped)));
-        assert_eq!((bare.summaries, bare.side_spent), (1, None));
+        // Dollars sit with the summaries, not under side jobs, so a
+        // link-only thread shows them on its `compactions` line.
+        assert_eq!(link.summary_spent, Some(stamped));
+        assert_eq!(link.side_spent, None);
+        assert_eq!((nest.summaries, nest.summary_spent), (1, Some(stamped)));
+        assert_eq!((bare.summaries, bare.summary_spent), (1, None));
+        assert!(
+            link.to_string()
+                .lines()
+                .any(|l| l.starts_with("compactions")
+                    && l.ends_with(&format!("${stamped:.4} priced"))),
+            "{link}"
+        );
         assert_eq!(
             (
                 bare.summary_input,
@@ -805,7 +825,8 @@ mod cost_tests {
             "{text}"
         );
 
-        // Beside a title, whose line does print, the dollars are the sum.
+        // Beside a title: each line carries its own dollars, the title's
+        // under side jobs and the summary's beside its tokens.
         let title_stamp = 0.0125;
         let with_title = cost_of(&[
             summary(
@@ -818,12 +839,12 @@ mod cost_tests {
                        "usage": {"input_tokens": 100, "output_tokens": 10, "cost_usd": title_stamp}}),
             ),
         ]);
-        let total = stamped + title_stamp;
-        assert_eq!(with_title.side_spent, Some(total));
+        assert_eq!(with_title.side_spent, Some(title_stamp));
+        assert_eq!(with_title.summary_spent, Some(stamped));
         assert!(
             with_title
                 .to_string()
-                .contains(&format!("${total:.4} priced")),
+                .contains(&format!("${title_stamp:.4} priced")),
             "{with_title}"
         );
     }
