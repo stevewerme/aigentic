@@ -23,9 +23,12 @@ project at a time.
 The client bar is Codex CLI's terminal client (`openai/codex`,
 `codex-rs/tui`, read on 2026-09-22); where this plan copies it, it says
 so, and where it differs, section 11 says why. One principle holds
-through every phase: the product runs on open-weight models through
-TensorX; Anthropic is the reference backend for comparison and never on
-the product path.
+through every phase (the PRD's, reworded 2026-10-07): the product runs
+on open-weight models, served from sovereign EU infrastructure or
+locally (today: TensorX, Scaleway, the person's own machine); Anthropic
+is the reference backend for comparison and never on the product path.
+Sovereign means an EU-headquartered provider, EU data centres, and no
+retention of prompts.
 
 Done when:
 
@@ -761,10 +764,10 @@ Settled in the grilling of 2026-09-22 (Q1 to Q18) and in the draft.
 
 ## 12. Open items
 
-- The classifier (decision 3): when the proposal log holds a few
-  hundred answers, try an embedding-similarity proposer run by the
-  daemon before the turn, and compare its accuracy against the model's
-  on the same log. If it wins, it proposes and the model stops.
+- The classifier (decision 3): superseded by section 15, item 7. A
+  classifier runs in shadow on project routing during the acceptance
+  week, so the week itself yields the comparison against the model's
+  proposals and the person's answers.
 - Whether `Explored` folding should also fold consecutive successful
   bash reads (`cat`, `rg`). Start with the file tools only.
 - The `p` prefix heuristic (stop at the first argument that looks like
@@ -918,3 +921,118 @@ section 10's steps 11 to 14 left open:
 - decision measurement;
 - the acceptance (#12, revised).
 
+## 15. Concepts and their seams (2026-10-07)
+
+Ten concepts Steve raised during phase 6, weighed against the PRD, ADR
+0002 and this plan. None is a ticket yet; each names the point in the
+plan where it belongs. Where this section and an earlier one differ,
+this one wins for the item it names.
+
+1. **Skill packs: Matt Pocock's skills and Impeccable.** Both are
+   third-party `SKILL.md` packs, installed per project where they
+   apply, never harness code. Impeccable (impeccable.style: design
+   commands, 61 "AI slop" detectors, `DESIGN.md` and `PRODUCT.md`)
+   belongs in projects with a web UI, not in this repository. Its hook
+   integration is another product's scaffolding, which the harness does
+   not read; its commands and detectors still work as skills. The gap
+   for both is #25 (packs and a user-level skills home): installing a
+   pack into aigentic should be one operation, not a copy of folders.
+   Seam: #25, whenever design work runs through aigentic.
+2. **Matt Pocock's skills v1.3.** `CONTEXT.md` becomes `GLOSSARY.md`,
+   and the updated skills look only for the new name, so this
+   repository renames it, and updates `AGENTS.md`'s domain-docs line,
+   in the same commit as the skills update. `/retro` feeds item 9;
+   `/pr`'s three-part body (a visual summary, evidence, merge danger)
+   is the shape for `## Implementation` and `## Review`. `/implement-spec`
+   overlaps the build loop and background jobs, and is not adopted.
+   Seam: now, by the supervisor, with no model spend.
+3. **Token economics** (after Token Atlas, gille.ai/tokenatlas). Every
+   figure is a projection of the log, which already holds `cost_usd`,
+   cache reads and writes, side jobs and retries per call: cost by day,
+   project, thread and model; the ten most expensive calls; what the
+   fixed prefix costs per call; quota against a provider's limits.
+   Figures, not interpretations: each states how it was computed. Seam:
+   after #98, tui only.
+4. **The true cost of a prompt.** At each turn's end, and in `/cost`,
+   one line for the person's message: total cost, calls, side jobs
+   (titles, memory, summaries on the utility profile) and the cache
+   share. It is only as true as the prices in the profile; TensorX's
+   were derived by hand and say so. Seam: with item 3.
+5. **Developer and normal modes.** Two views of the same log, in the
+   client only. Normal is replies, one line of activity, and cost;
+   developer is every tool cell, retry, sweep, batch and decision. #78
+   brings job cells into the front thread, so the two views are designed
+   before it. Seam: after #98, before #77.
+6. **Sandboxing.** Section 11's order (client, sandbox, orchestrator,
+   multiplayer) makes it phase 7's first item, and it needs no cloud:
+   macOS seatbelt or Linux landlock or bubblewrap around `bash`, as
+   Codex does. Background jobs (#77) run unattended in the front
+   thread's mode, which is what a sandbox protects, so #77's spec leaves
+   the seam for it even if the sandbox lands later. Seam: phase 7,
+   first; #77 designs for it.
+7. **System One classifiers** (the capability Jev showed: typed
+   questions in, answers with calibrated probabilities out, never text;
+   open-weight equivalents exist). What it brings: a decision in well
+   under a second, before the turn, with a probability the autonomy
+   ladder can set thresholds on, and no parsing. The decisions it fits,
+   by value:
+   - project routing, ahead of the model's `suggest_project`;
+   - job or conversation (#77's `job` kind);
+   - the memory cue gate (#14), skipping extraction calls;
+   - approval friction: ranking a command's risk to suggest an allow
+     rule, never the only gate, the policy rules staying the floor;
+   - stale progress (#102), in place of a call count;
+   - the ticket kind (#80), and later model routing.
+
+   In the architecture: a `Classifier` trait in `core` beside
+   `Provider`, a `classifier` profile like `utility`, and every
+   classification an event (the model, the answer, the probability), so
+   `stats --decisions` compares classifier, model and person per kind.
+   Shadow first (ADR 0001): it records what it would decide and changes
+   nothing until the data says so. Seam: **one ticket before #12**: the
+   trait, the profile, the event, and shadow on project routing only,
+   so the acceptance week measures it. The other decisions follow #12,
+   if the data says it pays.
+
+   The candidate is Laya (github.com/NandhaKishorM/laya, Apache 2.0:
+   ModernBERT-large, 421M, English; mmBERT-base, 322M, multilingual).
+   It runs locally on CPU or Apple Silicon, and its `laya-serve` speaks
+   the `/v1/systemone` protocol Jev introduced. So the trait's adapter
+   speaks that protocol and the model behind it stays swappable, as
+   `Provider` keeps chat models swappable. Constraints the ticket must
+   meet:
+   - a 512-token context (1 024 multilingual, unreliable past about
+     4 000): the state sent is the message and each project's name and
+     one-line brief, never the prefix;
+   - confidence calibrated on this project's own answers before any
+     threshold is set;
+   - a Python sidecar beside the daemon, optional, checked by
+     `doctor`, and shadow mode surviving it being down.
+
+   It is the first model on the product path served outside TensorX:
+   locally while it runs in shadow, then on Scaleway beside the daemon
+   once item 8 puts the daemon there, kept warm (a cold start defeats a
+   pre-turn decision). Both are within the principle as reworded on
+   2026-10-07 (open weights, sovereign EU infrastructure or local; see
+   the top of this plan and the PRD's principles).
+8. **Single player in the cloud.** The daemon, the socket protocol and
+   roles (phase 5) already exist; the cloud adds a VM, authentication and
+   TLS. An agent with `bash` on a public machine needs item 6 first.
+   Steve's usual hosting (Vercel) does not run long-lived daemons, so
+   this is a VM. Seam: phase 7, after the sandbox.
+9. **From the log to self-improvement.** The log already records
+   everything, decisions included (#74). Improvement is ADR 0002's
+   autonomy ladder, promoted from the acceptance week's data. A small
+   step that fits sooner: a `/retro` skill (item 2) that turns a run
+   into proposed edits to `.aigentic/knowledge/lessons.md`, which the
+   person approves. Seam: `/retro` any time; promotion after #12.
+10. **Code review services (Greptile).** Not adopted. They review pull
+    requests and this repository commits to main; a hosted reviewer on
+    the product path breaks the open-weight rule; and the judges
+    already run probes, mutation checks and the real binary. Revisit
+    only if judges start missing defects.
+
+The order, as of 2026-10-07: item 2 now; #102, #98; items 3 and 4; item
+5; #10, #8; #77 to #79, designed with item 6's seam; item 7's shadow
+ticket; #12; then phase 7 with items 6 and 8; item 7's other decisions
+and item 9's promotion from #12's data; item 1 when design work starts.

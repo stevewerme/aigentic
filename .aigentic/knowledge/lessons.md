@@ -216,6 +216,18 @@ so the rule can be judged, not just obeyed. The `brief`, `plan-check` and
   #40). Run it once with its output in a log file, then search the file:
   #40's implementer ran the whole suite five times, three of them only to
   read other lines of the same result.
+- **A build outside the repository cleans up after itself.** Probes and
+  mutation copies each built the whole workspace into their own
+  `/tmp/<name>-target`, a few GB each, and nothing deleted them: on
+  2026-10-07, 76 GB of them left 2.9 GB free while an implementer was
+  compiling. Use **one** shared `CARGO_TARGET_DIR=/tmp/aigentic-probes-target`
+  for every probe and mutation copy, and before posting the report delete
+  what the run created in `/tmp` (its probe crates, mutation copies and
+  `/tmp/aigentic-probes-target`). A gate in the repository uses its own
+  `target/` and adds nothing to `/tmp`.
+- If the full-workspace `cargo test` stalls in `crates/server/tests/runs.rs`
+  inside the REPL (#103), don't rerun it: run `cargo test --no-fail-fast -p
+  <crate>` per crate. #99's implementer lost its whole wall time rerunning.
 - **One task per thread.** A new commit-sized task starts a fresh thread;
   resume the same thread only to finish what it was doing.
 - A turn that stops on `max_tokens`, `max_iterations` or `max_wall_time`
@@ -248,7 +260,7 @@ so the rule can be judged, not just obeyed. The `brief`, `plan-check` and
   record", "we decided", "going forward", …); long task prompts are skipped.
   When a prompt itself talks about memory cues, turn memory off for that
   session first.
-- Context is bounded by eviction (sweep above 64k, ceiling 128k) and by
+- Context is bounded by eviction (sweep above 64k, working-set target 120k since #76) and by
   dropping old reasoning. A healthy build call is ~40–70k context and
   almost all cached; many cold calls in a row, or context past ~90k, means
   something is wrong.
