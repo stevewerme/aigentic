@@ -555,7 +555,7 @@ impl Tally {
 /// cut to [`ARGS_CHARS`].
 fn arguments(call: &ToolCall) -> String {
     let text = match call.args.get("command").and_then(|c| c.as_str()) {
-        Some(command) if call.name == "bash" => command.to_owned(),
+        Some(command) if call.name == "bash" => command.lines().next().unwrap_or("").to_owned(),
         _ => call.args.to_string(),
     };
     clip(&text, ARGS_CHARS)
@@ -1376,6 +1376,31 @@ cache_write = 1.75
             shown.as_str(),
             format!("{}…", &command.lines().next().unwrap()[..ARGS_CHARS])
         );
+    }
+
+    /// #109's judge: a command whose first line is short (a backslash
+    /// continuation, as a build's own gate command often is) still shows
+    /// its first line only, so the listing stays one line per thread.
+    #[test]
+    fn a_multi_line_command_with_a_short_first_line_shows_that_line_only() {
+        let command = "cargo test \\\n  --no-fail-fast";
+        let dir = tempfile::tempdir().unwrap();
+        let id = Ulid::generate();
+        let lines = vec![
+            user("2026-09-27T12:00:00Z", "a gate"),
+            assistant(
+                "2026-09-27T12:00:01Z",
+                vec![call_block("bash", "c1", json!({"command": command}))],
+                None,
+            ),
+        ];
+        write(dir.path(), id, &lines);
+        let events = read(dir.path(), id);
+        let now = last_at(&events) + Duration::seconds(5);
+        let p = progress(&events, now, false, &book()).unwrap();
+        let shown = &p.now.as_ref().unwrap().args;
+        assert_eq!(shown.as_str(), command.lines().next().unwrap());
+        assert!(!shown.contains('\n'), "one line per thread: {shown}");
     }
 
     #[test]
