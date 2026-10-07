@@ -285,21 +285,35 @@ pub struct UpdateTasksArgs {
     pub tasks: Vec<Task>,
 }
 
-/// The reminder the model gets when its own checklist has gone stale
-/// (issue #102), or `None` when there is nothing to remind it of.
+/// The open turn's own checklist: what its latest successful
+/// `update_tasks` call said, and how much work has landed since.
 ///
 /// Pure over the log, and read only for the open turn (everything after
 /// the last `turn_ended`): the latest `update_tasks` call there whose
 /// result is not an error — a refused call, with an unknown key or an
-/// empty list, is not a checklist — and the tool results since that call's
-/// own result, other `update_tasks` results excluded, because a later
-/// successful one is the latest by then and a failed one is no progress.
+/// empty list, is not a checklist. The call is the record: the whole list
+/// is in its arguments, so a later successful call replaces it and no
+/// event is written for a change.
 ///
-/// `Some` when at least one step is not `Done` and at least
-/// [`TASK_REMINDER_CALLS`] results have landed since. No event is
-/// appended and nothing is cached: the caller puts the text at the end of
-/// one model call's context and nowhere else.
-pub fn stale_tasks_reminder(events: &[Event]) -> Option<String> {
+/// `None` when the open turn has no successful `update_tasks` call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Checklist {
+    /// The steps whose state is `Done`.
+    pub done: usize,
+    /// The steps in the list.
+    pub total: usize,
+    /// The text of the `Active` step, else of the first step that is not
+    /// `Done`.
+    pub active: Option<String>,
+    /// The tool results that landed since the checklist's own result,
+    /// other `update_tasks` results excluded, because a later successful
+    /// one is the latest by then and a failed one is no progress.
+    pub since: usize,
+}
+
+/// The open turn's checklist, or `None` when it set none. See
+/// [`Checklist`] for what the counts mean.
+pub fn open_checklist(events: &[Event]) -> Option<Checklist> {
     let start = events
         .iter()
         .rposition(|e| e.kind == EventKind::TurnEnded)
@@ -321,8 +335,8 @@ pub fn stale_tasks_reminder(events: &[Event]) -> Option<String> {
     // The id of every `update_tasks` call in the turn, so a result of one
     // is not counted as work the model did on the checklist's behalf.
     let mut task_calls: BTreeSet<String> = BTreeSet::new();
-    // The latest successful call: when it was answered, and its counts.
-    let mut latest: Option<(usize, usize, usize)> = None;
+    // The latest successful call: when it was answered, and its own list.
+    let mut latest: Option<(usize, UpdateTasksArgs)> = None;
     for e in turn
         .iter()
         .filter(|e| e.kind == EventKind::AssistantMessage)
@@ -343,23 +357,48 @@ pub fn stale_tasks_reminder(events: &[Event]) -> Option<String> {
             let Ok(args) = serde_json::from_value::<UpdateTasksArgs>(call.args.clone()) else {
                 continue;
             };
-            let done = args
-                .tasks
-                .iter()
-                .filter(|t| t.state == TaskState::Done)
-                .count();
-            latest = Some((*at, done, args.tasks.len()));
+            latest = Some((*at, args));
         }
     }
 
-    let (at, done, total) = latest?;
-    if done == total {
-        return None;
-    }
+    let (at, args) = latest?;
+    let done = args
+        .tasks
+        .iter()
+        .filter(|t| t.state == TaskState::Done)
+        .count();
+    let active = args
+        .tasks
+        .iter()
+        .find(|t| t.state == TaskState::Active)
+        .or_else(|| args.tasks.iter().find(|t| t.state != TaskState::Done))
+        .map(|t| t.text.clone());
     let since = results
         .iter()
         .filter(|(i, id, _)| *i > at && !task_calls.contains(id))
         .count();
+    Some(Checklist {
+        done,
+        total: args.tasks.len(),
+        active,
+        since,
+    })
+}
+
+/// The reminder the model gets when its own checklist has gone stale
+/// (issue #102), or `None` when there is nothing to remind it of.
+///
+/// `Some` when [`open_checklist`] finds at least one step that is not
+/// `Done` and at least [`TASK_REMINDER_CALLS`] results have landed since.
+/// No event is appended and nothing is cached: the caller puts the text at
+/// the end of one model call's context and nowhere else.
+pub fn stale_tasks_reminder(events: &[Event]) -> Option<String> {
+    let Checklist {
+        done, total, since, ..
+    } = open_checklist(events)?;
+    if done == total {
+        return None;
+    }
     (since >= TASK_REMINDER_CALLS).then(|| {
         format!(
             "Your checklist reads {done}/{total} done, last updated {since} tool calls ago. \
@@ -1499,6 +1538,190 @@ mod tests {
         push_turn_ended(&mut events);
         push_others(&mut events, 100, K + 1);
         assert_eq!(stale_tasks_reminder(&events), None);
+    }
+
+    // --- `open_checklist` (issue #109) ---------------------------------
+    //
+    // #102's T1 cases, restated against the function the reminder now
+    // calls: every expected count comes from the fixture's own list.
+
+    /// A list whose states are spelled out, so a fixture can hold an
+    /// `Active` step.
+    fn tasks_with(states: &[&str]) -> serde_json::Value {
+        let tasks: Vec<serde_json::Value> = states
+            .iter()
+            .enumerate()
+            .map(|(i, state)| json!({"text": format!("step {i}"), "state": state}))
+            .collect();
+        json!({"tasks": tasks})
+    }
+
+    /// The `(done, total, active)` a fixture's own `update_tasks`
+    /// arguments imply, counted rather than hand-written.
+    fn from_list(args: &serde_json::Value) -> (usize, usize, Option<String>) {
+        let tasks = args["tasks"].as_array().expect("tasks");
+        let done = tasks.iter().filter(|t| t["state"] == "done").count();
+        let active = tasks
+            .iter()
+            .find(|t| t["state"] == "active")
+            .or_else(|| tasks.iter().find(|t| t["state"] != "done"))
+            .map(|t| t["text"].as_str().expect("text").to_string());
+        (done, tasks.len(), active)
+    }
+
+    /// T1: no list in the open turn, however many other calls landed.
+    #[test]
+    fn open_checklist_is_none_without_a_successful_update_tasks() {
+        let mut events = Vec::new();
+        push_others(&mut events, 0, K + 2);
+        assert_eq!(open_checklist(&events), None);
+    }
+
+    /// T1: the open turn's counts, its active step, and the calls since.
+    #[test]
+    fn open_checklist_reports_the_lists_counts_and_the_calls_since() {
+        let list = tasks_with(&["done", "active", "pending"]);
+        let mut events = Vec::new();
+        push_tasks(&mut events, vec![("u1", list.clone())]);
+        push_result(&mut events, "u1", false);
+        push_others(&mut events, 0, 3);
+        let (done, total, active) = from_list(&list);
+        assert_eq!(
+            open_checklist(&events),
+            Some(Checklist {
+                done,
+                total,
+                active,
+                since: 3,
+            })
+        );
+    }
+
+    /// T1: a step that is `Active` wins over an earlier unfinished one.
+    #[test]
+    fn open_checklist_prefers_the_active_step_to_the_first_unfinished_one() {
+        let list = tasks_with(&["pending", "active", "pending"]);
+        let mut events = Vec::new();
+        push_tasks(&mut events, vec![("u1", list.clone())]);
+        push_result(&mut events, "u1", false);
+        let (done, total, active) = from_list(&list);
+        assert_eq!(
+            open_checklist(&events),
+            Some(Checklist {
+                done,
+                total,
+                active,
+                since: 0,
+            }),
+            "no calls have landed since the list"
+        );
+    }
+
+    /// T1: an all-done list is still a checklist; `active` is then none.
+    #[test]
+    fn open_checklist_keeps_an_all_done_list_with_no_active_step() {
+        let list = tasks_with(&["done", "done"]);
+        let mut events = Vec::new();
+        push_tasks(&mut events, vec![("u1", list.clone())]);
+        push_result(&mut events, "u1", false);
+        push_others(&mut events, 0, K);
+        let (done, total, active) = from_list(&list);
+        assert_eq!(
+            open_checklist(&events),
+            Some(Checklist {
+                done,
+                total,
+                active,
+                since: K,
+            })
+        );
+    }
+
+    /// T1: a later successful list is the checklist, and resets `since`.
+    #[test]
+    fn open_checklist_takes_the_later_successful_list() {
+        let first = tasks_json(1, 3);
+        let second = tasks_json(2, 3);
+        let mut events = Vec::new();
+        push_tasks(&mut events, vec![("u1", first)]);
+        push_result(&mut events, "u1", false);
+        push_others(&mut events, 0, K);
+        push_tasks(&mut events, vec![("u2", second.clone())]);
+        push_result(&mut events, "u2", false);
+        push_others(&mut events, 100, 4);
+        let (done, total, active) = from_list(&second);
+        assert_eq!(
+            open_checklist(&events),
+            Some(Checklist {
+                done,
+                total,
+                active,
+                since: 4,
+            }),
+            "counted from u2's result"
+        );
+    }
+
+    /// T1: a later refused call is no checklist, so the earlier list stands
+    /// and the refusal is not progress either.
+    #[test]
+    fn open_checklist_ignores_a_later_failed_call() {
+        let first = tasks_json(1, 3);
+        let mut events = Vec::new();
+        push_tasks(&mut events, vec![("u1", first.clone())]);
+        push_result(&mut events, "u1", false);
+        push_others(&mut events, 0, K);
+        push_tasks(&mut events, vec![("u2", json!({"tasks": []}))]);
+        push_result(&mut events, "u2", true);
+        let (done, total, active) = from_list(&first);
+        assert_eq!(
+            open_checklist(&events),
+            Some(Checklist {
+                done,
+                total,
+                active,
+                since: K,
+            }),
+            "the refusal is not a call: `since` stays K"
+        );
+    }
+
+    /// T1: two calls in one message — the failed sibling is no checklist
+    /// and its result is no progress.
+    #[test]
+    fn open_checklist_ignores_a_failed_sibling_call() {
+        let good = tasks_json(1, 3);
+        let mut events = Vec::new();
+        push_tasks(
+            &mut events,
+            vec![("u1", good.clone()), ("u2", json!({"tasks": []}))],
+        );
+        push_result(&mut events, "u1", false);
+        push_result(&mut events, "u2", true);
+        push_others(&mut events, 0, 4);
+        let (done, total, active) = from_list(&good);
+        assert_eq!(
+            open_checklist(&events),
+            Some(Checklist {
+                done,
+                total,
+                active,
+                since: 4,
+            }),
+            "the sibling's failure is not a call"
+        );
+    }
+
+    /// T1: the same list, once the turn has ended, is the previous turn's.
+    #[test]
+    fn open_checklist_is_none_after_the_turn_ended() {
+        let mut events = Vec::new();
+        push_tasks(&mut events, vec![("u1", tasks_json(1, 3))]);
+        push_result(&mut events, "u1", false);
+        push_others(&mut events, 0, K);
+        push_turn_ended(&mut events);
+        push_others(&mut events, 100, 2);
+        assert_eq!(open_checklist(&events), None);
     }
 
     #[test]
