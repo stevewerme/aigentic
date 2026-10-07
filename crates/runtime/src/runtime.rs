@@ -202,7 +202,19 @@ pub struct Runtime {
     /// that failed to spawn mid-run is reported by the turn it affected
     /// rather than freezing its status into every thread at startup.
     pub(crate) keep_awake: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
+    /// How long a continuous summary's utility call may take (issue #98).
+    /// The call runs inside the turn, and the loop checks the wall budget
+    /// at its next iteration: the limit bounds how far a wedged utility
+    /// endpoint can push a turn past that budget. A timed-out link is
+    /// skipped, never fatal. Defaults to [`SUMMARY_LIMIT`], and
+    /// [`Runtime::with_summary_limit`] exists for tests: there is no
+    /// config key.
+    pub(crate) summary_limit: Duration,
 }
+
+/// How long a continuous summary's utility call may take (issue #98),
+/// the same 60 s the daemon's side jobs get.
+pub const SUMMARY_LIMIT: Duration = Duration::from_secs(60);
 
 impl Runtime {
     /// A runtime with the default policy and no approver: everything
@@ -250,7 +262,17 @@ impl Runtime {
             utility_prices: None,
             clock: Arc::new(|| (Instant::now(), SystemTime::now())),
             keep_awake: None,
+            summary_limit: SUMMARY_LIMIT,
         }
+    }
+
+    /// How long a continuous summary's utility call may take (issue
+    /// #98), test-only: there is no config key. A real run uses
+    /// [`SUMMARY_LIMIT`].
+    #[doc(hidden)]
+    pub fn with_summary_limit(mut self, limit: Duration) -> Self {
+        self.summary_limit = limit;
+        self
     }
 
     /// Move the thread to another project: every project-derived part is

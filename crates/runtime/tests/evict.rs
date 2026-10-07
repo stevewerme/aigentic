@@ -16,7 +16,9 @@ use aigentic_core::{
     AgentId, Author, Capabilities, CompletionRequest, ContentBlock, Event, EventKind, Message,
     Provider, ProviderEvent, Role, ToolCall, Usage,
 };
-use aigentic_log::{ContextEvictedPayload, ContextSaturatedPayload, ThreadLog, project_body};
+use aigentic_log::{
+    CompactedPayload, ContextEvictedPayload, ContextSaturatedPayload, ThreadLog, project_body,
+};
 use aigentic_runtime::{
     Answer, Approver, DEFAULT_COMPACTION, Decision, EVICT_MIN_FREE_PERCENT, RATIO_MAX,
     RATIO_SMOOTHING, Runtime, calibrated, min_free, next_ratio,
@@ -1613,6 +1615,13 @@ fn last_turn_ended_before(events: &[Event], seq: u64) -> Option<u64> {
 }
 
 /// Every kind in `events` with `from < seq <= to`, in log order.
+/// Whether a `compacted` event is a continuous link (issue #98).
+fn is_continuous(event: &Event) -> bool {
+    serde_json::from_value::<CompactedPayload>(event.payload.clone())
+        .map(|p| p.continuous)
+        .unwrap_or(false)
+}
+
 fn kinds_between(events: &[Event], from: u64, to: u64) -> Vec<EventKind> {
     events
         .iter()
@@ -1747,7 +1756,9 @@ async fn a_batch_stubs_the_closed_turns_once_the_target_is_crossed() {
     let replayed: Vec<(u64, u64)> = decisions
         .iter()
         .filter_map(|d| match d {
-            Decision::Batch { through_seq, freed } => Some((*through_seq, *freed)),
+            Decision::Batch {
+                through_seq, freed, ..
+            } => Some((*through_seq, *freed)),
             _ => None,
         })
         .collect();
@@ -1891,20 +1902,30 @@ async fn the_prefix_changes_only_at_a_turn_boundary_or_a_batch() {
         );
     }
 
-    // (b) At every turn's start, the only event of those kinds is a
-    // batch: the history changes once, at a turn start, and never twice.
+    // (b) At every turn's start, the only events of those kinds are a
+    // batch: at most one `results_stubbed` and, riding it, at most one
+    // continuous `compacted` (issue #98). The history changes once, at a
+    // turn start, and never twice.
     for (i, ended) in ran.events.iter().enumerate() {
         if ended.kind != EventKind::TurnEnded {
             continue;
         }
-        let Some(reply) = ran.events[i + 1..]
+        let between: Vec<&Event> = ran.events[i + 1..]
             .iter()
             .find(|e| e.kind == EventKind::AssistantMessage)
-        else {
+            .map(|r| {
+                ran.events
+                    .iter()
+                    .filter(|e| e.seq > ended.seq && e.seq < r.seq)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if between.is_empty() {
             continue; // the thread ends with the last turn
-        };
-        let changes: Vec<EventKind> = kinds_between(&ran.events, ended.seq, reply.seq)
-            .into_iter()
+        }
+        let changes: Vec<EventKind> = between
+            .iter()
+            .map(|e| e.kind)
             .filter(|k| {
                 matches!(
                     k,
@@ -1912,9 +1933,31 @@ async fn the_prefix_changes_only_at_a_turn_boundary_or_a_batch() {
                 )
             })
             .collect();
+        let stubs = changes
+            .iter()
+            .filter(|k| **k == EventKind::ResultsStubbed)
+            .count();
+        let continuous = between
+            .iter()
+            .filter(|e| e.kind == EventKind::Compacted && is_continuous(e))
+            .count();
         assert!(
-            changes.len() <= 1 && changes.iter().all(|k| *k == EventKind::ResultsStubbed),
-            "a turn start may change the history only by one batch, found {changes:?}"
+            stubs <= 1,
+            "a turn start may stub the history once, found {changes:?}"
+        );
+        assert!(
+            continuous <= 1,
+            "at most one link rides a batch, found {changes:?}"
+        );
+        assert!(
+            changes
+                .iter()
+                .all(|k| matches!(k, EventKind::ResultsStubbed | EventKind::Compacted)),
+            "a turn start may change the history only by a batch, found {changes:?}"
+        );
+        assert!(
+            changes.len() <= stubs + continuous,
+            "nothing else changes the history at a turn start, found {changes:?}"
         );
     }
 }

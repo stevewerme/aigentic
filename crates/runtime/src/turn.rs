@@ -219,24 +219,45 @@ impl Runtime {
             //
             // The closed-turn batch comes before both, and only at a
             // turn's first iteration (issue #76). A batch iteration does
-            // nothing else: the batch has already rewritten the history,
-            // so a sweep or a summary in the same iteration would either
-            // price the stale one or append a second cache break for no
-            // reason.
-            if !(self.at_turn_start() && self.batch_stale(observe)?) {
-                self.evict_stale(observe)?;
-                if let Err(e) = self.compact(observe).await {
-                    if let RuntimeError::Provider(p) = &e {
-                        self.end_turn(
-                            &format!("provider_error: {p}"),
-                            Some(p.clone()),
-                            &spent,
-                            &mut held,
-                            observe,
-                        )?;
+            // nothing else except its link (issue #98): the batch has
+            // already rewritten the history, so a sweep or a nested
+            // summary in the same iteration would either price the stale
+            // one or append a second cache break for no reason. The
+            // batch's own continuous summary carries the same break, so
+            // it rides along in the same iteration, before the first
+            // model call.
+            if self.at_turn_start() {
+                match self.batch_stale(observe)? {
+                    Some(Some((from, to))) => {
+                        // Best effort and never fatal: only the log
+                        // append inside can fail the turn, nothing else
+                        // can (issue #98, design 3).
+                        self.summarise_link(from, to, cancel, observe).await?;
                     }
-                    return Err(e);
+                    Some(None) => {}
+                    None => {
+                        self.evict_stale(observe)?;
+                    }
                 }
+            } else {
+                self.evict_stale(observe)?;
+            }
+            // The emergency net (issue #98, design 5), in every
+            // iteration and outside the batch's arm, so a batch whose
+            // link was skipped is still covered once the context nears
+            // the model's real window. Its error still ends the turn, as
+            // compaction's always did.
+            if let Err(e) = self.emergency_compact(observe).await {
+                if let RuntimeError::Provider(p) = &e {
+                    self.end_turn(
+                        &format!("provider_error: {p}"),
+                        Some(p.clone()),
+                        &spent,
+                        &mut held,
+                        observe,
+                    )?;
+                }
+                return Err(e);
             }
             let mut context = build_context(&self.prefix(), self.log.events())?;
             // The stale-checklist reminder (issue #102) rides at the very

@@ -101,6 +101,12 @@ pub fn cost_of(events: &[Event]) -> Cost {
                 cost.summary_input +=
                     usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens;
                 cost.summary_output += usage.output_tokens;
+                // A continuous summary runs on the utility profile inside
+                // the turn, so its spend is side spend the way memory's
+                // and a title's is (issue #98, design 8).
+                if let Some(usd) = usage.cost_usd {
+                    cost.side_spent = Some(cost.side_spent.unwrap_or(0.0) + usd);
+                }
             }
         }
     }
@@ -731,6 +737,95 @@ mod cost_tests {
         );
         // An unpriced line claims nothing about money.
         assert!(!bare.to_string().contains("priced"), "{bare}");
+    }
+
+    /// T8 (issue #98): a stamped summary's dollars reach `/cost` as side
+    /// spend — a continuous link runs on the utility profile, so its
+    /// dollars are side dollars like a title's or an extraction's, while
+    /// its token totals stay in the compaction line they always were.
+    /// The text's `side jobs` line is unchanged: it still prints when
+    /// there is an extraction or a title, and a link's dollars join it
+    /// there. What this pins down is the field a report sums.
+    #[test]
+    fn a_stamped_summary_reports_its_dollars() {
+        let stamped = 0.0081;
+        let summary = |usage: serde_json::Value, continuous: bool| {
+            let mut payload = json!({
+                "from_seq": 0,
+                "to_seq": 5,
+                "strategy": {"kind": "summary", "text": "s", "model": "utility-model", "usage": usage},
+            });
+            if continuous {
+                payload["continuous"] = json!(true);
+            }
+            event(EventKind::Compacted, payload)
+        };
+        let link = cost_of(&[summary(
+            json!({"input_tokens": 300, "output_tokens": 20, "cost_usd": stamped}),
+            true,
+        )]);
+        // The emergency net's or `/compact`'s summary: the stamp prices a
+        // summary, not the flag.
+        let nest = cost_of(&[summary(
+            json!({"input_tokens": 300, "output_tokens": 20, "cost_usd": stamped}),
+            false,
+        )]);
+        // A line with no stamp claims nothing about money.
+        let bare = cost_of(&[summary(
+            json!({"input_tokens": 300, "output_tokens": 20}),
+            true,
+        )]);
+
+        assert_eq!(
+            (link.summaries, link.summary_input, link.summary_output),
+            (1, 300, 20)
+        );
+        assert_eq!(link.side_spent, Some(stamped));
+        assert_eq!((nest.summaries, nest.side_spent), (1, Some(stamped)));
+        assert_eq!((bare.summaries, bare.side_spent), (1, None));
+        assert_eq!(
+            (
+                bare.summary_input,
+                bare.summary_output,
+                bare.side_input,
+                bare.side_output
+            ),
+            (
+                link.summary_input,
+                link.summary_output,
+                link.side_input,
+                link.side_output
+            ),
+            "the stamp adds dollars and nothing else"
+        );
+
+        let text = link.to_string();
+        assert!(
+            text.contains("compactions 1 (0 truncate, 1 summary)   summary tokens in 300 out 20"),
+            "{text}"
+        );
+
+        // Beside a title, whose line does print, the dollars are the sum.
+        let title_stamp = 0.0125;
+        let with_title = cost_of(&[
+            summary(
+                json!({"input_tokens": 300, "output_tokens": 20, "cost_usd": stamped}),
+                true,
+            ),
+            event(
+                EventKind::ThreadRenamed,
+                json!({"title": "t", "model": "utility-model",
+                       "usage": {"input_tokens": 100, "output_tokens": 10, "cost_usd": title_stamp}}),
+            ),
+        ]);
+        let total = stamped + title_stamp;
+        assert_eq!(with_title.side_spent, Some(total));
+        assert!(
+            with_title
+                .to_string()
+                .contains(&format!("${total:.4} priced")),
+            "{with_title}"
+        );
     }
 
     /// T8 (issue #49): a stamped title line reaches `/cost` — one title,

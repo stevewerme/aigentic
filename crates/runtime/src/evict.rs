@@ -122,8 +122,15 @@ pub enum Decision {
     /// — the last `turn_ended`'s seq — and record it as one
     /// `results_stubbed`, so the cached prefix breaks once for the batch
     /// rather than once per message. `freed` is what that takes out of
-    /// the projection, in the target's units.
-    Batch { through_seq: u64, freed: u64 },
+    /// the projection, in the target's units, plus — when there is one —
+    /// what the batch's own continuous summary would take out of it: the
+    /// two together are what pays for the cache break (issue #98). `link`
+    /// is the range that summary covers.
+    Batch {
+        through_seq: u64,
+        freed: u64,
+        link: Option<(u64, u64)>,
+    },
     /// Move nothing and append nothing: a sweep now would either free
     /// less than [`min_free`] or has nowhere to go.
     Hold,
@@ -269,7 +276,7 @@ fn probe(calls: &[u64], stubbed: usize) -> Option<u64> {
 /// A `results_stubbed` for `through_seq`, made to look like it follows
 /// `after`: the batch's probe, never appended to a log. Like
 /// [`synthetic`], its `ratio` stays `None`.
-fn synthetic_batch(after: &Event, through_seq: u64) -> Event {
+pub(crate) fn synthetic_batch(after: &Event, through_seq: u64) -> Event {
     Event {
         id: ulid::Ulid::generate(),
         thread_id: after.thread_id,
@@ -313,17 +320,20 @@ impl Runtime {
     /// already closed, in one batch, when the context is over the
     /// working-set target and the move frees enough to pay for the cache
     /// break (issue #76). Considered only at a turn's first loop
-    /// iteration. Whether anything was appended.
+    /// iteration. `Some(link)` when a batch fired, `link` being the
+    /// range the batch decided to summarise (issue #98), `None` when it
+    /// decided none; the whole is `None` when nothing was appended.
     pub(crate) fn batch_stale(
         &mut self,
         observe: &mut (dyn FnMut(Signal<'_>) + Send),
-    ) -> Result<bool, RuntimeError> {
+    ) -> Result<Option<Option<(u64, u64)>>, RuntimeError> {
         let events = self.log.events();
         let scan = Scan::of(events);
-        let Decision::Batch { through_seq, .. } =
-            self.decide_batch(self.compaction, events, &scan, self.ratio)?
+        let Decision::Batch {
+            through_seq, link, ..
+        } = self.decide_batch(self.compaction, events, &scan, self.ratio)?
         else {
-            return Ok(false);
+            return Ok(None);
         };
         // Stubbing leaves the context's length alone, so `fill` would
         // otherwise reuse the reported prompt from before the batch,
@@ -341,7 +351,7 @@ impl Runtime {
             None,
             observe,
         )?;
-        Ok(true)
+        Ok(Some(link))
     }
 
     /// Whether a batch may be considered at all (issue #76): only at the
@@ -381,17 +391,35 @@ impl Runtime {
         if !self.over_the_ceiling(events, target, None, &mut None, ratio)? {
             return Ok(Decision::Hold);
         }
-        let freed = self.freed_by_batch(events, through_seq, ratio)?;
+        // The two events a batch fires carry the same cache break, so the
+        // batch fires on what stubbing frees **plus** what the batch's own
+        // link would free (issue #98, design 4): a thread that grows by
+        // text alone, with nothing to stub, still batches once the link's
+        // range alone is worth the break.
+        let mut freed = self.freed_by_batch(events, through_seq, ratio)?;
+        let mut link = None;
+        if let Some((from, to)) = self.link_range(events, ratio) {
+            let saving = self.link_saving(events, from, to, through_seq, ratio)?;
+            if saving > 0 {
+                freed += saving;
+                link = Some((from, to));
+            }
+        }
         if freed < min_free(target, settings.evict_min_free_percent) {
             return Ok(Decision::Hold);
         }
-        Ok(Decision::Batch { through_seq, freed })
+        Ok(Decision::Batch {
+            through_seq,
+            freed,
+            link,
+        })
     }
 
     /// Estimated tokens a batch at `through_seq` would take out of the
     /// projection: the log as it stands, priced by the same estimator as
     /// the batch itself, against the log with a `results_stubbed` at
-    /// that boundary projected on the end.
+    /// that boundary projected on the end. The link's own share is
+    /// [`Runtime::link_saving`], added by the caller.
     fn freed_by_batch(
         &self,
         events: &[Event],
