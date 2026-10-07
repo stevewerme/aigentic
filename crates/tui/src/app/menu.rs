@@ -37,6 +37,11 @@ pub enum Pick {
     /// A typed destination, `n <where>` or `3 <where>`: #7's spelling,
     /// kept working.
     SwitchCorrected { to: String },
+    /// Go to a new thread anyway: the running turn is interrupted first
+    /// (issue #108).
+    NewYes,
+    /// Keep working in this thread: nothing is interrupted (issue #108).
+    NewNo,
 }
 
 /// One row of the menu.
@@ -59,6 +64,10 @@ pub enum Kind {
     /// A switch proposal (issue #82): go to the proposed project, stay,
     /// or say where it belongs.
     Switch,
+    /// `/new` while a turn is open (issue #108): interrupt it and start
+    /// a new thread, or keep working here. The engine's own menu, never
+    /// sent to the daemon.
+    NewThread,
 }
 
 /// What a key or a line came to.
@@ -302,6 +311,35 @@ impl Menu {
         }
     }
 
+    /// `/new` with a turn open (issue #108): the REPL's own question,
+    /// asked in the REPL's menu style, because a new front thread closes
+    /// this one and the running turn would be left behind, unseen. `No`
+    /// is the default; Esc answers it too.
+    pub fn new_thread() -> Self {
+        Self {
+            kind: Kind::NewThread,
+            title: "a turn is running in this thread".into(),
+            body: "Start a new thread anyway? The running turn is interrupted first.".into(),
+            note: Some("[y/N]".into()),
+            rows: vec![
+                Row {
+                    label: "Yes, interrupt it and start a new thread".into(),
+                    desc: None,
+                    pick: Pick::NewYes,
+                },
+                Row {
+                    label: "No, keep working here".into(),
+                    desc: None,
+                    pick: Pick::NewNo,
+                },
+            ],
+            selected: 1,
+            multi: false,
+            picked: Vec::new(),
+            questions: None,
+        }
+    }
+
     /// A question from `ask_human`: the first of the call's questions
     /// on the widget, the rest one after another as each is answered.
     /// A question without options has no rows: the composer takes the
@@ -434,6 +472,10 @@ impl Menu {
             KeyCode::Esc if self.kind == Kind::Checkpoint => self.pick(1),
             // Esc on a switch proposal is `No, stay here`, at once.
             KeyCode::Esc if self.kind == Kind::Switch => self.pick(1),
+            // Esc on the `/new` question keeps this thread, at once: it
+            // must never fall through to the keymap's interrupt, which
+            // is exactly what the question asks about (issue #108).
+            KeyCode::Esc if self.kind == Kind::NewThread => self.pick(1),
             _ if !settled => Keyed::Passed,
             KeyCode::Char(' ') if plain && self.multi && typing_safe => {
                 self.toggle(self.selected);
@@ -477,6 +519,16 @@ impl Menu {
                 'n' => self.pick(1),
                 _ => Keyed::Passed,
             },
+            // The `/new` question takes the switch's rule too, not the
+            // permission's: a draft beginning with "y" must never answer
+            // Yes to interrupting the turn (issue #108).
+            KeyCode::Char(c) if plain && self.kind == Kind::NewThread && composer_empty => {
+                match c {
+                    'y' => self.pick(0),
+                    'n' => self.pick(1),
+                    _ => Keyed::Passed,
+                }
+            }
             _ => Keyed::Passed,
         }
     }
@@ -554,6 +606,13 @@ impl Menu {
                 reason: None,
                 echo: format!("↳ {}", row.label),
             },
+            // The `/new` question (issue #108): the engine reads these
+            // two picks locally, nothing goes to the daemon from here.
+            Pick::NewYes | Pick::NewNo => Keyed::Decide {
+                pick: row.pick.clone(),
+                reason: None,
+                echo: format!("↳ {}", row.label),
+            },
             // A row never carries a typed destination: only `line`
             // builds one. Nothing to send from here.
             Pick::SwitchCorrected { .. } => Keyed::Passed,
@@ -589,6 +648,17 @@ impl Menu {
         // `3 <where>` is never read as a deny with a reason.
         if self.kind == Kind::Switch {
             return self.switch_line(text);
+        }
+        // The `/new` question answers on its own two rows only
+        // (issue #108): `1`/`y`/`yes` interrupts and starts a new
+        // thread, `2`/`n`/`no` keeps this one, and nothing else is an
+        // answer, so a stray line goes on as whatever it was.
+        if self.kind == Kind::NewThread {
+            return match text.trim() {
+                "1" | "y" | "yes" => Some(self.pick(0)),
+                "2" | "n" | "no" => Some(self.pick(1)),
+                _ => None,
+            };
         }
         if self.rows.is_empty() {
             return None;
@@ -694,6 +764,7 @@ impl Menu {
             Kind::Question => "question",
             Kind::Checkpoint => "checkpoint",
             Kind::Switch => "switch",
+            Kind::NewThread => "new thread",
         };
         let mut lines = vec![format!("[{tag}] {}", self.title)];
         if !self.body.is_empty() {
@@ -1405,5 +1476,167 @@ mod tests {
         // Anything else is a chat line.
         assert_eq!(menu.line("good morning"), None);
         assert_eq!(menu.line(""), None);
+    }
+
+    /// The pick a `Keyed` carries, whatever its echo says: the tests for
+    /// the `/new` question care which pick, not how it reads.
+    fn picked(keyed: Keyed) -> Option<Pick> {
+        match keyed {
+            Keyed::Decide { pick, .. } => Some(pick),
+            _ => None,
+        }
+    }
+
+    fn keyed_echo(keyed: &Keyed) -> String {
+        match keyed {
+            Keyed::Decide { echo, .. } => echo.clone(),
+            other => panic!("not a decide: {other:?}"),
+        }
+    }
+
+    /// T1 (#108): `Menu::new_thread` is a two-row block, `No` selected,
+    /// tagged `new thread`, with the `[y/N]` note; the digits and the
+    /// accelerators answer, Enter takes the default, and Esc is `No` at
+    /// once.
+    #[test]
+    fn the_new_thread_question_answers_by_key() {
+        let mut menu = Menu::new_thread();
+        assert_eq!(menu.kind, Kind::NewThread);
+        assert_eq!(menu.title, "a turn is running in this thread");
+        assert_eq!(
+            menu.body,
+            "Start a new thread anyway? The running turn is interrupted first."
+        );
+        assert_eq!(menu.note.as_deref(), Some("[y/N]"));
+        let labels: Vec<&str> = menu.rows.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "Yes, interrupt it and start a new thread",
+                "No, keep working here",
+            ]
+        );
+        let picks: Vec<Pick> = menu.rows.iter().map(|r| r.pick.clone()).collect();
+        assert_eq!(picks, vec![Pick::NewYes, Pick::NewNo]);
+        assert_eq!(menu.selected, 1, "No is the default");
+
+        let empty = KeyModifiers::NONE;
+        // Enter takes the selection, which is No.
+        assert_eq!(
+            picked(menu.key(&key(KeyCode::Enter, empty), true, true)),
+            Some(Pick::NewNo)
+        );
+        // The digits pick; the accelerators take the switch's rule, so
+        // they need an empty composer.
+        for (c, want) in [
+            ('1', Pick::NewYes),
+            ('y', Pick::NewYes),
+            ('2', Pick::NewNo),
+            ('n', Pick::NewNo),
+        ] {
+            let keyed = menu.key(&key(KeyCode::Char(c), empty), true, true);
+            assert_eq!(
+                picked(keyed.clone()),
+                Some(want.clone()),
+                "{c} picks {want:?}"
+            );
+            assert_eq!(
+                keyed_echo(&keyed),
+                format!(
+                    "↳ {}",
+                    menu.rows[if want == Pick::NewYes { 0 } else { 1 }].label
+                ),
+                "{c} echoes the row it picked"
+            );
+        }
+        // A draft starting with `y` is a message, not an answer: it
+        // must never answer Yes.
+        for c in ['y', 'n'] {
+            assert_eq!(
+                menu.key(&key(KeyCode::Char(c), empty), false, true),
+                Keyed::Passed,
+                "{c} with a draft falls through to the keymap"
+            );
+        }
+        // Esc is No, never Passed: the keymap's own Esc interrupts.
+        assert_eq!(
+            picked(menu.key(&key(KeyCode::Esc, empty), true, false)),
+            Some(Pick::NewNo)
+        );
+        assert_eq!(
+            picked(menu.key(&key(KeyCode::Esc, empty), false, true)),
+            Some(Pick::NewNo)
+        );
+
+        // Before the grace has passed, the answering keys are gone.
+        for code in [
+            KeyCode::Char('y'),
+            KeyCode::Char('n'),
+            KeyCode::Char('1'),
+            KeyCode::Char('2'),
+        ] {
+            assert_eq!(
+                menu.key(&key(code, empty), true, false),
+                Keyed::Passed,
+                "{code:?} waits out the grace"
+            );
+        }
+    }
+
+    /// T1 (#108): the plain block, pinned on the renderer's own text,
+    /// note indented as every other plain line is.
+    #[test]
+    fn a_new_thread_question_prints_in_plain() {
+        assert_eq!(
+            Menu::new_thread().plain(),
+            vec![
+                "[new thread] a turn is running in this thread",
+                "  Start a new thread anyway? The running turn is interrupted first.",
+                "  1. Yes, interrupt it and start a new thread",
+                "  2. No, keep working here",
+                "  [y/N]",
+            ]
+        );
+    }
+
+    /// T1 (#108): a typed line answers the `/new` question by number or
+    /// letter; anything else answers nothing, so it stays a chat line.
+    /// No case-folding, as #7.
+    #[test]
+    fn a_typed_line_answers_the_new_thread_question() {
+        let menu = Menu::new_thread();
+        for yes in ["1", "y", "yes"] {
+            assert_eq!(
+                picked(menu.line(yes).expect(yes)),
+                Some(Pick::NewYes),
+                "{yes} says yes"
+            );
+        }
+        for no in ["2", "n", "no"] {
+            assert_eq!(
+                picked(menu.line(no).expect(no)),
+                Some(Pick::NewNo),
+                "{no} says no"
+            );
+        }
+        // Trimmed.
+        assert_eq!(
+            picked(menu.line("  y  ").expect("trimmed y")),
+            Some(Pick::NewYes)
+        );
+        // Nothing else answers: not a bare digit out of range, not a
+        // wordier spelling, not case-folded.
+        for line in [
+            "3",
+            "",
+            "good morning",
+            "Y",
+            "Yes",
+            "N",
+            "No",
+            "start a new thread",
+        ] {
+            assert_eq!(menu.line(line), None, "{line:?} is not an answer");
+        }
     }
 }

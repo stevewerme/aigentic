@@ -99,10 +99,10 @@ impl Printer for Stdout {
     }
 }
 
-/// Which prompts a pipe prints (issue #82).
+/// Which prompts a pipe prints (issues #82, #108).
 fn prints_in_plain(kind: crate::app::menu::Kind) -> bool {
     use crate::app::menu::Kind;
-    matches!(kind, Kind::Checkpoint | Kind::Switch)
+    matches!(kind, Kind::Checkpoint | Kind::Switch | Kind::NewThread)
 }
 
 /// How many cells the pager keeps.
@@ -638,6 +638,9 @@ fn text_hint(kind: Option<crate::app::menu::Kind>) -> &'static str {
     match kind {
         Some(Kind::Question) => "answer: Enter sends · Esc cancels",
         Some(Kind::Switch) => "where it belongs: Enter sends · Esc cancels",
+        // The `/new` question (issue #108) has no text to type and no
+        // reason to deny: Enter takes the row, Esc answers `No`.
+        Some(Kind::NewThread) => "Enter answers · Esc says no",
         _ => "deny with a reason · Enter sends · Esc cancels",
     }
 }
@@ -1804,18 +1807,25 @@ mod tests {
             "deny with a reason · Enter sends · Esc cancels"
         );
         assert_eq!(
+            // The `/new` question (#108) is a row menu too.
+            text_hint(Some(Kind::NewThread)),
+            "Enter answers · Esc says no"
+        );
+        assert_eq!(
             text_hint(None),
             "deny with a reason · Enter sends · Esc cancels"
         );
     }
 
     /// T6 (#82): a pipe prints the two prompts that have no line of
-    /// their own — a followed run's checkpoint and a switch proposal.
+    /// their own — a followed run's checkpoint and a switch proposal —
+    /// and, since #108 (T4), the `/new` question.
     #[test]
     fn a_pipe_prints_the_checkpoint_and_the_switch() {
         use crate::app::menu::Kind;
         assert!(prints_in_plain(Kind::Checkpoint));
         assert!(prints_in_plain(Kind::Switch));
+        assert!(prints_in_plain(Kind::NewThread));
         assert!(!prints_in_plain(Kind::Permission));
         assert!(!prints_in_plain(Kind::Question));
     }

@@ -44,7 +44,8 @@ pub enum Command<'a> {
     Rename(&'a str),
     /// Move the thread to another project.
     ProjectUse(&'a str),
-    /// Start a new front thread, leaving the old one listed (issue #89).
+    /// Start a new front thread, leaving the old one listed. With a turn
+    /// open, the REPL asks first (issue #108).
     New,
     Unknown(&'a str),
     Chat(&'a str),
@@ -137,7 +138,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "threads",
         "your threads in every project: front, builds, then by workspace",
     ),
-    ("new", "start a new front thread; the old one stays listed"),
+    (
+        "new",
+        "start a new front thread; the old one stays listed; asks first if a turn is running",
+    ),
     ("build", "follow a build of issue n here: /build <n>"),
     ("diff", "the project's working-tree diff, in the pager"),
     ("copy", "copy a code block of the last reply: /copy [n|all]"),
@@ -163,7 +167,7 @@ pub const HELP: &str = "\
 /project         the layers, the knowledge mode and every tool's fate
 /project use <n> move this thread to project <n>, keeping the conversation
 /threads         your threads in every project: front, builds, then by workspace
-/new             start a new front thread; the old one stays listed
+/new             start a new front thread; the old one stays listed; asks first if a turn is running
 /build <n>       follow a build of issue n here, and answer its checkpoints
 /<skill> [args]  run a user-invoked skill
 /diff            the project's working-tree diff, untracked files included
@@ -360,6 +364,18 @@ mod tests {
             "{COMMANDS:#?}"
         );
         assert!(HELP.contains("/new"), "{HELP}");
+    }
+
+    /// The `/new` help says it asks first (issue #108, T4): the row and
+    /// the long help both carry the question.
+    #[test]
+    fn the_new_help_says_it_asks_first() {
+        let said = COMMANDS
+            .iter()
+            .find_map(|(name, said)| (*name == "new").then_some(*said))
+            .expect("a /new row");
+        assert!(said.contains("asks first if a turn is running"), "{said}");
+        assert!(HELP.contains("asks first if a turn is running"), "{HELP}");
     }
 
     /// `/copy` is discoverable wherever the others are (issue #41).

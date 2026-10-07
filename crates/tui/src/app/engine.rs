@@ -338,6 +338,11 @@ pub struct ClientRepl {
     /// A post went out while idle and its turn has not been seen
     /// running yet; input at its end waits for that turn.
     awaiting_turn: bool,
+    /// The `/new` question while a turn is open (issue #108), in a slot
+    /// of its own: a daemon prompt (approval, question, switch) sets
+    /// `menu` the moment it arrives and would overwrite it. Answered
+    /// here, never sent to the daemon.
+    confirm_new: Option<Menu>,
 }
 
 impl ClientRepl {
@@ -379,6 +384,7 @@ impl ClientRepl {
             last_turn: None,
             last_stop: None,
             awaiting_turn: false,
+            confirm_new: None,
             quit: false,
             home_project: project.to_owned(),
             following: None,
@@ -486,6 +492,16 @@ impl ClientRepl {
             }
             return;
         }
+        // The `/new` question (issue #108) is answered first, before the
+        // followed run's checkpoint and the chat prompt: it is the one
+        // on screen, and its keys are its own. `!` and `/` lines are
+        // exempt, so `!stop it` and `/new` keep working with it up.
+        if !line.trim().starts_with('/')
+            && let Some(keyed) = self.confirm_new.as_ref().and_then(|m| m.line(line))
+        {
+            self.apply_confirm(keyed, out).await;
+            return;
+        }
         // A followed run's checkpoint takes a typed line first (issue #68):
         // plain mode has no keys, so `1`/`stop` and `2`/`wait` are the
         // prompt's answers there. A `/` line still reaches the parser,
@@ -529,7 +545,9 @@ impl ClientRepl {
                         }
                         // A checkpoint pick never reaches here (its own prompt
                         // handles it): issue #68. Nor a switch pick
-                        // (issue #82).
+                        // (issue #82), nor the `/new` question's two
+                        // (#108): those are the checkpoint's, the
+                        // switch's and `apply_confirm`'s.
                         Pick::Answer
                         | Pick::Other
                         | Pick::StopRun
@@ -537,7 +555,9 @@ impl ClientRepl {
                         | Pick::SwitchYes
                         | Pick::SwitchNo
                         | Pick::SwitchElsewhere
-                        | Pick::SwitchCorrected { .. } => {}
+                        | Pick::SwitchCorrected { .. }
+                        | Pick::NewYes
+                        | Pick::NewNo => {}
                     }
                     return;
                 }
@@ -600,7 +620,25 @@ impl ClientRepl {
                 self.show(r, "", out);
             }
             Command::Cost => self.report(ReportKind::Cost, out).await,
-            Command::New => self.new_front(out).await,
+            // `/new` with a turn open asks first (issue #108): a y/N menu of
+            // this REPL's own, never sent to the daemon. The second
+            // `/new` while the question is up is ignored, here and in
+            // plain mode alike.
+            Command::New => {
+                if self.confirm_new.is_some() {
+                    return;
+                }
+                if self.turn_open() {
+                    let menu = Menu::new_thread();
+                    // Plain mode prints the question (its kind is in
+                    // `prints_in_plain`): a pipe that answers `y` or `n`
+                    // gets the same handling as a terminal.
+                    out.prompt(&menu);
+                    self.confirm_new = Some(menu);
+                } else {
+                    self.new_front(false, out).await;
+                }
+            }
             Command::Build(arg) => self.build(arg, out).await,
             // The raw stop reason stays off the transcript (issue #22):
             // `/why` fetches it, engine-local, no daemon round-trip.
@@ -740,11 +778,14 @@ impl ClientRepl {
         }
     }
 
-    /// `/new` (issue #89): start a new front thread and move this REPL
-    /// onto it. The old thread stays listed, and a turn running in it
-    /// keeps running in the daemon; this connection closes it last, so
-    /// a failure anywhere before that leaves the REPL where it was.
-    async fn new_front(&mut self, out: &mut dyn Printer) {
+    /// `/new` (issues #89, #108): start a new front thread and move this
+    /// REPL onto it. The old thread stays listed. A turn running in it
+    /// is interrupted first — `/new` asks before it does that, and
+    /// `interrupted` says the answer was yes — because a turn left
+    /// running in a thread this REPL no longer shows is unreachable
+    /// from here. This connection closes the old thread last, so a
+    /// failure anywhere before that leaves the REPL where it was.
+    async fn new_front(&mut self, interrupted: bool, out: &mut dyn Printer) {
         // The new thread is in the project this REPL is in; a thread
         // that never switched is in the project it started in. The
         // folder's project is not consulted.
@@ -763,7 +804,14 @@ impl ClientRepl {
             Response::Thread { thread } => thread,
             Response::Refused { reason } => {
                 let reason = crate::front::without_project(&reason, &project);
-                out.line(&format!("cannot start a new thread in {project}: {reason}"));
+                let already = if interrupted {
+                    " (the running turn was already interrupted)"
+                } else {
+                    ""
+                };
+                out.line(&format!(
+                    "cannot start a new thread in {project}: {reason}{already}"
+                ));
                 return;
             }
             other => {
@@ -806,7 +854,8 @@ impl ClientRepl {
                 return;
             }
         };
-        self.land_new_front(new, state, mode, identity, out).await;
+        self.land_new_front(new, state, mode, identity, interrupted, out)
+            .await;
     }
 
     /// Move the REPL onto a thread that has just been opened (`/new`'s
@@ -819,6 +868,7 @@ impl ClientRepl {
         state: ThreadState,
         mode: String,
         identity: Identity,
+        interrupted: bool,
         out: &mut dyn Printer,
     ) {
         let old = self.thread;
@@ -845,6 +895,9 @@ impl ClientRepl {
         self.last_turn = None;
         self.last_stop = None;
         self.awaiting_turn = false;
+        // The `/new` question was about the old thread (issue #108): it
+        // does not follow this REPL over.
+        self.confirm_new = None;
         // The role is the new project's, and only the daemon knows it:
         // `Welcome` named the project the client started in.
         let project = self
@@ -874,10 +927,20 @@ impl ClientRepl {
         }
         // 6. The shell drops the live state the old thread left behind.
         out.thread_changed();
-        out.line(&format!(
-            "new front thread {} · the old one stays listed in /threads",
-            new.id
-        ));
+        // With a turn interrupted (issue #108), say what was *sent*: this
+        // connection has just closed the old thread and cannot see the
+        // interrupt land. Without one, the plain line as before.
+        if interrupted {
+            out.line(&format!(
+                "sent an interrupt to {old}; new front thread {} · the old one stays listed in /threads",
+                new.id
+            ));
+        } else {
+            out.line(&format!(
+                "new front thread {} · the old one stays listed in /threads",
+                new.id
+            ));
+        }
     }
 
     async fn post(&mut self, text: &str, interrupt: bool, out: &mut dyn Printer) {
@@ -1104,7 +1167,9 @@ impl ClientRepl {
             | Pick::SwitchYes
             | Pick::SwitchNo
             | Pick::SwitchElsewhere
-            | Pick::SwitchCorrected { .. } => {}
+            | Pick::SwitchCorrected { .. }
+            | Pick::NewYes
+            | Pick::NewNo => {}
         }
     }
 
@@ -1153,10 +1218,14 @@ impl ClientRepl {
         self.turn.as_ref()
     }
 
-    /// The menu the shell draws while this client is prompted: the chat
-    /// prompt when there is one, else the followed run's checkpoint
-    /// prompt (issue #68).
+    /// The menu the shell draws while this client is prompted: the `/new`
+    /// question first (issue #108 — it is the one on screen and the one
+    /// keys go to), then the chat prompt, else the followed run's
+    /// checkpoint prompt (issue #68).
     pub fn menu(&self) -> Option<&Menu> {
+        if self.confirm_new.is_some() {
+            return self.confirm_new.as_ref();
+        }
         if self.prompted.is_some() {
             return self.menu.as_ref();
         }
@@ -1169,6 +1238,9 @@ impl ClientRepl {
     /// prompt that replaces it (#68's review: `1` allowed a command, and
     /// the Enter after it stopped the run).
     pub fn menu_id(&self) -> Option<String> {
+        if self.confirm_new.is_some() {
+            return Some("confirm:new".to_owned());
+        }
         if let Some(call_id) = self.prompted.as_ref() {
             return self.menu.as_ref().map(|_| format!("chat:{call_id}"));
         }
@@ -1189,6 +1261,26 @@ impl ClientRepl {
         settled: bool,
         out: &mut dyn Printer,
     ) -> MenuKey {
+        if self.confirm_new.is_some() {
+            // The `/new` question takes its keys first (issue #108):
+            // Esc is `No` in `Menu::key`, so it never reaches the
+            // keymap's interrupt. The question has no text input.
+            let keyed = {
+                let Some(menu) = self.confirm_new.as_mut() else {
+                    return MenuKey::Passed;
+                };
+                menu.key(key, composer_empty, settled)
+            };
+            return match keyed {
+                Keyed::Passed => MenuKey::Passed,
+                Keyed::Used => MenuKey::Used,
+                Keyed::Text => MenuKey::Passed,
+                keyed @ (Keyed::Decide { .. } | Keyed::Answer { .. }) => {
+                    self.apply_confirm(keyed, out).await;
+                    MenuKey::Used
+                }
+            };
+        }
         if self.prompted.is_none() {
             // With no chat prompt the keys belong to the followed run's
             // checkpoint menu (issue #68), if one is up.
@@ -1247,7 +1339,11 @@ impl ClientRepl {
                     | Pick::Other
                     | Pick::StopRun
                     | Pick::LeaveWaiting
-                    | Pick::SwitchElsewhere => {}
+                    | Pick::SwitchElsewhere
+                    // The `/new` question is answered by `apply_confirm`,
+                    // never by a daemon prompt's kind here (#108).
+                    | Pick::NewYes
+                    | Pick::NewNo => {}
                 }
             }
             Keyed::Answer { text, echo } => {
@@ -1256,6 +1352,39 @@ impl ClientRepl {
             }
             Keyed::Passed | Keyed::Used | Keyed::Text => {}
         }
+    }
+
+    /// Answer the `/new` question (issue #108). It is the REPL's own, so
+    /// nothing is sent to the daemon for the answer itself: `Yes`
+    /// interrupts the turn it names, then starts the new front thread;
+    /// `No` leaves the thread and the turn exactly as they were.
+    async fn apply_confirm(&mut self, keyed: Keyed, out: &mut dyn Printer) {
+        let Keyed::Decide { pick, .. } = keyed else {
+            return;
+        };
+        self.confirm_new = None;
+        match pick {
+            Pick::NewNo => out.line("kept this thread; nothing changed"),
+            Pick::NewYes => {
+                // The turn may have ended while the question was up:
+                // then there is nothing to interrupt, and the new front
+                // thread says only that.
+                let interrupted = self.turn_open();
+                if interrupted {
+                    self.interrupt(out).await;
+                }
+                self.new_front(interrupted, out).await;
+            }
+            _ => {}
+        }
+    }
+
+    /// A turn is open on this thread (issue #108): the states that mean
+    /// the daemon has one, or a post this REPL just made and has not
+    /// seen the state for yet (`awaiting_turn`), which is the same
+    /// window one keystroke wide.
+    fn turn_open(&self) -> bool {
+        !matches!(self.state, ThreadState::Idle) || self.awaiting_turn
     }
 
     /// Answer the current question with `contribution` (the echo is the
@@ -1333,6 +1462,10 @@ impl ClientRepl {
                     self.answer_menu(&contribution, out).await;
                 }
             }
+            // The `/new` question has no text input (issue #108): its
+            // keys are digits and `y`/`n`, and there is nothing for the
+            // composer to send.
+            Some(Kind::NewThread) => {}
             // A checkpoint has no text input: nothing to send.
             Some(Kind::Checkpoint) => {}
             // A switch proposal's text input is where it belongs
@@ -2346,7 +2479,7 @@ mod tests {
         ProviderEvent, RiskClass, ToolCall as CoreToolCall, Usage,
     };
     use aigentic_server::build::{BuildError, ProviderFactory};
-    use aigentic_server::{DefaultReports, Server};
+    use aigentic_server::{DefaultReports, Embedded, Server};
     use futures_core::Stream;
     use std::collections::VecDeque;
     use std::pin::Pin;
@@ -6139,5 +6272,578 @@ mod tests {
             crossterm::event::KeyCode::Char('c'),
             crossterm::event::KeyModifiers::CONTROL,
         )
+    }
+
+    /// The `/new` question's rig (issue #108): an embedded daemon whose
+    /// first turn stops at a bash call's approval and stays there until
+    /// someone answers it — no timer holds it, the gate does — a REPL on
+    /// the chat thread, and a second client to pace that turn.
+    struct HeldTurn {
+        dir: tempfile::TempDir,
+        embedded: Embedded,
+        repl: ClientRepl,
+        notices: mpsc::Receiver<Notice>,
+        pacer: Client,
+        paced: mpsc::Receiver<Notice>,
+        out: Copies,
+    }
+
+    impl HeldTurn {
+        async fn start() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let root = project(dir.path(), "proj", "");
+            let cfg_dir = dir.path().join("cfg");
+            std::fs::create_dir_all(&cfg_dir).unwrap();
+            // The first batch asks to run a command and then waits on the
+            // approval; the second is whatever follows it, so a test that
+            // lets the turn finish sees it end.
+            let script = vec![
+                vec![
+                    call("b1", "bash", serde_json::json!({"command": "rm -rf x"})),
+                    tool_use(),
+                ],
+                vec![text("fine, not deleting"), done()],
+            ];
+            let embedded = Server::embed_with(
+                config(dir.path()),
+                cfg_dir.clone(),
+                root,
+                "steve",
+                None,
+                Factory::scripted(script),
+                Arc::new(DefaultReports {
+                    global_instructions: cfg_dir.join("instructions.md"),
+                }),
+            )
+            .await
+            .unwrap();
+            let addr = Addr::Unix(embedded.socket.clone());
+            let (client, welcome) = Client::connect(&addr, &embedded.token).await.unwrap();
+            let role = welcome.projects[0].role.clone();
+            let (thread, state, mode) = open(&client, "proj", None).await;
+            let notices = client.take_notices().unwrap();
+            let repl = ClientRepl::new(
+                client,
+                thread,
+                "steve",
+                role,
+                state,
+                mode,
+                Identity::default(),
+                "proj",
+            );
+            let (pacer, _) = Client::connect(&addr, &embedded.token).await.unwrap();
+            open(&pacer, "proj", Some(thread)).await;
+            let paced = pacer.take_notices().unwrap();
+            Self {
+                dir,
+                embedded,
+                repl,
+                notices,
+                pacer,
+                paced,
+                out: Copies::default(),
+            }
+        }
+
+        /// The lines the REPL printed.
+        fn lines(&self) -> Vec<String> {
+            self.out.0.0.clone()
+        }
+
+        /// Post a message and wait for the daemon to report the turn
+        /// stopped at the bash call's approval: the turn is open, and
+        /// nothing moves it until someone answers the gate.
+        async fn post_and_hold(&mut self) {
+            self.repl.post("hello", false, &mut self.out).await;
+            until_state(
+                &mut self.paced,
+                |s| matches!(s, ThreadState::AwaitingApproval { call_id, .. } if call_id == "b1"),
+            )
+            .await;
+        }
+
+        /// The raw text of a thread's log.
+        fn log_text(&self, thread: Ulid) -> String {
+            let path = self
+                .dir
+                .path()
+                .join("threads")
+                .join(format!("{thread}.jsonl"));
+            std::fs::read_to_string(path).unwrap_or_default()
+        }
+
+        /// The kinds in a thread's log, read from the file: a line is
+        /// kept only when it parses, so a poll may catch the daemon
+        /// mid-append.
+        fn log_kinds(&self, thread: Ulid) -> Vec<String> {
+            self.log_text(thread)
+                .lines()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .filter_map(|v| v.get("kind").and_then(|k| k.as_str()).map(str::to_owned))
+                .collect()
+        }
+
+        /// Wait for a kind to appear in a thread's log.
+        async fn until_log_kind(&self, thread: Ulid, kind: &str, what: &str) {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !self.log_kinds(thread).iter().any(|k| k == kind) {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "{what}: no {kind} in the log of {thread}: {:?}",
+                    self.log_kinds(thread)
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+
+        /// Whether the daemon really has that thread, on a connection of
+        /// its own.
+        async fn thread_exists(&self, thread: Ulid) -> bool {
+            let addr = Addr::Unix(self.embedded.socket.clone());
+            let (client, _) = Client::connect(&addr, &self.embedded.token).await.unwrap();
+            matches!(
+                client
+                    .request(Request::Open {
+                        thread,
+                        from_seq: 0
+                    })
+                    .await,
+                Ok(Response::Opened { .. })
+            )
+        }
+
+        /// Draw this REPL's notices until it has seen the turn end, as
+        /// the shell does.
+        async fn draw_until_idle(&mut self) {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let n = tokio::time::timeout_at(deadline, self.notices.recv())
+                    .await
+                    .expect("a state notice in time")
+                    .expect("a notice");
+                let idle = matches!(&n, Notice::State { state, .. } if *state == ThreadState::Idle);
+                self.repl.render(n, &mut self.out);
+                if idle {
+                    return;
+                }
+            }
+        }
+
+        /// Draw this REPL's notices until the daemon's prompt is up, as
+        /// the shell does: the approval is the menu the REPL keys now.
+        async fn draw_the_prompt(&mut self) {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            while self.repl.menu().is_none() {
+                let n = tokio::time::timeout_at(deadline, self.notices.recv())
+                    .await
+                    .expect("a prompt in time")
+                    .expect("a notice");
+                self.repl.render(n, &mut self.out);
+            }
+        }
+    }
+
+    /// The question as a pipe prints it.
+    fn new_question() -> Vec<String> {
+        Menu::new_thread().plain()
+    }
+
+    /// The lines the question drew, asserted present in `lines`.
+    fn assert_question_drawn(lines: &[String]) {
+        let question = new_question();
+        assert!(
+            question.iter().all(|l| lines.contains(l)),
+            "the question is drawn: {question:?} in {lines:#?}"
+        );
+    }
+
+    /// T2 (#108): idle `/new` is untouched, and with a turn running a
+    /// `No` keeps the thread and the turn.
+    #[tokio::test]
+    async fn new_with_a_running_turn_asks_and_no_keeps_the_turn() {
+        let mut rig = HeldTurn::start().await;
+        rig.post_and_hold().await;
+        let old = rig.repl.thread;
+
+        rig.repl.handle_line("/new", &mut rig.out).await;
+        assert_eq!(
+            rig.repl.menu(),
+            Some(&Menu::new_thread()),
+            "the question is up"
+        );
+        assert_eq!(rig.repl.menu_id().as_deref(), Some("confirm:new"));
+        assert_question_drawn(&rig.lines());
+        assert_eq!(rig.repl.thread, old, "`/new` itself starts nothing");
+
+        rig.repl.handle_line("n", &mut rig.out).await;
+        let lines = rig.lines();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l == "kept this thread; nothing changed"),
+            "{lines:#?}"
+        );
+        assert_eq!(rig.repl.thread, old, "the REPL stayed on the thread");
+        assert_eq!(rig.repl.menu(), None, "and the question is gone");
+        let kinds = rig.log_kinds(old);
+        assert!(
+            !kinds
+                .iter()
+                .any(|k| k == "interrupted" || k == "turn_ended"),
+            "the turn is still open: {kinds:?}"
+        );
+    }
+
+    /// T2 (#108): a `Yes` interrupts the running turn, starts the new
+    /// front thread and says what it sent.
+    #[tokio::test]
+    async fn new_with_a_running_turn_asks_and_yes_interrupts_and_starts_a_new_thread() {
+        let mut rig = HeldTurn::start().await;
+        rig.post_and_hold().await;
+        let old = rig.repl.thread;
+
+        rig.repl.handle_line("/new", &mut rig.out).await;
+        assert_eq!(rig.repl.menu(), Some(&Menu::new_thread()));
+        rig.repl.handle_line("y", &mut rig.out).await;
+
+        let new = rig.repl.thread;
+        assert_ne!(new, old, "the REPL moved to a new front thread");
+        assert!(rig.thread_exists(new).await, "the daemon has {new}");
+        rig.until_log_kind(old, "interrupted", "the interrupt reached the turn")
+            .await;
+        rig.until_log_kind(old, "turn_ended", "and the turn ended")
+            .await;
+        let lines = rig.lines();
+        let sent = format!(
+            "sent an interrupt to {old}; new front thread {new} · the old one stays listed in /threads"
+        );
+        assert!(lines.contains(&sent), "{lines:#?}");
+        assert!(
+            lines.iter().any(|l| l == "[interrupting]"),
+            "the turn's own line went out first: {lines:#?}"
+        );
+    }
+
+    /// T2 (#108): `/new` typed right after a message, before the daemon
+    /// has reported the turn, still asks — `awaiting_turn` covers the
+    /// window.
+    #[tokio::test]
+    async fn new_typed_after_a_message_asks_before_the_state_notice() {
+        let mut rig = HeldTurn::start().await;
+        let old = rig.repl.thread;
+        rig.repl.post("hello", false, &mut rig.out).await;
+        // The turn is running on the daemon and this REPL has not drawn
+        // a notice since: only the post it just made says so.
+        assert_eq!(rig.repl.state, ThreadState::Idle, "no notice was drawn");
+        assert!(rig.repl.turn_open(), "but the turn this REPL started is");
+
+        rig.repl.handle_line("/new", &mut rig.out).await;
+        assert_eq!(
+            rig.repl.menu(),
+            Some(&Menu::new_thread()),
+            "it asks before the notice: {:#?}",
+            rig.lines()
+        );
+        rig.repl.handle_line("n", &mut rig.out).await;
+        assert_eq!(rig.repl.thread, old);
+    }
+
+    /// T2 (#108): the turn ends while the question is up. The question
+    /// stays, nothing is interrupted, and `Yes` starts the new thread.
+    #[tokio::test]
+    async fn new_while_the_question_is_up_after_the_turn_ended_starts_it_without_an_interrupt() {
+        let mut rig = HeldTurn::start().await;
+        rig.post_and_hold().await;
+        let old = rig.repl.thread;
+        rig.repl.handle_line("/new", &mut rig.out).await;
+        assert_eq!(rig.repl.menu(), Some(&Menu::new_thread()));
+
+        // The gate is answered on the pacer: the turn runs on and ends
+        // behind the question.
+        let r = rig
+            .pacer
+            .request(Request::Decide {
+                thread: old,
+                call_id: "b1".into(),
+                allow: true,
+                session: false,
+                prefix: None,
+                reason: None,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(r, Response::Ok), "{r:?}");
+        until_state(&mut rig.paced, |s| *s == ThreadState::Idle).await;
+        rig.draw_until_idle().await;
+        assert_eq!(rig.repl.state, ThreadState::Idle);
+        assert_eq!(
+            rig.repl.menu(),
+            Some(&Menu::new_thread()),
+            "the question stays: {:#?}",
+            rig.lines()
+        );
+
+        rig.repl.handle_line("y", &mut rig.out).await;
+        let new = rig.repl.thread;
+        assert_ne!(new, old, "the REPL moved to a new front thread");
+        rig.until_log_kind(old, "turn_ended", "the turn ended on its own")
+            .await;
+        let kinds = rig.log_kinds(old);
+        assert!(
+            !kinds.iter().any(|k| k == "interrupted"),
+            "nothing was interrupted: {kinds:?}"
+        );
+        let lines = rig.lines();
+        let sent = format!("new front thread {new} · the old one stays listed in /threads");
+        assert!(lines.contains(&sent), "{lines:#?}");
+    }
+
+    /// T2 (#108): a second `/new` while the question is up is ignored,
+    /// and the answer still works.
+    #[tokio::test]
+    async fn a_second_new_while_the_question_is_up_is_ignored() {
+        let mut rig = HeldTurn::start().await;
+        rig.post_and_hold().await;
+        let old = rig.repl.thread;
+        rig.repl.handle_line("/new", &mut rig.out).await;
+        let question = rig.repl.menu().cloned();
+        let drawn = rig.lines();
+
+        rig.repl.handle_line("/new", &mut rig.out).await;
+        assert_eq!(
+            rig.repl.menu().cloned(),
+            question,
+            "the question is the same one"
+        );
+        assert_eq!(rig.lines(), drawn, "and it was not drawn again");
+        assert_eq!(rig.repl.thread, old, "no new thread started");
+
+        rig.repl.handle_line("n", &mut rig.out).await;
+        assert!(
+            rig.lines()
+                .iter()
+                .any(|l| l == "kept this thread; nothing changed"),
+            "the answer still lands: {:#?}",
+            rig.lines()
+        );
+    }
+
+    /// T3 (#108): with a followed run's checkpoint also up, the question
+    /// is the one `menu()` and `menu_id()` name and the one that takes
+    /// its keys; a `No` hands the checkpoint back, still answerable.
+    #[tokio::test]
+    async fn the_question_takes_its_keys_before_a_checkpoint_and_gives_it_back() {
+        let lead_id = Ulid::generate();
+        let backlog = vec![run_event(
+            lead_id,
+            1,
+            EventKind::CheckpointAsked,
+            checkpoint_asked("gate-1"),
+        )];
+        let mut lead = Lead::start(lead_id, backlog).await;
+        lead.line("/build 58").await;
+        lead.pump().await;
+        let checkpoint = lead.repl.menu().cloned().expect("the checkpoint is up");
+
+        // The chat thread is running, as a notice says: `/new` asks.
+        lead.push(Notice::State {
+            thread: lead.repl.thread,
+            state: ThreadState::Running {
+                by: Author::User(aigentic_runtime::aigentic_core::UserId("steve".into())),
+                queued: 0,
+            },
+        });
+        lead.pump().await;
+        lead.line("/new").await;
+        assert_eq!(
+            lead.repl.menu(),
+            Some(&Menu::new_thread()),
+            "the question is drawn"
+        );
+        assert_eq!(lead.repl.menu_id().as_deref(), Some("confirm:new"));
+
+        // `n` is the checkpoint's own key too; it answers the question.
+        let keyed = lead
+            .repl
+            .menu_key(&key_for('n'), true, true, &mut lead.out)
+            .await;
+        assert!(matches!(keyed, MenuKey::Used), "{keyed:?}");
+        assert!(
+            lead.lines()
+                .iter()
+                .any(|l| l == "kept this thread; nothing changed"),
+            "{:#?}",
+            lead.lines()
+        );
+        assert!(
+            !lead
+                .daemon
+                .requests()
+                .iter()
+                .any(|r| matches!(r, Request::AnswerCheckpoint { .. })),
+            "the checkpoint was not answered: {:?}",
+            lead.daemon.requests()
+        );
+
+        // The checkpoint is the menu again, and still answerable.
+        assert_eq!(
+            lead.repl.menu().cloned(),
+            Some(checkpoint),
+            "the checkpoint is drawn again"
+        );
+        let before = lead.daemon.requests().len();
+        let keyed = lead
+            .repl
+            .menu_key(&key_for('1'), true, true, &mut lead.out)
+            .await;
+        assert!(matches!(keyed, MenuKey::Used), "{keyed:?}");
+        match &lead.daemon.requests()[before..] {
+            [Request::AnswerCheckpoint { gate, .. }] => assert_eq!(gate, "gate-1"),
+            other => panic!("the gate's own key answers it: {other:?}"),
+        }
+        lead.daemon.stop();
+    }
+
+    /// T3 (#108): a typed answer in plain mode answers the question, not
+    /// a followed run's checkpoint, and the question prints.
+    #[tokio::test]
+    async fn a_typed_answer_answers_the_question_and_not_a_checkpoint() {
+        let lead_id = Ulid::generate();
+        let backlog = vec![run_event(
+            lead_id,
+            1,
+            EventKind::CheckpointAsked,
+            checkpoint_asked("gate-1"),
+        )];
+        let mut lead = Lead::start(lead_id, backlog).await;
+        lead.line("/build 58").await;
+        lead.pump().await;
+        let checkpoint = lead.repl.menu().cloned().expect("the checkpoint is up");
+
+        lead.push(Notice::State {
+            thread: lead.repl.thread,
+            state: ThreadState::Running {
+                by: Author::User(aigentic_runtime::aigentic_core::UserId("steve".into())),
+                queued: 0,
+            },
+        });
+        lead.pump().await;
+        lead.line("/new").await;
+        assert_question_drawn(&lead.lines());
+        assert_eq!(lead.repl.menu(), Some(&Menu::new_thread()));
+
+        // A typed line, as a pipe hands it over: the question first.
+        lead.line("n").await;
+        assert!(
+            lead.lines()
+                .iter()
+                .any(|l| l == "kept this thread; nothing changed"),
+            "{:#?}",
+            lead.lines()
+        );
+        assert_eq!(
+            lead.repl.menu().cloned(),
+            Some(checkpoint),
+            "the checkpoint is untouched, and up"
+        );
+        assert!(
+            !lead
+                .daemon
+                .requests()
+                .iter()
+                .any(|r| matches!(r, Request::AnswerCheckpoint { .. })),
+            "and nothing was answered for it: {:?}",
+            lead.daemon.requests()
+        );
+        lead.daemon.stop();
+    }
+
+    /// T3 (#108): a daemon approval that arrives while the question is
+    /// up waits behind it — the question keeps the keys, and a `No`
+    /// hands the approval back, still answerable.
+    #[tokio::test]
+    async fn the_question_keeps_its_keys_while_an_approval_waits_behind_it() {
+        let mut rig = HeldTurn::start().await;
+        rig.post_and_hold().await;
+        rig.draw_the_prompt().await;
+        let old = rig.repl.thread;
+        let approval = rig.repl.menu().cloned().expect("the approval is up");
+        assert_eq!(rig.repl.menu_id().as_deref(), Some("chat:b1"));
+
+        rig.repl.handle_line("/new", &mut rig.out).await;
+        assert_eq!(
+            rig.repl.menu(),
+            Some(&Menu::new_thread()),
+            "the question is the one shown: {:#?}",
+            rig.lines()
+        );
+        assert_eq!(rig.repl.menu_id().as_deref(), Some("confirm:new"));
+
+        // `n` answers the question, never the approval behind it.
+        let keyed = rig
+            .repl
+            .menu_key(&key_for('n'), true, true, &mut rig.out)
+            .await;
+        assert!(matches!(keyed, MenuKey::Used), "{keyed:?}");
+        assert_eq!(
+            rig.repl.menu().cloned(),
+            Some(approval),
+            "the approval is drawn again"
+        );
+        assert_eq!(
+            rig.repl.menu_id().as_deref(),
+            Some("chat:b1"),
+            "and it is the one keyed"
+        );
+
+        // Still answerable: allow it once, and the turn runs on to its
+        // own end, with nothing denied along the way.
+        let keyed = rig
+            .repl
+            .menu_key(&key_for('1'), true, true, &mut rig.out)
+            .await;
+        assert!(matches!(keyed, MenuKey::Used), "{keyed:?}");
+        rig.until_log_kind(old, "turn_ended", "the turn ran to its end")
+            .await;
+        let log = rig.log_text(old);
+        assert!(
+            !log.contains("denied by"),
+            "the question's `n` denied nothing: {log}"
+        );
+        assert_eq!(rig.repl.thread, old, "and no thread moved");
+    }
+
+    /// T3 (#108): in plain mode (the rig's printer is a pipe: it prints a
+    /// prompt's `plain()` text) the question prints, and a typed `n`
+    /// answers the question rather than a followed run's checkpoint.
+    #[tokio::test]
+    async fn a_piped_new_with_a_turn_running_asks_and_a_typed_n_answers_it() {
+        let mut rig = HeldTurn::start().await;
+        rig.post_and_hold().await;
+        rig.draw_the_prompt().await;
+        let old = rig.repl.thread;
+
+        rig.repl.handle_line("/new", &mut rig.out).await;
+        let printed = rig.lines();
+        let question = Menu::new_thread().plain();
+        assert!(
+            printed.ends_with(&question),
+            "the question's own lines end the output: {printed:#?}"
+        );
+        assert_eq!(rig.repl.menu_id().as_deref(), Some("confirm:new"));
+
+        // A typed line, as a pipe sends one.
+        rig.repl.handle_line("n", &mut rig.out).await;
+        let lines = rig.lines();
+        assert!(
+            lines.contains(&"kept this thread; nothing changed".to_owned()),
+            "{lines:#?}"
+        );
+        assert_eq!(rig.repl.thread, old, "no thread moved");
+        assert!(
+            rig.repl.menu_id().as_deref() == Some("chat:b1"),
+            "the checkpoint is still the one keyed"
+        );
     }
 }
