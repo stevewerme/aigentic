@@ -14,8 +14,8 @@ use aigentic_log::{
 };
 use aigentic_policy::Policy;
 use aigentic_runtime::runner::{
-    Advanced, FakeForge, FakeInstaller, Forge, GhForge, GitRepo, IssueView, Runner, RunnerError,
-    RunnerHost, WriteGuard,
+    Advanced, FakeForge, FakeInstaller, Forge, GhForge, GitRepo, IssueView, Repo, RepoError,
+    Runner, RunnerError, RunnerHost, WriteGuard,
 };
 use aigentic_runtime::workflow::{LoadedWorkflow, WorkflowFile, WorkflowOrigin};
 use aigentic_runtime::{Answer, Approver, LENGTH_STOP, Prices, Runtime};
@@ -496,6 +496,10 @@ impl Fixture {
 
     /// A runner over the log as it stands, with the fixture's forge.
     fn runner(&self) -> TestRunner {
+        self.runner_with_repo(GitRepo::new(self.repo.clone()))
+    }
+
+    fn runner_with_repo<R: Repo>(&self, repo: R) -> Runner<Arc<FakeForge>, FakeHost, R> {
         let log = ThreadLog::open(self.dir.path(), self.lead).unwrap();
         let host = FakeHost::new(
             self.dir.path().to_path_buf(),
@@ -511,7 +515,7 @@ impl Fixture {
             host,
             Box::new(self.installer.clone()),
             self.workflow.clone(),
-            GitRepo::new(self.repo.clone()),
+            repo,
         )
         .expect("the log is the lead's")
     }
@@ -665,8 +669,14 @@ impl Fixture {
                 self.remote.to_str().unwrap(),
                 "refs/heads/main",
             ])
+            .current_dir(self.dir.path())
             .output()
             .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git ls-remote failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         String::from_utf8_lossy(&out.stdout)
             .split_whitespace()
             .next()
@@ -938,7 +948,10 @@ async fn replay(fx: &Fixture, snapshot: &Snapshot) -> (Advanced, TestRunner) {
 /// Drive a runner to its pause, doing the git work a run's middle needs:
 /// once the implementer has reported, the commits its brief named land, so
 /// a rebuilt run's checks read them and not an empty range.
-async fn drive(fx: &Fixture, runner: &mut TestRunner) -> Advanced {
+async fn drive<R: Repo>(
+    fx: &Fixture,
+    runner: &mut Runner<Arc<FakeForge>, FakeHost, R>,
+) -> Advanced {
     let mut committed = false;
     drive_with(fx, runner, || {
         if let Some(child) = fx.implementer_child() {
@@ -951,7 +964,11 @@ async fn drive(fx: &Fixture, runner: &mut TestRunner) -> Advanced {
 /// The same, with `between` called after each move: a run whose middle
 /// needs other git work (a wrong subject, an amend) drives itself this
 /// way, so a rebuilt run is caught up the same way the full one was.
-async fn drive_with(_fx: &Fixture, runner: &mut TestRunner, mut between: impl FnMut()) -> Advanced {
+async fn drive_with<R: Repo>(
+    _fx: &Fixture,
+    runner: &mut Runner<Arc<FakeForge>, FakeHost, R>,
+    mut between: impl FnMut(),
+) -> Advanced {
     loop {
         match runner.advance().await.expect("the run advances") {
             Advanced::Moved => between(),
@@ -3015,6 +3032,50 @@ async fn t3_a_second_failed_check_escalates_without_pushing() {
     );
 }
 
+struct PushRaceRepo<'a> {
+    fixture: &'a Fixture,
+    push_calls: Arc<Mutex<usize>>,
+    stranger_head: Arc<Mutex<Option<String>>>,
+}
+
+impl Repo for PushRaceRepo<'_> {
+    fn root(&self) -> &Path {
+        &self.fixture.repo
+    }
+
+    fn head(&self) -> Result<String, RepoError> {
+        GitRepo::new(self.fixture.repo.clone()).head()
+    }
+
+    fn branch(&self) -> Result<String, RepoError> {
+        GitRepo::new(self.fixture.repo.clone()).branch()
+    }
+
+    fn remote_head(&self, branch: &str) -> Result<Option<String>, RepoError> {
+        GitRepo::new(self.fixture.repo.clone()).remote_head(branch)
+    }
+
+    fn push(&self, branch: &str) -> Result<(), RepoError> {
+        *self.push_calls.lock().unwrap() += 1;
+        assert_eq!(
+            WriteGuard::holder(&self.fixture.repo),
+            Some(self.fixture.lead),
+            "the writing step holds the lock before pushing"
+        );
+        let move_remote = self.stranger_head.lock().unwrap().is_none();
+        if move_remote {
+            let stranger = self.fixture.push_a_stranger();
+            assert_eq!(
+                self.fixture.remote_head(),
+                stranger,
+                "the competing push advances the bare remote before the runner push"
+            );
+            *self.stranger_head.lock().unwrap() = Some(stranger);
+        }
+        GitRepo::new(self.fixture.repo.clone()).push(branch)
+    }
+}
+
 /// T4: a remote that moved while the step ran is never pushed over.
 #[tokio::test]
 async fn t4_a_remote_that_moved_is_never_pushed_over() {
@@ -3066,6 +3127,95 @@ async fn t4_a_remote_that_moved_is_never_pushed_over() {
         "the gate says what happened: {shown:?}"
     );
     assert_eq!(fx.installer.calls(), 0, "nothing is installed");
+}
+
+/// A non-fast-forward at push time opens one recoverable gate.
+#[tokio::test]
+async fn t4b_a_remote_that_moves_during_push_waits_at_push_error() {
+    let h = happy_path();
+    let fx = &h.fx;
+    let push_calls = Arc::new(Mutex::new(0));
+    let stranger_head = Arc::new(Mutex::new(None));
+    let repo = PushRaceRepo {
+        fixture: fx,
+        push_calls: push_calls.clone(),
+        stranger_head: stranger_head.clone(),
+    };
+    let mut runner = fx.runner_with_repo(repo);
+
+    assert_eq!(
+        drive(fx, &mut runner).await,
+        Advanced::WaitingHuman {
+            gate: "push_error".to_owned()
+        },
+        "a rejected push pauses for the human"
+    );
+    let events = fx.lead_events();
+    let stranger = stranger_head
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the remote moved inside Repo::push");
+    assert_eq!(
+        fx.remote_head(),
+        stranger,
+        "the stranger's commit is intact"
+    );
+    assert!(
+        pushed_events(&events).is_empty(),
+        "the runner records no push"
+    );
+    assert_eq!(*push_calls.lock().unwrap(), 1, "the runner pushes once");
+    assert_eq!(fx.installer.calls(), 0, "nothing is installed");
+    assert!(
+        events
+            .iter()
+            .all(|event| event.kind != EventKind::RunFinished),
+        "the run remains open at its gate"
+    );
+    let shown = gate_shown(&events);
+    assert!(
+        shown
+            .iter()
+            .any(|line| line.contains("remote moved during the push")),
+        "the gate explains the race: {shown:?}"
+    );
+    assert!(
+        shown
+            .iter()
+            .any(|line| line.contains("non-fast-forward") || line.contains("fetch first")),
+        "the gate preserves Git's non-fast-forward rejection detail: {shown:?}"
+    );
+    assert_eq!(
+        WriteGuard::holder(&fx.repo),
+        None,
+        "the gate releases the write lock"
+    );
+
+    let repo = PushRaceRepo {
+        fixture: fx,
+        push_calls: push_calls.clone(),
+        stranger_head: stranger_head.clone(),
+    };
+    let mut rebuilt = fx.runner_with_repo(repo);
+    assert_eq!(
+        rebuilt.advance().await.expect("the rebuilt runner waits"),
+        Advanced::WaitingHuman {
+            gate: "push_error".to_owned()
+        },
+        "the rebuilt runner resumes at the unanswered gate"
+    );
+    assert_eq!(
+        *push_calls.lock().unwrap(),
+        1,
+        "the rebuild does not push again"
+    );
+    assert_eq!(
+        checkpoints(&fx.lead_events()).len(),
+        1,
+        "the rebuild does not append a duplicate gate"
+    );
+    assert_eq!(fx.remote_head(), stranger, "the remote remains untouched");
 }
 
 /// T5: the push landed but the process died before `pushed`; a rebuild

@@ -840,7 +840,20 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
                     ],
                 );
             }
-            self.repo.push(&branch)?;
+            if let Err(error) = self.repo.push(&branch) {
+                let moved_during_push = match &error {
+                    RepoError::Command { message, .. } => {
+                        message.contains("non-fast-forward") || message.contains("fetch first")
+                    }
+                    RepoError::Io(_) => false,
+                };
+                let detail = if moved_during_push {
+                    format!("remote moved during the push: {error}")
+                } else {
+                    error.to_string()
+                };
+                return self.escalate("push_error", vec![step.id.clone(), detail]);
+            }
         }
         let installed = self.installer.install(&self.repo)?;
         let short = &head[..head.len().min(12)];
