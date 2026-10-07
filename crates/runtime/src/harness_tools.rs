@@ -3,16 +3,18 @@
 //! like any tool, with class `safe`, so the model's view is uniform; the
 //! tools crate never sees them.
 
-use aigentic_core::{Author, EventKind, RiskClass, ToolCall, ToolResult, ToolSpec};
+use aigentic_core::{
+    Author, ContentBlock, Event, EventKind, RiskClass, ToolCall, ToolResult, ToolSpec,
+};
 use aigentic_log::{
-    CommitRef, DecisionAnswer, DecisionKind, DecisionProposedPayload, DecisionStage, Finding,
-    FixSize, Handoff, Invoker, LedgerEntry, PinnedPayload, PlannedTest, ReleaseImpact,
-    ReportStatus, Route, SkillLoadedPayload, StepReport, Verdict,
+    AssistantMessagePayload, CommitRef, DecisionAnswer, DecisionKind, DecisionProposedPayload,
+    DecisionStage, Finding, FixSize, Handoff, Invoker, LedgerEntry, PinnedPayload, PlannedTest,
+    ReleaseImpact, ReportStatus, Route, SkillLoadedPayload, StepReport, ToolResultPayload, Verdict,
 };
 use aigentic_skills::Invocation;
 use serde::Deserialize;
 use serde_json::json;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{Runtime, RuntimeError, Signal};
 
@@ -23,6 +25,16 @@ pub const LOAD_SKILL: &str = "load_skill";
 /// whole list is in its arguments, so a client draws it from the call and
 /// a replay of the log shows every version.
 pub const UPDATE_TASKS: &str = "update_tasks";
+/// How many completed tool calls may pass in the open turn after the model
+/// last set its checklist before the harness reminds it (issue #102). The
+/// model sets the list and then rarely calls `update_tasks` again — the
+/// checklist sat at `0/N` for hundreds of events — so the harness
+/// reminds it: at this distance, and as the very last message of the
+/// context sent, a reminder is cheap and leaves no trace in the log.
+/// The counts behind the number are in #102's body; 25 is well above the
+/// handful of calls a short turn takes, so a turn that is not actually
+/// running long stays silent.
+pub const TASK_REMINDER_CALLS: usize = 25;
 /// Bringing back what the harness forgot (issue #75): one dropped result
 /// by its handle, a range of the log, or a search over the thread. Always
 /// offered, in every thread.
@@ -271,6 +283,89 @@ pub enum TaskState {
 #[serde(deny_unknown_fields)]
 pub struct UpdateTasksArgs {
     pub tasks: Vec<Task>,
+}
+
+/// The reminder the model gets when its own checklist has gone stale
+/// (issue #102), or `None` when there is nothing to remind it of.
+///
+/// Pure over the log, and read only for the open turn (everything after
+/// the last `turn_ended`): the latest `update_tasks` call there whose
+/// result is not an error — a refused call, with an unknown key or an
+/// empty list, is not a checklist — and the tool results since that call's
+/// own result, other `update_tasks` results excluded, because a later
+/// successful one is the latest by then and a failed one is no progress.
+///
+/// `Some` when at least one step is not `Done` and at least
+/// [`TASK_REMINDER_CALLS`] results have landed since. No event is
+/// appended and nothing is cached: the caller puts the text at the end of
+/// one model call's context and nowhere else.
+pub fn stale_tasks_reminder(events: &[Event]) -> Option<String> {
+    let start = events
+        .iter()
+        .rposition(|e| e.kind == EventKind::TurnEnded)
+        .map_or(0, |i| i + 1);
+    let turn = &events[start..];
+
+    // The turn's results in log order: where each sits, which call it
+    // answers and whether it failed.
+    let results: Vec<(usize, String, bool)> = turn
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.kind == EventKind::ToolResult)
+        .filter_map(|(i, e)| {
+            let payload = serde_json::from_value::<ToolResultPayload>(e.payload.clone()).ok()?;
+            Some((i, payload.result.id, payload.result.is_error))
+        })
+        .collect();
+
+    // The id of every `update_tasks` call in the turn, so a result of one
+    // is not counted as work the model did on the checklist's behalf.
+    let mut task_calls: BTreeSet<String> = BTreeSet::new();
+    // The latest successful call: when it was answered, and its counts.
+    let mut latest: Option<(usize, usize, usize)> = None;
+    for e in turn
+        .iter()
+        .filter(|e| e.kind == EventKind::AssistantMessage)
+    {
+        let Ok(payload) = serde_json::from_value::<AssistantMessagePayload>(e.payload.clone())
+        else {
+            continue;
+        };
+        let calls = payload.blocks.iter().filter_map(|b| match b {
+            ContentBlock::ToolCall(c) if c.name == UPDATE_TASKS => Some(c),
+            _ => None,
+        });
+        for call in calls {
+            task_calls.insert(call.id.clone());
+            let Some((at, _, false)) = results.iter().find(|(_, id, _)| *id == call.id) else {
+                continue;
+            };
+            let Ok(args) = serde_json::from_value::<UpdateTasksArgs>(call.args.clone()) else {
+                continue;
+            };
+            let done = args
+                .tasks
+                .iter()
+                .filter(|t| t.state == TaskState::Done)
+                .count();
+            latest = Some((*at, done, args.tasks.len()));
+        }
+    }
+
+    let (at, done, total) = latest?;
+    if done == total {
+        return None;
+    }
+    let since = results
+        .iter()
+        .filter(|(i, id, _)| *i > at && !task_calls.contains(id))
+        .count();
+    (since >= TASK_REMINDER_CALLS).then(|| {
+        format!(
+            "Your checklist reads {done}/{total} done, last updated {since} tool calls ago. \
+             If a step has started or finished since, call update_tasks now."
+        )
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -1175,6 +1270,232 @@ mod tests {
     // The runtime parses each harness call with
     // `serde_json::from_value::<T>(call.args.clone())`, so these go
     // through the same path.
+
+    // --- The stale checklist reminder (issue #102) ---------------------
+    //
+    // Hand-built logs, because the function is pure: it reads the open
+    // turn's `update_tasks` calls and the results that answer them.
+
+    use aigentic_log::{PolicyRecord, TurnEndedPayload};
+    use time::OffsetDateTime;
+    use ulid::Ulid;
+
+    /// A `K - 1`/`K` boundary test needs the constant by hand.
+    const K: usize = TASK_REMINDER_CALLS;
+
+    /// The reminder as the issue spells it, from a fixture's counts.
+    fn reminder(done: usize, total: usize, since: usize) -> String {
+        format!(
+            "Your checklist reads {done}/{total} done, last updated {since} tool calls ago. If a \
+             step has started or finished since, call update_tasks now."
+        )
+    }
+
+    fn event(seq: u64, kind: EventKind, payload: serde_json::Value) -> Event {
+        Event {
+            id: Ulid::from_parts(1_700_000_000_000 + seq, u128::from(seq)),
+            thread_id: Ulid::from_parts(1_700_000_000_000, 7),
+            seq,
+            kind,
+            author: Author::System,
+            payload,
+            parent_event: None,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+        }
+    }
+
+    /// An assistant message carrying one or more `update_tasks` calls.
+    fn push_tasks(events: &mut Vec<Event>, calls: Vec<(&str, serde_json::Value)>) {
+        let blocks = calls
+            .into_iter()
+            .map(|(id, args)| {
+                ContentBlock::ToolCall(ToolCall {
+                    id: id.into(),
+                    name: UPDATE_TASKS.into(),
+                    args,
+                })
+            })
+            .collect();
+        let payload = serde_json::to_value(AssistantMessagePayload {
+            blocks,
+            usage: None,
+            finish_reason: None,
+        })
+        .unwrap();
+        let seq = events.len() as u64;
+        events.push(event(seq, EventKind::AssistantMessage, payload));
+    }
+
+    /// A tool result answering the call `id`.
+    fn push_result(events: &mut Vec<Event>, id: &str, is_error: bool) {
+        let result = ToolResult {
+            id: id.into(),
+            content: if is_error {
+                "invalid arguments".into()
+            } else {
+                "ok".into()
+            },
+            is_error,
+        };
+        let payload = serde_json::to_value(ToolResultPayload::new(
+            result,
+            PolicyRecord::rule("test", "allow"),
+        ))
+        .unwrap();
+        let seq = events.len() as u64;
+        events.push(event(seq, EventKind::ToolResult, payload));
+    }
+
+    /// `n` successful results of other tools, ids from `first`.
+    fn push_others(events: &mut Vec<Event>, first: usize, n: usize) {
+        for k in 0..n {
+            push_result(events, &format!("call_{}", first + k), false);
+        }
+    }
+
+    fn push_turn_ended(events: &mut Vec<Event>) {
+        let payload = serde_json::to_value(TurnEndedPayload::new("done")).unwrap();
+        let seq = events.len() as u64;
+        events.push(event(seq, EventKind::TurnEnded, payload));
+    }
+
+    /// A checklist of `total` steps, the first `done` of them done.
+    fn tasks_json(done: usize, total: usize) -> serde_json::Value {
+        let tasks: Vec<serde_json::Value> = (0..total)
+            .map(|i| {
+                json!({
+                    "text": format!("step {i}"),
+                    "state": if i < done { "done" } else { "pending" },
+                })
+            })
+            .collect();
+        json!({"tasks": tasks})
+    }
+
+    /// T1: the wording the issue fixes, filled from the fixture's counts.
+    #[test]
+    fn the_reminder_text_is_the_issue_text_with_the_fixtures_counts() {
+        let mut events = Vec::new();
+        push_tasks(&mut events, vec![("u1", tasks_json(2, 3))]);
+        push_result(&mut events, "u1", false);
+        push_others(&mut events, 0, K);
+
+        let text = stale_tasks_reminder(&events).expect("a reminder");
+        assert_eq!(
+            text,
+            format!(
+                "Your checklist reads 2/3 done, last updated {K} tool calls ago. If a step has \
+                 started or finished since, call update_tasks now."
+            )
+        );
+    }
+
+    /// T1: no checklist in the open turn, however busy the turn was.
+    #[test]
+    fn no_update_tasks_in_the_open_turn_gives_no_reminder() {
+        let mut events = Vec::new();
+        push_others(&mut events, 0, K + 2);
+        assert_eq!(stale_tasks_reminder(&events), None);
+    }
+
+    /// T1: an all-done checklist is not stale, whatever `since` says.
+    #[test]
+    fn an_all_done_checklist_gives_no_reminder_however_many_calls_since() {
+        let mut events = Vec::new();
+        push_tasks(&mut events, vec![("u1", tasks_json(3, 3))]);
+        push_result(&mut events, "u1", false);
+        push_others(&mut events, 0, K);
+        assert_eq!(stale_tasks_reminder(&events), None);
+        push_others(&mut events, 100, K);
+        assert_eq!(stale_tasks_reminder(&events), None);
+    }
+
+    /// T1: `K - 1` results since the update are silent; the `K`-th speaks.
+    #[test]
+    fn the_reminder_waits_for_k_calls_since_the_update() {
+        let mut events = Vec::new();
+        push_tasks(&mut events, vec![("u1", tasks_json(1, 3))]);
+        push_result(&mut events, "u1", false);
+        push_others(&mut events, 0, K - 1);
+        assert_eq!(stale_tasks_reminder(&events), None, "one call short");
+        push_others(&mut events, 100, 1);
+        assert_eq!(stale_tasks_reminder(&events), Some(reminder(1, 3, K)));
+    }
+
+    /// T1: a later successful update is the checklist, and resets `since`.
+    #[test]
+    fn a_later_successful_update_tasks_resets_the_count() {
+        let mut events = Vec::new();
+        push_tasks(&mut events, vec![("u1", tasks_json(1, 3))]);
+        push_result(&mut events, "u1", false);
+        push_others(&mut events, 0, K);
+        assert!(stale_tasks_reminder(&events).is_some(), "stale by now");
+
+        push_tasks(&mut events, vec![("u2", tasks_json(2, 3))]);
+        push_result(&mut events, "u2", false);
+        push_others(&mut events, 100, K - 1);
+        assert_eq!(
+            stale_tasks_reminder(&events),
+            None,
+            "counted from u2's result"
+        );
+        push_others(&mut events, 200, 1);
+        assert_eq!(stale_tasks_reminder(&events), Some(reminder(2, 3, K)));
+    }
+
+    /// T1: a failed later update neither replaces the checklist nor counts.
+    #[test]
+    fn a_later_failed_update_tasks_resets_nothing_and_counts_nothing() {
+        let mut events = Vec::new();
+        push_tasks(&mut events, vec![("u1", tasks_json(1, 3))]);
+        push_result(&mut events, "u1", false);
+        push_others(&mut events, 0, K);
+
+        push_tasks(&mut events, vec![("u2", json!({"bogus": true}))]);
+        push_result(&mut events, "u2", true);
+        assert_eq!(
+            stale_tasks_reminder(&events),
+            Some(reminder(1, 3, K)),
+            "the refusal is not a call: `since` stays K"
+        );
+    }
+
+    /// T1: one message with two calls — the failed sibling is no checklist
+    /// and its result is no call.
+    #[test]
+    fn a_failed_sibling_call_is_neither_the_checklist_nor_progress() {
+        let mut events = Vec::new();
+        push_tasks(
+            &mut events,
+            vec![("u1", tasks_json(1, 3)), ("u2", json!({"bogus": true}))],
+        );
+        push_result(&mut events, "u1", false);
+        push_result(&mut events, "u2", true);
+        push_others(&mut events, 0, K - 1);
+        assert_eq!(
+            stale_tasks_reminder(&events),
+            None,
+            "the sibling's result does not count towards `since`"
+        );
+        push_others(&mut events, 100, 1);
+        assert_eq!(
+            stale_tasks_reminder(&events),
+            Some(reminder(1, 3, K)),
+            "the first call's list is the checklist"
+        );
+    }
+
+    /// T1: a checklist belongs to the turn that set it.
+    #[test]
+    fn a_checklist_from_a_previous_turn_gives_no_reminder() {
+        let mut events = Vec::new();
+        push_tasks(&mut events, vec![("u1", tasks_json(1, 3))]);
+        push_result(&mut events, "u1", false);
+        push_others(&mut events, 0, K);
+        push_turn_ended(&mut events);
+        push_others(&mut events, 100, K + 1);
+        assert_eq!(stale_tasks_reminder(&events), None);
+    }
 
     #[test]
     fn ask_human_rejects_unknown_argument_keys() {

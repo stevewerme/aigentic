@@ -403,6 +403,57 @@ mod tests {
         assert!(matches!(parsed[3], WireMessage::User { .. }));
     }
 
+    /// The stale-checklist reminder's text (issue #102), as the runtime
+    /// writes it.
+    const REMINDER: &str = "Your checklist reads 1/3 done, last updated 25 tool calls ago. \
+                            If a step has started or finished since, call update_tasks now.";
+
+    #[test]
+    fn the_task_reminder_after_tool_results_is_a_plain_user_message() {
+        // Issue #102: the reminder is the very last message of the
+        // context, a user message the system authored. This wire sends
+        // every message with its role, so it goes after the `tool`
+        // messages as a plain `user` message, with no author name.
+        let ctx = vec![
+            Message {
+                role: Role::Assistant,
+                author: Author::Agent(AgentId("worker".into())),
+                blocks: vec![ContentBlock::ToolCall(ToolCall {
+                    id: "call_1".into(),
+                    name: "read_file".into(),
+                    args: json!({"path": "Cargo.toml"}),
+                })],
+            },
+            Message {
+                role: Role::Tool,
+                author: Author::System,
+                blocks: vec![ContentBlock::ToolResult(ToolResult {
+                    id: "call_1".into(),
+                    content: "[workspace]".into(),
+                    is_error: false,
+                })],
+            },
+            Message {
+                role: Role::User,
+                author: Author::System,
+                blocks: vec![ContentBlock::Text(REMINDER.into())],
+            },
+        ];
+        let value = serde_json::to_value(to_wire(&ctx)).unwrap();
+        assert_eq!(
+            value,
+            json!([
+                {"role": "assistant", "content": null, "name": "worker", "tool_calls": [
+                    {"id": "call_1", "type": "function", "function": {
+                        "name": "read_file", "arguments": r#"{"path":"Cargo.toml"}"#}}
+                ]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "[workspace]"},
+                {"role": "user", "content": REMINDER},
+            ]),
+            "the reminder is its own user message after the tool messages"
+        );
+    }
+
     #[test]
     fn tool_results_go_one_way_with_an_error_prefix() {
         let wire = to_wire(&[tool_results()]);

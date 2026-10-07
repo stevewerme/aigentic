@@ -4,8 +4,8 @@
 use std::time::Instant;
 
 use aigentic_core::{
-    Author, CUT_STREAM, CompletionRequest, ContentBlock, EventKind, ProviderError, ProviderEvent,
-    ToolCall, ToolResult, ToolSpec,
+    Author, CUT_STREAM, CompletionRequest, ContentBlock, EventKind, Message, ProviderError,
+    ProviderEvent, Role, ToolCall, ToolResult, ToolSpec,
 };
 use aigentic_log::{
     AssistantMessagePayload, InterruptedPayload, ProviderRetriedPayload, ToolResultPayload, Usage,
@@ -18,7 +18,7 @@ use aigentic_log::{Invoker, NewEvent, PolicyRecord};
 use crate::decisions::{CancelToken, Inbox, Queued};
 use crate::harness_tools::{
     ASK_HUMAN, FINISH_STEP, HARNESS_CLASS, NOT_RUN_LENGTH, NOT_RUN_OVER_LIMIT, NOT_RUN_SIBLING,
-    NOT_RUN_SOLO, SUGGEST_PROJECT, harness_specs, is_harness_tool,
+    NOT_RUN_SOLO, SUGGEST_PROJECT, harness_specs, is_harness_tool, stale_tasks_reminder,
 };
 use crate::runtime::{ASKED_HUMAN, INTERRUPTED, LENGTH_STOP, MAX_TOKENS_STOP, STEP_REPORTED};
 use crate::seams::{Verdict, author_name, denial_text};
@@ -238,7 +238,30 @@ impl Runtime {
                     return Err(e);
                 }
             }
-            let context = build_context(&self.prefix(), self.log.events())?;
+            let mut context = build_context(&self.prefix(), self.log.events())?;
+            // The stale-checklist reminder (issue #102) rides at the very
+            // end of this call's context and nowhere else: no event is
+            // appended, so the log, the projection, replay and the cached
+            // prefix are unchanged, and the next call's context is this
+            // one without the reminder, which is what keeps it cached.
+            // `Role::User` with `Author::System`, because Anthropic keeps
+            // only the leading system run as the system prompt and would
+            // drop a later one.
+            //
+            // The reminder stays part of `context` for `measured`, the
+            // ratio, `window_usage` and the no-usage fallback
+            // `estimate_usage` below, so all of them price what was
+            // actually sent: a call whose provider reports no usage
+            // estimates about 30-40 tokens more while the reminder is
+            // present, and the eviction probes, which call `build_context`
+            // directly, are a few tokens off. Both are accepted.
+            if let Some(text) = stale_tasks_reminder(self.log.events()) {
+                context.push(Message {
+                    role: Role::User,
+                    author: Author::System,
+                    blocks: vec![ContentBlock::Text(text)],
+                });
+            }
             let request = CompletionRequest {
                 messages: &context,
                 tools: &specs,

@@ -394,6 +394,86 @@ mod tests {
         assert!(w.get("system").is_none());
     }
 
+    /// The stale-checklist reminder's text (issue #102), as the runtime
+    /// writes it. Only its shape matters here: one text block.
+    const REMINDER: &str = "Your checklist reads 1/3 done, last updated 25 tool calls ago. \
+                            If a step has started or finished since, call update_tasks now.";
+
+    /// The reminder as the runtime builds it: a user message the system
+    /// authored, so Anthropic must not read it as a system message.
+    fn system_authored(role: Role, text: &str) -> Message {
+        Message {
+            role,
+            author: Author::System,
+            blocks: vec![ContentBlock::Text(text.into())],
+        }
+    }
+
+    #[test]
+    fn the_task_reminder_merges_into_the_tool_result_user_message() {
+        // Issue #102: the reminder is the very last message of the
+        // context. This API requires alternation, so it rides on the
+        // same user message as the tool results, after them — where a
+        // steered message goes.
+        let messages = vec![
+            msg(Role::User, vec![ContentBlock::Text("go".into())]),
+            msg(
+                Role::Assistant,
+                vec![ContentBlock::ToolCall(ToolCall {
+                    id: "toolu_1".into(),
+                    name: "bash".into(),
+                    args: json!({"command": "ls"}),
+                })],
+            ),
+            msg(
+                Role::Tool,
+                vec![ContentBlock::ToolResult(ToolResult {
+                    id: "toolu_1".into(),
+                    content: "Cargo.toml".into(),
+                    is_error: false,
+                })],
+            ),
+            system_authored(Role::User, REMINDER),
+        ];
+        let w = build(&messages, &AnthropicConfig::new("k", "m").with_cache(false));
+        let m = w["messages"].as_array().unwrap();
+        assert_eq!(m.len(), 3, "user, assistant, user: {m:#?}");
+        assert_eq!(m[2]["role"], "user");
+        assert_eq!(
+            m[2]["content"],
+            json!([
+                {"type": "tool_result", "tool_use_id": "toolu_1",
+                 "content": "Cargo.toml", "is_error": false},
+                {"type": "text", "text": REMINDER},
+            ]),
+            "the reminder is in the tool-result user message, after the results"
+        );
+        assert!(
+            w.get("system").is_none(),
+            "the reminder is not a leading system message: {w:#?}"
+        );
+
+        // A `Role::System` message in that place is dropped instead, which
+        // is why the reminder is a user message.
+        let dropped = vec![
+            msg(Role::User, vec![ContentBlock::Text("go".into())]),
+            msg(
+                Role::Tool,
+                vec![ContentBlock::ToolResult(ToolResult {
+                    id: "toolu_1".into(),
+                    content: "Cargo.toml".into(),
+                    is_error: false,
+                })],
+            ),
+            system_authored(Role::System, REMINDER),
+        ];
+        let w = build(&dropped, &AnthropicConfig::new("k", "m").with_cache(false));
+        assert!(
+            !w.to_string().contains("Your checklist reads"),
+            "a trailing system message is dropped: {w}"
+        );
+    }
+
     #[test]
     fn a_steered_message_merges_into_the_tool_result_user_message() {
         // Issue #33: a message posted mid-turn is emitted where it sits,
