@@ -43,16 +43,38 @@ fn commits_text(items: &[Value]) -> Option<String> {
 
 /// A report's slots as the workflow declares them. Models write every
 /// slot value as a string, so a `bool` slot arrives as `"false"` — which
-/// a section would read as truthy — and `commits`, which the brief
-/// template asks for as a JSON list, arrives as that list's text — once
-/// with objects for items and prose after it — which E2 would read as no
-/// subjects (both found by slice 1's acceptance run). `commits` becomes a
-/// list of subject strings when every item yields one. Anything else is
-/// left as written.
+/// a section would read as truthy — and an optional string section can
+/// arrive as a placeholder such as `"false"`, `"none"` or `"n/a"`.
+/// Optional slots are only valid inside their own section, so those
+/// placeholders become absent before rendering. `commits`, which the
+/// brief template asks for as a JSON list, arrives as that list's text —
+/// once with objects for items and prose after it — which E2 would read
+/// as no subjects (both found by slice 1's acceptance run). `commits`
+/// becomes a list of subject strings when every item yields one. Anything
+/// else is left as written.
 pub(crate) fn normalized(
     mut slots: BTreeMap<String, Value>,
     declared: &[SlotDecl],
 ) -> BTreeMap<String, Value> {
+    for decl in declared
+        .iter()
+        .filter(|decl| decl.kind == SlotKind::String && !decl.required)
+    {
+        let is_placeholder = match slots.get(&decl.name) {
+            Some(Value::String(text)) => {
+                let text = text.trim();
+                text.is_empty()
+                    || text.eq_ignore_ascii_case("false")
+                    || text.eq_ignore_ascii_case("none")
+                    || text.eq_ignore_ascii_case("n/a")
+            }
+            _ => false,
+        };
+        if is_placeholder {
+            slots.remove(&decl.name);
+        }
+    }
+
     for decl in declared.iter().filter(|decl| decl.kind == SlotKind::Bool) {
         if let Some(Value::String(text)) = slots.get(&decl.name) {
             let flag = match text.trim().to_ascii_lowercase().as_str() {
@@ -226,7 +248,15 @@ mod tests {
 
     #[test]
     fn a_bool_slot_written_as_text_is_a_bool() {
-        let declared = [decl("ui", SlotKind::Bool), decl("size", SlotKind::String)];
+        let declared = [
+            decl("ui", SlotKind::Bool),
+            SlotDecl {
+                name: "size".into(),
+                kind: SlotKind::String,
+                required: true,
+                filled_by: "brief".into(),
+            },
+        ];
         let out = normalized(
             slots(&[("ui", json!("false")), ("size", json!("false"))]),
             &declared,
@@ -239,6 +269,97 @@ mod tests {
         assert_eq!(out["ui"], json!(true), "a real bool stays");
         let out = normalized(slots(&[("ui", json!("maybe"))]), &declared);
         assert_eq!(out["ui"], json!("maybe"), "neither word: left as written");
+    }
+
+    #[test]
+    fn optional_string_placeholders_are_absent_but_required_strings_are_preserved() {
+        let declared = [
+            decl("reference_check", SlotKind::String),
+            SlotDecl {
+                name: "required".into(),
+                kind: SlotKind::String,
+                required: true,
+                filled_by: "brief".into(),
+            },
+        ];
+
+        for placeholder in ["", " false ", "NONE", " N/A "] {
+            let out = normalized(
+                slots(&[
+                    ("reference_check", json!(placeholder)),
+                    ("required", json!("false")),
+                ]),
+                &declared,
+            );
+            assert!(
+                !out.contains_key("reference_check"),
+                "placeholder {placeholder:?} is absent"
+            );
+            assert_eq!(out["required"], json!("false"));
+        }
+
+        let out = normalized(
+            slots(&[("reference_check", json!("cargo test --locked"))]),
+            &declared,
+        );
+        assert_eq!(out["reference_check"], json!("cargo test --locked"));
+    }
+
+    #[test]
+    fn bundled_reference_check_placeholders_drop_the_implementer_section() {
+        use std::path::Path;
+
+        use crate::workflow::{WorkflowFile, WorkflowRoots};
+
+        let bundled = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("workflows");
+        let workflow = WorkflowFile::load(
+            "build",
+            &WorkflowRoots {
+                project: None,
+                user: None,
+                bundled: Some(bundled),
+            },
+        )
+        .expect("the bundled build workflow loads");
+        let required_slots: BTreeMap<String, Value> = workflow
+            .workflow
+            .slots
+            .iter()
+            .filter(|slot| slot.required)
+            .map(|slot| {
+                let value = match slot.kind {
+                    SlotKind::Bool => Value::Bool(true),
+                    SlotKind::String => Value::String(format!("<{}>", slot.name)),
+                };
+                (slot.name.clone(), value)
+            })
+            .collect();
+
+        let render = |reference_check: &str| {
+            let mut slots = required_slots.clone();
+            slots.insert(
+                "reference_check".into(),
+                Value::String(reference_check.into()),
+            );
+            let slots = normalized(slots, &workflow.workflow.slots);
+            workflow
+                .render("implement-alone", &slots)
+                .expect("the bundled implementer template renders")
+        };
+
+        for placeholder in ["false", "none", "n/a"] {
+            let prompt = render(placeholder);
+            assert!(
+                !prompt.contains("## Reference check"),
+                "placeholder {placeholder:?} drops the section"
+            );
+        }
+
+        let prompt = render("cargo test --locked -p aigentic-runtime");
+        assert!(prompt.contains("## Reference check"));
+        assert!(prompt.contains("cargo test --locked -p aigentic-runtime"));
     }
 
     #[test]
