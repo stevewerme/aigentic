@@ -506,37 +506,7 @@ impl Profile {
             )));
         }
         if let Some(c) = &self.compaction {
-            // `context_ceiling_tokens` is `working_set_tokens`'s old name
-            // (issue #76): reading either alone is fine, both at once is
-            // a mistake the file should say so about, not one name
-            // silently winning.
-            if c.working_set_tokens.is_some() && c.context_ceiling_tokens.is_some() {
-                return Err(ConfigError::msg(
-                    "compaction.working_set_tokens and compaction.context_ceiling_tokens are the \
-                     same setting under its old name; keep working_set_tokens",
-                ));
-            }
-            if let Some(f) = c.trigger_fraction
-                && !(0.05..=0.95).contains(&f)
-            {
-                return Err(ConfigError::msg(format!(
-                    "compaction.trigger_fraction must be between 0.05 and 0.95, got {f}"
-                )));
-            }
-            if let Some(n) = c.working_set_tokens.or(c.context_ceiling_tokens)
-                && n < 8_192
-            {
-                return Err(ConfigError::msg(
-                    "compaction.working_set_tokens must be at least 8192",
-                ));
-            }
-            if let Some(p) = c.evict_min_free_percent
-                && p > 100
-            {
-                return Err(ConfigError::msg(format!(
-                    "compaction.evict_min_free_percent must be at most 100, got {p}"
-                )));
-            }
+            c.validate().map_err(ConfigError::msg)?;
         }
         match self.provider {
             ProviderKind::OpenaiCompat => {

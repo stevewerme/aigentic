@@ -785,8 +785,9 @@ Settled in the grilling of 2026-09-22 (Q1 to Q18) and in the draft.
   during the acceptance week; tighten `MEMORY_PROMPT` if it files chatter.
 - As landed in step 10: the workspace layer carries instructions and
   memory; its knowledge and brief come with step 12. A switch keeps the
-  thread's compaction settings and budget (the profile's) and swaps the
-  provider; the thread's log stays under the project it was created in
+  thread's resolved compaction settings (profile values overlaid by its
+  starting project's `[compaction]` table) and profile budget; it swaps the
+  provider. The thread's log stays under the project it was created in
   until step 13's flat directory. `project_of` for an unloaded thread
   still answers from that directory, so a role check before reopening
   uses the first project; step 13 reads the log instead.

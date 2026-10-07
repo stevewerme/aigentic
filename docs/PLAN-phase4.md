@@ -204,7 +204,9 @@ this venture is, its conventions and priorities.
 **Model, budget, compaction.** `[model] profile = "tensorx"` names a
 profile from `config.toml`; `--profile` on the command line still wins.
 `[budget]` and `[compaction]` have the phase 3 shapes and override the
-profile's values field by field.
+profile's values field by field when a thread is built or reloaded. A
+project switch keeps the thread's existing compaction settings, as the
+phase 6 switch semantics specify.
 
 **Tools and skills.** `[tools] allow = ["read_file", "bash", "mcp.docs.*"]`
 lists what this project's model may see; empty or absent means every

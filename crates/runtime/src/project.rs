@@ -360,7 +360,7 @@ pub struct CompactionConfig {
     pub working_set_tokens: Option<u64>,
     /// The working-set target's old name (issue #30), still read. Settling
     /// both names is a config error, not a silent last-one-wins
-    /// ([`Profile::validate`]).
+    /// ([`CompactionConfig::validate`]).
     #[serde(default)]
     pub context_ceiling_tokens: Option<u64>,
     /// The sweep runs only over this many tokens (issue #32).
@@ -375,6 +375,37 @@ pub struct CompactionConfig {
 }
 
 impl CompactionConfig {
+    /// The range checks shared by project and profile configuration.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.working_set_tokens.is_some() && self.context_ceiling_tokens.is_some() {
+            return Err(
+                "compaction.working_set_tokens and compaction.context_ceiling_tokens are the \
+                 same setting under its old name; keep working_set_tokens"
+                    .into(),
+            );
+        }
+        if let Some(f) = self.trigger_fraction
+            && !(0.05..=0.95).contains(&f)
+        {
+            return Err(format!(
+                "compaction.trigger_fraction must be between 0.05 and 0.95, got {f}"
+            ));
+        }
+        if let Some(n) = self.working_set_tokens.or(self.context_ceiling_tokens)
+            && n < 8_192
+        {
+            return Err("compaction.working_set_tokens must be at least 8192".into());
+        }
+        if let Some(p) = self.evict_min_free_percent
+            && p > 100
+        {
+            return Err(format!(
+                "compaction.evict_min_free_percent must be at most 100, got {p}"
+            ));
+        }
+        Ok(())
+    }
+
     pub fn over(&self, base: CompactionSettings) -> CompactionSettings {
         CompactionSettings {
             trigger_fraction: self.trigger_fraction.unwrap_or(base.trigger_fraction),
@@ -385,9 +416,9 @@ impl CompactionConfig {
                 .unwrap_or(base.summary_max_output_tokens),
             keep_last_calls: self.keep_last_calls.unwrap_or(base.keep_last_calls),
             // The old name maps onto the new field, and the new name wins
-            // if both are somehow set here: `Profile::validate` refuses
-            // that, so this is only reachable from a table nobody
-            // validated (issue #76).
+            // if both are somehow set here: `CompactionConfig::validate`
+            // refuses that, so this is only reachable before validation
+            // (issue #76).
             working_set_tokens: self
                 .working_set_tokens
                 .or(self.context_ceiling_tokens)
@@ -416,6 +447,11 @@ impl ProjectFile {
                 "[tools] bash_timeout_secs must be 1 to {}, got {secs}",
                 aigentic_tools::MAX_TIMEOUT_SECS
             ));
+        }
+        if let Some(compaction) = &file.compaction {
+            compaction
+                .validate()
+                .map_err(|message| format!("invalid [compaction] table: {message}"))?;
         }
         let unknown = match toml::from_str::<toml::Value>(text) {
             Ok(value) => project_spec().unknown(&value),
@@ -732,6 +768,43 @@ enabled = ["implement"]
     }
 
     #[test]
+    fn project_compaction_uses_profile_range_validation() {
+        for (text, expected) in [
+            (
+                "[compaction]\ntrigger_fraction = 2.0\n",
+                "trigger_fraction must be between 0.05 and 0.95",
+            ),
+            (
+                "[compaction]\nworking_set_tokens = 1024\n",
+                "working_set_tokens must be at least 8192",
+            ),
+            (
+                "[compaction]\ncontext_ceiling_tokens = 1024\n",
+                "working_set_tokens must be at least 8192",
+            ),
+            (
+                "[compaction]\nevict_min_free_percent = 101\n",
+                "evict_min_free_percent must be at most 100",
+            ),
+        ] {
+            let error = ProjectFile::parse(text).unwrap_err();
+            assert!(error.contains(expected), "{error}");
+        }
+        let error = ProjectFile::parse(
+            "[compaction]\nworking_set_tokens = 8192\ncontext_ceiling_tokens = 65536\n",
+        )
+        .unwrap_err();
+        assert!(error.contains("same setting under its old name"), "{error}");
+    }
+
+    #[test]
+    fn project_compaction_accepts_the_deprecated_working_set_name() {
+        let parsed = ProjectFile::parse("[compaction]\ncontext_ceiling_tokens = 65536\n").unwrap();
+        let settings = parsed.compaction.unwrap().over(crate::DEFAULT_COMPACTION);
+        assert_eq!(settings.working_set_tokens, 65536);
+    }
+
+    #[test]
     fn unknown_fields_are_collected_not_refused() {
         // The shape this replaces ("unknown fields are rejected in every
         // section") is issue #37's whole point: a newer file must load.
@@ -842,9 +915,11 @@ enabled = ["implement"]
         }
     }
 
-    /// Every key `aigentic.toml`'s structs have, in one file. This is the
-    /// checklist: a struct that gains a field without a line here and in
-    /// `PROJECT_SPEC` fails `the_full_fixture_is_clean_under_the_spec`.
+    /// Every canonical key `aigentic.toml`'s structs have, in one file. This
+    /// is the checklist: a struct that gains a field without a line here and
+    /// in `PROJECT_SPEC` fails `the_full_fixture_is_clean_under_the_spec`.
+    /// The old `context_ceiling_tokens` alias is tested separately because
+    /// it cannot be set alongside its replacement.
     const FULL_PROJECT: &str = "\
 [project]
 name = \"vendela\"
@@ -863,7 +938,6 @@ max_result_bytes = 100
 summary_max_output_tokens = 10
 keep_last_calls = 3
 working_set_tokens = 90000
-context_ceiling_tokens = 80000
 evict_above_tokens = 64000
 [tools]
 allow = [\"bash\"]
@@ -896,8 +970,8 @@ steve = \"admin\"
     fn the_full_fixture_is_clean_under_the_spec() {
         let (file, unknown) = ProjectFile::parse_with(FULL_PROJECT).unwrap();
         assert_eq!(unknown, Vec::<String>::new(), "{FULL_PROJECT}");
-        // The fixture really is the whole struct, not a subset: a key the
-        // struct has but the file leaves out would go unnoticed above.
+        // The fixture covers canonical fields; the deprecated alias is
+        // mutually exclusive with its replacement and is checked separately.
         assert!(file.project.is_some() && file.model.is_some());
         assert!(file.budget.is_some() && file.compaction.is_some());
         assert!(file.pocock.is_some());
