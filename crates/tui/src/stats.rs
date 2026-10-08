@@ -50,8 +50,14 @@ pub struct Stats {
     pub days: Vec<DayStats>,
     /// Every project in the window, by name.
     pub projects: Vec<ProjectStats>,
+    /// Every model in the window, dearest first (issue #111). A model
+    /// row's `calls` and its side jobs are the calls the model ran.
+    pub models: Vec<ModelStats>,
     /// Up to five threads by effective spend, costliest first.
     pub threads: Vec<ThreadSpend>,
+    /// Up to ten individual calls by effective cost, dearest first
+    /// (issue #111).
+    pub costliest_calls: Vec<CallSpend>,
     /// Threads whose files could not be read; counted so the totals are
     /// never silently short.
     pub unreadable: u32,
@@ -142,6 +148,133 @@ pub struct ProjectStats {
     pub job_spent: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub job_price_estimated_spent: Option<f64>,
+}
+
+/// One model's row (issue #111): `ProjectStats` field for field, with
+/// the model key in place of the project, so a reader can see what the
+/// thread's model and the utility model each cost. `turns` and `retries`
+/// stay empty: a turn or a retry spans whatever models it used, so they
+/// have no single model to fold into.
+#[derive(Debug, Default, PartialEq, Serialize)]
+pub struct ModelStats {
+    pub model: String,
+    pub calls: u32,
+    pub priced_calls: u32,
+    pub price_estimated_calls: u32,
+    pub unpriced_calls: u32,
+    pub unstamped_calls: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spent: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub price_estimated_spent: Option<f64>,
+    pub peak_context: u64,
+    pub context_total: u64,
+    pub mean_context: u64,
+    pub cache_read: u64,
+    pub hit_rate: f64,
+    pub turns: BTreeMap<String, u32>,
+    pub retries: u32,
+    pub job_calls: u32,
+    pub job_priced_calls: u32,
+    pub job_price_estimated_calls: u32,
+    pub job_unpriced_calls: u32,
+    pub extractions: u32,
+    pub titles: u32,
+    pub job_context: u64,
+    pub job_output: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job_spent: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job_price_estimated_spent: Option<f64>,
+}
+
+/// One of the ten costliest calls (issue #111): the log's own numbers
+/// for a single `assistant_message` usage, so one huge prompt is visible
+/// beside the threads it hides in.
+#[derive(Debug, PartialEq, Serialize)]
+pub struct CallSpend {
+    /// The thread's full id; the text line shows its first six
+    /// characters.
+    pub id: String,
+    pub project: String,
+    /// `YYYY-MM-DD HH:MM`, UTC.
+    pub created_at: String,
+    /// The model key, as the model table names it.
+    pub model: String,
+    /// The prompt: input plus cache read plus cache write.
+    pub context: u64,
+    pub output: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spent: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub price_estimated_spent: Option<f64>,
+}
+
+/// A call's whole dollar figure for ordering: stamped plus retro-priced,
+/// `Some` when either is.
+fn call_effective(c: &CallSpend) -> Option<f64> {
+    add(c.spent, c.price_estimated_spent)
+}
+
+/// A model row's whole dollar figure: the calls' plus the side jobs',
+/// stamped plus retro-priced (issue #111), the same sum the costliest
+/// threads rank by.
+fn model_effective(m: &ModelStats) -> Option<f64> {
+    add(
+        add(m.spent, m.job_spent),
+        add(m.price_estimated_spent, m.job_price_estimated_spent),
+    )
+}
+
+/// The bounded top ten the walk keeps (issue #111): a call joins it, and
+/// once it holds more than ten the worst is dropped, so a long log costs
+/// ten rows, not thousands.
+#[derive(Debug, Default)]
+pub(crate) struct CallSink {
+    calls: Vec<RankedCall>,
+}
+
+/// A candidate call with the last tie-break the order needs, kept out of
+/// `CallSpend` so the wire shape stays what it is.
+#[derive(Debug)]
+struct RankedCall {
+    spend: CallSpend,
+    /// The event's `seq`, so the order is the same on every run.
+    seq: u64,
+}
+
+impl CallSink {
+    pub(crate) fn push(&mut self, spend: CallSpend, seq: u64) {
+        self.calls.push(RankedCall { spend, seq });
+        if self.calls.len() > 10 {
+            self.calls.sort_by(rank_calls);
+            self.calls.truncate(10);
+        }
+    }
+
+    fn into_sorted(mut self) -> Vec<CallSpend> {
+        self.calls.sort_by(rank_calls);
+        self.calls.into_iter().map(|r| r.spend).collect()
+    }
+}
+
+/// The costliest-calls order (issue #111): priced calls first, by
+/// effective cost descending; then unpriced calls by context descending.
+/// Ties go by context, then the thread id, then the event's seq.
+fn rank_calls(a: &RankedCall, b: &RankedCall) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let context = b.spend.context.cmp(&a.spend.context);
+    let id_seq = a.spend.id.cmp(&b.spend.id).then_with(|| a.seq.cmp(&b.seq));
+    match (call_effective(&a.spend), call_effective(&b.spend)) {
+        (Some(x), Some(y)) => y
+            .partial_cmp(&x)
+            .unwrap_or(Ordering::Equal)
+            .then(context)
+            .then(id_seq),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => context.then(id_seq),
+    }
 }
 
 /// The sum of two optional dollar figures: `Some` when either is,
@@ -439,6 +572,26 @@ fn is_unstamped(u: &Usage) -> bool {
     !u.estimated && u.model.is_none() && u.profile.is_none()
 }
 
+/// The model table's key for one usage line (issue #111): its `model`
+/// when it names one, else its `profile` name, else `assumed <name>`
+/// when `--assume-profile` priced a line that names neither, else
+/// `(unknown)`. The key says which table priced the call and never
+/// hides a call behind a blank name.
+fn model_key(u: &Usage, book: &PriceBook) -> String {
+    if let Some(model) = u.model.as_deref() {
+        return model.to_owned();
+    }
+    if let Some(profile) = u.profile.as_deref() {
+        return format!("profile {profile}");
+    }
+    // Neither field: only `--assume-profile` can price it, and a
+    // runtime-estimated line or a stamped one with no name is unpriced.
+    match (&book.assumed, u.estimated, u.cost_usd) {
+        (Some((name, _)), false, None) => format!("assumed {name}"),
+        _ => "(unknown)".to_owned(),
+    }
+}
+
 /// `aigentic stats --since 7d --json`. `base` is the threads directory
 /// before the per-project split; `project` narrows to one project (the
 /// global `--project`), `None` covering every project on the machine.
@@ -502,6 +655,8 @@ pub fn collect(
 
     let mut days: BTreeMap<String, Accum> = BTreeMap::new();
     let mut by_project: BTreeMap<String, Accum> = BTreeMap::new();
+    let mut models: BTreeMap<String, Accum> = BTreeMap::new();
+    let mut calls = CallSink::default();
     let mut threads: Vec<ThreadSpend> = Vec::new();
 
     for found in threads_index::catalogue(base) {
@@ -521,7 +676,21 @@ pub fn collect(
         }
         let acc = by_project.entry(name.clone()).or_default();
         let mut thread = Accum::default();
-        let meta = absorb(acc, &mut thread, &events, cutoff, &mut days, book);
+        let id = found.id.to_string();
+        let meta = absorb(
+            acc,
+            &mut thread,
+            WindowSinks {
+                models: &mut models,
+                thread_id: &id,
+                project_name: &name,
+                calls: &mut calls,
+            },
+            &events,
+            cutoff,
+            &mut days,
+            book,
+        );
         // #40: a thread with no call inside the window is not a row. Its
         // title is a label, but a row is a total. #46: an extraction
         // inside the window is a total too, so a thread that only
@@ -559,6 +728,25 @@ pub fn collect(
     threads.truncate(5);
     stats.threads = threads;
     stats.projects = project_rows(by_project);
+    // #111: a project with nothing in the window — no call, no side job,
+    // no retry, no turn — is not a row. On 2026-10-07 about 22 empty
+    // temp projects led the report. Dropping them changes no total: every
+    // summary figure is summed over the days, not the projects. The one
+    // named by `--project` is kept even when empty, as its own group.
+    stats.projects.retain(|p| {
+        p.calls > 0
+            || p.job_calls > 0
+            || p.retries > 0
+            || !p.turns.is_empty()
+            || project.is_some_and(|want| want == p.project)
+            // `(no project)` is a real group, not an empty temp project:
+            // a log that names no project is shown as such (see
+            // `attributed`), so it is kept even with nothing inside the
+            // window.
+            || p.project == NO_PROJECT
+    });
+    stats.models = model_rows(models);
+    stats.costliest_calls = calls.into_sorted();
     stats.days = days.into_iter().map(|(day, a)| a.into_day(day)).collect();
     Ok(stats)
 }
@@ -584,6 +772,30 @@ fn project_rows(by_project: BTreeMap<String, Accum>) -> Vec<ProjectStats> {
             ..acc.into_project()
         })
         .collect()
+}
+
+/// One row per model, dearest first (issue #111): effective spend
+/// (calls plus side jobs), a priced model before an unpriced one, then
+/// calls, then the key, so the order is the same on every run.
+fn model_rows(models: BTreeMap<String, Accum>) -> Vec<ModelStats> {
+    let mut rows: Vec<ModelStats> = models
+        .into_iter()
+        .map(|(name, acc)| ModelStats {
+            model: name,
+            ..acc.into_model()
+        })
+        .collect();
+    rows.sort_by(|a, b| match (model_effective(a), model_effective(b)) {
+        (Some(x), Some(y)) => y
+            .partial_cmp(&x)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.calls.cmp(&a.calls))
+            .then_with(|| a.model.cmp(&b.model)),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => b.calls.cmp(&a.calls).then_with(|| a.model.cmp(&b.model)),
+    });
+    rows
 }
 
 pub fn run_thread(
@@ -660,10 +872,18 @@ fn collect_thread(
         }
         let mut thread = Accum::default();
         let mut dropped = Accum::default();
+        let mut dropped_models = BTreeMap::new();
+        let mut dropped_calls = CallSink::default();
         let mut dropped_days = BTreeMap::new();
         let meta = absorb(
             &mut dropped,
             &mut thread,
+            WindowSinks {
+                models: &mut dropped_models,
+                thread_id: &id.to_string(),
+                project_name: &name,
+                calls: &mut dropped_calls,
+            },
             &events,
             cutoff,
             &mut dropped_days,
@@ -712,10 +932,18 @@ fn collect_issue(
         }
         let mut thread = Accum::default();
         let mut dropped = Accum::default();
+        let mut dropped_models = BTreeMap::new();
+        let mut dropped_calls = CallSink::default();
         let mut dropped_days = BTreeMap::new();
         let meta = absorb(
             &mut dropped,
             &mut thread,
+            WindowSinks {
+                models: &mut dropped_models,
+                thread_id: &found.id.to_string(),
+                project_name: &name,
+                calls: &mut dropped_calls,
+            },
             &events,
             cutoff,
             &mut dropped_days,
@@ -895,6 +1123,39 @@ impl Accum {
         }
     }
 
+    /// One model's row (issue #111): `ProjectStats` field for field, as
+    /// `into_project` builds it, with the model key filled in by the
+    /// caller.
+    fn into_model(self) -> ModelStats {
+        ModelStats {
+            calls: self.calls,
+            priced_calls: self.priced_calls,
+            price_estimated_calls: self.price_estimated_calls,
+            unpriced_calls: self.unpriced_calls,
+            unstamped_calls: self.unstamped_calls,
+            spent: self.spent,
+            price_estimated_spent: self.price_estimated_spent,
+            peak_context: self.peak_context,
+            mean_context: mean(self.context_total, self.calls),
+            hit_rate: hit_rate(self.cache_read, self.context_total),
+            context_total: self.context_total,
+            cache_read: self.cache_read,
+            turns: self.turns,
+            retries: self.retries,
+            job_calls: self.job_calls,
+            job_priced_calls: self.job_priced_calls,
+            job_price_estimated_calls: self.job_price_estimated_calls,
+            job_unpriced_calls: self.job_unpriced_calls,
+            extractions: self.extractions,
+            titles: self.titles,
+            job_context: self.job_context,
+            job_output: self.job_output,
+            job_spent: self.job_spent,
+            job_price_estimated_spent: self.job_price_estimated_spent,
+            model: String::new(),
+        }
+    }
+
     fn into_day(self, day: String) -> DayStats {
         DayStats {
             calls: self.calls,
@@ -1017,6 +1278,42 @@ struct ThreadMeta {
     tool_errors: u32,
 }
 
+/// A call queued for replay into the project, the day and the model
+/// once the thread is fully folded (issue #111 added the model and the
+/// costliest-calls sink).
+struct QueuedCall {
+    model: String,
+    day: String,
+    context: u64,
+    cache_read: u64,
+    output: u64,
+    cost: Cost,
+    unstamped: bool,
+    stamp: String,
+    seq: u64,
+}
+
+/// A side job queued for the same replay, under the model that ran it.
+struct QueuedJob {
+    model: String,
+    day: String,
+    context: u64,
+    output: u64,
+    cost: Cost,
+    job: SideJob,
+}
+
+// #111: the two outputs that are neither the project nor the day — the
+// model table and the costliest-calls sink. `collect` keeps them;
+// `collect_thread` and `collect_issue` pass throwaways, so `--thread`
+// and `--issue` are unchanged.
+struct WindowSinks<'a> {
+    models: &'a mut BTreeMap<String, Accum>,
+    thread_id: &'a str,
+    project_name: &'a str,
+    calls: &'a mut CallSink,
+}
+
 /// Fold one thread's events into its own totals, its project's, and —
 /// for events in the window — its day's. Since #40 the window gates the
 /// project and the thread as well; only a thread's labels are read from
@@ -1024,20 +1321,30 @@ struct ThreadMeta {
 fn absorb(
     project: &mut Accum,
     thread: &mut Accum,
+    sinks: WindowSinks<'_>,
     events: &[aigentic_runtime::aigentic_core::Event],
     cutoff: Option<OffsetDateTime>,
     days: &mut BTreeMap<String, Accum>,
     book: &PriceBook,
 ) -> ThreadMeta {
+    let WindowSinks {
+        models,
+        thread_id,
+        project_name,
+        calls: sink,
+    } = sinks;
     let mut meta = ThreadMeta::default();
     let mut renamed: Option<String> = None;
     let mut own_user_seen = false;
-    // The project and the days are the same window partitioned two ways,
-    // so each accepted call is replayed into both once the thread is
-    // fully folded. The side jobs — extractions and, since #49, titled
-    // calls — are replayed the same way, with their own counters.
-    let mut calls: Vec<(String, u64, u64, Cost, bool)> = Vec::new();
-    let mut job_days: Vec<(String, u64, u64, Cost, SideJob)> = Vec::new();
+    // The project, the days and the models are the same window
+    // partitioned three ways, so each accepted call is replayed into all
+    // three once the thread is fully folded (issue #111 added the
+    // model table and the costliest-calls sink; neither folds inline,
+    // which would double-count). The side jobs — extractions and, since
+    // #49, titled calls — are replayed the same way, with their own
+    // counters under the model that ran them.
+    let mut calls: Vec<QueuedCall> = Vec::new();
+    let mut job_days: Vec<QueuedJob> = Vec::new();
     let mut retry_days: Vec<String> = Vec::new();
     let mut turn_days: Vec<(String, String)> = Vec::new();
 
@@ -1074,7 +1381,19 @@ fn absorb(
                 if unstamped {
                     thread.unstamped_calls += 1;
                 }
-                calls.push((day, context, u.cache_read_tokens, cost, unstamped));
+                let model = model_key(&u, book);
+                let stamp = event.created_at.format(&Rfc3339).unwrap_or_default();
+                calls.push(QueuedCall {
+                    model,
+                    day,
+                    context,
+                    cache_read: u.cache_read_tokens,
+                    output: u.output_tokens,
+                    cost,
+                    unstamped,
+                    stamp,
+                    seq: event.seq,
+                });
             }
             EventKind::MemoryExtracted => {
                 // #46: the extraction is a priced call the log made on
@@ -1098,7 +1417,14 @@ fn absorb(
                     usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens;
                 let cost = classify_cost(&usage, book);
                 thread.add_job(SideJob::Extraction, context, usage.output_tokens, cost);
-                job_days.push((day, context, usage.output_tokens, cost, SideJob::Extraction));
+                job_days.push(QueuedJob {
+                    model: model_key(&usage, book),
+                    day,
+                    context,
+                    output: usage.output_tokens,
+                    cost,
+                    job: SideJob::Extraction,
+                });
             }
             EventKind::ProviderRetried => {
                 if in_window {
@@ -1163,7 +1489,14 @@ fn absorb(
                     usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens;
                 let cost = classify_cost(&usage, book);
                 thread.add_job(SideJob::Title, context, usage.output_tokens, cost);
-                job_days.push((day, context, usage.output_tokens, cost, SideJob::Title));
+                job_days.push(QueuedJob {
+                    model: model_key(&usage, book),
+                    day,
+                    context,
+                    output: usage.output_tokens,
+                    cost,
+                    job: SideJob::Title,
+                });
             }
             EventKind::SkillLoaded => {
                 // Only a slash command in the client counts, and only
@@ -1200,7 +1533,18 @@ fn absorb(
         }
     }
 
-    for (day, context, cache_read, cost, unstamped) in calls {
+    for q in calls {
+        let QueuedCall {
+            model,
+            day,
+            context,
+            cache_read,
+            output,
+            cost,
+            unstamped,
+            stamp,
+            seq,
+        } = q;
         project.add_call(context, cache_read, cost);
         if unstamped {
             project.unstamped_calls += 1;
@@ -1210,10 +1554,44 @@ fn absorb(
         if unstamped {
             d.unstamped_calls += 1;
         }
+        models
+            .entry(model.clone())
+            .or_default()
+            .add_call(context, cache_read, cost);
+        let (spent, estimated) = match cost {
+            Cost::Stamped(usd) => (Some(usd), None),
+            Cost::Retro(usd) => (None, Some(usd)),
+            Cost::Unpriced => (None, None),
+        };
+        sink.push(
+            CallSpend {
+                id: thread_id.to_owned(),
+                project: project_name.to_owned(),
+                created_at: short_when(&stamp),
+                model,
+                context,
+                output,
+                spent,
+                price_estimated_spent: estimated,
+            },
+            seq,
+        );
     }
-    for (day, context, output, cost, job) in job_days {
+    for q in job_days {
+        let QueuedJob {
+            model,
+            day,
+            context,
+            output,
+            cost,
+            job,
+        } = q;
         project.add_job(job, context, output, cost);
         days.entry(day)
+            .or_default()
+            .add_job(job, context, output, cost);
+        models
+            .entry(model)
             .or_default()
             .add_job(job, context, output, cost);
     }
@@ -1285,6 +1663,17 @@ pub(crate) fn money(stamped: Option<f64>, estimated: Option<f64>) -> String {
         (Some(a), None) => format!("${a:.4}"),
         (None, Some(b)) => format!("~${b:.4}"),
         (None, None) => "-".into(),
+    }
+}
+
+/// The `YYYY-MM-DD HH:MM`, UTC, the costliest-calls table shows for an
+/// event's RFC 3339 `created_at`. A value too short to hold them — which
+/// the log never writes — comes back as it is rather than panicking.
+fn short_when(created_at: &str) -> String {
+    if created_at.len() >= 16 {
+        format!("{} {}", &created_at[..10], &created_at[11..16])
+    } else {
+        created_at.to_owned()
     }
 }
 
@@ -1697,6 +2086,29 @@ pub fn render(stats: &Stats) -> String {
             ));
         }
     }
+    // #111: what the money went on, by model. The thread's model and the
+    // utility model are priced very differently, so the same window read
+    // by model answers a question the project table cannot. The layout
+    // is the project table's, and a window with no side job renders
+    // without the `jobs` column exactly as before.
+    if !stats.models.is_empty() {
+        out.push_str(&format!(
+            "\n{:<32} {:>5}{job_header} {:>10} {:>18} {:>9} {:>6}\n",
+            "model", "calls", "priced", "cost", "peak", "hit"
+        ));
+        for m in &stats.models {
+            let cell = side_cell(jobs > 0, m.job_spent, m.job_price_estimated_spent);
+            out.push_str(&format!(
+                "{:<32} {:>5}{cell} {:>10} {:>18} {:>9} {:>6.0}%\n",
+                m.model,
+                m.calls,
+                m.priced_calls,
+                money(m.spent, m.price_estimated_spent),
+                m.peak_context,
+                m.hit_rate * 100.0
+            ));
+        }
+    }
     if !stats.threads.is_empty() {
         out.push_str("\ncostliest threads\n");
         for t in &stats.threads {
@@ -1707,6 +2119,21 @@ pub fn render(stats: &Stats) -> String {
                 t.calls,
                 money(t.spent, t.price_estimated_spent),
                 t.title
+            ));
+        }
+    }
+    if !stats.costliest_calls.is_empty() {
+        out.push_str("\ncostliest calls\n");
+        for c in &stats.costliest_calls {
+            let id = c.id.chars().take(6).collect::<String>();
+            out.push_str(&format!(
+                "  {}  {id}  {}  {}  in {}  out {}  {}\n",
+                c.created_at,
+                c.project,
+                c.model,
+                c.context,
+                c.output,
+                money(c.spent, c.price_estimated_spent)
             ));
         }
     }
@@ -3884,6 +4311,520 @@ api_key_env = "TENSORX_API_KEY"
             row.contains(&money(day.job_spent, day.job_price_estimated_spent)),
             "{row}"
         );
+    }
+
+    /// T1 (issue #111): the model table folds every call and side job
+    /// under the model that ran it, keeps the calls' and the side jobs'
+    /// dollars apart, and ranks rows by effective spend (a priced row
+    /// before an unpriced one). Every figure is the fixture's own.
+    #[test]
+    fn t1_model_table_folds_calls_and_side_jobs_by_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("alpha");
+        let one = Ulid::generate();
+        let two = Ulid::generate();
+        let stamped = call(
+            "2026-09-28T10:00:01Z",
+            100,
+            0,
+            10,
+            Some(0.05),
+            Some("z-ai/glm-5.3"),
+            Some("tensorx"),
+        );
+        let retro = call(
+            "2026-09-28T10:00:02Z",
+            200,
+            0,
+            20,
+            None,
+            Some("deepseek/deepseek-v4.1-flash"),
+            Some("flash"),
+        );
+        let unpriced = call(
+            "2026-09-28T10:00:03Z",
+            300,
+            0,
+            30,
+            None,
+            Some("some/other-model"),
+            Some("priceless"),
+        );
+        let profile_only = call(
+            "2026-09-28T10:00:04Z",
+            400,
+            0,
+            40,
+            None,
+            None,
+            Some("flash"),
+        );
+        let nameless = call("2026-09-28T10:00:05Z", 500, 0, 50, None, None, None);
+        write_thread(
+            &base,
+            one,
+            &[
+                user("2026-09-28T10:00:00Z", "calls by model"),
+                stamped,
+                retro.clone(),
+                unpriced,
+                profile_only,
+                nameless,
+            ],
+        );
+        let extraction = stamped_extraction(
+            "2026-09-28T11:00:01Z",
+            "deepseek/deepseek-v4.1-flash",
+            100,
+            0,
+            10,
+            Some(0.30),
+        );
+        let title = titled(
+            "2026-09-28T11:00:02Z",
+            "a title",
+            "deepseek/deepseek-v4.1-flash",
+            50,
+            0,
+            5,
+            Some(0.20),
+        );
+        write_thread(
+            &base,
+            two,
+            &[user("2026-09-28T11:00:00Z", "side jobs"), extraction, title],
+        );
+
+        let stats = collect(dir.path(), &[], None, None, &book_of(PRICED_CONFIG)).unwrap();
+        let row = |name: &str| {
+            stats
+                .models
+                .iter()
+                .find(|m| m.model == name)
+                .unwrap_or_else(|| panic!("no {name} row in {:?}", stats.models))
+        };
+
+        // The thread's own model: one stamped call, nothing on the side.
+        let glm = row("z-ai/glm-5.3");
+        assert_eq!((glm.calls, glm.priced_calls, glm.spent), (1, 1, Some(0.05)));
+        assert_eq!(glm.job_calls, 0);
+        assert_eq!(glm.job_spent, None);
+        assert_eq!(glm.peak_context, 100);
+        assert_eq!(glm.hit_rate, hit_rate(0, 100));
+
+        // A retro-priced call: priced from the config's table, marked
+        // estimated. The utility model's own row carries the side jobs,
+        // kept apart from its calls.
+        let retro_cost = expected_cost(PRICED_CONFIG, "flash", &retro);
+        let flash = row("deepseek/deepseek-v4.1-flash");
+        assert_eq!(flash.calls, 1);
+        assert_eq!(flash.price_estimated_calls, 1);
+        assert!((flash.price_estimated_spent.unwrap() - retro_cost).abs() < 1e-12);
+        assert_eq!(flash.job_calls, 2);
+        assert_eq!(flash.extractions, 1);
+        assert_eq!(flash.titles, 1);
+        assert_eq!(flash.job_spent, Some(0.50));
+        assert_eq!(flash.job_context, 150);
+
+        // A line that names a profile but no model is keyed by the
+        // profile; a line with neither says so.
+        let prof = row("profile flash");
+        assert_eq!((prof.calls, prof.price_estimated_calls), (1, 1));
+        let unknown = row("(unknown)");
+        assert_eq!((unknown.calls, unknown.unpriced_calls), (1, 1));
+
+        // Dearest first; the two unpriced rows fall back to calls, then
+        // the key.
+        assert_eq!(
+            stats
+                .models
+                .iter()
+                .map(|m| m.model.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "deepseek/deepseek-v4.1-flash",
+                "z-ai/glm-5.3",
+                "profile flash",
+                "(unknown)",
+                "some/other-model",
+            ]
+        );
+    }
+
+    /// T1 (issue #111), second half: a line that names neither a model
+    /// nor a profile is keyed `assumed <name>` when `--assume-profile`
+    /// priced it, and reads `~$`.
+    #[test]
+    fn t1_a_nameless_line_is_keyed_by_the_assumed_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("alpha");
+        let id = Ulid::generate();
+        let nameless = call("2026-09-28T10:00:01Z", 500, 0, 50, None, None, None);
+        write_thread(
+            &base,
+            id,
+            &[user("2026-09-28T10:00:00Z", "old line"), nameless.clone()],
+        );
+        let config = Config::parse(PRICED_CONFIG).unwrap();
+
+        // No book: `(unknown)`, unpriced.
+        let stats = collect(dir.path(), &[], None, None, &no_prices()).unwrap();
+        let unknown = stats
+            .models
+            .iter()
+            .find(|m| m.model == "(unknown)")
+            .unwrap_or_else(|| panic!("no (unknown) row in {:?}", stats.models));
+        assert_eq!(
+            (unknown.calls, unknown.unpriced_calls, unknown.spent),
+            (1, 1, None)
+        );
+
+        // `--assume-profile tensorx`: keyed `assumed tensorx`, estimated.
+        let book = PriceBook::from_config(&config, Some("tensorx")).unwrap();
+        let stats = collect(dir.path(), &[], None, None, &book).unwrap();
+        let assumed = stats
+            .models
+            .iter()
+            .find(|m| m.model == "assumed tensorx")
+            .unwrap_or_else(|| panic!("no assumed row in {:?}", stats.models));
+        let expected = expected_cost(PRICED_CONFIG, "tensorx", &nameless);
+        assert_eq!(assumed.price_estimated_calls, 1);
+        assert!((assumed.price_estimated_spent.unwrap() - expected).abs() < 1e-12);
+        assert!(
+            render(&stats).contains(&format!("~${expected:.4}")),
+            "{}",
+            render(&stats)
+        );
+    }
+
+    /// T2 (issue #111): the ten costliest calls, priced ones first by
+    /// effective cost descending, each field the event's own; the text
+    /// line shows the id's first six characters and the JSON the full id.
+    #[test]
+    fn t2_ten_costliest_calls_rank_priced_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("alpha");
+        let id = Ulid::generate();
+        let mut lines = vec![user("2026-10-07T13:00:00Z", "spend")];
+        let mut priced = Vec::new();
+        for n in 1..=14u64 {
+            let at = format!("2026-10-07T14:{n:02}:00Z");
+            let cost = n as f64 / 100.0;
+            let e = call(
+                &at,
+                1000,
+                0,
+                100,
+                Some(cost),
+                Some("z-ai/glm-5.3"),
+                Some("tensorx"),
+            );
+            lines.push(e);
+            priced.push((at, cost));
+        }
+        // Three unpriced calls with far bigger prompts: priced calls
+        // outrank them, so none of these is listed.
+        for (i, ctx) in [900_000u64, 800_000, 700_000].iter().enumerate() {
+            lines.push(call(
+                &format!("2026-10-07T15:0{i}:00Z"),
+                *ctx,
+                0,
+                1,
+                None,
+                Some("some/other-model"),
+                Some("priceless"),
+            ));
+        }
+        write_thread(&base, id, &lines);
+
+        let stats = collect(dir.path(), &[], None, None, &book_of(PRICED_CONFIG)).unwrap();
+        assert_eq!(stats.costliest_calls.len(), 10);
+        // Dearest first: n = 14 down to 5, each field the event's own.
+        for (slot, n) in (5..=14u64).rev().enumerate() {
+            let c = &stats.costliest_calls[slot];
+            let (at, cost) = &priced[(n - 1) as usize];
+            assert_eq!(c.id, id.to_string());
+            assert_eq!(c.project, "alpha");
+            assert_eq!(c.created_at, short_when(at));
+            assert_eq!(c.model, "z-ai/glm-5.3");
+            assert_eq!(c.context, 1000);
+            assert_eq!(c.output, 100);
+            assert!((c.spent.unwrap() - cost).abs() < 1e-12);
+            assert_eq!(c.price_estimated_spent, None);
+        }
+
+        // The text line shows the id's first six characters; the JSON's
+        // `id` is the whole one.
+        let text = render(&stats);
+        assert!(text.contains("costliest calls"), "{text}");
+        let first = text
+            .lines()
+            .skip_while(|l| *l != "costliest calls")
+            .nth(1)
+            .unwrap_or_else(|| panic!("no costliest-calls row in {text}"));
+        let short: String = id.to_string().chars().take(6).collect();
+        assert!(first.contains(&short), "{first}");
+        assert!(!first.contains(&id.to_string()), "{first}");
+        let json = serde_json::to_value(&stats).unwrap();
+        assert_eq!(json["costliest_calls"].as_array().unwrap().len(), 10);
+        assert_eq!(json["costliest_calls"][0]["id"], json!(id.to_string()));
+    }
+
+    /// T2 (issue #111): two calls of equal cost go by the larger prompt
+    /// first.
+    #[test]
+    fn t2_a_tie_gives_the_larger_prompt_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("alpha");
+        let id = Ulid::generate();
+        write_thread(
+            &base,
+            id,
+            &[
+                user("2026-10-08T09:00:00Z", "tie"),
+                call(
+                    "2026-10-08T09:00:01Z",
+                    100,
+                    0,
+                    1,
+                    Some(0.10),
+                    Some("z-ai/glm-5.3"),
+                    Some("tensorx"),
+                ),
+                call(
+                    "2026-10-08T09:00:02Z",
+                    200,
+                    0,
+                    2,
+                    Some(0.10),
+                    Some("z-ai/glm-5.3"),
+                    Some("tensorx"),
+                ),
+            ],
+        );
+        let stats = collect(dir.path(), &[], None, None, &book_of(PRICED_CONFIG)).unwrap();
+        assert_eq!(stats.costliest_calls.len(), 2);
+        assert_eq!(stats.costliest_calls[0].context, 200);
+        assert_eq!(stats.costliest_calls[1].context, 100);
+    }
+
+    /// T2 (issue #111): an unpriced window lists the largest prompts,
+    /// with `-` where a cost would be.
+    #[test]
+    fn t2_an_unpriced_window_lists_the_largest_prompts() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("alpha");
+        let id = Ulid::generate();
+        let mut lines = vec![user("2026-10-08T10:00:00Z", "unpriced")];
+        for (i, ctx) in [10u64, 300, 20].iter().enumerate() {
+            lines.push(call(
+                &format!("2026-10-08T10:0{i}:01Z"),
+                *ctx,
+                0,
+                1,
+                None,
+                Some("some/other-model"),
+                Some("priceless"),
+            ));
+        }
+        write_thread(&base, id, &lines);
+
+        let stats = collect(dir.path(), &[], None, None, &book_of(PRICED_CONFIG)).unwrap();
+        assert_eq!(
+            stats
+                .costliest_calls
+                .iter()
+                .map(|c| c.context)
+                .collect::<Vec<_>>(),
+            vec![300, 20, 10]
+        );
+        assert!(stats.costliest_calls.iter().all(|c| c.spent.is_none()));
+        assert!(render(&stats).contains("  -  "), "{}", render(&stats));
+    }
+
+    /// T2 (issue #111): a call outside `--since` is not listed.
+    #[test]
+    fn t2_the_window_filters_the_calls_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("alpha");
+        let id = Ulid::generate();
+        write_thread(
+            &base,
+            id,
+            &[
+                user("2026-10-01T09:00:00Z", "old"),
+                call(
+                    "2026-10-01T09:00:01Z",
+                    100,
+                    0,
+                    1,
+                    Some(0.10),
+                    Some("z-ai/glm-5.3"),
+                    Some("tensorx"),
+                ),
+                call(
+                    "2026-10-08T09:00:01Z",
+                    200,
+                    0,
+                    2,
+                    Some(0.20),
+                    Some("z-ai/glm-5.3"),
+                    Some("tensorx"),
+                ),
+            ],
+        );
+        let cutoff = datetime!(2026-10-05 00:00 UTC);
+        let stats = collect(dir.path(), &[], None, Some(cutoff), &book_of(PRICED_CONFIG)).unwrap();
+        assert_eq!(stats.costliest_calls.len(), 1);
+        assert_eq!(stats.costliest_calls[0].created_at, "2026-10-08 09:00");
+        assert_eq!(stats.costliest_calls[0].context, 200);
+    }
+
+    /// T2 (issue #111): a retro-priced call reads `~$`.
+    #[test]
+    fn t2_a_retro_priced_call_reads_as_estimated() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("alpha");
+        let id = Ulid::generate();
+        let line = call(
+            "2026-10-08T11:00:01Z",
+            1_000_000,
+            0,
+            1000,
+            None,
+            Some("deepseek/deepseek-v4.1-flash"),
+            Some("flash"),
+        );
+        write_thread(
+            &base,
+            id,
+            &[user("2026-10-08T11:00:00Z", "retro"), line.clone()],
+        );
+        let stats = collect(dir.path(), &[], None, None, &book_of(PRICED_CONFIG)).unwrap();
+        let expected = expected_cost(PRICED_CONFIG, "flash", &line);
+        assert_eq!(stats.costliest_calls.len(), 1);
+        assert!((stats.costliest_calls[0].price_estimated_spent.unwrap() - expected).abs() < 1e-12);
+        assert!(
+            render(&stats).contains(&format!("~${expected:.4}")),
+            "{}",
+            render(&stats)
+        );
+    }
+
+    /// T3 (issue #111): a project with nothing in the window is not a
+    /// row; a side-job-only project is; `--project` still shows a named
+    /// empty group.
+    #[test]
+    fn t3_empty_project_rows_are_dropped_but_a_named_one_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+        write_thread(
+            &base.join("empty"),
+            Ulid::generate(),
+            &[user("2026-10-09T09:00:00Z", "no calls here")],
+        );
+        write_thread(
+            &base.join("side"),
+            Ulid::generate(),
+            &[
+                user("2026-10-09T09:01:00Z", "only a side job"),
+                stamped_extraction(
+                    "2026-10-09T09:01:01Z",
+                    "deepseek/deepseek-v4.1-flash",
+                    100,
+                    0,
+                    10,
+                    Some(0.30),
+                ),
+            ],
+        );
+        write_thread(
+            &base.join("real"),
+            Ulid::generate(),
+            &[
+                user("2026-10-09T09:02:00Z", "a call"),
+                call(
+                    "2026-10-09T09:02:01Z",
+                    100,
+                    0,
+                    10,
+                    Some(0.05),
+                    Some("z-ai/glm-5.3"),
+                    Some("tensorx"),
+                ),
+            ],
+        );
+
+        let stats = collect(&base, &[], None, None, &book_of(PRICED_CONFIG)).unwrap();
+        assert_eq!(
+            stats
+                .projects
+                .iter()
+                .map(|p| p.project.as_str())
+                .collect::<Vec<_>>(),
+            vec!["real", "side"],
+        );
+
+        // `--project empty` still shows its own, empty group.
+        let named = collect(&base, &[], Some("empty"), None, &book_of(PRICED_CONFIG)).unwrap();
+        assert_eq!(named.projects.len(), 1);
+        assert_eq!(named.projects[0].project, "empty");
+        assert_eq!(named.projects[0].calls, 0);
+    }
+
+    /// T4 (issue #111): the model and costliest-calls tables render in
+    /// the documented layout, a window with no side job shows no `jobs`
+    /// text anywhere, and `--json` carries both new fields.
+    #[test]
+    fn t4_the_new_tables_render_and_cross_the_wire() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("alpha");
+        let id = Ulid::generate();
+        let line = call(
+            "2026-10-10T09:00:01Z",
+            1000,
+            0,
+            100,
+            Some(0.05),
+            Some("z-ai/glm-5.3"),
+            Some("tensorx"),
+        );
+        write_thread(&base, id, &[user("2026-10-10T09:00:00Z", "render"), line]);
+
+        let stats = collect(dir.path(), &[], None, None, &book_of(PRICED_CONFIG)).unwrap();
+        let text = render(&stats);
+
+        // The model table: the project table's columns.
+        let header = text
+            .lines()
+            .find(|l| l.starts_with("model "))
+            .unwrap_or_else(|| panic!("no model table in {text}"));
+        for column in ["calls", "priced", "cost", "peak", "hit"] {
+            assert!(header.contains(column), "{header}");
+        }
+        let row = text
+            .lines()
+            .find(|l| l.starts_with("z-ai/glm-5.3"))
+            .unwrap_or_else(|| panic!("no model row in {text}"));
+        let m = &stats.models[0];
+        assert!(
+            row.contains(&money(m.spent, m.price_estimated_spent)),
+            "{row}"
+        );
+        assert!(row.contains(&m.peak_context.to_string()), "{row}");
+
+        // No side job: no `jobs` text anywhere.
+        assert!(!text.contains("jobs"), "{text}");
+
+        // The costliest-calls table, and both new fields in JSON.
+        assert!(text.contains("costliest calls"), "{text}");
+        let short: String = id.to_string().chars().take(6).collect();
+        assert!(text.contains(&short), "{text}");
+        let json = serde_json::to_value(&stats).unwrap();
+        assert_eq!(json["models"][0]["model"], json!("z-ai/glm-5.3"));
+        assert_eq!(json["models"][0]["calls"], json!(1));
+        assert_eq!(json["costliest_calls"][0]["context"], json!(1000));
+        assert_eq!(json["costliest_calls"][0]["spent"], json!(0.05));
     }
 
     /// T9 (issue #46): the drill-down and the issue report show the
