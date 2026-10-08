@@ -14,14 +14,15 @@ use std::collections::{HashMap, VecDeque};
 
 use aigentic_api::client::Client;
 use aigentic_api::{Notice, ReportKind, Request, Response, SwitchReply, ThreadInfo, ThreadState};
-use aigentic_runtime::aigentic_core::{Author, ContentBlock, EventKind, ToolCall};
+use aigentic_runtime::aigentic_core::{Author, ContentBlock, Event, EventKind, ToolCall};
 use aigentic_runtime::aigentic_log::{
     AssistantMessagePayload, CheckpointAnsweredPayload, CheckpointAskedPayload, CompactedPayload,
     CompactionStrategy, DecisionScope, InterruptedPayload, MemoryExtractedPayload,
-    MemoryRememberedPayload, PermissionDecidedPayload, RunFinishedPayload, SkillLoadedPayload,
-    ToolResultPayload, TurnEndedPayload, UserMessagePayload,
+    MemoryRememberedPayload, PermissionDecidedPayload, PolicyRecord, RunFinishedPayload,
+    SkillLoadedPayload, ToolResultPayload, TurnEndedPayload, UserMessagePayload,
 };
-use aigentic_runtime::{ASKED_HUMAN, INTERRUPTED, LENGTH_STOP};
+use aigentic_runtime::harness_tools::open_checklist;
+use aigentic_runtime::{ASKED_HUMAN, INTERRUPTED, LENGTH_STOP, NOT_RUN_OVER_LIMIT, NOT_RUN_SOLO};
 
 use crate::app::cells::full_command;
 use tokio::sync::mpsc;
@@ -409,6 +410,9 @@ pub struct ClientRepl {
     /// failure (issue #22): the machine text kept off the screen, shown
     /// by `/why`. Cleared by a turn that ended in the ordinary way.
     last_stop: Option<String>,
+    /// The open turn's own events, for its turn-end report (issue #113).
+    /// Cleared at each turn start and at its `turn_ended`.
+    turn_events: TurnEvents,
     /// A post went out while idle and its turn has not been seen
     /// running yet; input at its end waits for that turn.
     awaiting_turn: bool,
@@ -457,6 +461,7 @@ impl ClientRepl {
             usage: None,
             last_turn: None,
             last_stop: None,
+            turn_events: TurnEvents::default(),
             awaiting_turn: false,
             confirm_new: None,
             quit: false,
@@ -1951,6 +1956,12 @@ impl ClientRepl {
         event: &aigentic_runtime::aigentic_core::Event,
         out: &mut dyn Printer,
     ) {
+        // The turn's own events, kept for the turn-end report (issue
+        // #113). The `turn_ended` event itself is not one of them: it is
+        // what the report is read at.
+        if event.kind != EventKind::TurnEnded {
+            self.turn_events.push(event);
+        }
         match event.kind {
             EventKind::AssistantMessage => {
                 self.flush_partial(out);
@@ -2080,10 +2091,13 @@ impl ClientRepl {
                     self.last_stop = stop_reason(&p);
                     // After the summary, before the stop line, so a turn
                     // that ended for any reason still says it slept
-                    // (issue #47).
-                    for line in turn_end_lines(&p) {
+                    // (issue #47). What stopped it, what it did and
+                    // whether anything is left come from the turn's own
+                    // events (issue #113).
+                    for line in turn_end_report(&p, self.turn_events.as_slice()) {
                         out.line(&line);
                     }
+                    self.turn_events.clear();
                 }
             }
             EventKind::Compacted => {
@@ -2295,32 +2309,271 @@ pub(crate) fn why_line(last_stop: Option<&str>) -> String {
 pub(crate) const LENGTH_STOP_TEXT: &str =
     "the reply hit the model's output limit; type continue to go on";
 
-/// The lines a `turn_ended` payload prints after the turn's summary: the
-/// slept line (issue #47), then the stop line for a turn that ended on
-/// anything but `done`/`asked_human`/`interrupted`. A provider failure
-/// with a structured `error` reads as its plain line (issue #22); a line
-/// without one (an old log, an older daemon) keeps the raw reason.
-pub(crate) fn turn_end_lines(p: &TurnEndedPayload) -> Vec<String> {
+/// The lines a `turn_ended` payload prints after the turn's summary
+/// (issues #47, #96, #113): the slept line, then — for a turn that ended
+/// on anything but `done`/`asked_human`/`interrupted` — what stopped it,
+/// what the turn did, and whether anything is left. Everything after the
+/// first line comes from the turn's own events, so a turn that finished
+/// its work and then lost its closing reply is not told to continue.
+/// `turn` is the open turn's events as the caller kept them; see
+/// [`TurnEvents`].
+pub(crate) fn turn_end_report(p: &TurnEndedPayload, turn: &[Event]) -> Vec<String> {
     let mut lines: Vec<String> = slept_line(p).into_iter().collect();
     if p.reason == "done" || p.reason == ASKED_HUMAN || p.reason == INTERRUPTED {
         return lines;
     }
-    let message = match (reason_head(&p.reason), &p.error) {
-        ("provider_error", Some(e)) => format!("{} (/why shows the raw error)", e.plain_line()),
+    let head = reason_head(&p.reason);
+    let message = match (head, &p.error) {
+        ("provider_error", Some(e)) => format!(
+            "the model's reply failed: {}  (/why shows the raw error)",
+            e.cause_line()
+        ),
         // A reply the model's own output limit stopped (issue #96): no
         // tool ran, and nothing failed, so it says what to do next.
         (LENGTH_STOP, None) => LENGTH_STOP_TEXT.to_owned(),
+        // A budget cap, by its plain name (issue #113). The payload
+        // carries no figure, and the tui has no budget config to read
+        // one from, so none is invented.
+        ("max_wall_time", _) => "the turn hit its wall-time limit".to_owned(),
+        ("max_tokens", _) => "the turn hit its token budget".to_owned(),
+        ("max_iterations", _) => "the turn hit its call limit".to_owned(),
         _ => p.reason.clone(),
     };
-    if p.touched.is_empty() {
-        lines.push(format!("[turn ended: {message}]"));
+    lines.push(format!("[turn ended: {message}]"));
+    if turn.iter().any(is_turn_start) {
+        let calls = successful_calls(turn, REPORT_CALLS);
+        let what = if calls.is_empty() {
+            "no tool ran".to_owned()
+        } else {
+            calls
+                .iter()
+                .map(|c| format!("{} {}", c.name, summarise_args(c)))
+                .collect::<Vec<_>>()
+                .join(" · ")
+        };
+        lines.push(format!("[before that: {what}]"));
     } else {
-        lines.push(format!(
-            "[turn ended: {message}; wrote {}]",
-            p.touched.join(", ")
-        ));
+        // The client attached or resumed mid-turn, so it never saw the
+        // turn start: it can say what it has seen, not that nothing ran.
+        lines.push(format!("[{JOINED_MID_TURN}]"));
     }
+    if !p.touched.is_empty() {
+        lines.push(format!("[files written: {}]", p.touched.join(", ")));
+    }
+    lines.push(format!("[{}]", left_line(head, turn)));
     lines
+}
+
+/// What is left of the turn, decided only from the turn's own events
+/// (issue #113): an unfinished call or an open checklist first, then a
+/// finished checklist, then a cap that stopped the model while it was
+/// working, then the honest unknown. `continue` appears only where there
+/// might be something to continue.
+fn left_line(head: &str, turn: &[Event]) -> String {
+    if let Some(call) = unfinished_call(turn) {
+        return format!(
+            "left: {} {} — type continue to carry on",
+            call.name,
+            summarise_args(&call)
+        );
+    }
+    let checklist = open_checklist(turn);
+    if let Some(c) = &checklist {
+        if c.done < c.total {
+            let step = c.active.as_deref().unwrap_or("the checklist");
+            return format!("left: {step} — type continue to carry on");
+        }
+        // A finished checklist is done even when a cap ended the turn:
+        // the cap is already named in the first line.
+        return "nothing was left mid-way".to_owned();
+    }
+    if is_cap(head) {
+        return "left: the turn was stopped while working — type continue to carry on".to_owned();
+    }
+    "if that wasn't the end, type continue".to_owned()
+}
+
+/// The head of a `turn_ended` reason that is a budget cap, not a failure.
+fn is_cap(head: &str) -> bool {
+    matches!(head, "max_wall_time" | "max_tokens" | "max_iterations")
+}
+
+/// The open turn's own events, as a client keeps them (issues #109,
+/// #113): cleared at each turn start and bounded by what the turn-end
+/// report needs, not by a count. A turn start is a `user_message` with
+/// `mid_turn == false`, so a message typed mid-turn does not clear it.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct TurnEvents(Vec<Event>);
+
+impl TurnEvents {
+    /// Adds an event, clearing the buffer first when it starts a turn.
+    pub(crate) fn push(&mut self, event: &Event) {
+        if is_turn_start(event) {
+            self.0.clear();
+        }
+        self.0.push(event.clone());
+        self.prune();
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    pub(crate) fn as_slice(&self) -> &[Event] {
+        &self.0
+    }
+
+    /// Drops what the report cannot need: everything but the turn start,
+    /// every `update_tasks` call and its result, the last assistant
+    /// message and every event after it, and the last `REPORT_CALLS`
+    /// successful calls with their results.
+    fn prune(&mut self) {
+        let mut keep: Vec<String> = Vec::new();
+        for e in &self.0 {
+            if e.kind == EventKind::AssistantMessage {
+                keep.extend(
+                    message_calls(e)
+                        .into_iter()
+                        .filter(|c| c.name == UPDATE_TASKS)
+                        .map(|c| c.id),
+                );
+            }
+        }
+        keep.extend(
+            successful_calls(&self.0, REPORT_CALLS)
+                .into_iter()
+                .map(|c| c.id),
+        );
+        let last_at = last_message_at(&self.0);
+        let mut kept = Vec::with_capacity(self.0.len());
+        for (i, e) in self.0.iter().enumerate() {
+            let holds = e.kind == EventKind::AssistantMessage
+                && message_calls(e).iter().any(|c| keep.contains(&c.id));
+            let answers = e.kind == EventKind::ToolResult
+                && result_id(e).is_some_and(|id| keep.contains(&id));
+            if is_turn_start(e) && i == 0 || last_at.is_some_and(|at| i >= at) || holds || answers {
+                kept.push(e.clone());
+            }
+        }
+        self.0 = kept;
+    }
+}
+
+/// How many of the turn's successful calls the report names.
+const REPORT_CALLS: usize = 3;
+
+/// What a client that attached or resumed mid-turn reads in place of the
+/// `before that:` line: it never saw the turn start, so it never claims
+/// that no tool ran.
+const JOINED_MID_TURN: &str = "this window joined mid-turn; the transcript and /why have the rest";
+
+/// The tool name that carries the model's checklist.
+const UPDATE_TASKS: &str = "update_tasks";
+
+/// Whether an event starts a turn: a `user_message` with `mid_turn ==
+/// false` (issue #109's rule), or an old line without the field.
+fn is_turn_start(event: &Event) -> bool {
+    event.kind == EventKind::UserMessage
+        && serde_json::from_value::<UserMessagePayload>(event.payload.clone())
+            .is_ok_and(|p| !p.mid_turn)
+}
+
+/// The tool calls a message holds, in order.
+fn message_calls(event: &Event) -> Vec<ToolCall> {
+    let Ok(p) = serde_json::from_value::<AssistantMessagePayload>(event.payload.clone()) else {
+        return Vec::new();
+    };
+    p.blocks
+        .into_iter()
+        .filter_map(|b| match b {
+            ContentBlock::ToolCall(c) => Some(c),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The index of the turn's last assistant message, if it has one.
+fn last_message_at(turn: &[Event]) -> Option<usize> {
+    turn.iter()
+        .rposition(|e| e.kind == EventKind::AssistantMessage)
+}
+
+/// The id of the call a result answers, if it parses as one.
+fn result_id(event: &Event) -> Option<String> {
+    serde_json::from_value::<ToolResultPayload>(event.payload.clone())
+        .ok()
+        .map(|p| p.result.id)
+}
+
+/// The turn's successful tool calls, newest last, at most `n` of them:
+/// a call whose result came back without an error (issue #113). Rendering
+/// goes through the transcript's own [`summarise_args`], so the report
+/// and the screen never disagree.
+fn successful_calls(turn: &[Event], n: usize) -> Vec<ToolCall> {
+    let mut out: Vec<ToolCall> = Vec::new();
+    for e in turn {
+        if e.kind != EventKind::ToolResult {
+            continue;
+        }
+        let Ok(p) = serde_json::from_value::<ToolResultPayload>(e.payload.clone()) else {
+            continue;
+        };
+        if p.result.is_error {
+            continue;
+        }
+        let call = turn
+            .iter()
+            .filter(|m| m.kind == EventKind::AssistantMessage)
+            .flat_map(message_calls)
+            .find(|c| c.id == p.result.id)
+            // `update_tasks` draws as a checklist in the transcript, not as
+            // a call, so the report does not name it either.
+            .filter(|c| c.name != UPDATE_TASKS);
+        if let Some(call) = call {
+            out.push(call);
+        }
+    }
+    let keep = out.len().saturating_sub(n);
+    out.split_off(keep)
+}
+
+/// The first call in the turn's last batch that did not run or never came
+/// back (issue #113): a call with no result at all, or one whose result a
+/// policy record marks as not run. Only the last batch counts: a sibling's
+/// not-run result is written while the turn continues, so the model's next
+/// call can recover from it.
+fn unfinished_call(turn: &[Event]) -> Option<ToolCall> {
+    let at = last_message_at(turn)?;
+    for call in message_calls(&turn[at]) {
+        let result = turn.iter().find_map(|e| {
+            if e.kind != EventKind::ToolResult {
+                return None;
+            }
+            let p = serde_json::from_value::<ToolResultPayload>(e.payload.clone()).ok()?;
+            (p.result.id == call.id).then_some(p.policy)
+        });
+        match result {
+            None => return Some(call),
+            Some(policy) if not_run(&policy) => return Some(call),
+            Some(_) => {}
+        }
+    }
+    None
+}
+
+/// Whether a result's policy record says the call did not run: an
+/// interrupt, a `suggest_project` sibling, the model's own output limit
+/// (issue #96), or a resume's synthetic result.
+fn not_run(policy: &Option<PolicyRecord>) -> bool {
+    match policy {
+        Some(PolicyRecord::Rule { rule, decision, .. }) => {
+            rule == INTERRUPTED
+                || rule == NOT_RUN_SOLO
+                || rule == NOT_RUN_OVER_LIMIT
+                || decision == "synthetic"
+        }
+        _ => false,
+    }
 }
 
 pub(crate) fn author_name(author: &Author) -> String {
@@ -4262,21 +4515,21 @@ mod tests {
         );
     }
 
-    /// T7 (issue #22): a provider-error turn end prints the plain line
-    /// plus the `/why` pointer, never the raw JSON reason.
+    /// T7 (issue #22), reshaped by #113: a provider-error turn end names
+    /// the failure in plain words plus the `/why` pointer, never the raw
+    /// JSON reason, and still names the files written.
     #[test]
     fn provider_error_turn_end_renders_plain_line() {
         let mut p = provider_error_payload(503, "{\"error\": {\"message\": \"unavailable\"}}");
         p.touched = vec!["src/main.rs".into()];
+        let error = p.error.as_ref().expect("the payload carries its error");
         let expected = format!(
-            "[turn ended: {} (/why shows the raw error); wrote src/main.rs]",
-            p.error
-                .as_ref()
-                .expect("the payload carries its error")
-                .plain_line()
+            "[turn ended: the model's reply failed: {}  (/why shows the raw error)]",
+            error.cause_line()
         );
-        let lines = turn_end_lines(&p);
-        assert_eq!(lines, vec![expected], "{lines:#?}");
+        let lines = turn_end_report(&p, &[]);
+        assert_eq!(lines[0], expected, "{lines:#?}");
+        assert_eq!(lines[2], "[files written: src/main.rs]", "{lines:#?}");
         assert!(!lines[0].contains('{'), "{lines:#?}");
         assert!(!lines[0].contains("provider_error"), "{lines:#?}");
     }
@@ -4303,11 +4556,12 @@ mod tests {
     #[test]
     fn legacy_turn_end_without_error_falls_back() {
         let p = TurnEndedPayload::new("provider_error: transport error: connection closed");
+        let lines = turn_end_report(&p, &[]);
         assert_eq!(
-            turn_end_lines(&p),
-            vec!["[turn ended: provider_error: transport error: connection closed]".to_owned()],
+            lines[0], "[turn ended: provider_error: transport error: connection closed]",
             "an unreadable error shape degrades to the raw reason"
         );
+        assert_eq!(lines.len(), 3, "and nothing else is known: {lines:#?}");
     }
 
     /// T6 (issue #96): a cut reply reads as the `Cut` plain line plus the
@@ -4321,18 +4575,18 @@ mod tests {
             ..TurnEndedPayload::new("")
         };
         let expected_cut = format!(
-            "[turn ended: {} (/why shows the raw error)]",
-            ProviderError::Cut.plain_line()
+            "[turn ended: the model's reply failed: {}  (/why shows the raw error)]",
+            ProviderError::Cut.cause_line()
         );
-        let cut_lines = turn_end_lines(&cut);
-        assert_eq!(cut_lines, vec![expected_cut], "{cut_lines:#?}");
+        let cut_lines = turn_end_report(&cut, &[]);
+        assert_eq!(cut_lines[0], expected_cut, "{cut_lines:#?}");
         assert!(!cut_lines[0].contains("provider_error"), "{cut_lines:#?}");
 
         let length = TurnEndedPayload::new(LENGTH_STOP);
-        let length_lines = turn_end_lines(&length);
+        let length_lines = turn_end_report(&length, &[]);
         assert_eq!(
-            length_lines,
-            vec![format!("[turn ended: {LENGTH_STOP_TEXT}]")],
+            length_lines[0],
+            format!("[turn ended: {LENGTH_STOP_TEXT}]"),
             "a length stop names what to do next"
         );
         assert!(
@@ -4368,10 +4622,604 @@ mod tests {
         let mut p = provider_error_payload(503, "{}");
         p.slept_secs = Some(750);
         p.slept_awaiting_secs = Some(750);
-        let lines = turn_end_lines(&p);
-        assert_eq!(lines.len(), 2, "{lines:#?}");
+        let lines = turn_end_report(&p, &[]);
+        assert!(lines.len() >= 2, "{lines:#?}");
         assert!(lines[0].starts_with("the machine slept"), "{lines:#?}");
         assert!(lines[1].starts_with("[turn ended: "), "{lines:#?}");
+    }
+
+    // ---- the turn-end report (issue #113) ----------------------------
+
+    /// One turn event for the report's fixtures, authored by the model.
+    fn turn_event(seq: u64, kind: EventKind, payload: serde_json::Value) -> Event {
+        Event {
+            id: Ulid::generate(),
+            thread_id: Ulid::generate(),
+            seq,
+            kind,
+            author: Author::Agent(aigentic_runtime::aigentic_core::AgentId("model".into())),
+            payload,
+            parent_event: None,
+            created_at: time::OffsetDateTime::now_utc(),
+        }
+    }
+
+    /// The `user_message` that starts a turn (`mid_turn == false`).
+    fn turn_start(seq: u64) -> Event {
+        turn_event(
+            seq,
+            EventKind::UserMessage,
+            serde_json::to_value(UserMessagePayload::new(Vec::new())).unwrap(),
+        )
+    }
+
+    /// A model message holding `calls` and no text.
+    fn call_message(seq: u64, calls: &[ToolCall]) -> Event {
+        turn_event(
+            seq,
+            EventKind::AssistantMessage,
+            serde_json::to_value(AssistantMessagePayload {
+                blocks: calls.iter().cloned().map(ContentBlock::ToolCall).collect(),
+                usage: None,
+                finish_reason: Some("tool_calls".into()),
+            })
+            .unwrap(),
+        )
+    }
+
+    /// The result answering `call`, with `policy`, in log order.
+    fn call_result(seq: u64, call: &ToolCall, is_error: bool, policy: PolicyRecord) -> Event {
+        turn_event(
+            seq,
+            EventKind::ToolResult,
+            serde_json::to_value(ToolResultPayload::new(
+                aigentic_runtime::aigentic_core::ToolResult {
+                    id: call.id.clone(),
+                    content: format!("{} done", call.name),
+                    is_error,
+                },
+                policy,
+            ))
+            .unwrap(),
+        )
+    }
+
+    /// A `bash` call; `summarise_args` renders it as its command.
+    fn a_bash_call(id: &str, command: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            name: "bash".into(),
+            args: serde_json::json!({ "command": command }),
+        }
+    }
+
+    /// An `update_tasks` call, as the model sends one.
+    fn an_update_tasks_call(id: &str, tasks: serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            name: "update_tasks".into(),
+            args: serde_json::json!({ "tasks": tasks }),
+        }
+    }
+
+    /// How the transcript draws one call, as the report shares it.
+    fn rendered(call: &ToolCall) -> String {
+        format!("{} {}", call.name, summarise_args(call))
+    }
+
+    /// T2 (issue #113): #111's own case — the closing reply failed after
+    /// the work was done and the temp file deleted. The line says what
+    /// failed, what the turn did, that the files are written, and that
+    /// nothing was left — and never sends the reader back for finished
+    /// work.
+    #[test]
+    fn a_failed_closing_reply_after_finished_work_invites_no_retry() {
+        let comment = a_bash_call(
+            "c1",
+            "gh issue comment 113 --body-file /tmp/113-spec-check.md",
+        );
+        let rm = a_bash_call("c2", "rm -f /tmp/113-spec-check.md");
+        let tasks = an_update_tasks_call(
+            "t1",
+            serde_json::json!([
+                { "text": "post the comment", "state": "done" },
+                { "text": "delete the temp file", "state": "done" },
+            ]),
+        );
+        let turn = vec![
+            turn_start(1),
+            call_message(2, std::slice::from_ref(&tasks)),
+            call_result(
+                3,
+                &tasks,
+                false,
+                PolicyRecord::rule("harness tool", "allow"),
+            ),
+            call_message(4, std::slice::from_ref(&comment)),
+            call_result(
+                5,
+                &comment,
+                false,
+                PolicyRecord::rule("bash allow-pattern gh", "allow"),
+            ),
+            call_message(6, std::slice::from_ref(&rm)),
+            call_result(
+                7,
+                &rm,
+                false,
+                PolicyRecord::rule("bash allow-pattern rm", "allow"),
+            ),
+            turn_event(
+                8,
+                EventKind::AssistantMessage,
+                serde_json::to_value(AssistantMessagePayload {
+                    blocks: vec![ContentBlock::Text("posted; temp file gone".into())],
+                    usage: None,
+                    finish_reason: Some("end_of_stream".into()),
+                })
+                .unwrap(),
+            ),
+        ];
+        let mut p = TurnEndedPayload::new("provider_error: transport error: connection closed");
+        p.error = Some(ProviderError::Transport("connection closed".into()));
+        p.touched = vec!["/tmp/113-spec-check.md".into()];
+        let cause = p.error.as_ref().unwrap().cause_line();
+
+        let lines = turn_end_report(&p, &turn);
+        assert_eq!(
+            lines,
+            vec![
+                format!(
+                    "[turn ended: the model's reply failed: {cause}  (/why shows the raw error)]"
+                ),
+                format!("[before that: {} · {}]", rendered(&comment), rendered(&rm)),
+                "[files written: /tmp/113-spec-check.md]".to_owned(),
+                "[nothing was left mid-way]".to_owned(),
+            ],
+            "{lines:#?}"
+        );
+    }
+
+    /// A failure that leaves the last batch unfinished is `left:`, whatever
+    /// left it: the four not-run shapes the log writes.
+    #[test]
+    fn a_not_run_result_in_the_last_batch_is_left() {
+        let call = a_bash_call("c1", "cargo test");
+        let shapes = [
+            PolicyRecord::rule(NOT_RUN_OVER_LIMIT, "deny"),
+            PolicyRecord::rule(INTERRUPTED, "deny"),
+            PolicyRecord::rule(NOT_RUN_SOLO, "deny"),
+            PolicyRecord::synthetic(),
+        ];
+        for policy in shapes {
+            let turn = vec![
+                turn_start(1),
+                call_message(2, std::slice::from_ref(&call)),
+                call_result(3, &call, true, policy.clone()),
+            ];
+            let p = provider_error_payload(503, "{}");
+            let lines = turn_end_report(&p, &turn);
+            assert_eq!(
+                lines.last().unwrap(),
+                &format!("[left: {} — type continue to carry on]", rendered(&call)),
+                "{policy:?}: {lines:#?}"
+            );
+        }
+    }
+
+    /// A sibling's not-run result is written while the turn goes on: once
+    /// the turn recovered and its checklist is complete, nothing is left.
+    #[test]
+    fn a_not_run_sibling_that_the_turn_recovered_from_is_not_left() {
+        let solo = ToolCall {
+            id: "s1".into(),
+            name: "suggest_project".into(),
+            args: serde_json::json!({ "project": "aigentic-web" }),
+        };
+        let tasks = an_update_tasks_call(
+            "t1",
+            serde_json::json!([{ "text": "post the comment", "state": "done" }]),
+        );
+        let gate = a_bash_call("c1", "cargo test");
+        let turn = vec![
+            turn_start(1),
+            call_message(2, std::slice::from_ref(&solo)),
+            call_result(3, &solo, true, PolicyRecord::rule(NOT_RUN_SOLO, "deny")),
+            call_message(4, std::slice::from_ref(&tasks)),
+            call_result(
+                5,
+                &tasks,
+                false,
+                PolicyRecord::rule("harness tool", "allow"),
+            ),
+            call_message(6, std::slice::from_ref(&gate)),
+            call_result(
+                7,
+                &gate,
+                false,
+                PolicyRecord::rule("bash allow-pattern", "allow"),
+            ),
+        ];
+        let p = provider_error_payload(503, "{}");
+        let lines = turn_end_report(&p, &turn);
+        assert_eq!(
+            lines.last().unwrap(),
+            "[nothing was left mid-way]",
+            "{lines:#?}"
+        );
+        assert!(!lines.iter().any(|l| l.contains("continue")), "{lines:#?}");
+    }
+
+    /// A client that attached or resumed mid-turn never saw the turn
+    /// start, so it says so instead of claiming no tool ran.
+    #[test]
+    fn a_window_that_joined_mid_turn_says_so() {
+        let call = a_bash_call("c1", "cargo test");
+        let turn = vec![
+            call_message(2, std::slice::from_ref(&call)),
+            call_result(
+                3,
+                &call,
+                false,
+                PolicyRecord::rule("bash allow-pattern", "allow"),
+            ),
+        ];
+        let p = provider_error_payload(503, "{}");
+        let lines = turn_end_report(&p, &turn);
+        assert_eq!(
+            lines[1], "[this window joined mid-turn; the transcript and /why have the rest]",
+            "{lines:#?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("no tool ran")),
+            "{lines:#?}"
+        );
+    }
+
+    /// A call the process never answered is named, with the advice.
+    #[test]
+    fn a_call_with_no_result_is_named_as_left() {
+        let call = a_bash_call("c1", "gh issue comment 113 --body-file /tmp/113.md");
+        let turn = vec![turn_start(1), call_message(2, std::slice::from_ref(&call))];
+        let p = provider_error_payload(503, "{}");
+        let lines = turn_end_report(&p, &turn);
+        assert_eq!(
+            lines.last().unwrap(),
+            &format!("[left: {} — type continue to carry on]", rendered(&call)),
+            "{lines:#?}"
+        );
+    }
+
+    /// An unfinished checklist names the step it stopped on, not the last
+    /// call, when the last batch is answered and fine.
+    #[test]
+    fn a_checklist_that_is_not_finished_names_the_active_step() {
+        let tasks = an_update_tasks_call(
+            "t1",
+            serde_json::json!([
+                { "text": "read the spec", "state": "done" },
+                { "text": "write the code", "state": "done" },
+                { "text": "run the gate", "state": "active" },
+                { "text": "post the report", "state": "pending" },
+                { "text": "push", "state": "pending" },
+            ]),
+        );
+        let gate = a_bash_call("c1", "cargo test");
+        let turn = vec![
+            turn_start(1),
+            call_message(2, std::slice::from_ref(&tasks)),
+            call_result(
+                3,
+                &tasks,
+                false,
+                PolicyRecord::rule("harness tool", "allow"),
+            ),
+            call_message(4, std::slice::from_ref(&gate)),
+            call_result(
+                5,
+                &gate,
+                false,
+                PolicyRecord::rule("bash allow-pattern", "allow"),
+            ),
+        ];
+        let p = provider_error_payload(503, "{}");
+        let lines = turn_end_report(&p, &turn);
+        assert_eq!(
+            lines.last().unwrap(),
+            "[left: run the gate — type continue to carry on]",
+            "{lines:#?}"
+        );
+        assert_eq!(
+            open_checklist(&turn).unwrap().total,
+            5,
+            "2/5, as the fixture"
+        );
+    }
+
+    /// A failure with nothing known either way says so, and offers the
+    /// cheap retry without claiming the work is unfinished.
+    #[test]
+    fn a_failure_with_no_checklist_and_nothing_unfinished_is_unknown() {
+        let call = a_bash_call("c1", "cargo test");
+        let turn = vec![
+            turn_start(1),
+            call_message(2, std::slice::from_ref(&call)),
+            call_result(
+                3,
+                &call,
+                false,
+                PolicyRecord::rule("bash allow-pattern", "allow"),
+            ),
+        ];
+        let p = provider_error_payload(503, "{}");
+        let lines = turn_end_report(&p, &turn);
+        assert_eq!(
+            lines.last().unwrap(),
+            "[if that wasn't the end, type continue]",
+            "{lines:#?}"
+        );
+    }
+
+    /// A cap that caught a finished turn is still named, and says nothing
+    /// is left: a cap can end a turn whose checklist is complete.
+    #[test]
+    fn a_wall_time_cap_on_finished_work_is_done_with_no_figure() {
+        let tasks = an_update_tasks_call(
+            "t1",
+            serde_json::json!([{ "text": "post the report", "state": "done" }]),
+        );
+        let turn = vec![
+            turn_start(1),
+            call_message(2, std::slice::from_ref(&tasks)),
+            call_result(
+                3,
+                &tasks,
+                false,
+                PolicyRecord::rule("harness tool", "allow"),
+            ),
+        ];
+        let p = TurnEndedPayload::new("max_wall_time");
+        let lines = turn_end_report(&p, &turn);
+        assert_eq!(
+            lines[0], "[turn ended: the turn hit its wall-time limit]",
+            "{lines:#?}"
+        );
+        assert!(
+            !lines[0].chars().any(|c| c.is_ascii_digit()),
+            "no figure is in the payload to name: {lines:#?}"
+        );
+        assert_eq!(
+            lines.last().unwrap(),
+            "[nothing was left mid-way]",
+            "{lines:#?}"
+        );
+        assert!(!lines.iter().any(|l| l.contains("continue")), "{lines:#?}");
+    }
+
+    /// A cap with no checklist stopped the model while it was working.
+    #[test]
+    fn a_wall_time_cap_while_working_is_left() {
+        let call = a_bash_call("c1", "cargo test");
+        let turn = vec![
+            turn_start(1),
+            call_message(2, std::slice::from_ref(&call)),
+            call_result(
+                3,
+                &call,
+                false,
+                PolicyRecord::rule("bash allow-pattern", "allow"),
+            ),
+        ];
+        let p = TurnEndedPayload::new("max_tokens");
+        let lines = turn_end_report(&p, &turn);
+        assert_eq!(
+            lines[0], "[turn ended: the turn hit its token budget]",
+            "{lines:#?}"
+        );
+        assert_eq!(
+            lines.last().unwrap(),
+            "[left: the turn was stopped while working — type continue to carry on]",
+            "{lines:#?}"
+        );
+    }
+
+    /// A length stop keeps its own text, and a turn that ran no tool says
+    /// so rather than leaving the reader to guess.
+    #[test]
+    fn a_length_stop_keeps_its_text_and_an_empty_turn_says_no_tool_ran() {
+        let turn = vec![turn_start(1)];
+        let lines = turn_end_report(&TurnEndedPayload::new(LENGTH_STOP), &turn);
+        assert_eq!(
+            lines[0],
+            format!("[turn ended: {LENGTH_STOP_TEXT}]"),
+            "{lines:#?}"
+        );
+        assert_eq!(lines[1], "[before that: no tool ran]", "{lines:#?}");
+    }
+
+    /// A turn that ended `done`, `asked_human` or `interrupted` prints
+    /// exactly what it printed before this ticket.
+    #[test]
+    fn a_finished_turn_prints_no_new_lines() {
+        for reason in ["done", ASKED_HUMAN, INTERRUPTED] {
+            let turn = vec![
+                turn_start(1),
+                call_message(2, &[a_bash_call("c1", "cargo test")]),
+            ];
+            assert!(
+                turn_end_report(&TurnEndedPayload::new(reason), &turn).is_empty(),
+                "{reason} says nothing new"
+            );
+        }
+        let mut slept = slept_payload(750, 750, 750, None);
+        slept.reason = INTERRUPTED.into();
+        let lines = turn_end_report(&slept, &[turn_start(1)]);
+        assert_eq!(lines.len(), 1, "only the slept line: {lines:#?}");
+        assert!(lines[0].starts_with("the machine slept"), "{lines:#?}");
+    }
+
+    // ---- the turn-end report through the engine (issue #113) ---------
+
+    /// One embedded daemon-repl run (the shape of
+    /// `the_repl_streams_a_reply_reports_and_quits_over_an_embedded_daemon`),
+    /// with `input` typed as a person would and the drawn lines back.
+    async fn run_a_scripted_repl(
+        dir: &std::path::Path,
+        root: std::path::PathBuf,
+        script: Vec<Vec<ProviderEvent>>,
+        input: &str,
+    ) -> (aigentic_server::Embedded, Vec<String>) {
+        let cfg_dir = dir.join("cfg");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        let embedded = Server::embed_with(
+            config(dir),
+            cfg_dir.clone(),
+            root,
+            "steve",
+            None,
+            Factory::scripted(script),
+            Arc::new(DefaultReports {
+                global_instructions: cfg_dir.join("instructions.md"),
+            }),
+        )
+        .await
+        .unwrap();
+        let (client, welcome) =
+            Client::connect(&Addr::Unix(embedded.socket.clone()), &embedded.token)
+                .await
+                .unwrap();
+        let (thread, state, mode) = open(&client, "p", None).await;
+        let notices = client.take_notices().unwrap();
+        let mut repl = ClientRepl::new(
+            client,
+            thread,
+            "steve",
+            welcome.projects[0].role.clone(),
+            state,
+            mode,
+            Identity::default(),
+            "p",
+        );
+        let (tx, rx) = mpsc::unbounded_channel();
+        let typed: Vec<String> = input.split('\n').map(str::to_owned).collect();
+        let feeder = async move {
+            for line in typed {
+                tx.send(line).unwrap();
+                // A pause so each turn finishes before the next line.
+                tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+            }
+            tx.send("/quit".into()).unwrap();
+        };
+        let mut out = Lines::default();
+        let ((), ()) = tokio::join!(repl.run(rx, notices, &mut out), feeder);
+        (embedded, out.0)
+    }
+
+    /// T3 (#113): a turn whose provider fails after two tool calls draws
+    /// the report's lines after the summary cell, and what it did comes
+    /// from `summarise_args`, the transcript's own rendering.
+    #[tokio::test]
+    async fn a_failed_turn_draws_what_it_did_and_what_is_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = project(dir.path(), "p", "");
+        // Two read-class calls: they run, and they need no gate.
+        let (a, b) = (dir.path().join("a.md"), dir.path().join("b.md"));
+        std::fs::write(&a, "one\n").unwrap();
+        std::fs::write(&b, "two\n").unwrap();
+        let one = call("c1", "read_file", serde_json::json!({"path": a}));
+        let two = call("c2", "read_file", serde_json::json!({"path": b}));
+        let script = vec![
+            vec![one.clone(), tool_use()],
+            vec![two.clone(), tool_use()],
+            vec![ProviderEvent::Error(ProviderError::Transport(
+                "connection closed".into(),
+            ))],
+        ];
+        let (embedded, lines) = run_a_scripted_repl(dir.path(), root, script, "hello").await;
+        let rendered = |e: &ProviderEvent| match e {
+            ProviderEvent::ToolCall(c) => summarise_args(c),
+            _ => unreachable!(),
+        };
+        let expected = format!(
+            "[before that: read_file {} · read_file {}]",
+            rendered(&one),
+            rendered(&two)
+        );
+        assert!(lines.contains(&expected), "{lines:#?}");
+        // Unknown: no checklist, and the turn's last batch answered both
+        // calls. Nothing is left, so no `continue` — only the door.
+        assert!(
+            lines.contains(&"[if that wasn't the end, type continue]".to_owned()),
+            "{lines:#?}"
+        );
+        let stop = format!(
+            "[turn ended: the model's reply failed: {}  (/why shows the raw error)]",
+            ProviderError::Transport("connection closed".into()).cause_line()
+        );
+        let stop_at = lines
+            .iter()
+            .position(|l| *l == stop)
+            .expect("the stop line");
+        let summary_at = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with("─ "))
+            .expect("the summary cell");
+        assert!(stop_at > summary_at, "after the summary: {lines:#?}");
+        let before_at = lines.iter().position(|l| *l == expected).unwrap();
+        assert!(before_at > stop_at, "the stop line reads first: {lines:#?}");
+        assert!(
+            !lines.iter().any(|l| l.contains("type continue to retry")),
+            "no old advice either: {lines:#?}"
+        );
+        drop(embedded);
+    }
+
+    /// T3 (#113): the buffer is cleared at the next turn start, so the
+    /// second turn's report never claims the first turn's calls.
+    #[tokio::test]
+    async fn the_turn_events_are_cleared_at_the_next_turn_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = project(dir.path(), "p", "");
+        let (a, b) = (dir.path().join("a.md"), dir.path().join("b.md"));
+        std::fs::write(&a, "one\n").unwrap();
+        std::fs::write(&b, "two\n").unwrap();
+        let one = call("c1", "read_file", serde_json::json!({"path": a}));
+        let two = call("c2", "read_file", serde_json::json!({"path": b}));
+        let failed = || ProviderEvent::Error(ProviderError::Transport("connection closed".into()));
+        let script = vec![
+            vec![one.clone(), tool_use()],
+            vec![two.clone(), tool_use()],
+            vec![failed()],
+            vec![failed()],
+            vec![failed()],
+        ];
+        let (embedded, lines) = run_a_scripted_repl(dir.path(), root, script, "hello\nagain").await;
+        let rendered = |e: &ProviderEvent| match e {
+            ProviderEvent::ToolCall(c) => summarise_args(c),
+            _ => unreachable!(),
+        };
+        let did = format!(
+            "read_file {} · read_file {}",
+            rendered(&one),
+            rendered(&two)
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|l| *l == &format!("[before that: {did}]"))
+                .count(),
+            1,
+            "the first turn's calls, once: {lines:#?}"
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|l| *l == "[before that: no tool ran]")
+                .count(),
+            1,
+            "the second turn's own, empty: {lines:#?}"
+        );
+        drop(embedded);
     }
 
     // ---- /build in the REPL (issue #68) ------------------------------

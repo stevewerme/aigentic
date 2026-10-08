@@ -55,7 +55,7 @@ pub use evict::{
     Decision, EVICT_BLOCK_CALLS, EVICT_MIN_FREE_PERCENT, RATIO_MAX, RATIO_MIN, RATIO_SMOOTHING,
     calibrated, calibrated_delta, min_free, next_ratio, schemas_tokens,
 };
-pub use harness_tools::{IdleProposal, NOT_RUN_LENGTH, NOT_RUN_OVER_LIMIT, Settled};
+pub use harness_tools::{IdleProposal, NOT_RUN_LENGTH, NOT_RUN_OVER_LIMIT, NOT_RUN_SOLO, Settled};
 pub use knowledge::{Knowledge, KnowledgeMode};
 pub use layers::{Decided, GlobalLayer, Layers, WorkspaceLayer};
 pub use memory::{MEMORY_FILES, MEMORY_PROMPT};

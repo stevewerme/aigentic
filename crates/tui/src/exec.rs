@@ -18,6 +18,8 @@ use anyhow::bail;
 use tokio::sync::mpsc;
 use ulid::Ulid;
 
+use crate::app::engine::{TurnEvents, turn_end_report};
+
 /// The turn ended `done` and nothing was denied.
 pub const EXIT_OK: i32 = 0;
 /// A budget stop, a provider error, or no turn at all.
@@ -183,6 +185,9 @@ struct Follow {
     /// The last `turn_ended` reason.
     reason: Option<String>,
     last_message: String,
+    /// The open turn's own events, for the turn-end report (issue #113),
+    /// under the same bound the engine keeps (`app::engine::TurnEvents`).
+    turn: TurnEvents,
 }
 
 impl Follow {
@@ -216,64 +221,79 @@ impl Follow {
                     writeln!(err, "→ {} {args}", call.name)?;
                 }
             }
-            Notice::Event { event, .. } => match event.kind {
-                EventKind::AssistantMessage => {
-                    self.end_line(err)?;
-                    if let Ok(p) =
-                        serde_json::from_value::<AssistantMessagePayload>(event.payload.clone())
-                    {
-                        let text: Vec<&str> = p
-                            .blocks
-                            .iter()
-                            .filter_map(|b| match b {
-                                ContentBlock::Text(t) => Some(t.as_str()),
-                                _ => None,
-                            })
-                            .collect();
-                        if !text.is_empty() {
-                            self.last_message = text.join("\n");
+            Notice::Event { event, .. } => {
+                self.turn.push(&event);
+                match event.kind {
+                    EventKind::AssistantMessage => {
+                        self.end_line(err)?;
+                        if let Ok(p) =
+                            serde_json::from_value::<AssistantMessagePayload>(event.payload.clone())
+                        {
+                            let text: Vec<&str> = p
+                                .blocks
+                                .iter()
+                                .filter_map(|b| match b {
+                                    ContentBlock::Text(t) => Some(t.as_str()),
+                                    _ => None,
+                                })
+                                .collect();
+                            if !text.is_empty() {
+                                self.last_message = text.join("\n");
+                            }
                         }
                     }
-                }
-                EventKind::ToolResult if !self.json => {
-                    if let Ok(ToolResultPayload { result, .. }) =
-                        serde_json::from_value(event.payload.clone())
-                    {
-                        let marker = if result.is_error { "✗" } else { "✓" };
-                        let lines: Vec<&str> = result.content.lines().collect();
-                        for line in lines.iter().take(RESULT_LINES) {
-                            writeln!(err, "  {marker} {line}")?;
+                    EventKind::ToolResult if !self.json => {
+                        if let Ok(ToolResultPayload { result, .. }) =
+                            serde_json::from_value(event.payload.clone())
+                        {
+                            let marker = if result.is_error { "✗" } else { "✓" };
+                            let lines: Vec<&str> = result.content.lines().collect();
+                            for line in lines.iter().take(RESULT_LINES) {
+                                writeln!(err, "  {marker} {line}")?;
+                            }
+                            if lines.len() > RESULT_LINES {
+                                writeln!(err, "  … +{} lines", lines.len() - RESULT_LINES)?;
+                            }
                         }
-                        if lines.len() > RESULT_LINES {
-                            writeln!(err, "  … +{} lines", lines.len() - RESULT_LINES)?;
+                    }
+                    EventKind::TurnEnded => {
+                        if let Ok(p) = serde_json::from_value::<TurnEndedPayload>(event.payload) {
+                            // What the turn did and what is left (issue
+                            // #113), ahead of the final `[exec: …]` line
+                            // and never under `--json`, whose consumers
+                            // read the notices.
+                            if !self.json {
+                                self.end_line(err)?;
+                                for line in turn_end_report(&p, self.turn.as_slice()) {
+                                    writeln!(err, "{line}")?;
+                                }
+                            }
+                            self.reason = Some(p.reason);
                         }
                     }
-                }
-                EventKind::TurnEnded => {
-                    if let Ok(p) = serde_json::from_value::<TurnEndedPayload>(event.payload) {
-                        self.reason = Some(p.reason);
+                    // A retry (issue #90): the turn is waiting out a
+                    // provider outage, so a watcher sees it on stderr
+                    // rather than a run that looks hung.
+                    EventKind::ProviderRetried if !self.json => {
+                        self.end_line(err)?;
+                        if let Ok(p) =
+                            serde_json::from_value::<ProviderRetriedPayload>(event.payload)
+                        {
+                            writeln!(
+                                err,
+                                "[retrying {}/{} · {} · next in {}]",
+                                p.attempt,
+                                p.retries,
+                                p.reason,
+                                crate::app::status::elapsed_short(
+                                    std::time::Duration::from_millis(p.wait_ms,)
+                                )
+                            )?;
+                        }
                     }
+                    _ => {}
                 }
-                // A retry (issue #90): the turn is waiting out a
-                // provider outage, so a watcher sees it on stderr
-                // rather than a run that looks hung.
-                EventKind::ProviderRetried if !self.json => {
-                    self.end_line(err)?;
-                    if let Ok(p) = serde_json::from_value::<ProviderRetriedPayload>(event.payload) {
-                        writeln!(
-                            err,
-                            "[retrying {}/{} · {} · next in {}]",
-                            p.attempt,
-                            p.retries,
-                            p.reason,
-                            crate::app::status::elapsed_short(std::time::Duration::from_millis(
-                                p.wait_ms,
-                            ))
-                        )?;
-                    }
-                }
-                _ => {}
-            },
+            }
             Notice::State { state, .. } => match state {
                 ThreadState::Idle if self.running => {
                     self.end_line(err)?;
@@ -360,6 +380,7 @@ impl Follow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::cells::summarise_args;
     use std::collections::VecDeque;
     use std::pin::Pin;
     use std::sync::{Arc, Mutex};
@@ -647,6 +668,65 @@ mod tests {
         assert!(!err.contains("[retrying"), "{err}");
     }
 
+    /// T4 (#113): a scripted provider that makes two tool calls and
+    /// then fails. The report the engine draws reaches `exec`'s stderr
+    /// too, ahead of the final `[exec: …]` line, and never under
+    /// `--json`, whose consumers read the notices.
+    #[tokio::test]
+    async fn a_failed_turn_reports_what_it_did_before_the_exec_line() {
+        let read = ToolCall {
+            id: "c1".into(),
+            name: "read_file".into(),
+            args: serde_json::json!({"path": "aigentic.toml"}),
+        };
+        let list = ToolCall {
+            id: "c2".into(),
+            name: "list_dir".into(),
+            args: serde_json::json!({"path": "."}),
+        };
+        let failed = ProviderEvent::Error(
+            aigentic_runtime::aigentic_core::ProviderError::Transport("connection closed".into()),
+        );
+        let script = || {
+            vec![
+                vec![ProviderEvent::ToolCall(read.clone()), finish("tool_use")],
+                vec![ProviderEvent::ToolCall(list.clone()), finish("tool_use")],
+                vec![failed.clone()],
+            ]
+        };
+        let (o, _, err) = exec(script(), args(false)).await;
+        assert_eq!(o.code, EXIT_FAILED, "{err}");
+        let did = format!(
+            "[before that: read_file {} · list_dir {}]",
+            summarise_args(&read),
+            summarise_args(&list)
+        );
+        let stop = err
+            .lines()
+            .position(|l| l.starts_with("[turn ended: the model's reply failed:"))
+            .unwrap_or_else(|| panic!("no stop line in {err}"));
+        assert!(
+            err.lines()
+                .nth(stop)
+                .unwrap()
+                .contains("(/why shows the raw error)")
+        );
+        let tail: Vec<&str> = err.lines().skip(stop).collect();
+        assert_eq!(tail[1], did, "{err}");
+        assert_eq!(tail[2], "[if that wasn't the end, type continue]", "{err}");
+        let last = err.lines().last().unwrap();
+        assert!(last.starts_with("[exec: "), "{err}");
+
+        // `--json` carries every notice already; a person's lines stay off it.
+        let (o, _, err) = exec(script(), args(true)).await;
+        assert_eq!(o.code, EXIT_FAILED, "{err}");
+        assert!(!err.contains("before that:"), "{err}");
+        assert!(!err.contains("turn ended:"), "{err}");
+    }
+
+    /// A budget stop or a provider error at the end of a run reads as a
+    /// failure on stderr; the report lines are printed before that line
+    /// and never change the exit code (issue #113).
     #[tokio::test]
     async fn a_budget_or_provider_stop_is_a_failure() {
         let f = Follow {
