@@ -433,7 +433,6 @@ impl Runtime {
                     return self.interrupt_turn(by, Vec::new(), &spent, &mut held, observe);
                 }
                 flush_text(&mut text, &mut blocks);
-                spent.iterations += 1;
                 // The one place both numbers exist for the same context
                 // (issue #52): what the provider counted against what the
                 // estimator makes of the same messages. Memory extraction and
@@ -475,6 +474,9 @@ impl Runtime {
                     // Not if the person has asked to stop (issue #114): a
                     // retry nobody is listening for is a call not wanted.
                     if let Some(by) = cancel.cancelled_by() {
+                        // The attempt settled, so the call costs its one
+                        // iteration before the turn ends on the interrupt.
+                        spent.iterations += 1;
                         return self.interrupt_turn(by, Vec::new(), &spent, &mut held, observe);
                     }
                     let payload = serde_json::to_value(ProviderRetriedPayload {
@@ -498,6 +500,11 @@ impl Runtime {
                 break;
             }
             let usage = settled_usage;
+            // Issue #114: a model call costs one iteration, however many
+            // attempts it took — once per model call, not once per attempt.
+            // A call that ends the turn on its error counts its one
+            // iteration here too, exactly as it did before #114.
+            spent.iterations += 1;
             if let Some(e) = error {
                 self.end_turn(
                     &format!("provider_error: {e}"),

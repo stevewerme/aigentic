@@ -8,10 +8,11 @@
 
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use aigentic_core::{
-    AgentId, Author, BoxFuture, CUT_STREAM, Capabilities, CompletionRequest, ContentBlock, Event,
-    EventKind, Message, Provider, ProviderError, ProviderEvent, RiskClass, Tool, ToolError,
+    AgentId, Author, BoxFuture, Budget, CUT_STREAM, Capabilities, CompletionRequest, ContentBlock,
+    Event, EventKind, Message, Provider, ProviderError, ProviderEvent, RiskClass, Tool, ToolError,
     ToolOutput, UserId,
 };
 use aigentic_log::{ThreadLog, TurnEndedPayload};
@@ -507,4 +508,134 @@ async fn a_cancelled_turn_is_not_asked_again() {
     assert_eq!(*calls.lock().unwrap(), 1, "no second request went out");
     assert!(!log_text(&events).contains("partial"));
     assert_eq!(turn_ended(&events).reason, "interrupted");
+}
+
+/// A budget a test sets so an iteration count is the thing under test.
+fn budget(max_iterations: u32) -> Budget {
+    Budget {
+        max_iterations,
+        max_tokens: u64::MAX,
+        max_wall_time: Duration::from_secs(60),
+        cache_read_price_ratio: 0.25,
+    }
+}
+
+/// T10: a model call costs one iteration, however many attempts it took:
+/// a cut and its retry fit inside a budget of one (issue #114).
+#[tokio::test]
+async fn a_cut_and_its_retry_fit_inside_one_iteration() {
+    let mut h = harness(
+        vec![
+            vec![ProviderEvent::TextDelta("partial".into()), done(CUT_STREAM)],
+            vec![ProviderEvent::TextDelta("the answer".into()), done("stop")],
+        ],
+        None,
+    );
+    h.runtime.set_budget(budget(1));
+    let out = h
+        .runtime
+        .run_turn(steve(), vec![ContentBlock::Text("go".into())], &mut |_| {})
+        .await
+        .expect("a retried cut recovers");
+    assert_eq!(out.reason, "done");
+    assert_eq!(
+        retries(&h.runtime.log().read_all().unwrap()).len(),
+        1,
+        "the retry happened: two `complete` calls"
+    );
+    assert_eq!(
+        out.iterations, 1,
+        "two attempts of one model call are one iteration"
+    );
+}
+
+/// T11: a retry does not cost the *next* model call its iteration: with a
+/// budget of two, a first call cut once (its retry asks for a tool) and a
+/// second call as the final reply both fit, exactly as they do without the
+/// cut (issue #114).
+#[tokio::test]
+async fn a_cut_does_not_cost_the_next_model_call_its_iteration() {
+    let mut cut = harness(
+        vec![
+            vec![
+                ProviderEvent::TextDelta("discarded".into()),
+                done(CUT_STREAM),
+            ],
+            vec![
+                ProviderEvent::ToolCall(call("c1", "work")),
+                done("tool_calls"),
+            ],
+            vec![ProviderEvent::TextDelta("all done".into()), done("stop")],
+        ],
+        None,
+    );
+    let mut clean = harness(
+        vec![
+            vec![
+                ProviderEvent::ToolCall(call("c1", "work")),
+                done("tool_calls"),
+            ],
+            vec![ProviderEvent::TextDelta("all done".into()), done("stop")],
+        ],
+        None,
+    );
+
+    let mut seen = Vec::new();
+    for h in [&mut cut, &mut clean] {
+        h.runtime.set_budget(budget(2));
+        let out = h
+            .runtime
+            .run_turn(steve(), vec![ContentBlock::Text("go".into())], &mut |_| {})
+            .await
+            .expect("two model calls fit a budget of two");
+        assert_eq!(out.reason, "done", "neither turn stops on the budget");
+        seen.push(out.iterations);
+    }
+    assert_eq!(
+        seen,
+        vec![2, 2],
+        "two model calls, two iterations, cut or not"
+    );
+    assert_eq!(retries(&cut.runtime.log().read_all().unwrap()).len(), 1);
+    assert_eq!(retries(&clean.runtime.log().read_all().unwrap()).len(), 0);
+}
+
+/// T12: a failing call still counts its one iteration (issue #114). The
+/// cut below ends the turn on its error, exactly as a single uncut error
+/// does; `run_turn` returns `Err` on that path, so the count is read from
+/// the turn that ends without an error — the person's cancel between the
+/// failure and the retry — over the same `spent`.
+#[tokio::test]
+async fn a_failing_call_still_counts_its_one_iteration() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = ThreadLog::open(dir.path(), ulid::Ulid::generate()).unwrap();
+    let token = CancelToken::never();
+    let calls = Arc::new(Mutex::new(0u32));
+    let provider = CutAndCancel {
+        token: token.clone(),
+        calls: calls.clone(),
+    };
+    let mut runtime = Runtime::new(
+        Box::new(provider),
+        registry(),
+        log,
+        AgentId("worker".into()),
+    );
+    let out = runtime
+        .run_turn_until(
+            steve(),
+            vec![ContentBlock::Text("go".into())],
+            &token,
+            &mut Inbox::none(),
+            &mut |_| {},
+        )
+        .await
+        .expect("an interrupted turn is not an error");
+
+    assert_eq!(out.reason, "interrupted", "the person's interrupt wins");
+    assert_eq!(*calls.lock().unwrap(), 1, "one call, cut");
+    assert_eq!(
+        out.iterations, 1,
+        "the call that failed counts once, as before #114"
+    );
 }
