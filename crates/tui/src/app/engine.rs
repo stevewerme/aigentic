@@ -2341,7 +2341,7 @@ pub(crate) fn turn_end_report(p: &TurnEndedPayload, turn: &[Event]) -> Vec<Strin
     };
     lines.push(format!("[turn ended: {message}]"));
     if turn.iter().any(is_turn_start) {
-        let calls = successful_calls(turn, REPORT_CALLS);
+        let calls = named_calls(turn, REPORT_CALLS);
         let what = if calls.is_empty() {
             "no tool ran".to_owned()
         } else {
@@ -2444,6 +2444,9 @@ impl TurnEvents {
                 .into_iter()
                 .map(|c| c.id),
         );
+        // The calls that ran but did not finish, so `before that:` never
+        // claims that no tool ran while one did.
+        keep.extend(last_calls(&self.0, REPORT_CALLS).into_iter().map(|c| c.id));
         let last_at = last_message_at(&self.0);
         let mut kept = Vec::with_capacity(self.0.len());
         for (i, e) in self.0.iter().enumerate() {
@@ -2535,6 +2538,39 @@ fn successful_calls(turn: &[Event], n: usize) -> Vec<ToolCall> {
     }
     let keep = out.len().saturating_sub(n);
     out.split_off(keep)
+}
+
+/// Every tool call the turn holds, in order, newest last, whichever way
+/// its result went.
+fn last_calls(turn: &[Event], n: usize) -> Vec<ToolCall> {
+    let mut out: Vec<ToolCall> = turn
+        .iter()
+        .filter(|e| e.kind == EventKind::AssistantMessage)
+        .flat_map(message_calls)
+        .collect();
+    let keep = out.len().saturating_sub(n);
+    out.split_off(keep)
+}
+
+/// The calls `before that:` names (issue #113): the last `n` successful
+/// calls other than the checklist call — the same text already shows in
+/// the call's own cell — or, when nothing succeeded, what did run, so
+/// the line never says no tool ran while a tool did.
+fn named_calls(turn: &[Event], n: usize) -> Vec<ToolCall> {
+    let good = successful_calls(turn, n);
+    if !good.is_empty() {
+        return good;
+    }
+    let ran: Vec<ToolCall> = last_calls(turn, n)
+        .into_iter()
+        .filter(|c| c.name != UPDATE_TASKS)
+        .collect();
+    if ran.is_empty() {
+        // Nothing but the checklist call: name it rather than deny it.
+        last_calls(turn, n)
+    } else {
+        ran
+    }
 }
 
 /// The first call in the turn's last batch that did not run or never came
@@ -4933,6 +4969,54 @@ mod tests {
             open_checklist(&turn).unwrap().total,
             5,
             "2/5, as the fixture"
+        );
+    }
+
+    /// `before that:` never says no tool ran while one did: a turn whose
+    /// only tool was the checklist call, and a turn whose only call
+    /// failed, both name what ran instead.
+    #[test]
+    fn a_turn_that_ran_a_tool_is_not_said_to_have_run_none() {
+        let tasks = an_update_tasks_call(
+            "t1",
+            serde_json::json!([{ "text": "write the code", "state": "active" }]),
+        );
+        let p = provider_error_payload(503, "{}");
+        let turn = vec![
+            turn_start(1),
+            call_message(2, std::slice::from_ref(&tasks)),
+            call_result(
+                3,
+                &tasks,
+                false,
+                PolicyRecord::rule("harness tool", "allow"),
+            ),
+        ];
+        let lines = turn_end_report(&p, &turn);
+        assert_eq!(
+            lines
+                .iter()
+                .find(|l| l.starts_with("[before that: "))
+                .expect("the line is drawn"),
+            &format!("[before that: {}]", rendered(&tasks)),
+            "{lines:#?}"
+        );
+
+        // A call that ran and failed is named too, not denied.
+        let call = a_bash_call("c1", "cargo test");
+        let turn = vec![
+            turn_start(1),
+            call_message(2, std::slice::from_ref(&call)),
+            call_result(3, &call, true, PolicyRecord::rule("bash", "allow")),
+        ];
+        let lines = turn_end_report(&p, &turn);
+        assert_eq!(
+            lines
+                .iter()
+                .find(|l| l.starts_with("[before that: "))
+                .expect("the line is drawn"),
+            &format!("[before that: {}]", rendered(&call)),
+            "{lines:#?}"
         );
     }
 
