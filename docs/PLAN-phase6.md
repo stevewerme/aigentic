@@ -990,7 +990,8 @@ this one wins for the item it names.
    classification an event (the model, the answer, the probability), so
    `stats --decisions` compares classifier, model and person per kind.
    Shadow first (ADR 0001): it records what it would decide and changes
-   nothing until the data says so. Seam: **one ticket before #12**: the
+   nothing until the data says so. Seam: **the labels now, the trait later** (revised 2026-10-08, below).
+   As first written: **one ticket before #12**: the
    trait, the profile, the event, and shadow on project routing only,
    so the acceptance week measures it. The other decisions follow #12,
    if the data says it pays.
@@ -1016,6 +1017,18 @@ this one wins for the item it names.
    pre-turn decision). Both are within the principle as reworded on
    2026-10-07 (open weights, sovereign EU infrastructure or local; see
    the top of this plan and the PRD's principles).
+
+   **Revised 2026-10-08 (Steve).** The scarce asset is not the trait, it
+   is the labels, so the seam moves. One small ticket records, for every
+   decision kind, the slice a fast decider would see (the message, each
+   project's name and one-liner, never the prefix), the model's answer
+   and the person's, in one shape: the calibration set, which costs a
+   field and no model. The trait, the `classifier` profile, the shadow
+   event and Laya come **after #12**, when routing has a few hundred
+   labelled answers. A trait with no implementation is a placeholder;
+   the labels are what any System One is calibrated on. The rule this
+   keeps: design for the decision the system needs, not for a classifier.
+   The ticket is `log, runtime: the decider's input on every decision`.
 8. **Single player in the cloud.** The daemon, the socket protocol and
    roles (phase 5) already exist; the cloud adds a VM, authentication and
    TLS. An agent with `bash` on a public machine needs item 6 first.
@@ -1033,7 +1046,9 @@ this one wins for the item it names.
     already run probes, mutation checks and the real binary. Revisit
     only if judges start missing defects.
 
-The order, as of 2026-10-07: item 2 now; #102, #98; items 3 and 4; item
-5; #10, #8; #77 to #79, designed with item 6's seam; item 7's shadow
-ticket; #12; then phase 7 with items 6 and 8; item 7's other decisions
-and item 9's promotion from #12's data; item 1 when design work starts.
+The order, as of 2026-10-08: item 2 now; #102, #98; items 3 and 4;
+item 5, which #115 carries; #10's ask, then #8; #77 to #79, designed
+with item 6's seam; then the pipeline job (#117), so the loop stops
+needing pasted prompts; item 7's label record; #12; then phase 7 with
+items 6 and 8; item 7's trait, profile and Laya after #12's labels;
+item 9's promotion from #12's data; item 1 when design work starts.
