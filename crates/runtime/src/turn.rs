@@ -289,139 +289,215 @@ impl Runtime {
                 max_output_tokens: None,
             };
 
-            let (mut blocks, mut text, mut usage, mut error) =
-                (Vec::new(), String::new(), None, None);
-            // The provider's own reason the reply ended (issue #96): the
-            // difference between a reply that finished and one that was
-            // cut off or ran out of output tokens.
-            let mut finish_reason: Option<String> = None;
+            // Per attempt (issue #114): every one of these is re-assigned
+            // at the top of the attempt loop, so a retry discards all the
+            // previous attempt collected before anything is appended,
+            // run or trusted.
+            let mut blocks;
+            let mut text;
+            let mut raw_usage;
+            let mut error;
+            // `finish_reason` is the provider's own reason the reply ended
+            // (issue #96): the difference between a reply that finished and
+            // one that was cut off or ran out of output tokens.
+            let mut finish_reason;
+            // Whether any content has arrived on the attempt now running
+            // (issue #114): a delta, a tool call or a blob, the same
+            // predicate the time-to-first-token below uses. Only a failure
+            // after content is asked again.
+            let mut content;
             // Issue #31: the call's waiting time, stamped on its usage
             // line. `ttft_ms` is the first streamed block, so a slow
             // model (thinking before any delta) reads separately from a
-            // slow transport.
-            let requested = Instant::now();
-            let mut ttft_ms = None;
-            let mut stream = self.provider.complete(&request);
-            let mut interrupted_by = None;
+            // slow transport. Both are re-stamped per attempt (issue
+            // #114) so the successful attempt's usage line spans only
+            // itself.
+            let mut requested;
+            let mut ttft_ms;
+            // Issue #114: a reply cut off after content is asked again,
+            // once, inside this same model call. The outer loop is not
+            // re-entered: the request is built once, so no compaction,
+            // inbox drain or budget check runs between the two attempts
+            // and the call costs one iteration either way.
+            let mut retried_once = false;
+            // The usage of the attempt that is not retried, carried out of
+            // the attempt loop (issue #114): the raw `raw_usage` slot is
+            // shadowed by the finalised `Usage` inside the loop.
+            let settled_usage;
+            let agent = Author::Agent(self.agent.clone());
             loop {
-                let event = tokio::select! {
-                    biased;
-                    by = cancel.cancelled() => {
-                        interrupted_by = Some(by);
-                        break;
-                    }
-                    // A message posted mid-call is held, not appended:
-                    // the stream borrows the provider, the log is
-                    // another field, and this call is already out, so
-                    // nothing can show the message to it. It leaves
-                    // `held` at the next safe point — after that reply's
-                    // last tool result and before the call that reads it
-                    // (`steer`), or before `turn_ended` if the turn ends
-                    // first (`steer` unset), so the next turn, which
-                    // the actor starts, picks it up.
-                    queued = inbox.recv() => {
-                        held.push(queued);
-                        continue;
-                    }
-                    event = stream.next() => event,
-                };
-                let Some(event) = event else { break };
-                if ttft_ms.is_none() && block_start(&event) {
-                    ttft_ms = Some(requested.elapsed().as_millis() as u64);
-                }
-                match event {
-                    // Live retries (issue #31): appended as they arrive,
-                    // so the log and every client see the wait as it
-                    // happens rather than after the call recovers.
-                    ProviderEvent::Retried {
-                        attempt,
-                        retries,
-                        reason,
-                        wait,
-                    } => {
-                        let payload = serde_json::to_value(ProviderRetriedPayload {
-                            attempt,
-                            retries,
-                            reason: self.retry_reason(&reason),
-                            wait_ms: wait.as_millis() as u64,
-                        })
-                        .expect("serialisable");
-                        let event = self.log.append(NewEvent {
-                            kind: EventKind::ProviderRetried,
-                            author: Author::System,
-                            payload,
-                            parent_event: None,
-                        })?;
-                        observe(Signal::Event(&event));
-                    }
-                    ProviderEvent::TextDelta(t) => {
-                        observe(Signal::TextDelta(&t));
-                        text.push_str(&t);
-                    }
-                    ProviderEvent::ToolCall(call) => {
-                        flush_text(&mut text, &mut blocks);
-                        blocks.push(ContentBlock::ToolCall(call));
-                    }
-                    ProviderEvent::Blob(blob) => blocks.push(ContentBlock::ProviderBlob(blob)),
-                    ProviderEvent::Usage(u) => usage = Some(Usage::reported(u)),
-                    ProviderEvent::Done {
-                        finish_reason: reason,
-                    } => {
-                        // A stream that ended without a reason was cut
-                        // off mid-reply (issue #96): the text may stop
-                        // mid-sentence and a tool call mid-arguments, so
-                        // nothing about it can be trusted — the existing
-                        // error path below ends the turn, writes no
-                        // assistant message and runs no call.
-                        if reason == CUT_STREAM {
-                            error = Some(ProviderError::Cut);
+                blocks = Vec::new();
+                text = String::new();
+                raw_usage = None;
+                error = None;
+                finish_reason = None;
+                content = false;
+                requested = Instant::now();
+                ttft_ms = None;
+                let mut stream = self.provider.complete(&request);
+                let mut interrupted_by = None;
+                loop {
+                    let event = tokio::select! {
+                        biased;
+                        by = cancel.cancelled() => {
+                            interrupted_by = Some(by);
                             break;
                         }
-                        finish_reason = Some(reason);
+                        // A message posted mid-call is held, not appended:
+                        // the stream borrows the provider, the log is
+                        // another field, and this call is already out, so
+                        // nothing can show the message to it. It leaves
+                        // `held` at the next safe point — after that reply's
+                        // last tool result and before the call that reads it
+                        // (`steer`), or before `turn_ended` if the turn ends
+                        // first (`steer` unset), so the next turn, which
+                        // the actor starts, picks it up.
+                        queued = inbox.recv() => {
+                            held.push(queued);
+                            continue;
+                        }
+                        event = stream.next() => event,
+                    };
+                    let Some(event) = event else { break };
+                    if block_start(&event) {
+                        content = true;
+                        if ttft_ms.is_none() {
+                            ttft_ms = Some(requested.elapsed().as_millis() as u64);
+                        }
                     }
-                    ProviderEvent::Error(e) => {
-                        error = Some(e);
-                        break;
+                    match event {
+                        // Live retries (issue #31): appended as they arrive,
+                        // so the log and every client see the wait as it
+                        // happens rather than after the call recovers.
+                        ProviderEvent::Retried {
+                            attempt,
+                            retries,
+                            reason,
+                            wait,
+                        } => {
+                            let payload = serde_json::to_value(ProviderRetriedPayload {
+                                attempt,
+                                retries,
+                                reason: self.retry_reason(&reason),
+                                wait_ms: wait.as_millis() as u64,
+                            })
+                            .expect("serialisable");
+                            let event = self.log.append(NewEvent {
+                                kind: EventKind::ProviderRetried,
+                                author: Author::System,
+                                payload,
+                                parent_event: None,
+                            })?;
+                            observe(Signal::Event(&event));
+                        }
+                        ProviderEvent::TextDelta(t) => {
+                            observe(Signal::TextDelta(&t));
+                            text.push_str(&t);
+                        }
+                        ProviderEvent::ToolCall(call) => {
+                            flush_text(&mut text, &mut blocks);
+                            blocks.push(ContentBlock::ToolCall(call));
+                        }
+                        ProviderEvent::Blob(blob) => blocks.push(ContentBlock::ProviderBlob(blob)),
+                        ProviderEvent::Usage(u) => raw_usage = Some(Usage::reported(u)),
+                        ProviderEvent::Done {
+                            finish_reason: reason,
+                        } => {
+                            // A stream that ended without a reason was cut
+                            // off mid-reply (issue #96): the text may stop
+                            // mid-sentence and a tool call mid-arguments, so
+                            // nothing about it can be trusted — the existing
+                            // error path below ends the turn, writes no
+                            // assistant message and runs no call.
+                            if reason == CUT_STREAM {
+                                error = Some(ProviderError::Cut);
+                                break;
+                            }
+                            finish_reason = Some(reason);
+                        }
+                        ProviderEvent::Error(e) => {
+                            error = Some(e);
+                            break;
+                        }
                     }
                 }
+                drop(stream);
+                // What arrived in the instants the last polls of the stream
+                // raced past joins what the arm held — same rule, same point
+                // of first sight — rather than landing before the assistant
+                // message of the reply it interrupted.
+                held.extend(inbox.drain());
+                if let Some(by) = interrupted_by {
+                    // Dropped mid-call: no partial message, as a crash would
+                    // leave none.
+                    return self.interrupt_turn(by, Vec::new(), &spent, &mut held, observe);
+                }
+                flush_text(&mut text, &mut blocks);
+                spent.iterations += 1;
+                // The one place both numbers exist for the same context
+                // (issue #52): what the provider counted against what the
+                // estimator makes of the same messages. Memory extraction and
+                // titles run on the utility provider and never reach here, so
+                // only the thread's own model teaches the ratio.
+                let prompt = raw_usage
+                    .as_ref()
+                    .map(|u| u.input_tokens + u.cache_read_tokens + u.cache_write_tokens);
+                self.measured = prompt.map(|p| (p, context.len()));
+                if let Some(reported) = prompt {
+                    let estimate = self.provider.count_tokens(&context);
+                    self.ratio =
+                        crate::evict::next_ratio(self.ratio, reported, estimate, self.overhead);
+                }
+                observe(Signal::Usage(self.window_usage(&context)));
+                let mut usage =
+                    raw_usage.unwrap_or_else(|| self.estimate_usage(&context, &agent, &blocks));
+                usage.profile = self.profile.clone();
+                usage.model = Some(self.model_label.clone());
+                usage.effort = self.effort.clone();
+                usage.latency_ms = Some(requested.elapsed().as_millis() as u64);
+                usage.ttft_ms = ttft_ms;
+                usage.cost_usd = self.prices.map(|p| p.cost_usd(&usage));
+                spent.tokens += self.budget.spent_of(&usage.to_core());
+                // Issue #114: the attempt failed after content, and the
+                // failure is one a fresh call can get past — a stream cut off
+                // with no end marker (`Cut`), or a transient error such as a
+                // dropped mid-stream connection. `Protocol`, `Unsupported` and
+                // a refusal are not transient (`ProviderError::is_transient`),
+                // so a malformed stream still ends the turn as before; the
+                // boundary is deliberately narrower than "any error after
+                // content". #90's adapter retries are untouched: this is the
+                // one retry the runtime itself makes, and the new call gets
+                // its own adapter window.
+                let retryable = error
+                    .as_ref()
+                    .is_some_and(|e| matches!(e, ProviderError::Cut) || e.is_transient());
+                if content && retryable && !retried_once {
+                    // Not if the person has asked to stop (issue #114): a
+                    // retry nobody is listening for is a call not wanted.
+                    if let Some(by) = cancel.cancelled_by() {
+                        return self.interrupt_turn(by, Vec::new(), &spent, &mut held, observe);
+                    }
+                    let payload = serde_json::to_value(ProviderRetriedPayload {
+                        attempt: 1,
+                        retries: 1,
+                        reason: self.retry_reason("cut off mid-reply"),
+                        wait_ms: 0,
+                    })
+                    .expect("serialisable");
+                    let event = self.log.append(NewEvent {
+                        kind: EventKind::ProviderRetried,
+                        author: Author::System,
+                        payload,
+                        parent_event: None,
+                    })?;
+                    observe(Signal::Event(&event));
+                    retried_once = true;
+                    continue;
+                }
+                settled_usage = usage;
+                break;
             }
-            drop(stream);
-            // What arrived in the instants the last polls of the stream
-            // raced past joins what the arm held — same rule, same point
-            // of first sight — rather than landing before the assistant
-            // message of the reply it interrupted.
-            held.extend(inbox.drain());
-            if let Some(by) = interrupted_by {
-                // Dropped mid-call: no partial message, as a crash would
-                // leave none.
-                return self.interrupt_turn(by, Vec::new(), &spent, &mut held, observe);
-            }
-            flush_text(&mut text, &mut blocks);
-            spent.iterations += 1;
-            let agent = Author::Agent(self.agent.clone());
-            // The one place both numbers exist for the same context
-            // (issue #52): what the provider counted against what the
-            // estimator makes of the same messages. Memory extraction and
-            // titles run on the utility provider and never reach here, so
-            // only the thread's own model teaches the ratio.
-            let prompt = usage
-                .as_ref()
-                .map(|u| u.input_tokens + u.cache_read_tokens + u.cache_write_tokens);
-            self.measured = prompt.map(|p| (p, context.len()));
-            if let Some(reported) = prompt {
-                let estimate = self.provider.count_tokens(&context);
-                self.ratio =
-                    crate::evict::next_ratio(self.ratio, reported, estimate, self.overhead);
-            }
-            observe(Signal::Usage(self.window_usage(&context)));
-            let mut usage = usage.unwrap_or_else(|| self.estimate_usage(&context, &agent, &blocks));
-            usage.profile = self.profile.clone();
-            usage.model = Some(self.model_label.clone());
-            usage.effort = self.effort.clone();
-            usage.latency_ms = Some(requested.elapsed().as_millis() as u64);
-            usage.ttft_ms = ttft_ms;
-            usage.cost_usd = self.prices.map(|p| p.cost_usd(&usage));
-            spent.tokens += self.budget.spent_of(&usage.to_core());
+            let usage = settled_usage;
             if let Some(e) = error {
                 self.end_turn(
                     &format!("provider_error: {e}"),

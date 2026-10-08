@@ -541,7 +541,13 @@ impl Rig {
 /// one release, nothing left outstanding.
 #[tokio::test]
 async fn a_turn_that_ends_on_a_provider_error_is_balanced() {
-    let rig = rig(vec![Some(vec![text("half"), failed()])]);
+    // The retry a transient error after content earns (issue #114) fails
+    // too, so the turn still ends on the error; the hold is taken once per
+    // turn, so the retry adds none.
+    let rig = rig(vec![
+        Some(vec![text("half"), failed()]),
+        Some(vec![failed()]),
+    ]);
     let mut notices = rig.subscribe().await;
     rig.post(steve(), "one", false).await;
     rig.until_idle(&mut notices).await;

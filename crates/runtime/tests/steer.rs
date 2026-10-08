@@ -562,6 +562,14 @@ async fn a_message_posted_mid_stream_before_a_provider_error_is_not_lost() {
                 "connection dropped".into(),
             ))),
         ],
+        // The retry (issue #114): the error is transient after content, so
+        // the runtime asks once more — and this attempt fails too, so the
+        // turn still ends on the error. No content here, so no further
+        // retry follows.
+        vec![Step::Event(ProviderEvent::Error(ProviderError::Transport(
+            "connection dropped".into(),
+        )))],
+        // The next turn's answer, which reads the mid-stream message.
         vec![
             Step::Event(ProviderEvent::TextDelta("adjusted.".into())),
             Step::Event(done("stop")),
@@ -601,12 +609,28 @@ async fn a_message_posted_mid_stream_before_a_provider_error_is_not_lost() {
 
     // And the turn the actor starts next answers it.
     let seen = rig.seen.lock().unwrap();
-    assert_eq!(seen.len(), 2, "the call that errored, then the answer");
+    // The call that errored, the retry the cut error earns (issue #114),
+    // then the answer: a retry re-issues the same request, so it is a
+    // model call of its own and the double records it.
+    assert_eq!(
+        seen.len(),
+        3,
+        "the call that errored, the retry, then the answer"
+    );
     assert!(
-        matches!(&seen[1].last().unwrap().blocks[0], ContentBlock::Text(t) if t.contains("magnus")
+        matches!(&seen[2].last().unwrap().blocks[0], ContentBlock::Text(t) if t.contains("magnus")
             && t.contains("use the other file")),
         "the next turn reads it, {:?}",
+        texts(&seen[2])
+    );
+    // And it is not in the retry's request: the request was already out
+    // when the message was posted.
+    assert!(
+        !texts(&seen[1])
+            .iter()
+            .any(|t| t.contains("use the other file")),
+        "the retry read a message posted while it was streaming: {:?}",
         texts(&seen[1])
     );
-    assert_replay(rig.dir.path(), rig.thread, &seen[1..]);
+    assert_replay(rig.dir.path(), rig.thread, &seen[2..]);
 }

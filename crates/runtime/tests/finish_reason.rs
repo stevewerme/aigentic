@@ -71,6 +71,10 @@ async fn a_cut_reply_is_a_provider_failure_with_nothing_kept() {
             ],
             // A call that arrived whole, and then the cut: it must not run.
             vec![sent("c1", "do it"), done(aigentic_core::CUT_STREAM)],
+            // Each cut earns one retry (issue #114), and each retry is cut
+            // too, so the turn still ends on the cut with nothing kept.
+            vec![done(aigentic_core::CUT_STREAM)],
+            vec![done(aigentic_core::CUT_STREAM)],
         ],
         None,
     );

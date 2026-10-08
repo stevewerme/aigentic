@@ -373,6 +373,16 @@ pub struct ClientRepl {
     /// (issue #41), the source of `/copy`: unlike `partial` it survives a
     /// newline, so a whole reply's fences are intact.
     reply: String,
+    /// Whether streamed text has arrived since the last
+    /// `AssistantMessage` or turn start (issue #114). `partial` cannot
+    /// serve: the engine flushes it at a streamed tool call, so a reply
+    /// cut behind a tool call leaves it empty while its text is still on
+    /// screen.
+    streamed_text: bool,
+    /// The length of `reply` when the current call's text stream began
+    /// (issue #114), so a retried cut truncates `/copy` back past exactly
+    /// the discarded attempt and no further.
+    reply_stream_start: usize,
     /// The call id of the request or question this client prompted for
     /// and has not answered: a decision from elsewhere withdraws it.
     prompted: Option<String>,
@@ -451,6 +461,8 @@ impl ClientRepl {
             identity,
             partial: String::new(),
             reply: String::new(),
+            streamed_text: false,
+            reply_stream_start: 0,
             prompted: None,
             menu: None,
             turn: None,
@@ -965,6 +977,8 @@ impl ClientRepl {
         self.calls.clear();
         self.partial.clear();
         self.reply.clear();
+        self.streamed_text = false;
+        self.reply_stream_start = 0;
         self.prompted = None;
         self.menu = None;
         self.turn = None;
@@ -1040,6 +1054,7 @@ impl ClientRepl {
             // A new prompt starts a new reply (issue #41): what `/copy`
             // copies is the answer to the last thing asked here.
             self.reply.clear();
+            self.streamed_text = false;
         }
         self.show(r, ok, out);
     }
@@ -1752,6 +1767,13 @@ impl ClientRepl {
                 };
             }
             Notice::TextDelta { text, .. } => {
+                // The first text of this call's stream marks where a
+                // discarded attempt would start (issue #114), so a
+                // runtime retry truncates `/copy` back to exactly here.
+                if !self.streamed_text {
+                    self.streamed_text = true;
+                    self.reply_stream_start = self.reply.len();
+                }
                 if let Some(t) = self.turn.as_mut() {
                     // A blank block is not writing (issue #43): the
                     // model sends one before nearly every tool call,
@@ -1850,6 +1872,9 @@ impl ClientRepl {
                         // A fresh checklist per turn: the last one's
                         // items are already in the scrollback.
                         self.tasks.clear();
+                        // A fresh turn: no call of it has streamed text
+                        // yet (issue #114).
+                        self.streamed_text = false;
                     }
                 }
                 self.state = state;
@@ -1965,6 +1990,9 @@ impl ClientRepl {
         match event.kind {
             EventKind::AssistantMessage => {
                 self.flush_partial(out);
+                // The call's reply is settled and kept: text after this
+                // belongs to the next call (issue #114).
+                self.streamed_text = false;
                 if let Some(t) = self.turn.as_mut() {
                     t.writing = false;
                     t.retry = None;
@@ -2184,6 +2212,26 @@ impl ClientRepl {
             // line of its own. The attempt is visible the moment the
             // wait starts, so a dead endpoint never reads as a slow model.
             EventKind::ProviderRetried => {
+                // A runtime retry after text was streamed (issue #114):
+                // the reply on screen and in `/copy` is discarded whole,
+                // so say so and cut it back past the attempt. A #90
+                // adapter retry never reaches here with text shown — its
+                // window is before the first content — so it stays silent,
+                // as before. A backlog carries no `TextDelta` notices, so
+                // the flag is false on replay and nothing is drawn.
+                if self.streamed_text {
+                    self.flush_partial(out);
+                    out.cell(
+                        Cell::Note(
+                            "[the reply was cut off mid-stream; asking again — the text above is \
+                             discarded]"
+                                .into(),
+                        ),
+                        true,
+                    );
+                    self.reply.truncate(self.reply_stream_start);
+                    self.streamed_text = false;
+                }
                 if let Ok(p) = serde_json::from_value::<
                     aigentic_runtime::aigentic_log::ProviderRetriedPayload,
                 >(event.payload.clone())
@@ -2979,6 +3027,13 @@ mod tests {
     fn done() -> ProviderEvent {
         ProviderEvent::Done {
             finish_reason: "stop".into(),
+        }
+    }
+
+    /// A stream cut off with no end marker (issue #96/#114).
+    fn cut() -> ProviderEvent {
+        ProviderEvent::Done {
+            finish_reason: aigentic_runtime::aigentic_core::CUT_STREAM.into(),
         }
     }
     fn call(id: &str, name: &str, args: serde_json::Value) -> ProviderEvent {
@@ -8301,6 +8356,118 @@ mod tests {
         assert!(
             rig.repl.menu_id().as_deref() == Some("chat:b1"),
             "the checkpoint is still the one keyed"
+        );
+    }
+
+    // ---- the retry after a cut (issue #114) ---------------------------
+
+    /// T7 (#114): a reply cut off mid-stream is asked again and the shown
+    /// text is said to be dropped: the flushed partial, then the dim note,
+    /// then the retry's reply.
+    #[tokio::test]
+    async fn a_cut_after_streamed_text_draws_the_note_between_the_text_and_the_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = project(dir.path(), "p", "");
+        let script = vec![
+            vec![text("half a reply"), cut()],
+            vec![text("the real reply"), done()],
+        ];
+        let (embedded, lines) = run_a_scripted_repl(dir.path(), root, script, "hello").await;
+        drop(embedded);
+
+        let index = |needle: &str| {
+            lines
+                .iter()
+                .position(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("no line with {needle:?}: {lines:#?}"))
+        };
+        let text = index("half a reply");
+        let note = index("cut off mid-stream");
+        let answer = index("the real reply");
+        assert!(
+            lines[note].contains("asking again") && lines[note].contains("discarded"),
+            "the note says what happened: {:?}",
+            lines[note]
+        );
+        assert!(
+            text < note && note < answer,
+            "the note comes after the text it retracts and before the answer: {lines:#?}"
+        );
+    }
+
+    /// T7 (#114): `/copy` drops exactly the attempt the retry discarded
+    /// and keeps the turn's earlier, kept reply — the truncation back to
+    /// where the cut call's stream began, not `clear()`.
+    #[tokio::test]
+    async fn copy_drops_the_attempt_a_retry_discarded_and_keeps_the_kept_reply() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = project(dir.path(), "p", "");
+        let cfg_dir = dir.path().join("cfg");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        let script = vec![
+            vec![
+                text("kept reply"),
+                call("c1", "update_tasks", serde_json::json!({"tasks": []})),
+                tool_use(),
+            ],
+            vec![text("discarded reply"), cut()],
+            vec![text("the real reply"), done()],
+        ];
+        let embedded = Server::embed_with(
+            config(dir.path()),
+            cfg_dir.clone(),
+            root,
+            "steve",
+            None,
+            Factory::scripted(script),
+            Arc::new(DefaultReports {
+                global_instructions: cfg_dir.join("instructions.md"),
+            }),
+        )
+        .await
+        .unwrap();
+        let addr = Addr::Unix(embedded.socket.clone());
+        let (client, welcome) = Client::connect(&addr, &embedded.token).await.unwrap();
+        let role = welcome.projects[0].role.clone();
+        let (thread, state, mode) = open(&client, "p", None).await;
+        let notices = client.take_notices().unwrap();
+        let mut repl = ClientRepl::new(
+            client,
+            thread,
+            "steve",
+            role,
+            state,
+            mode,
+            Identity::default(),
+            "p",
+        );
+        let (pacer, _) = Client::connect(&addr, &embedded.token).await.unwrap();
+        open(&pacer, "p", Some(thread)).await;
+        let mut paced = pacer.take_notices().unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let feeder = async move {
+            tx.send("hello".into()).unwrap();
+            // The turn has three model calls: let it finish them all.
+            until_state(&mut paced, |s| *s == ThreadState::Idle).await;
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            tx.send("/copy all".into()).unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            tx.send("/quit".into()).unwrap();
+        };
+        let mut caps = Copies::default();
+        let ((), ()) = tokio::join!(repl.run(rx, notices, &mut caps), feeder);
+        let copied = caps
+            .1
+            .last()
+            .unwrap_or_else(|| panic!("nothing was copied: {:#?}", caps.0.0))
+            .clone();
+        assert!(
+            copied.contains("kept reply") && copied.contains("the real reply"),
+            "the kept calls are still copyable: {copied:?}"
+        );
+        assert!(
+            !copied.contains("discarded reply"),
+            "the discarded attempt is gone: {copied:?}"
         );
     }
 }

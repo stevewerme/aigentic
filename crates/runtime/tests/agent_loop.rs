@@ -304,14 +304,13 @@ async fn unknown_tool_and_tool_error_become_error_results_not_crashes() {
 
 #[tokio::test]
 async fn provider_error_ends_the_turn_with_an_event_and_an_error() {
+    // The error comes before any content, so nothing of this reply was
+    // ever shown and no retry is earned (issue #114).
     let mut h = harness(
-        vec![vec![
-            ProviderEvent::TextDelta("partial".into()),
-            ProviderEvent::Error(ProviderError::Http {
-                status: 500,
-                body: "boom".into(),
-            }),
-        ]],
+        vec![vec![ProviderEvent::Error(ProviderError::Http {
+            status: 500,
+            body: "boom".into(),
+        })]],
         None,
     );
     let err = h
