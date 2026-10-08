@@ -106,6 +106,18 @@ pub enum Mail {
         reason: String,
         reply: oneshot::Sender<Response>,
     },
+    /// Record the start-up ask's answer (issue #121): the person was
+    /// asked which project to work in before anything was open, and the
+    /// pair — a `project` proposal and its answer — is written back to
+    /// back through the real observer, with no state waiting and no
+    /// keep-awake guard. Idle only, like every other writer.
+    RecordStartupAsk {
+        offered: String,
+        chosen: String,
+        reason: String,
+        by: Author,
+        reply: oneshot::Sender<Response>,
+    },
     Compact {
         reply: oneshot::Sender<Response>,
     },
@@ -685,6 +697,41 @@ impl ThreadActor {
                 reply,
             } => {
                 self.propose_switch_idle(project, reason, reply).await;
+                None
+            }
+            Mail::RecordStartupAsk {
+                offered,
+                chosen,
+                reason,
+                by,
+                reply,
+            } => {
+                let shared = self.shared.clone();
+                let sys = Author::System;
+                let _ = reply.send(
+                    match self.runtime.record_startup_ask(
+                        &offered,
+                        &chosen,
+                        &reason,
+                        by,
+                        &mut |s| shared.observe(s, &sys),
+                    ) {
+                        Ok(()) => {
+                            // `observe` reads the answered event as the
+                            // end of a wait and puts the guard up, but no
+                            // turn runs here: nothing would take it down,
+                            // so do it here, the way `answer_idle_switch`
+                            // does after an idle answer (#47).
+                            shared.set_state(ThreadState::Idle);
+                            shared.take_switched();
+                            shared.drop_guard();
+                            Response::Ok
+                        }
+                        Err(e) => Response::Error {
+                            message: e.to_string(),
+                        },
+                    },
+                );
                 None
             }
             Mail::Pin {
@@ -1281,6 +1328,7 @@ impl ThreadActor {
             | Mail::Rename { reply, .. }
             | Mail::SwitchProject { reply, .. }
             | Mail::ProposeSwitch { reply, .. }
+            | Mail::RecordStartupAsk { reply, .. }
             | Mail::Compact { reply }
             | Mail::SetMode { reply, .. }
             | Mail::Report { reply, .. } => {

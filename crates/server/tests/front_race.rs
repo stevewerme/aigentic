@@ -130,6 +130,7 @@ async fn front_race_child() {
         .request(Request::Front {
             project: embedded.project.clone(),
             here: None,
+            asked: None,
         })
         .await
         .unwrap();

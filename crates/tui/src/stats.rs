@@ -6302,6 +6302,87 @@ api_key_env = "TENSORX_API_KEY"
         assert!(text.contains("project (start-up)"), "{text}");
     }
 
+    /// T5 (issue #121): a start-up ask's pair lands in `project`'s
+    /// `startup` row — `yes` when the person took the offered project,
+    /// `corrected` when they went elsewhere — with no pending proposal
+    /// and no orphan. The lines are built from the payload types
+    /// `record_startup_ask` writes, so the fixture cannot drift from the
+    /// event shape.
+    #[test]
+    fn t5_a_startup_ask_answer_counts_in_the_project_startup_row() {
+        use aigentic_runtime::aigentic_log::{
+            DecisionAnsweredPayload, DecisionProposedPayload, DecisionStage, STARTUP_PREFIX,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let offered = "web";
+        // One answer takes the offered project, the other goes elsewhere.
+        for (n, chosen) in ["web", "api"].into_iter().enumerate() {
+            let proposal = Ulid::generate();
+            // The call id's shape is the writer's: the start-up prefix and
+            // an `ask-` marker.
+            let call_id = format!("{STARTUP_PREFIX}ask-{}", Ulid::generate());
+            let at = format!("2026-10-0{}T09:00:00Z", n + 5);
+            let proposed = json!({
+                "id": proposal.to_string(),
+                "kind": "decision_proposed",
+                "author": {"kind": "system"},
+                "payload": serde_json::to_value(DecisionProposedPayload {
+                    kind: DecisionKind::Project,
+                    proposal: offered.to_owned(),
+                    target: None,
+                    reason: "which project to start in".to_owned(),
+                    call_id: Some(call_id),
+                    stage: DecisionStage::Ask,
+                })
+                .unwrap(),
+                "created_at": at,
+            });
+            let (answer, correction) = if chosen == offered {
+                (DecisionAnswer::Yes, None)
+            } else {
+                (DecisionAnswer::Corrected, Some(chosen.to_owned()))
+            };
+            let answered = json!({
+                "id": Ulid::generate().to_string(),
+                "kind": "decision_answered",
+                "author": {"kind": "user", "id": PERSON},
+                "parent_event": proposal.to_string(),
+                "payload": serde_json::to_value(DecisionAnsweredPayload {
+                    answer,
+                    correction,
+                    note: None,
+                })
+                .unwrap(),
+                "created_at": at,
+            });
+            write_decisions(
+                &dir.path().join(format!("start-{n}")),
+                Ulid::generate(),
+                &[proposed, answered],
+            );
+        }
+
+        let report = collect_decisions(dir.path(), &[], None, None).unwrap();
+        assert_eq!(report.orphans, 0, "the answer names its proposal");
+        let names: Vec<String> = report.kinds.iter().map(row_name).collect();
+        assert_eq!(names, vec!["project (start-up)".to_owned()]);
+        let row = &report.kinds[0];
+        assert_eq!(
+            (
+                row.proposed,
+                row.yes,
+                row.no,
+                row.corrected,
+                row.withdrawn,
+                row.pending
+            ),
+            (2, 1, 0, 1, 0, 0)
+        );
+        // One of the two was taken as offered.
+        assert_eq!(row.rate, Some(50));
+    }
+
     /// #85's review: a table with plain rows only keeps the 14-wide
     /// name column it always had.
     #[test]

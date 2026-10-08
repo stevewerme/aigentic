@@ -486,6 +486,7 @@ async fn front_here(
         .request(Request::Front {
             project: project_name.into(),
             here: here.map(str::to_owned),
+            asked: None,
         })
         .await
         .unwrap()
@@ -791,6 +792,7 @@ async fn t9a_a_lost_role_in_the_requested_project_refuses_to_create_one() {
         Request::Front {
             project: "p".into(),
             here: None,
+            asked: None,
         },
     )
     .await;
@@ -926,6 +928,7 @@ async fn t10b_a_front_that_must_create_is_refused_without_write() {
         Request::Front {
             project: "p".into(),
             here: None,
+            asked: None,
         },
     )
     .await;
@@ -2595,4 +2598,336 @@ async fn t86_t6_workspace_names_group_rows() {
             .all(|r| r.kind == ThreadKind::Thread && r.workspace.as_deref() == Some(name)),
         "{rows:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// T4–T5 (issue #121): the start-up ask's answer rides `Front`
+// ---------------------------------------------------------------------------
+
+/// The ask's answer, as the client sends it after `start_ask` ran: the
+/// offered project, the chosen one, and the reason the offer carried.
+async fn front_asked(
+    client: &mut Client,
+    offered: &str,
+    chosen: &str,
+    reason: &str,
+) -> (Ulid, FrontOutcome) {
+    match client
+        .request(Request::Front {
+            project: chosen.into(),
+            here: Some(chosen.to_owned()),
+            asked: Some(aigentic_api::StartAsk {
+                offered: offered.into(),
+                chosen: chosen.into(),
+                reason: reason.into(),
+            }),
+        })
+        .await
+        .unwrap()
+    {
+        Response::Front { thread, outcome } => (thread.id, outcome),
+        other => panic!("a front thread: {other:?}"),
+    }
+}
+
+/// The `decision_proposed`/`decision_answered` pair a start-up ask
+/// leaves in `t`'s log, or nothing where the server logged none.
+fn ask_pair(
+    base: &Path,
+    t: Ulid,
+) -> (
+    DecisionProposedPayload,
+    Option<(DecisionAnsweredPayload, Option<Ulid>)>,
+) {
+    let events = events_of(base, t);
+    let proposed = events
+        .iter()
+        .filter(|e| e.kind == EventKind::DecisionProposed)
+        .map(|e| {
+            (
+                e.id,
+                serde_json::from_value::<DecisionProposedPayload>(e.payload.clone()).unwrap(),
+            )
+        })
+        .find(|(_, p)| aigentic_runtime::aigentic_log::is_startup_call(p.call_id.as_deref()))
+        .expect("a start-up proposal");
+    let answered = events
+        .iter()
+        .find(|e| e.kind == EventKind::DecisionAnswered && e.parent_event == Some(proposed.0))
+        .map(|e| {
+            (
+                serde_json::from_value::<DecisionAnsweredPayload>(e.payload.clone()).unwrap(),
+                e.parent_event,
+            )
+        });
+    (proposed.1, answered)
+}
+
+/// T4 — a `Resumed` front thread in another project: the answer moves it
+/// there, raises no switch proposal, and the pair lands after the move.
+#[tokio::test]
+async fn t4_ask_a_resumed_thread_moves_to_the_chosen_project_and_logs_the_pair() {
+    let dir = tempfile::tempdir().unwrap();
+    let (daemon, _a, _b, _c) = three_projects(dir.path()).await;
+    let mut steve = daemon.connect("steve").await;
+    let (t, outcome) = front(&mut steve, "a").await;
+    assert_eq!(outcome, FrontOutcome::First);
+
+    let (again, outcome) = front_asked(&mut steve, "a", "b", "the ask says so").await;
+    assert_eq!(outcome, FrontOutcome::Resumed, "the reply's own outcome");
+    assert_eq!(again, t, "the same front thread, moved");
+
+    // Moved: `b` lists it now, and `a` does not.
+    assert!(listed(&mut steve, "b").await.contains(&t));
+    assert!(!listed(&mut steve, "a").await.contains(&t));
+
+    // The pair, and nothing else: no `AwaitingSwitch` was left behind.
+    let (proposed, answered) = ask_pair(daemon.base(), t);
+    assert_eq!(proposed.kind, DecisionKind::Project);
+    assert_eq!(
+        proposed.target, None,
+        "the ask declines nothing: {proposed:?}"
+    );
+    assert!(
+        proposed
+            .call_id
+            .as_deref()
+            .is_some_and(|c| c.starts_with(&format!(
+                "{}ask-",
+                aigentic_runtime::aigentic_log::STARTUP_PREFIX
+            ))),
+        "{proposed:?}"
+    );
+    assert_eq!(proposed.reason, "the ask says so");
+    let (answered, parent) = answered.expect("an answer to the ask");
+    assert_eq!(answered.answer, DecisionAnswer::Corrected);
+    assert_eq!(answered.correction.as_deref(), Some("b"));
+    assert_eq!(
+        parent,
+        Some(
+            events_of(daemon.base(), t)
+                .iter()
+                .find(|e| e.kind == EventKind::DecisionProposed)
+                .expect("the proposal")
+                .id
+        ),
+        "the answer names its proposal"
+    );
+
+    // After the move, so the fold's scope is the new project.
+    let switch = at(daemon.base(), t, EventKind::ProjectSwitched).expect("a switch");
+    let proposal = at(daemon.base(), t, EventKind::DecisionProposed).expect("a proposal");
+    assert!(switch < proposal, "{switch} before {proposal}");
+
+    // Nothing is waiting on the person's answer.
+    assert_eq!(open_state(&mut steve, t).await, ThreadState::Idle);
+    assert_eq!(proposed_of(daemon.base(), t).len(), 1, "one, and only one");
+}
+
+/// T4 — `chosen == offered` logs `Yes` and does not move the thread.
+#[tokio::test]
+async fn t4_ask_b_choosing_the_offered_project_logs_yes_and_does_not_move() {
+    let dir = tempfile::tempdir().unwrap();
+    let (daemon, _a, _b, _c) = three_projects(dir.path()).await;
+    let mut steve = daemon.connect("steve").await;
+    let (t, _) = front(&mut steve, "a").await;
+
+    let (again, outcome) = front_asked(&mut steve, "a", "a", "the ask says so").await;
+    assert_eq!(outcome, FrontOutcome::Resumed);
+    assert_eq!(again, t);
+
+    assert!(listed(&mut steve, "a").await.contains(&t), "it stayed in a");
+    assert!(at(daemon.base(), t, EventKind::ProjectSwitched).is_none());
+    let (proposed, answered) = ask_pair(daemon.base(), t);
+    assert_eq!(proposed.target, None);
+    let (answered, _) = answered.expect("an answer to the ask");
+    assert_eq!(answered.answer, DecisionAnswer::Yes);
+    assert_eq!(answered.correction, None);
+}
+
+/// T4 — `target: None` declines nothing: a later #92 start-up proposal
+/// for the project the ask steered away from is still offered.
+#[tokio::test]
+async fn t4_ask_c_the_answer_declines_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (daemon, _a, _b, _c) = three_projects(dir.path()).await;
+    let (mut steve, t) = idle_front_in_a(&daemon).await;
+
+    // The ask took the person from `a` to `b`: a `Corrected` for `a`.
+    let (again, outcome) = front_asked(&mut steve, "a", "b", "the ask says so").await;
+    assert_eq!(outcome, FrontOutcome::Resumed);
+    assert_eq!(again, t);
+    let (_, answered) = ask_pair(daemon.base(), t);
+    assert_eq!(
+        answered.expect("an answer").0.answer,
+        DecisionAnswer::Corrected
+    );
+
+    // Now a start from `a`'s folder: #92's proposal for `a` is raised
+    // anyway, because the ask's own record names no target.
+    let (again, outcome) = front_here(&mut steve, "a", Some("a")).await;
+    assert_eq!(outcome, FrontOutcome::Resumed);
+    assert_eq!(again, t);
+    let (call_id, project) = waiting(&mut steve, t).await;
+    assert_eq!(project, "a");
+    assert!(call_id.starts_with(STARTUP_PREFIX), "{call_id}");
+}
+
+/// T4 — a busy thread ignores the answer: no move, no pair, resumed as
+/// today, for a thread running and for one waiting on a person.
+#[tokio::test]
+async fn t4_ask_d_a_busy_thread_ignores_the_answer() {
+    for waiting_on_a_person in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let a = project(dir.path(), "a", "");
+        let b = project(dir.path(), "b", "");
+        // First script: a tool call that waits for a person. Second (and
+        // for the other leg, first): a turn that never answers.
+        let script = if waiting_on_a_person {
+            vec![
+                Some(vec![
+                    ProviderEvent::ToolCall(ToolCall {
+                        id: "c1".into(),
+                        name: "write_file".into(),
+                        args: serde_json::json!({"path": "x", "content": "y"}),
+                    }),
+                    ProviderEvent::Done {
+                        finish_reason: "tool_use".into(),
+                    },
+                ]),
+                None,
+            ]
+        } else {
+            vec![None]
+        };
+        let daemon = Daemon::new_with(
+            dir.path(),
+            vec![pc("a", &a), pc("b", &b)],
+            &["steve"],
+            false,
+            ScriptedFactory::new(script),
+        )
+        .await;
+        let mut steve = daemon.connect("steve").await;
+        let (t, _) = front(&mut steve, "a").await;
+        post(&mut steve, t, "go").await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let state = open_state(&mut steve, t).await;
+            let busy = match &state {
+                ThreadState::Running { .. } => !waiting_on_a_person,
+                ThreadState::AwaitingApproval { .. } => waiting_on_a_person,
+                _ => false,
+            };
+            if busy {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "a busy turn");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let (again, outcome) = front_asked(&mut steve, "a", "b", "the ask says so").await;
+        assert_eq!(outcome, FrontOutcome::Resumed);
+        assert_eq!(again, t);
+        assert!(
+            listed(&mut steve, "a").await.contains(&t),
+            "a busy thread is not moved"
+        );
+        assert!(
+            proposed_of(daemon.base(), t).is_empty(),
+            "and no pair is written"
+        );
+    }
+}
+
+/// T4 — the move works with the thread not loaded yet, the case a
+/// just-started daemon is in.
+#[tokio::test]
+async fn t4_ask_e_an_unloaded_thread_still_moves() {
+    let dir = tempfile::tempdir().unwrap();
+    let (daemon, _a, _b, _c) = three_projects(dir.path()).await;
+    let (mut steve, t) = idle_front_in_a(&daemon).await;
+
+    let (again, outcome) = front_asked(&mut steve, "a", "b", "the ask says so").await;
+    assert_eq!(outcome, FrontOutcome::Resumed);
+    assert_eq!(again, t);
+    assert!(listed(&mut steve, "b").await.contains(&t));
+    let (_, answered) = ask_pair(daemon.base(), t);
+    assert_eq!(
+        answered.expect("an answer").0.answer,
+        DecisionAnswer::Corrected
+    );
+}
+
+/// T4 — the answer needs `write` in the chosen project: a `read`-only
+/// user is refused with the answer's own shape, and nothing moves.
+#[tokio::test]
+async fn t4_ask_f_without_write_in_the_chosen_project_it_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = project(
+        dir.path(),
+        "a",
+        "[participants]\nsteve = \"write\"\ncara = \"write\"\n",
+    );
+    let b = project(
+        dir.path(),
+        "b",
+        "[participants]\nsteve = \"write\"\ncara = \"read\"\n",
+    );
+    let daemon = Daemon::new(
+        dir.path(),
+        vec![pc("a", &a), pc("b", &b)],
+        &["steve", "cara"],
+        false,
+    )
+    .await;
+    let mut cara = daemon.connect("cara").await;
+    let (t, _) = front(&mut cara, "a").await;
+
+    let reason = refusal(
+        &mut cara,
+        Request::Front {
+            project: "b".into(),
+            here: Some("b".into()),
+            asked: Some(aigentic_api::StartAsk {
+                offered: "a".into(),
+                chosen: "b".into(),
+                reason: "the ask says so".into(),
+            }),
+        },
+    )
+    .await;
+    assert_eq!(
+        reason, "in b: cara is read in this project; this needs write",
+        "the `AnswerSwitch` shape"
+    );
+    assert!(listed(&mut cara, "a").await.contains(&t), "still in a");
+    assert!(
+        proposed_of(daemon.base(), t).is_empty(),
+        "a refusal logs nothing"
+    );
+}
+
+/// T4 — `First` creates the front thread in the chosen project and logs
+/// the pair there.
+#[tokio::test]
+async fn t4_ask_g_first_creates_in_the_chosen_project_and_logs_the_pair() {
+    let dir = tempfile::tempdir().unwrap();
+    let (daemon, _a, _b, _c) = three_projects(dir.path()).await;
+    let mut steve = daemon.connect("steve").await;
+
+    let (t, outcome) = front_asked(&mut steve, "a", "b", "the ask says so").await;
+    assert_eq!(outcome, FrontOutcome::First);
+    assert_eq!(
+        front_of(daemon.base(), t).project.as_deref(),
+        Some("b"),
+        "created where the person chose"
+    );
+    assert!(listed(&mut steve, "b").await.contains(&t));
+    let (proposed, answered) = ask_pair(daemon.base(), t);
+    assert_eq!(proposed.target, None);
+    let (answered, _) = answered.expect("an answer to the ask");
+    assert_eq!(answered.answer, DecisionAnswer::Corrected);
+    assert_eq!(answered.correction.as_deref(), Some("b"));
+    assert_eq!(open_state(&mut steve, t).await, ThreadState::Idle);
 }

@@ -99,10 +99,21 @@ pub enum Request {
     /// daemon may offer to switch to it when the front thread is
     /// somewhere else. `None` from an old client or a bare folder, and
     /// an old daemon ignores it.
+    ///
+    /// `asked` is the start-up ask's answer (issue #121), sent when the
+    /// client asked which project to work in before opening a thread: a
+    /// client that asked sends `project = chosen` and `here = chosen`
+    /// too. Optional, so an old client's frame is the same as before and
+    /// an old daemon ignores the key. There is no `PROTOCOL_VERSION`
+    /// bump: `here` was added by #92 the same way, and nothing here
+    /// refuses an unknown field — an old daemon then drops the answer,
+    /// and the pair is simply absent from its log.
     Front {
         project: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         here: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        asked: Option<StartAsk>,
     },
     /// A new front thread in `project` (issue #84), replacing whatever
     /// was front; the old one stays listed.
@@ -317,6 +328,20 @@ pub enum Response {
     Error {
         message: String,
     },
+}
+
+/// The start-up ask's answer (issue #121): the client asked which
+/// project to work in before opening a front thread, and the person
+/// answered. `offered` is row 1, the one Enter takes — the client's
+/// guess and the default; `chosen` is where they settled; `reason` is
+/// the ladder's own words for why it asked, recorded on the proposal.
+/// The daemon logs the pair as a `project` decision, and a `chosen`
+/// that differs from `offered` moves the thread before it opens.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartAsk {
+    pub offered: String,
+    pub chosen: String,
+    pub reason: String,
 }
 
 /// How a `Front` request was answered (issue #84).
@@ -645,6 +670,7 @@ mod tests {
             Request::Front {
                 project: "p".into(),
                 here: Some("q".into()),
+                asked: None,
             },
             Request::NewFront {
                 project: "q".into(),
@@ -940,6 +966,7 @@ mod tests {
             Request::Front {
                 project: "p".into(),
                 here: None,
+                asked: None,
             },
         ));
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
@@ -992,6 +1019,7 @@ mod tests {
             Request::Front {
                 project: "p".into(),
                 here: Some("q".into()),
+                asked: None,
             },
         );
         let line = encode(&with);
@@ -1004,6 +1032,7 @@ mod tests {
             Request::Front {
                 project: "p".into(),
                 here: None,
+                asked: None,
             },
         );
         let line = encode(&without);
@@ -1018,6 +1047,64 @@ mod tests {
             Body::Request(Request::Front {
                 project: "p".into(),
                 here: None,
+                asked: None,
+            })
+        );
+    }
+
+    /// T7 (issue #121): `Front`'s `asked` is an additive optional field
+    /// like #92's `here`. A frame carrying it round-trips; one without
+    /// it is serialised with no `asked` key at all; and a frame that
+    /// predates the field decodes as `asked: None`.
+    ///
+    /// No `PROTOCOL_VERSION` bump: `here` was added the same way and
+    /// nothing here refuses an unknown field. The consequence is that an
+    /// older daemon ignores `asked`, so the decision pair is absent from
+    /// its log and the client cannot tell.
+    #[test]
+    fn t7_front_asked_round_trips_and_the_old_frame_still_decodes() {
+        assert_eq!(PROTOCOL_VERSION, 5, "no bump for `asked`");
+        let asked = StartAsk {
+            offered: "web".into(),
+            chosen: "api".into(),
+            reason: "started in a folder that names no project".into(),
+        };
+        let with = Frame::request(
+            1,
+            Request::Front {
+                project: "api".into(),
+                here: Some("api".into()),
+                asked: Some(asked.clone()),
+            },
+        );
+        let line = encode(&with);
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["request"]["asked"]["offered"], "web");
+        assert_eq!(v["request"]["asked"]["chosen"], "api");
+        assert_eq!(v["request"]["asked"]["reason"], asked.reason);
+        assert_eq!(decode(&line).unwrap(), with, "{line}");
+
+        let without = Frame::request(
+            2,
+            Request::Front {
+                project: "p".into(),
+                here: None,
+                asked: None,
+            },
+        );
+        let line = encode(&without);
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert!(v["request"].get("asked").is_none(), "{line}");
+        assert_eq!(decode(&line).unwrap(), without, "{line}");
+
+        // An old client's frame, with no `asked` key at all.
+        let old = decode(r#"{"id":3,"request":{"kind":"front","project":"p"}}"#).unwrap();
+        assert_eq!(
+            old.body,
+            Body::Request(Request::Front {
+                project: "p".into(),
+                here: None,
+                asked: None,
             })
         );
     }

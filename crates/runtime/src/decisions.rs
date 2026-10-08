@@ -7,11 +7,15 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use aigentic_core::{Author, ContentBlock};
-use aigentic_log::PermissionRequestedPayload;
+use aigentic_core::{Author, ContentBlock, EventKind};
+use aigentic_log::{
+    DecisionAnswer, DecisionKind, DecisionProposedPayload, DecisionStage,
+    PermissionRequestedPayload,
+};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::runtime::ProjectContext;
+use crate::{Runtime, RuntimeError, Signal};
 
 /// What a turn is waiting for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -357,6 +361,60 @@ impl Inbox {
             out.push(q);
         }
         out
+    }
+}
+
+/// Record a start-up ask's answer (issue #121): the person was asked
+/// which project to work in before any thread was open, and this is the
+/// pair the log keeps of it — a `project` proposal and its answer, back
+/// to back through the observer.
+///
+/// No turn waits and nothing parks: the ask is answered before the front
+/// thread is opened, so there is no `AwaitingSwitch` state and no
+/// keep-awake guard, and a subscriber of an already-open thread sees two
+/// decision events and nothing else. The `call_id` carries
+/// [`STARTUP_PREFIX`](aigentic_log::STARTUP_PREFIX) so `stats` counts the
+/// pair in the `startup` row, and `target` is `None` so answering
+/// "api, not web" does not decline a later #92 start-up proposal for
+/// web. The answered event's `parent_event` is the proposed event's id,
+/// which is what `decision_records` pairs by.
+impl Runtime {
+    pub fn record_startup_ask(
+        &mut self,
+        offered: &str,
+        chosen: &str,
+        reason: &str,
+        by: Author,
+        observe: &mut (dyn FnMut(Signal<'_>) + Send),
+    ) -> Result<(), RuntimeError> {
+        let call_id = format!(
+            "{}ask-{}",
+            aigentic_log::STARTUP_PREFIX,
+            ulid::Ulid::generate()
+        );
+        let proposed = self.append(
+            EventKind::DecisionProposed,
+            Author::System,
+            serde_json::to_value(DecisionProposedPayload {
+                kind: DecisionKind::Project,
+                proposal: offered.to_owned(),
+                target: None,
+                reason: reason.to_owned(),
+                call_id: Some(call_id),
+                stage: DecisionStage::Ask,
+            })
+            .expect("serialisable"),
+            None,
+            observe,
+        )?;
+        // `Yes` when the person took the default row; `Corrected` names
+        // where they went instead.
+        let (answer, correction) = if chosen == offered {
+            (DecisionAnswer::Yes, None)
+        } else {
+            (DecisionAnswer::Corrected, Some(chosen.to_owned()))
+        };
+        self.append_decision_answered(answer, correction, None, by, proposed.id, observe)
     }
 }
 

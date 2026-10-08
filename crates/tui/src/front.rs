@@ -57,6 +57,7 @@ pub async fn pick_thread(
         Request::Front {
             project: project.to_owned(),
             here: here.map(str::to_owned),
+            asked: None,
         }
     };
     match client.request(request).await? {

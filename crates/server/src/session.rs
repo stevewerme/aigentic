@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use aigentic_api::{
     Body, CheckpointAnswer, Frame, FrontOutcome, Notice, PROTOCOL_VERSION, ProjectInfo, Request,
-    Response, SwitchReply, ThreadInfo, ThreadState, Welcome, decode, encode,
+    Response, StartAsk, SwitchReply, ThreadInfo, ThreadState, Welcome, decode, encode,
 };
 use aigentic_runtime::aigentic_core::{AgentId, Author, UserId};
 use aigentic_runtime::aigentic_policy::Role;
@@ -280,9 +280,11 @@ fn project_for(threads: &ThreadTable, request: &Request) -> Option<String> {
 async fn front_thread(
     config: &Arc<ServerConfig>,
     threads: &Arc<ThreadTable>,
+    open: &mut HashMap<Ulid, OpenThread>,
     user: &str,
     author: &Author,
     project: &str,
+    asked: Option<&StartAsk>,
 ) -> FrontReply {
     // One process at a time, per user (issue #88): two terminals launched
     // together must not both find no front thread and both make one. Held
@@ -294,19 +296,38 @@ async fn front_thread(
     };
     let replaced = match threads.latest_front(user) {
         Some(front) => match resumable(config, threads, user, front) {
-            Ok(info) => return FrontReply::Open(Box::new(info), FrontOutcome::Resumed),
+            Ok(info) => {
+                return match asked {
+                    Some(ask) => {
+                        honour_startup_ask(config, threads, open, user, author, info, ask).await
+                    }
+                    None => FrontReply::Open {
+                        thread: Box::new(info),
+                        outcome: FrontOutcome::Resumed,
+                        answered: false,
+                    },
+                };
+            }
             Err(reason) => Some(reason),
         },
         None => None,
     };
     match create_front(config, threads, user, author, project).await {
-        Ok(info) => FrontReply::Open(
-            Box::new(info),
-            match replaced {
-                None => FrontOutcome::First,
-                Some(reason) => FrontOutcome::Replaced { reason },
-            },
-        ),
+        Ok(info) => {
+            // Issue #121: the client's answer is logged in the thread it
+            // created — `create_front` already lands it in `chosen`.
+            if let Some(ask) = asked {
+                record_startup_ask(threads, open, info.id, ask, author).await;
+            }
+            FrontReply::Open {
+                thread: Box::new(info),
+                outcome: match replaced {
+                    None => FrontOutcome::First,
+                    Some(reason) => FrontOutcome::Replaced { reason },
+                },
+                answered: asked.is_some(),
+            }
+        }
         Err(refusal) => FrontReply::Refused(refusal),
     }
 }
@@ -314,8 +335,136 @@ async fn front_thread(
 /// What `Front` gets back: a thread to open and how it was reached, or
 /// the refusal that stood in the way instead.
 enum FrontReply {
-    Open(Box<ThreadInfo>, FrontOutcome),
+    Open {
+        thread: Box<ThreadInfo>,
+        outcome: FrontOutcome,
+        /// Issue #121: the request carried the start-up ask's answer, so
+        /// the person has already chosen and #92's proposal is not
+        /// raised for this thread.
+        answered: bool,
+    },
     Refused(Box<Response>),
+}
+
+/// Whether a resumed front thread's start-up answer can be honoured
+/// (issue #121), and the thread to open either way.
+///
+/// The server is the judge of a busy thread: the client's listing cannot
+/// say (design 5), so a thread that is running or waiting on a person
+/// ignores the answer — no move and no pair — and resumes where it
+/// lives. The person has still answered, so #92's proposal is not raised
+/// on top of it.
+async fn honour_startup_ask(
+    config: &Arc<ServerConfig>,
+    threads: &Arc<ThreadTable>,
+    open: &mut HashMap<Ulid, OpenThread>,
+    user: &str,
+    author: &Author,
+    info: ThreadInfo,
+    ask: &StartAsk,
+) -> FrontReply {
+    let thread = info.id;
+    if !matches!(live_state(threads, open, thread).await, ThreadState::Idle) {
+        return FrontReply::Open {
+            thread: Box::new(info),
+            outcome: FrontOutcome::Resumed,
+            answered: true,
+        };
+    }
+    if threads.project_of(thread).as_deref() != Some(ask.chosen.as_str()) {
+        // The person needs `write` where they are going, the role a
+        // `SwitchProject` needs — the same check `Front`'s pre-check
+        // makes for one.
+        let participants = match threads.participants(&ask.chosen) {
+            Ok(p) => p,
+            Err(e) => return FrontReply::Refused(Box::new(thread_error(e))),
+        };
+        let switch = Request::SwitchProject {
+            thread,
+            project: ask.chosen.clone(),
+        };
+        if let Err(denied) = auth::allowed(user, config.owner(), &participants, &switch) {
+            return FrontReply::Refused(Box::new(Response::Refused {
+                reason: format!("in {}: {}", ask.chosen, denied.reason),
+            }));
+        }
+        // The move without a proposal (issue #121): the target's context
+        // is built here and the actor swaps it in, as `AnswerSwitch`
+        // does for a `yes`. Not `threads.switch`, which needs a live
+        // mailbox a just-started daemon does not have.
+        let ctx = match threads.build_target(thread, &ask.chosen).await {
+            Ok(ctx) => ctx,
+            Err(e) => return FrontReply::Refused(Box::new(thread_error(e))),
+        };
+        let moved = ask_actor(threads, open, thread, |reply| Mail::SwitchProject {
+            ctx: Box::new(ctx),
+            by: author.clone(),
+            reply,
+        })
+        .await;
+        match moved {
+            Response::Ok => threads.note_project(thread, &ask.chosen),
+            Response::Refused { reason } => {
+                return FrontReply::Refused(Box::new(Response::Refused { reason }));
+            }
+            other => {
+                return FrontReply::Refused(Box::new(Response::Error {
+                    message: format!("the switch to {} said {other:?}", ask.chosen),
+                }));
+            }
+        }
+    }
+    // The row after the move, so the client's banner and its role follow
+    // the switch (`front::thread_project`).
+    let row = threads.info(thread).unwrap_or(info);
+    record_startup_ask(threads, open, thread, ask, author).await;
+    FrontReply::Open {
+        thread: Box::new(row),
+        outcome: FrontOutcome::Resumed,
+        answered: true,
+    }
+}
+
+/// Write the pair the start-up ask leaves in the log (issue #121): the
+/// `project` proposal and its answer, back to back. The reply is
+/// ignored, as the `Front` answer is the same either way.
+async fn record_startup_ask(
+    threads: &Arc<ThreadTable>,
+    open: &mut HashMap<Ulid, OpenThread>,
+    thread: Ulid,
+    ask: &StartAsk,
+    author: &Author,
+) {
+    let _ = ask_actor(threads, open, thread, |reply| Mail::RecordStartupAsk {
+        offered: ask.offered.clone(),
+        chosen: ask.chosen.clone(),
+        reason: ask.reason.clone(),
+        by: author.clone(),
+        reply,
+    })
+    .await;
+}
+
+/// A thread's live state, without opening anything: the actor's own
+/// answer when one runs, and `Idle` when none does — nothing is writing
+/// a thread without an actor.
+async fn live_state(
+    threads: &Arc<ThreadTable>,
+    open: &mut HashMap<Ulid, OpenThread>,
+    thread: Ulid,
+) -> ThreadState {
+    let mailbox = match open.get(&thread).and_then(|entry| entry.mailbox.clone()) {
+        Some(m) => m,
+        None => match threads.mailbox(thread) {
+            Some(m) => m,
+            None => return ThreadState::Idle,
+        },
+    };
+    let (reply, rx) = oneshot::channel();
+    if mailbox.send(Mail::Status { reply }).is_err() {
+        return ThreadState::Idle;
+    }
+    rx.await.unwrap_or(ThreadState::Idle)
 }
 
 /// Whether the user's front thread can be opened, and its listing row if
@@ -518,15 +667,30 @@ async fn handle(
         },
         // The front thread (issue #84): `Front` resumes one or makes
         // the replacement, `NewFront` always makes one.
-        Request::Front { project, here } => {
-            match front_thread(config, threads, user, author, &project).await {
-                FrontReply::Open(thread, outcome) => {
+        Request::Front {
+            project,
+            here,
+            asked,
+        } => {
+            // Issue #121: the client's answer names the project, so the
+            // front thread is reached in `chosen` and #92's proposal is
+            // not raised on top of an answered ask.
+            let target = match &asked {
+                Some(ask) => ask.chosen.as_str(),
+                None => project.as_str(),
+            };
+            match front_thread(config, threads, open, user, author, target, asked.as_ref()).await {
+                FrontReply::Open {
+                    thread,
+                    outcome,
+                    answered,
+                } => {
                     // Issue #92: a resumed front thread started in
                     // another folder's project is offered a switch in
                     // #82's block. The `Front` reply is the same either
                     // way; the proposal only changes the state the
                     // client's `Open` then finds.
-                    if matches!(outcome, FrontOutcome::Resumed) {
+                    if matches!(outcome, FrontOutcome::Resumed) && !answered {
                         raise_startup_proposal(
                             config,
                             threads,
