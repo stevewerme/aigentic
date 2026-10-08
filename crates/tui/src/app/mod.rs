@@ -1148,6 +1148,18 @@ mod tests {
         }
     }
 
+    /// The plain REPL's printer leaves `view()` to the `Printer`
+    /// default, so it is the default that decides whether a pipe stays
+    /// on HEAD's rows (issue #115). Pin it: `Stdout` prints `Normal`.
+    #[test]
+    fn the_plain_stdout_printer_prints_the_normal_view() {
+        assert_eq!(
+            Stdout.view(),
+            View::Normal,
+            "the plain REPL must not draw the developer view's cells"
+        );
+    }
+
     /// T4 (issue #115): the pager keeps the step headers. `full()` has
     /// no view, so both views see them.
     #[test]

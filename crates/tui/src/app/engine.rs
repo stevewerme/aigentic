@@ -8827,10 +8827,20 @@ mod tests {
     }
     // ---- the developer view (issue #115, T4/T6/T7) -------------------
 
-    /// Run one scripted turn to completion and hand back the printer's
-    /// lines. `detail` picks the developer view's `Lines` (T6) or the
-    /// default (T7), the one every existing test uses.
-    async fn dev_lines(script: Vec<Vec<ProviderEvent>>, detail: bool) -> Vec<String> {
+    /// A printer that collects lines like `Lines` and leaves `view()`
+    /// to the `Printer` trait's default — the guard that the default
+    /// stays `Normal` (issue #115).
+    #[derive(Default)]
+    struct DefaultView(pub Vec<String>);
+
+    impl Printer for DefaultView {
+        fn line(&mut self, text: &str) {
+            self.0.push(text.to_owned());
+        }
+    }
+
+    /// Drive one scripted turn into `out` and hand the printer back.
+    async fn run_turn<P: Printer>(script: Vec<Vec<ProviderEvent>>, mut out: P) -> P {
         let dir = tempfile::tempdir().unwrap();
         let root = project(dir.path(), "proj", "");
         let cfg_dir = dir.path().join("cfg");
@@ -8871,14 +8881,21 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
             tx.send("/quit".into()).unwrap();
         };
-        let mut out = if detail {
+        let ((), ()) = tokio::join!(repl.run(rx, notices, &mut out), feeder);
+        drop(embedded);
+        out
+    }
+
+    /// One scripted turn's lines through a `Lines`. `detail` picks the
+    /// developer view's `Lines` (T6) or the default (T7), the one every
+    /// existing test uses.
+    async fn dev_lines(script: Vec<Vec<ProviderEvent>>, detail: bool) -> Vec<String> {
+        let out = if detail {
             Lines::detail_on()
         } else {
             Lines::default()
         };
-        let ((), ()) = tokio::join!(repl.run(rx, notices, &mut out), feeder);
-        drop(embedded);
-        out.0
+        run_turn(script, out).await.0
     }
 
     /// A `update_tasks` argument value with the given `(text, state)`
@@ -8975,6 +8992,44 @@ mod tests {
                 .windows(2)
                 .any(|w| w[0].is_empty() && w[1].is_empty()),
             "no blank-row additions: {normal:#?}"
+        );
+    }
+
+    /// The trait's default `view()` is what a plain printer gets:
+    /// `Stdout` (the plain REPL) and `Copies` both leave it alone
+    /// (issue #115). Pin it on a printer that overrides nothing, through
+    /// the same two-call turn as the dev-view test: no `Call`, `Step` or
+    /// `System` cell.
+    #[tokio::test]
+    async fn the_default_view_keeps_a_plain_printer_on_the_normal_view() {
+        assert_eq!(
+            Copies::default().view(),
+            View::Normal,
+            "a printer with no view() of its own must print the normal view"
+        );
+        let script = vec![
+            vec![
+                ProviderEvent::Usage(usage(1_000, 3_000, 200)),
+                text("first\n"),
+                call("c1", "bash", serde_json::json!({ "command": "echo hi" })),
+                tool_use(),
+            ],
+            vec![
+                ProviderEvent::Usage(usage(2_000, 600, 300)),
+                text("second\n"),
+                done(),
+            ],
+        ];
+        let lines = run_turn(script, DefaultView::default()).await.0;
+        for l in &lines {
+            assert!(
+                !l.contains("◦ call") && !l.contains('▸') && !l.starts_with("· "),
+                "the default view draws no developer cell: {l:?}"
+            );
+        }
+        assert!(
+            !lines.windows(2).any(|w| w[0].is_empty() && w[1].is_empty()),
+            "no blank-row additions: {lines:#?}"
         );
     }
 
