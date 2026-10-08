@@ -10,7 +10,7 @@
 //! who it waits for when not; a prompt answered on
 //! another connection first is withdrawn with who decided it.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use aigentic_api::client::Client;
 use aigentic_api::{Notice, ReportKind, Request, Response, SwitchReply, ThreadInfo, ThreadState};
@@ -2347,7 +2347,18 @@ pub(crate) fn turn_end_report(p: &TurnEndedPayload, turn: &[Event]) -> Vec<Strin
         } else {
             calls
                 .iter()
-                .map(|c| format!("{} {}", c.name, summarise_args(c)))
+                .map(|(c, failed)| {
+                    let text = format!("{} {}", c.name, summarise_args(c));
+                    // A call whose result was an error is marked, so the
+                    // line never reads as if failed work was done
+                    // (issue #113 follow-up); a successful one is
+                    // unchanged.
+                    if *failed {
+                        format!("{text} (failed)")
+                    } else {
+                        text
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join(" · ")
         };
@@ -2423,37 +2434,93 @@ impl TurnEvents {
         &self.0
     }
 
-    /// Drops what the report cannot need: everything but the turn start,
-    /// every `update_tasks` call and its result, the last assistant
-    /// message and every event after it, and the last `REPORT_CALLS`
-    /// successful calls with their results.
+    /// Drops what the report cannot need: everything but the turn start;
+    /// the newest `update_tasks` call whose result succeeded, its result,
+    /// and every `update_tasks` call after it with its result; the last
+    /// assistant message and every event after it; and the last
+    /// `REPORT_CALLS` calls, successful or not, with their results.
+    ///
+    /// Keeping only the newest successful `update_tasks` call (and what
+    /// follows it) bounds the checklist set however often the model
+    /// updates it: `open_checklist` reads `done`, `total` and `active`
+    /// from that one call alone, so the buffer's checklist stays the
+    /// same as the whole turn's at a fixed size. The older calls remain
+    /// in the log; only this client-side buffer drops them.
     fn prune(&mut self) {
-        let mut keep: Vec<String> = Vec::new();
-        for e in &self.0 {
+        // Parse each event once: the calls a message holds, and the id and
+        // outcome of a result. `message_calls` is then not re-run for
+        // every result, which is what made a checklist-heavy turn cost
+        // quadratic time.
+        let mut calls: Vec<Vec<ToolCall>> = Vec::with_capacity(self.0.len());
+        let mut results: Vec<Option<(String, bool)>> = Vec::with_capacity(self.0.len());
+        let mut last_at: Option<usize> = None;
+        for (i, e) in self.0.iter().enumerate() {
             if e.kind == EventKind::AssistantMessage {
-                keep.extend(
-                    message_calls(e)
-                        .into_iter()
-                        .filter(|c| c.name == UPDATE_TASKS)
-                        .map(|c| c.id),
-                );
+                calls.push(message_calls(e));
+                last_at = Some(i);
+            } else {
+                calls.push(Vec::new());
+            }
+            results.push(if e.kind == EventKind::ToolResult {
+                serde_json::from_value::<ToolResultPayload>(e.payload.clone())
+                    .ok()
+                    .map(|p| (p.result.id, p.result.is_error))
+            } else {
+                None
+            });
+        }
+        // The ids whose result came back without an error.
+        let mut succeeded: HashSet<&str> = HashSet::new();
+        for (id, is_error) in results.iter().flatten() {
+            if !is_error {
+                succeeded.insert(id);
             }
         }
-        keep.extend(
-            successful_calls(&self.0, REPORT_CALLS)
-                .into_iter()
-                .map(|c| c.id),
-        );
+        let ordered: Vec<&ToolCall> = calls.iter().flatten().collect();
+        let mut keep: HashSet<String> = HashSet::new();
+        // The newest successful `update_tasks` call, and every
+        // `update_tasks` call after it (a failed one, or one still in
+        // flight), each with its result.
+        if let Some(at) = ordered
+            .iter()
+            .rposition(|c| c.name == UPDATE_TASKS && succeeded.contains(c.id.as_str()))
+        {
+            keep.extend(
+                ordered[at..]
+                    .iter()
+                    .filter(|c| c.name == UPDATE_TASKS)
+                    .map(|c| c.id.clone()),
+            );
+        }
+        // The last `REPORT_CALLS` successful calls: `before that:` prefers
+        // them.
+        let mut good: Vec<&ToolCall> = Vec::new();
+        for (id, is_error) in results.iter().flatten() {
+            if *is_error {
+                continue;
+            }
+            if let Some(c) = ordered
+                .iter()
+                .find(|c| c.id == *id)
+                .filter(|c| c.name != UPDATE_TASKS)
+            {
+                good.push(c);
+            }
+        }
+        let skip = good.len().saturating_sub(REPORT_CALLS);
+        keep.extend(good[skip..].iter().map(|c| c.id.clone()));
         // The calls that ran but did not finish, so `before that:` never
-        // claims that no tool ran while one did.
-        keep.extend(last_calls(&self.0, REPORT_CALLS).into_iter().map(|c| c.id));
-        let last_at = last_message_at(&self.0);
+        // claims that no tool ran while one did, and so the last batch's
+        // unfinished call survives.
+        let skip = ordered.len().saturating_sub(REPORT_CALLS);
+        keep.extend(ordered[skip..].iter().map(|c| c.id.clone()));
+
         let mut kept = Vec::with_capacity(self.0.len());
         for (i, e) in self.0.iter().enumerate() {
             let holds = e.kind == EventKind::AssistantMessage
-                && message_calls(e).iter().any(|c| keep.contains(&c.id));
+                && calls[i].iter().any(|c| keep.contains(&c.id));
             let answers = e.kind == EventKind::ToolResult
-                && result_id(e).is_some_and(|id| keep.contains(&id));
+                && results[i].as_ref().is_some_and(|(id, _)| keep.contains(id));
             if is_turn_start(e) && i == 0 || last_at.is_some_and(|at| i >= at) || holds || answers {
                 kept.push(e.clone());
             }
@@ -2501,13 +2568,6 @@ fn last_message_at(turn: &[Event]) -> Option<usize> {
         .rposition(|e| e.kind == EventKind::AssistantMessage)
 }
 
-/// The id of the call a result answers, if it parses as one.
-fn result_id(event: &Event) -> Option<String> {
-    serde_json::from_value::<ToolResultPayload>(event.payload.clone())
-        .ok()
-        .map(|p| p.result.id)
-}
-
 /// The turn's successful tool calls, newest last, at most `n` of them:
 /// a call whose result came back without an error (issue #113). Rendering
 /// goes through the transcript's own [`summarise_args`], so the report
@@ -2552,25 +2612,45 @@ fn last_calls(turn: &[Event], n: usize) -> Vec<ToolCall> {
     out.split_off(keep)
 }
 
-/// The calls `before that:` names (issue #113): the last `n` successful
-/// calls other than the checklist call — the same text already shows in
-/// the call's own cell — or, when nothing succeeded, what did run, so
-/// the line never says no tool ran while a tool did.
-fn named_calls(turn: &[Event], n: usize) -> Vec<ToolCall> {
+/// The calls `before that:` names (issue #113), each with whether its
+/// result was an error (the mark a failed call carries), so the line
+/// never reads as if failed work was done: the last `n` successful calls
+/// other than the checklist call — the same text already shows in the
+/// call's own cell — or, when nothing succeeded, what did run, so the
+/// line never says no tool ran while a tool did.
+fn named_calls(turn: &[Event], n: usize) -> Vec<(ToolCall, bool)> {
+    let failed = failed_ids(turn);
     let good = successful_calls(turn, n);
     if !good.is_empty() {
-        return good;
+        return good.into_iter().map(|c| (c, false)).collect();
     }
     let ran: Vec<ToolCall> = last_calls(turn, n)
         .into_iter()
         .filter(|c| c.name != UPDATE_TASKS)
         .collect();
-    if ran.is_empty() {
+    let ran = if ran.is_empty() {
         // Nothing but the checklist call: name it rather than deny it.
         last_calls(turn, n)
     } else {
         ran
-    }
+    };
+    ran.into_iter()
+        .map(|c| {
+            let was_failed = failed.contains(&c.id);
+            (c, was_failed)
+        })
+        .collect()
+}
+
+/// The ids of the turn's calls whose result came back as an error, so a
+/// failed call can be marked in `before that:`.
+fn failed_ids(turn: &[Event]) -> HashSet<String> {
+    turn.iter()
+        .filter(|e| e.kind == EventKind::ToolResult)
+        .filter_map(|e| serde_json::from_value::<ToolResultPayload>(e.payload.clone()).ok())
+        .filter(|p| p.result.is_error)
+        .map(|p| p.result.id)
+        .collect()
 }
 
 /// The first call in the turn's last batch that did not run or never came
@@ -5002,7 +5082,9 @@ mod tests {
             "{lines:#?}"
         );
 
-        // A call that ran and failed is named too, not denied.
+        // A call that ran and failed is named too, not denied — and
+        // marked `(failed)` so the line never reads as work done
+        // (supervisor extra 1).
         let call = a_bash_call("c1", "cargo test");
         let turn = vec![
             turn_start(1),
@@ -5015,8 +5097,46 @@ mod tests {
                 .iter()
                 .find(|l| l.starts_with("[before that: "))
                 .expect("the line is drawn"),
-            &format!("[before that: {}]", rendered(&call)),
+            &format!("[before that: {} (failed)]", rendered(&call)),
             "{lines:#?}"
+        );
+    }
+
+    /// Supervisor extra 1 (issue #113): a call whose result was an error
+    /// is marked in `before that:`; a successful call is unchanged, with
+    /// no suffix.
+    #[test]
+    fn a_failed_call_is_marked_and_a_successful_one_is_not() {
+        let p = provider_error_payload(503, "{}");
+        let call = a_bash_call("c1", "cargo test");
+
+        let failed = vec![
+            turn_start(1),
+            call_message(2, std::slice::from_ref(&call)),
+            call_result(3, &call, true, PolicyRecord::rule("bash", "allow")),
+        ];
+        let lines = turn_end_report(&p, &failed);
+        assert_eq!(
+            lines[1],
+            format!("[before that: {} (failed)]", rendered(&call)),
+            "{lines:#?}"
+        );
+
+        let ok = vec![
+            turn_start(1),
+            call_message(2, std::slice::from_ref(&call)),
+            call_result(
+                3,
+                &call,
+                false,
+                PolicyRecord::rule("bash allow-pattern", "allow"),
+            ),
+        ];
+        let lines = turn_end_report(&p, &ok);
+        assert_eq!(
+            lines[1],
+            format!("[before that: {}]", rendered(&call)),
+            "no suffix on a success: {lines:#?}"
         );
     }
 
@@ -5140,6 +5260,148 @@ mod tests {
         let lines = turn_end_report(&slept, &[turn_start(1)]);
         assert_eq!(lines.len(), 1, "only the slept line: {lines:#?}");
         assert!(lines[0].starts_with("the machine slept"), "{lines:#?}");
+    }
+
+    // ---- the turn buffer's bound (issue #113 fix) --------------------
+
+    /// The report over the pruned buffer equals the report over the whole
+    /// turn: pruning keeps everything `turn_end_report` reads.
+    fn assert_prune_keeps_the_report(p: &TurnEndedPayload, turn: &[Event]) {
+        let mut buffer = TurnEvents::default();
+        for e in turn {
+            buffer.push(e);
+        }
+        assert_eq!(
+            turn_end_report(p, buffer.as_slice()),
+            turn_end_report(p, turn),
+            "pruning changed the report: {turn:#?}"
+        );
+    }
+
+    /// A bounded turn: the buffer keeps only the newest successful
+    /// `update_tasks` call pair, however many the turn made, so a
+    /// checklist-heavy turn stays small. The count is derived, not
+    /// measured: the turn start (1) plus the last `REPORT_CALLS` calls
+    /// each with a result (2 × REPORT_CALLS = 6) = 7; the last assistant
+    /// message and the newest checklist pair lie inside that set here.
+    /// No timing assertion: the bound, not a clock, is the contract.
+    #[test]
+    fn a_checklist_heavy_turn_keeps_a_bounded_buffer() {
+        let steps = serde_json::json!(
+            (0..30)
+                .map(|i| serde_json::json!({ "text": format!("step {i}"), "state": "done" }))
+                .collect::<Vec<_>>()
+        );
+        let mut buffer = TurnEvents::default();
+        let mut full: Vec<Event> = vec![];
+        buffer.push(&turn_start(1));
+        full.push(turn_start(1));
+        let mut seq = 2;
+        for i in 0..500 {
+            let call = an_update_tasks_call(&format!("t{i}"), steps.clone());
+            let message = call_message(seq, std::slice::from_ref(&call));
+            buffer.push(&message);
+            full.push(message);
+            seq += 1;
+            let result = call_result(
+                seq,
+                &call,
+                false,
+                PolicyRecord::rule("harness tool", "allow"),
+            );
+            buffer.push(&result);
+            full.push(result);
+            seq += 1;
+        }
+        assert_eq!(
+            buffer.as_slice().len(),
+            1 + 2 * REPORT_CALLS,
+            "turn start + the last {REPORT_CALLS} calls, each with a result"
+        );
+        // The checklist the bounded buffer holds is the whole turn's: the
+        // drop is safe because `open_checklist` reads the last success.
+        assert_eq!(
+            open_checklist(buffer.as_slice()),
+            open_checklist(&full),
+            "the checklist is unchanged by the bound"
+        );
+    }
+
+    /// Pruning loses nothing the report reads, across the fixtures it was
+    /// built for, plus the latest `update_tasks` failing after an earlier
+    /// success: the newest successful call is what the checklist reads.
+    #[test]
+    fn a_pruned_turn_reports_the_same_as_the_whole_turn() {
+        let p = provider_error_payload(503, "{}");
+        let allow = || PolicyRecord::rule("bash allow-pattern", "allow");
+
+        // A complete checklist, then two successful calls (#111's shape).
+        let comment = a_bash_call("c1", "gh issue comment 113 --body-file /tmp/113.md");
+        let rm = a_bash_call("c2", "rm -f /tmp/113.md");
+        let done = an_update_tasks_call(
+            "t1",
+            serde_json::json!([{ "text": "post the comment", "state": "done" }]),
+        );
+        let turn = vec![
+            turn_start(1),
+            call_message(2, std::slice::from_ref(&done)),
+            call_result(3, &done, false, PolicyRecord::rule("harness tool", "allow")),
+            call_message(4, std::slice::from_ref(&comment)),
+            call_result(5, &comment, false, allow()),
+            call_message(6, std::slice::from_ref(&rm)),
+            call_result(7, &rm, false, allow()),
+        ];
+        assert_prune_keeps_the_report(&p, &turn);
+
+        // A 2/5 checklist: the buffer still names the active step.
+        let tasks = an_update_tasks_call(
+            "t1",
+            serde_json::json!([
+                { "text": "read", "state": "done" },
+                { "text": "write", "state": "done" },
+                { "text": "run the gate", "state": "active" },
+                { "text": "post", "state": "pending" },
+                { "text": "push", "state": "pending" },
+            ]),
+        );
+        let turn = vec![
+            turn_start(1),
+            call_message(2, std::slice::from_ref(&tasks)),
+            call_result(
+                3,
+                &tasks,
+                false,
+                PolicyRecord::rule("harness tool", "allow"),
+            ),
+        ];
+        assert_prune_keeps_the_report(&p, &turn);
+
+        // The latest `update_tasks` failed after an earlier success: the
+        // earlier success is the checklist the report reads.
+        let first = an_update_tasks_call(
+            "t1",
+            serde_json::json!([
+                { "text": "write", "state": "done" },
+                { "text": "run the gate", "state": "active" },
+            ]),
+        );
+        let failed = an_update_tasks_call(
+            "t2",
+            serde_json::json!([{ "text": "run the gate", "state": "done" }]),
+        );
+        let turn = vec![
+            turn_start(1),
+            call_message(2, std::slice::from_ref(&first)),
+            call_result(
+                3,
+                &first,
+                false,
+                PolicyRecord::rule("harness tool", "allow"),
+            ),
+            call_message(4, std::slice::from_ref(&failed)),
+            call_result(5, &failed, true, PolicyRecord::rule("harness tool", "deny")),
+        ];
+        assert_prune_keeps_the_report(&p, &turn);
     }
 
     // ---- the turn-end report through the engine (issue #113) ---------
