@@ -17,20 +17,22 @@ use aigentic_api::{Notice, ReportKind, Request, Response, SwitchReply, ThreadInf
 use aigentic_runtime::aigentic_core::{Author, ContentBlock, Event, EventKind, ToolCall};
 use aigentic_runtime::aigentic_log::{
     AssistantMessagePayload, CheckpointAnsweredPayload, CheckpointAskedPayload, CompactedPayload,
-    CompactionStrategy, DecisionScope, InterruptedPayload, MemoryExtractedPayload,
+    CompactionStrategy, DecisionAnswer, DecisionAnsweredPayload, DecisionKind,
+    DecisionProposedPayload, DecisionScope, InterruptedPayload, MemoryExtractedPayload,
     MemoryRememberedPayload, PermissionDecidedPayload, PolicyRecord, RunFinishedPayload,
-    SkillLoadedPayload, ToolResultPayload, TurnEndedPayload, UserMessagePayload,
+    SkillLoadedPayload, ToolResultPayload, TurnEndedPayload, Usage, UserMessagePayload,
 };
-use aigentic_runtime::harness_tools::open_checklist;
+use aigentic_runtime::harness_tools::{TaskState, open_checklist};
 use aigentic_runtime::{ASKED_HUMAN, INTERRUPTED, LENGTH_STOP, NOT_RUN_OVER_LIMIT, NOT_RUN_SOLO};
 
 use crate::app::cells::full_command;
 use tokio::sync::mpsc;
 use ulid::Ulid;
 
-use crate::app::cells::{Cell, ToolState, summarise_args};
+use crate::app::cells::{CallLine, Cell, ToolDetail, ToolState, summarise_args};
 use crate::app::commands::{Command, HELP, parse_line, truncate_for_display};
 use crate::app::copy::Used;
+use crate::app::look::View;
 use crate::app::menu::{Keyed, Kind, Menu, Pick};
 use crate::front;
 
@@ -55,6 +57,9 @@ pub struct TurnStats {
     /// Output across the turn's calls, reasoning included: the turn's
     /// cost in tokens, shown by `/cost`.
     pub output: u64,
+    /// How many usage-bearing `AssistantMessage`s the turn has drawn,
+    /// 1-based (issue #115): the ordinal a call line shows.
+    calls: u32,
     /// Dollars the turn's calls were stamped with, summed by the
     /// `classify_cost` rule (issue #110): only a call that is not
     /// estimated and carries a `cost_usd` adds here.
@@ -97,6 +102,33 @@ pub struct RetryWait {
     /// When the backoff ends and the next attempt starts. The turn line
     /// counts down to it, and reads `trying now` once it has passed.
     pub until: std::time::Instant,
+    /// The backoff as the event held it, for the `System` line (issue
+    /// #115), so its `in 2.0s` need not be re-derived from `until`.
+    pub wait_ms: u64,
+}
+
+impl RetryWait {
+    /// The activity row's text (issue #31), countdown unchanged (issue
+    /// #90): `retrying 1/3 · overloaded · next in 4s`.
+    pub fn activity(&self, countdown: &str) -> String {
+        format!(
+            "retrying {}/{} · {} · {countdown}",
+            self.attempt, self.retries, self.reason
+        )
+    }
+
+    /// The developer view's `System` line (issue #115): `retry 1/3 in
+    /// 2.0s: overloaded`. One helper renders both this and the activity
+    /// row, so the two never drift.
+    pub fn system(&self) -> String {
+        format!(
+            "retry {}/{} in {}: {}",
+            self.attempt,
+            self.retries,
+            crate::app::cells::secs_ms(self.wait_ms),
+            self.reason
+        )
+    }
 }
 
 /// `next in 12s` while the backoff runs, and `trying now` once it has
@@ -128,6 +160,7 @@ impl TurnStats {
             started: std::time::Instant::now(),
             tools: 0,
             output: 0,
+            calls: 0,
             spent: 0.0,
             priced: 0,
             unpriced: 0,
@@ -159,6 +192,14 @@ impl TurnStats {
         } else {
             self.unpriced += 1;
         }
+    }
+
+    /// Fold one call's usage in and say which call of the turn it was,
+    /// 1-based (issue #115): the ordinal the call line shows.
+    fn record_usage(&mut self, u: &aigentic_runtime::aigentic_log::Usage) -> u32 {
+        self.add_usage(u);
+        self.calls += 1;
+        self.calls
     }
 
     /// `1m 12s · 4 tools`: how long the turn has run and how many
@@ -216,13 +257,7 @@ impl TurnStats {
             (None, _) if self.retry.is_some() => {
                 let r = self.retry.as_ref().expect("checked");
                 let until = r.until.checked_duration_since(std::time::Instant::now());
-                format!(
-                    "retrying {}/{} · {} · {}",
-                    r.attempt,
-                    r.retries,
-                    r.reason,
-                    retry_countdown(until)
-                )
+                r.activity(&retry_countdown(until))
             }
             (None, true) => "writing".into(),
             (None, false) => "thinking".into(),
@@ -269,6 +304,16 @@ pub trait Printer {
     /// drops the live state that belonged to the old one; a pipe holds
     /// none, so the default does nothing.
     fn thread_changed(&mut self) {}
+    /// The transcript view the printer wants (issue #115). The default is
+    /// `Normal`: `Stdout`, `Lines` and `Copies` print HEAD's rows, so a
+    /// pipe, `exec` and every scripted-turn test is unchanged. The shell's
+    /// printer returns `Dev` unless `/view normal` is in force.
+    fn view(&self) -> View {
+        View::Normal
+    }
+    /// A switch the shell acts on. A pipe has no view to switch, so the
+    /// default ignores it.
+    fn set_view(&mut self, _view: View) {}
     fn cell(&mut self, cell: Cell, done: bool) {
         let lines = cell.plain();
         if done {
@@ -281,15 +326,45 @@ pub trait Printer {
     }
 }
 
-/// A vector, for tests.
+/// Whether the printer asks for the developer view's cells (issue #115):
+/// the call line, the step headers, the system lines, and the tool
+/// detail that rides on an existing head line. The shell's printer does;
+/// `Stdout`, `Lines` and `Copies` do not.
+fn detailed(printer: &dyn Printer) -> bool {
+    printer.view().detailed()
+}
+
+/// Emit a system line (issue #115): what the harness did on its own.
+/// The developer view only, so a `Normal` printer never sees the cell.
+fn system_cell(out: &mut dyn Printer, line: String) {
+    if detailed(out) {
+        out.cell(Cell::System(line), true);
+    }
+}
+
+/// A vector, for tests. Field 1 asks for the developer view's cells
+/// (issue #115); `Default` is off, so every scripted turn that builds
+/// `Lines::default()` prints HEAD's rows.
 #[cfg(test)]
 #[derive(Default)]
-pub struct Lines(pub Vec<String>);
+pub struct Lines(pub Vec<String>, pub bool);
+
+#[cfg(test)]
+impl Lines {
+    /// A `Lines` that asks for the developer view, as the shell does.
+    pub fn detail_on() -> Self {
+        Lines(Vec::new(), true)
+    }
+}
 
 #[cfg(test)]
 impl Printer for Lines {
     fn line(&mut self, text: &str) {
         self.0.push(text.to_owned());
+    }
+
+    fn view(&self) -> View {
+        if self.1 { View::Dev } else { View::Normal }
     }
 }
 
@@ -400,6 +475,10 @@ pub struct ClientRepl {
     tasks: Vec<aigentic_runtime::harness_tools::Task>,
     /// The `update_tasks` call ids, whose results draw nothing.
     task_calls: std::collections::HashSet<String>,
+    /// The text of the last step header committed this turn (issue
+    /// #115), so an identical list re-emitting prints no header, and
+    /// `None` when no step is open. Cleared at turn start.
+    step_header: Option<String>,
     quit: bool,
     /// The project this REPL started in (issue #68): `/build` names it,
     /// and its run is opened through it.
@@ -434,6 +513,39 @@ pub struct ClientRepl {
 }
 
 impl ClientRepl {
+    /// The step header to draw, if one is due (issue #115): the active
+    /// checklist step's text, when it differs from the last committed
+    /// header's, or nothing when no step is active any more (the group
+    /// closes). The text is compared, never the index, so a re-emitted
+    /// identical list does not re-header and renumbering alone does not.
+    /// Decided at `ToolCallStarted` from the `update_tasks` args, like
+    /// the `Done` lines, so it prints even if that call's result fails.
+    pub(crate) fn step_header(&mut self, out: &mut dyn Printer) {
+        let active = self.tasks.iter().position(|t| t.state == TaskState::Active);
+        match active {
+            Some(index) => {
+                let text = self.tasks[index].text.clone();
+                if self.step_header.as_deref() == Some(text.as_str()) {
+                    return;
+                }
+                self.step_header = Some(text.clone());
+                if detailed(out) {
+                    out.cell(
+                        Cell::Step {
+                            index: index + 1,
+                            total: self.tasks.len(),
+                            text,
+                        },
+                        true,
+                    );
+                }
+            }
+            None => {
+                self.step_header = None;
+            }
+        }
+    }
+
     // One argument per thing the REPL needs to know at birth: the wire,
     // the chat thread, who is talking, what they may do, what to show,
     // what to remember, how to count money, and the project it started
@@ -470,6 +582,7 @@ impl ClientRepl {
             title: None,
             tasks: Vec::new(),
             task_calls: std::collections::HashSet::new(),
+            step_header: None,
             usage: None,
             last_turn: None,
             last_stop: None,
@@ -668,6 +781,27 @@ impl ClientRepl {
                     out.line(l);
                 }
             }
+            // `/view` (issue #115): the transcript view. The default is
+            // `dev`; committed cells keep the rows they were built with,
+            // only cells committed from here on change.
+            Command::View(name) => match name {
+                None => out.line(&format!(
+                    "view: {} · {}",
+                    out.view().name(),
+                    out.view().meaning()
+                )),
+                Some("dev") => {
+                    out.set_view(View::Dev);
+                    out.line("view: dev · every call's figures, the step, the policy");
+                }
+                Some("normal") => {
+                    out.set_view(View::Normal);
+                    out.line("view: normal · the transcript as before #115");
+                }
+                Some(other) => out.line(&format!(
+                    "unknown view {other:?} · dev or normal"
+                )),
+            },
             Command::ProjectUse(name) => {
                 let r = self
                     .request(Request::SwitchProject {
@@ -1830,6 +1964,9 @@ impl ClientRepl {
                         out.cell(Cell::Done(text), true);
                     }
                     self.tasks = args.tasks;
+                    // A new active step gets a header, and its calls
+                    // indent under it (issue #115).
+                    self.step_header(out);
                 }
             }
             Notice::ToolCallStarted { call, .. } => {
@@ -1854,6 +1991,7 @@ impl ClientRepl {
                         full,
                         state: ToolState::Running,
                         output: String::new(),
+                        detail: None,
                     },
                     false,
                 );
@@ -1996,10 +2134,27 @@ impl ClientRepl {
                 if let Some(t) = self.turn.as_mut() {
                     t.writing = false;
                     t.retry = None;
-                    if let Ok(AssistantMessagePayload { usage: Some(u), .. }) =
-                        serde_json::from_value(event.payload.clone())
-                    {
-                        t.add_usage(&u);
+                }
+                if let Ok(AssistantMessagePayload { usage: Some(u), .. }) =
+                    serde_json::from_value(event.payload.clone())
+                {
+                    // The call line (issue #115): drawn after the
+                    // flushed reply text and before its tool results.
+                    // The ordinal is the turn's own counter of
+                    // usage-bearing messages.
+                    let n = match self.turn.as_mut() {
+                        Some(t) => t.record_usage(&u),
+                        None => 1,
+                    };
+                    if detailed(out) {
+                        out.cell(
+                            Cell::Call(CallLine::from_usage(
+                                n,
+                                &u,
+                                self.identity.profile.as_deref(),
+                            )),
+                            true,
+                        );
                     }
                 }
             }
@@ -2033,7 +2188,7 @@ impl ClientRepl {
                 {
                     return;
                 }
-                if let Ok(ToolResultPayload { result: r, .. }) =
+                if let Ok(ToolResultPayload { result: r, policy }) =
                     serde_json::from_value(event.payload.clone())
                 {
                     // Our question, answered on another connection: the
@@ -2049,11 +2204,22 @@ impl ClientRepl {
                         .calls
                         .remove(&r.id)
                         .unwrap_or_else(|| ("tool".to_owned(), String::new(), None));
+                    // What the log held about the call (issue #115): its
+                    // run time (the result's `created_at` minus its
+                    // parent assistant message's), the result's size and
+                    // the policy that allowed it.
+                    let detail = tool_detail(policy.as_ref(), r.content.len(), event, &self.turn_events);
                     if matches!(name.as_str(), "edit_file" | "write_file")
                         && !r.is_error
                         && let Some(edit) = crate::app::diff::parse_edit_result(&r.content)
                     {
-                        out.cell(Cell::Edit(edit), true);
+                        out.cell(
+                            Cell::Edit {
+                                edit,
+                                detail: Some(detail),
+                            },
+                            true,
+                        );
                         return;
                     }
                     out.cell(
@@ -2067,6 +2233,7 @@ impl ClientRepl {
                                 ToolState::Ok
                             },
                             output: r.content,
+                            detail: Some(detail),
                         },
                         true,
                     );
@@ -2157,26 +2324,6 @@ impl ClientRepl {
                     ));
                 }
             }
-            EventKind::MemoryExtracted => {
-                if let Ok(p) =
-                    serde_json::from_value::<MemoryExtractedPayload>(event.payload.clone())
-                {
-                    for line in p.written {
-                        out.quiet(&format!("filed to memory: {} ({})", line.text, line.file));
-                    }
-                }
-            }
-            EventKind::MemoryRemembered => {
-                if let Ok(p) =
-                    serde_json::from_value::<MemoryRememberedPayload>(event.payload.clone())
-                {
-                    if p.written {
-                        out.quiet(&format!("filed to memory: {} ({})", p.text, p.file));
-                    } else {
-                        out.quiet(&format!("already in memory: {} ({})", p.text, p.file));
-                    }
-                }
-            }
             EventKind::ProjectSwitched => {
                 self.flush_partial(out);
                 if let Ok(p) = serde_json::from_value::<
@@ -2235,17 +2382,24 @@ impl ClientRepl {
                 if let Ok(p) = serde_json::from_value::<
                     aigentic_runtime::aigentic_log::ProviderRetriedPayload,
                 >(event.payload.clone())
-                    && let Some(t) = self.turn.as_mut()
                 {
-                    t.retry = Some(RetryWait {
+                    // The developer view's own line (issue #115): drawn
+                    // after #114's note above when both apply, from the
+                    // one helper the activity row also reads.
+                    let wait = RetryWait {
                         attempt: p.attempt,
                         retries: p.retries,
                         reason: p.reason,
                         // The line counts down to the next attempt
                         // (issue #90); the app ticks every 250 ms.
                         until: std::time::Instant::now()
-                                + std::time::Duration::from_millis(p.wait_ms),
-                    });
+                            + std::time::Duration::from_millis(p.wait_ms),
+                        wait_ms: p.wait_ms,
+                    };
+                    system_cell(out, wait.system());
+                    if let Some(t) = self.turn.as_mut() {
+                        t.retry = Some(wait);
+                    }
                 }
             }
             // Saturation (issue #35): the sweep can stub no deeper, so the
@@ -2261,14 +2415,50 @@ impl ClientRepl {
                     out.line(&saturated_line(&p));
                 }
             }
+            EventKind::MemoryExtracted => {
+                // The pipe's footer, one per written item (unchanged,
+                // item 8); the shell keeps it out of the transcript.
+                if let Ok(p) =
+                    serde_json::from_value::<MemoryExtractedPayload>(event.payload.clone())
+                {
+                    for line in &p.written {
+                        out.quiet(&format!("filed to memory: {} ({})", line.text, line.file));
+                    }
+                }
+                if let Some(line) = system_line(event) {
+                    self.flush_partial(out);
+                    system_cell(out, line);
+                }
+            }
+            EventKind::MemoryRemembered => {
+                if let Ok(p) =
+                    serde_json::from_value::<MemoryRememberedPayload>(event.payload.clone())
+                {
+                    if p.written {
+                        out.quiet(&format!("filed to memory: {} ({})", p.text, p.file));
+                    } else {
+                        out.quiet(&format!("already in memory: {} ({})", p.text, p.file));
+                    }
+                }
+                if let Some(line) = system_line(event) {
+                    self.flush_partial(out);
+                    system_cell(out, line);
+                }
+            }
+            EventKind::ContextEvicted
+            | EventKind::ResultsStubbed
+            | EventKind::DecisionProposed
+            | EventKind::DecisionAnswered => {
+                // The sweep and decision lines (issue #115): what the
+                // harness did on its own. Developer view only.
+                if let Some(line) = system_line(event) {
+                    self.flush_partial(out);
+                    system_cell(out, line);
+                }
+            }
             EventKind::Pinned
             | EventKind::PermissionRequested
             | EventKind::ThreadStarted
-            | EventKind::ContextEvicted
-            // A closed-turn batch (issue #76) is eviction machinery, not
-            // a turn's own line: the status line that reports the
-            // working set is #99's.
-            | EventKind::ResultsStubbed
             // The build runner's events (issue #53): they belong to the
             // lead thread's run view, not to any turn, so a turn view
             // prints no line for them.
@@ -2282,12 +2472,167 @@ impl ClientRepl {
             | EventKind::BudgetWarned
             | EventKind::Pushed
             | EventKind::RunFinished
-            | EventKind::StepReported
-            // Decisions (issue #74): the REPL draws no line for them;
-            // #7 and #78 draw their own proposal prompts.
-            | EventKind::DecisionProposed
-            | EventKind::DecisionAnswered => {}
+            | EventKind::StepReported => {}
         }
+    }
+}
+
+/// One sweep's line (issue #115): `context evicted through #42`, with
+/// the calibration ratio as a percentage when the event carried one.
+pub(crate) fn sweep_line(what: &str, through_seq: u64, ratio: Option<f64>) -> String {
+    let mut line = format!("{what} through #{through_seq}");
+    if let Some(ratio) = ratio {
+        line.push_str(&format!(" · {:.0}%", ratio * 100.0));
+    }
+    line
+}
+
+/// The developer view's line for what the harness did on its own (issue
+/// #115), or `None` for a kind that draws none. Pure over the event, so
+/// each kind's wording is tested without a daemon.
+fn system_line(event: &Event) -> Option<String> {
+    match event.kind {
+        EventKind::ProviderRetried => payload(
+            event,
+            |p: aigentic_runtime::aigentic_log::ProviderRetriedPayload| {
+                RetryWait {
+                    attempt: p.attempt,
+                    retries: p.retries,
+                    reason: p.reason,
+                    until: std::time::Instant::now(),
+                    wait_ms: p.wait_ms,
+                }
+                .system()
+            },
+        ),
+        EventKind::ContextEvicted => payload(
+            event,
+            |p: aigentic_runtime::aigentic_log::ContextEvictedPayload| {
+                sweep_line("context evicted", p.through_seq, p.ratio)
+            },
+        ),
+        EventKind::ResultsStubbed => payload(
+            event,
+            |p: aigentic_runtime::aigentic_log::ResultsStubbedPayload| {
+                sweep_line("old results stubbed", p.through_seq, p.ratio)
+            },
+        ),
+        EventKind::MemoryExtracted => payload(event, |p: MemoryExtractedPayload| {
+            let n = p.written.len();
+            if n == 0 {
+                "memory: nothing written".to_owned()
+            } else {
+                let noun = if n == 1 { "line" } else { "lines" };
+                let mut line = format!("memory: {n} {noun} written");
+                if !p.model.is_empty() {
+                    line.push_str(&format!(" · {}", p.model));
+                }
+                let (stamped, estimated) = money_cells(&p.usage);
+                let money = crate::stats::money(stamped, estimated);
+                if money != "-" {
+                    line.push_str(&format!(" · {money}"));
+                }
+                line
+            }
+        }),
+        EventKind::MemoryRemembered => payload(event, |p: MemoryRememberedPayload| {
+            if p.written {
+                format!("remembered in {}", p.file)
+            } else {
+                format!("already known: {}", p.file)
+            }
+        }),
+        EventKind::DecisionProposed => payload(event, |p: DecisionProposedPayload| {
+            format!(
+                "proposed {}: {} — {}",
+                decision_kind_name(p.kind),
+                p.proposal,
+                p.reason
+            )
+        }),
+        EventKind::DecisionAnswered => payload(event, |p: DecisionAnsweredPayload| {
+            let mut line = format!("answered {}", decision_answer_name(p.answer));
+            if let Some(correction) = p.correction {
+                line.push_str(&format!(" — {correction}"));
+            } else if let Some(note) = p.note {
+                line.push_str(&format!(" ({note})"));
+            }
+            line
+        }),
+        _ => None,
+    }
+}
+
+/// Read `event.payload` as `P` and map it; `None` when it will not parse
+/// (an old or foreign line).
+fn payload<P: serde::de::DeserializeOwned>(
+    event: &Event,
+    f: impl FnOnce(P) -> String,
+) -> Option<String> {
+    serde_json::from_value(event.payload.clone()).ok().map(f)
+}
+
+/// The two cells [`crate::stats::money`] takes for one usage: the stamped
+/// amount, or the estimate when the log marked it guessed. `None` both
+/// ways when the line holds no price, so no figure is invented.
+pub(crate) fn money_cells(u: &Usage) -> (Option<f64>, Option<f64>) {
+    match (u.cost_usd, u.estimated) {
+        (Some(usd), false) => (Some(usd), None),
+        (Some(usd), true) => (None, Some(usd)),
+        (None, _) => (None, None),
+    }
+}
+
+/// The word a decision kind reads as, matching `stats.rs`'s report.
+fn decision_kind_name(kind: DecisionKind) -> &'static str {
+    match kind {
+        DecisionKind::Project => "project",
+        DecisionKind::Job => "job",
+        DecisionKind::Ticket => "ticket",
+        DecisionKind::Knowledge => "knowledge",
+        DecisionKind::Route => "route",
+        DecisionKind::WorkingSet => "working_set",
+    }
+}
+
+/// The word a decision answer reads as.
+fn decision_answer_name(answer: DecisionAnswer) -> &'static str {
+    match answer {
+        DecisionAnswer::Yes => "yes",
+        DecisionAnswer::No => "no",
+        DecisionAnswer::Corrected => "corrected",
+        DecisionAnswer::Withdrawn => "withdrawn",
+    }
+}
+
+/// What the log held about one tool call (issue #115): its run time —
+/// the result's `created_at` minus its `parent_event` event's
+/// `created_at`, the `assistant_message` that carried the call — the
+/// result's size, and the policy that allowed it. For a parallel batch
+/// this is "done after the call was made", not the call's own span.
+/// Never estimated: a part the log does not hold is `None`.
+pub(crate) fn tool_detail(
+    policy: Option<&PolicyRecord>,
+    content_len: usize,
+    event: &Event,
+    events: &TurnEvents,
+) -> ToolDetail {
+    let took = event
+        .parent_event
+        .and_then(|id| events.at(&id))
+        .and_then(|start| std::time::Duration::try_from(event.created_at - start.created_at).ok());
+    let policy = policy.map(|p| match p {
+        PolicyRecord::Rule { rule, decision, .. } if decision == "deny" => {
+            format!("denied: rule {rule}")
+        }
+        PolicyRecord::Rule { rule, .. } => format!("rule {rule}"),
+        PolicyRecord::Human { allow: true, .. } => "you allowed".to_owned(),
+        PolicyRecord::Human { allow: false, .. } => "you denied".to_owned(),
+    });
+    ToolDetail {
+        took,
+        bytes: content_len,
+        policy,
     }
 }
 
@@ -2480,6 +2825,13 @@ impl TurnEvents {
 
     pub(crate) fn as_slice(&self) -> &[Event] {
         &self.0
+    }
+
+    /// The event with this id, when the buffer still holds it (issue
+    /// #115): a tool result's `took` is read from its parent assistant
+    /// message's `created_at`.
+    pub(crate) fn at(&self, id: &Ulid) -> Option<&Event> {
+        self.0.iter().find(|e| &e.id == id)
     }
 
     /// Drops what the report cannot need: everything but the turn start;
@@ -4552,6 +4904,7 @@ mod tests {
             attempt: 2,
             retries: 3,
             reason: "tensorx · not answering".into(),
+            wait_ms: 0,
             until: std::time::Instant::now() + std::time::Duration::from_secs(90),
         });
         let line = t.activity();
@@ -4571,6 +4924,7 @@ mod tests {
             attempt: 2,
             retries: 3,
             reason: "tensorx · not answering".into(),
+            wait_ms: 0,
             until: std::time::Instant::now(),
         });
         assert!(t.activity().ends_with("trying now"), "{}", t.activity());
@@ -4583,6 +4937,7 @@ mod tests {
             attempt: 1,
             retries: 3,
             reason: "tensorx · not answering".into(),
+            wait_ms: 0,
             until: std::time::Instant::now() + std::time::Duration::from_secs(1),
         });
         t.current = Some("bash cargo test".into());
@@ -8469,5 +8824,555 @@ mod tests {
             !copied.contains("discarded reply"),
             "the discarded attempt is gone: {copied:?}"
         );
+    }
+    // ---- the developer view (issue #115, T4/T6/T7) -------------------
+
+    /// Run one scripted turn to completion and hand back the printer's
+    /// lines. `detail` picks the developer view's `Lines` (T6) or the
+    /// default (T7), the one every existing test uses.
+    async fn dev_lines(script: Vec<Vec<ProviderEvent>>, detail: bool) -> Vec<String> {
+        let dir = tempfile::tempdir().unwrap();
+        let root = project(dir.path(), "proj", "");
+        let cfg_dir = dir.path().join("cfg");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        let embedded = Server::embed_with(
+            config(dir.path()),
+            cfg_dir.clone(),
+            root,
+            "steve",
+            None,
+            Factory::scripted(script),
+            Arc::new(DefaultReports {
+                global_instructions: cfg_dir.join("instructions.md"),
+            }),
+        )
+        .await
+        .unwrap();
+        let (client, welcome) =
+            Client::connect(&Addr::Unix(embedded.socket.clone()), &embedded.token)
+                .await
+                .unwrap();
+        let role = welcome.projects[0].role.clone();
+        let (thread, state, mode) = open(&client, "proj", None).await;
+        let notices = client.take_notices().unwrap();
+        let mut repl = ClientRepl::new(
+            client,
+            thread,
+            "steve",
+            role,
+            state,
+            mode,
+            Identity::default(),
+            "proj",
+        );
+        let (tx, rx) = mpsc::unbounded_channel();
+        let feeder = async move {
+            tx.send("go".into()).unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+            tx.send("/quit".into()).unwrap();
+        };
+        let mut out = if detail {
+            Lines::detail_on()
+        } else {
+            Lines::default()
+        };
+        let ((), ()) = tokio::join!(repl.run(rx, notices, &mut out), feeder);
+        drop(embedded);
+        out.0
+    }
+
+    /// A `update_tasks` argument value with the given `(text, state)`
+    /// rows.
+    fn tasks(rows: &[(&str, &str)]) -> serde_json::Value {
+        serde_json::json!({
+            "tasks": rows
+                .iter()
+                .map(|(text, state)| serde_json::json!({ "text": text, "state": state }))
+                .collect::<Vec<_>>()
+        })
+    }
+
+    fn usage(input: u64, cache_read: u64, output: u64) -> Usage {
+        Usage {
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_tokens: cache_read,
+            cache_write_tokens: 0,
+            reasoning_tokens: None,
+        }
+    }
+
+    /// T6 (issue #115): through the engine, with a `Lines` built with
+    /// detail on, the turn reads in log order — the reply text, the call
+    /// lines, the tool cells and the closing summary — and the call
+    /// lines carry the scripted usage's figures. Through a default
+    /// `Lines` the same turn is HEAD's rows: no `Call`, `Step` or
+    /// `System` line, no blank-row additions.
+    #[tokio::test]
+    async fn the_developer_view_shows_each_call_in_log_order_and_normal_shows_none() {
+        let script = vec![
+            vec![
+                ProviderEvent::Usage(usage(1_000, 3_000, 200)),
+                text("first\n"),
+                call("c1", "bash", serde_json::json!({ "command": "echo hi" })),
+                tool_use(),
+            ],
+            vec![
+                ProviderEvent::Usage(usage(2_000, 600, 300)),
+                text("second\n"),
+                done(),
+            ],
+        ];
+        let dev = dev_lines(script.clone(), true).await;
+        let call1 = dev
+            .iter()
+            .position(|l| l.contains("◦ call 1"))
+            .unwrap_or_else(|| panic!("no call 1 line: {dev:#?}"));
+        let call2 = dev
+            .iter()
+            .position(|l| l.contains("◦ call 2"))
+            .unwrap_or_else(|| panic!("no call 2 line: {dev:#?}"));
+        let first = dev.iter().position(|l| l.contains("first")).unwrap();
+        let second = dev.iter().position(|l| l.contains("second")).unwrap();
+        let tool = dev
+            .iter()
+            .position(|l| l.contains("bash") && l.contains("echo hi"))
+            .unwrap_or_else(|| panic!("no tool cell: {dev:#?}"));
+        assert!(
+            first < call1,
+            "the reply text comes before call 1: {dev:#?}"
+        );
+        assert!(call1 < tool, "call 1 comes before its tool cell: {dev:#?}");
+        assert!(
+            tool < second,
+            "the tool cell comes before the closing text: {dev:#?}"
+        );
+        assert!(
+            second < call2,
+            "a reply's text comes before its own call line: {dev:#?}"
+        );
+        // The figures are the scripted usage's: the numbers the log holds.
+        let line1 = &dev[call1];
+        assert!(
+            line1.contains("4.0k in") && line1.contains("75% cached") && line1.contains("200 out"),
+            "call 1 reads the first usage: {line1:?}"
+        );
+        let line2 = &dev[call2];
+        assert!(
+            line2.contains("300 out"),
+            "call 2 reads the second usage: {line2:?}"
+        );
+
+        let normal = dev_lines(script, false).await;
+        for l in &normal {
+            assert!(
+                !l.contains("◦ call") && !l.contains('▸') && !l.contains("retry "),
+                "a default Lines sees no developer cell: {l:?}"
+            );
+        }
+        assert!(
+            !normal
+                .windows(2)
+                .any(|w| w[0].is_empty() && w[1].is_empty()),
+            "no blank-row additions: {normal:#?}"
+        );
+    }
+
+    /// T4 (issue #115): a scripted turn whose `update_tasks` moves the
+    /// active step twice. Under `Dev` every change draws a header with
+    /// its calls indented, and there is no blank row between a header
+    /// and its first call; re-emitting the identical list and
+    /// renumbering alone draw none. Under `Normal` there is no header
+    /// and no indent.
+    #[tokio::test]
+    async fn a_moved_step_draws_a_header_with_its_calls_indented() {
+        let script = vec![
+            vec![
+                text("planning\n"),
+                call(
+                    "u1",
+                    "update_tasks",
+                    tasks(&[("one", "active"), ("two", "pending"), ("three", "pending")]),
+                ),
+                tool_use(),
+            ],
+            vec![
+                text("reading\n"),
+                call("b1", "bash", serde_json::json!({ "command": "echo a" })),
+                tool_use(),
+            ],
+            vec![
+                text("moving on\n"),
+                call(
+                    "u2",
+                    "update_tasks",
+                    tasks(&[("one", "done"), ("two", "active"), ("three", "pending")]),
+                ),
+                tool_use(),
+            ],
+            // The identical list again: no new header.
+            vec![
+                text("again\n"),
+                call(
+                    "u3",
+                    "update_tasks",
+                    tasks(&[("one", "done"), ("two", "active"), ("three", "pending")]),
+                ),
+                tool_use(),
+            ],
+            // Renumbered (a fourth row), same active text: still none.
+            vec![
+                text("renumbered\n"),
+                call(
+                    "u4",
+                    "update_tasks",
+                    tasks(&[
+                        ("one", "done"),
+                        ("two", "active"),
+                        ("three", "pending"),
+                        ("four", "pending"),
+                    ]),
+                ),
+                tool_use(),
+            ],
+            vec![text("done\n"), done()],
+        ];
+        let dev = dev_lines(script.clone(), true).await;
+        let headers: Vec<&String> = dev.iter().filter(|l| l.contains('▸')).collect();
+        assert_eq!(headers.len(), 2, "one header per change, no more: {dev:#?}");
+        assert!(
+            headers[0].contains("1/3") && headers[0].contains("one"),
+            "the first header names step 1/3: {headers:?}"
+        );
+        assert!(
+            headers[1].contains("2/3") && headers[1].contains("two"),
+            "the second header names step 2/3: {headers:?}"
+        );
+        // A header's very next row is never blank (a call indents under it
+        // rather than opening a new block; the indent itself is the
+        // renderer's, covered by the look.rs step tests).
+        let h = dev.iter().position(|l| l.contains('▸')).unwrap();
+        assert!(
+            !dev[h + 1].is_empty(),
+            "no blank row between a header and the row under it: {dev:#?}"
+        );
+        assert!(
+            !headers[0].starts_with(' '),
+            "a header itself is not indented: {:?}",
+            headers[0]
+        );
+
+        let normal = dev_lines(script, false).await;
+        assert!(
+            !normal.iter().any(|l| l.contains('▸')),
+            "Normal draws no header: {normal:#?}"
+        );
+    }
+
+    /// T7 (issue #115): a turn through a default `Lines` — HEAD's printer
+    /// — carries no developer row and no extra blank row. The cell-level
+    /// half, that `Normal` of a cell with detail equals `Normal` of the
+    /// same cell with none, is pinned by
+    /// `the_developer_view_adds_the_tool_detail_and_normal_is_the_bare_cell`
+    /// in `look.rs`; here the whole turn is checked.
+    #[tokio::test]
+    async fn a_normal_turn_adds_no_developer_rows_and_no_extra_blank_rows() {
+        let script = vec![
+            vec![
+                text("here you go\n"),
+                call("c1", "bash", serde_json::json!({ "command": "echo hi" })),
+                tool_use(),
+            ],
+            vec![text("all done\n"), done()],
+        ];
+        let rows = dev_lines(script, false).await;
+        for l in &rows {
+            assert!(
+                !l.contains("◦ call") && !l.contains('▸') && !l.contains("retry "),
+                "Normal prints no developer row: {l:?}"
+            );
+        }
+        assert!(
+            !rows.windows(2).any(|w| w[0].is_empty() && w[1].is_empty()),
+            "Normal adds no blank rows: {rows:#?}"
+        );
+    }
+    // ---- the developer view's pure parts (issue #115, T3/T5) ---------
+
+    mod dev_view {
+        use super::*;
+        use aigentic_runtime::aigentic_core::{Author, UserId};
+        use aigentic_runtime::aigentic_log::{
+            ContextEvictedPayload, DecisionAnsweredPayload, DecisionProposedPayload,
+            MemoryExtractedPayload, MemoryLine, MemoryRememberedPayload, PolicyRecord,
+            ProviderRetriedPayload, ResultsStubbedPayload, Usage,
+        };
+        use time::OffsetDateTime;
+        use time::macros::datetime;
+
+        fn at(seconds: i64) -> OffsetDateTime {
+            datetime!(2026-10-08 12:00:00 UTC) + time::Duration::seconds(seconds)
+        }
+
+        fn ulid(n: u64) -> Ulid {
+            Ulid::from_parts(n, 1)
+        }
+
+        fn event(kind: EventKind, seq: u64, payload: serde_json::Value) -> Event {
+            Event {
+                id: ulid(seq + 10),
+                thread_id: ulid(1),
+                seq,
+                kind,
+                author: Author::System,
+                payload,
+                parent_event: None,
+                created_at: at(seq as i64),
+            }
+        }
+
+        fn log_usage(cost: Option<f64>, model: &str) -> Usage {
+            Usage {
+                input_tokens: 1_000,
+                output_tokens: 200,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                reasoning_tokens: None,
+                estimated: false,
+                profile: None,
+                model: if model.is_empty() {
+                    None
+                } else {
+                    Some(model.to_owned())
+                },
+                effort: None,
+                latency_ms: None,
+                ttft_ms: None,
+                cost_usd: cost,
+            }
+        }
+
+        /// T3 (issue #115): the policy words, one per shape the log holds,
+        /// and `None` prints nothing.
+        #[test]
+        fn a_tool_detail_words_each_policy_shape() {
+            let cases: &[(Option<PolicyRecord>, &str)] = &[
+                (
+                    Some(PolicyRecord::Rule {
+                        rule: "read_only".into(),
+                        decision: "allow".into(),
+                        reason: None,
+                    }),
+                    "rule read_only",
+                ),
+                (
+                    Some(PolicyRecord::Rule {
+                        rule: "no_shell".into(),
+                        decision: "deny".into(),
+                        reason: None,
+                    }),
+                    "denied: rule no_shell",
+                ),
+                (
+                    Some(PolicyRecord::Human {
+                        event: ulid(7),
+                        allow: true,
+                    }),
+                    "you allowed",
+                ),
+                (
+                    Some(PolicyRecord::Human {
+                        event: ulid(8),
+                        allow: false,
+                    }),
+                    "you denied",
+                ),
+                (None, ""),
+            ];
+            let result = event(EventKind::ToolResult, 2, serde_json::json!({}));
+            let events = TurnEvents::default();
+            for (policy, want) in cases {
+                let d = tool_detail(policy.as_ref(), 0, &result, &events);
+                if want.is_empty() {
+                    assert_eq!(d.policy, None, "an absent policy prints nothing");
+                } else {
+                    assert_eq!(d.policy.as_deref(), Some(*want));
+                }
+            }
+        }
+
+        /// T3 (issue #115): `took` is the result's `created_at` minus the
+        /// `created_at` of the event its `parent_event` names — the
+        /// assistant message that carried the call — and `bytes` is the
+        /// result content's length. A parallel batch is "done after".
+        #[test]
+        fn a_tool_detail_reads_took_from_the_parent_and_bytes_from_the_result() {
+            let parent = Event {
+                id: ulid(1),
+                thread_id: ulid(9),
+                seq: 1,
+                kind: EventKind::AssistantMessage,
+                author: Author::System,
+                payload: serde_json::json!({}),
+                parent_event: None,
+                created_at: at(0),
+            };
+            let mut events = TurnEvents::default();
+            events.push(&parent);
+            // Two results off the one message, at different times: each
+            // reads its own `took`.
+            let mut early = event(EventKind::ToolResult, 2, serde_json::json!({}));
+            early.parent_event = Some(parent.id);
+            early.created_at = at(1);
+            let mut late = event(EventKind::ToolResult, 3, serde_json::json!({}));
+            late.parent_event = Some(parent.id);
+            late.created_at = at(3);
+            let a = tool_detail(None, 1_000, &early, &events);
+            let b = tool_detail(None, 12_345, &late, &events);
+            assert_eq!(a.took, Some(std::time::Duration::from_secs(1)));
+            assert_eq!(b.took, Some(std::time::Duration::from_secs(3)));
+            assert_eq!(a.bytes, 1_000);
+            assert_eq!(b.bytes, 12_345);
+            // A result whose parent is not in the buffer has no duration.
+            let mut orphan = event(EventKind::ToolResult, 4, serde_json::json!({}));
+            orphan.parent_event = Some(ulid(999));
+            let o = tool_detail(None, 5, &orphan, &TurnEvents::default());
+            assert_eq!(o.took, None);
+        }
+
+        /// T5 (issue #115): one fixture event per silent kind gives exactly
+        /// its line, and an event with no line stays `None`. The set is
+        /// Design 7's, including the empty-`written` and no-price memory
+        /// cases; `Pinned`, `PermissionRequested` and the build kinds are
+        /// silent.
+        #[test]
+        fn a_system_line_words_each_silent_kind() {
+            let cases: Vec<(EventKind, serde_json::Value, Option<&str>)> = vec![
+                (
+                    EventKind::ProviderRetried,
+                    serde_json::to_value(ProviderRetriedPayload {
+                        attempt: 1,
+                        retries: 3,
+                        reason: "overloaded".into(),
+                        wait_ms: 2_000,
+                    })
+                    .unwrap(),
+                    Some("retry 1/3 in 2.0s: overloaded"),
+                ),
+                (
+                    EventKind::ContextEvicted,
+                    serde_json::to_value(ContextEvictedPayload {
+                        through_seq: 42,
+                        ratio: None,
+                    })
+                    .unwrap(),
+                    Some("context evicted through #42"),
+                ),
+                (
+                    EventKind::ContextEvicted,
+                    serde_json::to_value(ContextEvictedPayload {
+                        through_seq: 42,
+                        ratio: Some(0.8),
+                    })
+                    .unwrap(),
+                    Some("context evicted through #42 · 80%"),
+                ),
+                (
+                    EventKind::ResultsStubbed,
+                    serde_json::to_value(ResultsStubbedPayload {
+                        through_seq: 9,
+                        ratio: None,
+                    })
+                    .unwrap(),
+                    Some("old results stubbed through #9"),
+                ),
+                (
+                    EventKind::MemoryExtracted,
+                    serde_json::to_value(MemoryExtractedPayload {
+                        through_seq: 5,
+                        written: Vec::new(),
+                        model: "flash".into(),
+                        usage: log_usage(None, "flash"),
+                    })
+                    .unwrap(),
+                    Some("memory: nothing written"),
+                ),
+                (
+                    EventKind::MemoryExtracted,
+                    serde_json::to_value(MemoryExtractedPayload {
+                        through_seq: 5,
+                        written: vec![
+                            MemoryLine {
+                                file: "decisions.md".into(),
+                                text: "a".into(),
+                                stated_by: Author::User(UserId("steve".into())),
+                                at_seq: 2,
+                            },
+                            MemoryLine {
+                                file: "decisions.md".into(),
+                                text: "b".into(),
+                                stated_by: Author::User(UserId("steve".into())),
+                                at_seq: 2,
+                            },
+                        ],
+                        model: "flash".into(),
+                        usage: log_usage(Some(0.0141), "flash"),
+                    })
+                    .unwrap(),
+                    Some("memory: 2 lines written · flash · $0.0141"),
+                ),
+                (
+                    EventKind::MemoryRemembered,
+                    serde_json::to_value(MemoryRememberedPayload {
+                        file: "decisions.md".into(),
+                        text: "x".into(),
+                        written: true,
+                    })
+                    .unwrap(),
+                    Some("remembered in decisions.md"),
+                ),
+                (
+                    EventKind::MemoryRemembered,
+                    serde_json::to_value(MemoryRememberedPayload {
+                        file: "decisions.md".into(),
+                        text: "x".into(),
+                        written: false,
+                    })
+                    .unwrap(),
+                    Some("already known: decisions.md"),
+                ),
+                (
+                    EventKind::DecisionProposed,
+                    serde_json::to_value(DecisionProposedPayload {
+                        kind: aigentic_runtime::aigentic_log::DecisionKind::Project,
+                        proposal: "switch to site".into(),
+                        target: None,
+                        reason: "it is the front".into(),
+                        call_id: None,
+                        stage: Default::default(),
+                    })
+                    .unwrap(),
+                    Some("proposed project: switch to site — it is the front"),
+                ),
+                (
+                    EventKind::DecisionAnswered,
+                    serde_json::to_value(DecisionAnsweredPayload {
+                        answer: aigentic_runtime::aigentic_log::DecisionAnswer::Yes,
+                        correction: None,
+                        note: None,
+                    })
+                    .unwrap(),
+                    Some("answered yes"),
+                ),
+                // Silent kinds stay silent.
+                (EventKind::Pinned, serde_json::json!({}), None),
+                (EventKind::PermissionRequested, serde_json::json!({}), None),
+                (EventKind::ThreadStarted, serde_json::json!({}), None),
+            ];
+            for (i, (kind, payload, want)) in cases.into_iter().enumerate() {
+                let e = event(kind, i as u64 + 1, payload);
+                assert_eq!(system_line(&e).as_deref(), want, "kind {kind:?} line");
+            }
+        }
     }
 }

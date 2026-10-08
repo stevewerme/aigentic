@@ -30,6 +30,42 @@ const TWO_WORD: &[&str] = &[
     "uv", "pip", "vercel",
 ];
 
+/// Which transcript the shell draws (issue #115). `Dev` is the default:
+/// a developer reading the scrollback sees every figure the log holds,
+/// while `Normal` prints what the shell printed before the developer
+/// view existed, byte for byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum View {
+    /// Calls, step headers, system lines and tool detail.
+    #[default]
+    Dev,
+    /// The rows the shell printed before #115.
+    Normal,
+}
+
+impl View {
+    pub fn name(self) -> &'static str {
+        match self {
+            View::Dev => "dev",
+            View::Normal => "normal",
+        }
+    }
+
+    /// The one line `/view` prints beside the name.
+    pub fn meaning(self) -> &'static str {
+        match self {
+            View::Dev => "dev: every call's cost, the step it served, and what the harness did",
+            View::Normal => "normal: the rows the shell printed before the developer view",
+        }
+    }
+
+    /// Whether the developer view's cells (a call line, a step header, a
+    /// system line) are drawn and emitted at all (issue #115).
+    pub fn detailed(self) -> bool {
+        matches!(self, View::Dev)
+    }
+}
+
 /// Which kind of block a cell belongs to; a blank line separates two
 /// blocks of different kinds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,11 +84,27 @@ pub fn group(cell: &Cell) -> Group {
     match cell {
         Cell::User(_) => Group::User,
         Cell::Assistant { .. } => Group::Assistant,
-        Cell::Tool { .. } | Cell::Explored(_) | Cell::Edit(_) | Cell::Done(_) => Group::Tools,
+        Cell::Tool { .. }
+        | Cell::Explored(_)
+        | Cell::Edit { .. }
+        | Cell::Done(_)
+        | Cell::Step { .. }
+        | Cell::Call(_)
+        | Cell::System(_) => Group::Tools,
         Cell::Run(_) => Group::Run,
         Cell::Summary(_) => Group::Summary,
         Cell::Note(_) => Group::Note,
     }
+}
+
+/// Whether a cell takes the active step's two-column indent under
+/// `Dev` (issue #115). A header opens the group and the `Done` line
+/// closes it, so neither is indented.
+pub fn indents(cell: &Cell) -> bool {
+    matches!(
+        cell,
+        Cell::Tool { .. } | Cell::Explored(_) | Cell::Edit { .. } | Cell::Call(_) | Cell::System(_)
+    )
 }
 
 fn dim() -> Style {
@@ -138,18 +190,64 @@ pub fn explored_entry(tool: &str, summary: &str, output: &str) -> String {
     format!("{} {summary}{}", verb(tool), count(output.lines().count()))
 }
 
-/// The running tool, in the viewport.
-pub fn running(tool: &str, summary: &str, width: usize) -> Vec<Line<'static>> {
-    hang(
+/// The running tool, in the viewport. Under `Dev`, while a step is
+/// active, the row takes the step's indent too (issue #115), so it
+/// never jumps left when it commits.
+pub fn running(
+    tool: &str,
+    summary: &str,
+    view: View,
+    indent: bool,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let indent = indent && view == View::Dev;
+    let width = if indent {
+        width.saturating_sub(2).max(1)
+    } else {
+        width
+    };
+    let rows = hang(
         Line::from(head_spans(tool, summary)),
         Span::styled("◦ ", Style::default().fg(Color::Yellow)),
         width,
-    )
+    );
+    if indent { prefix_two(rows) } else { rows }
+}
+
+/// Two columns in front of every row (issue #115): the indent is a
+/// prefix, and the leaf got `width - 2`, so a wrapped row still hangs
+/// under its own marker rather than two past it.
+fn prefix_two(rows: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    rows.into_iter()
+        .map(|mut line| {
+            line.spans.insert(0, Span::raw("  "));
+            line
+        })
+        .collect()
 }
 
 /// A cell's rows in the shell. The assistant's `first` says whether this
 /// line starts a reply (the marker) or continues one (two spaces).
-pub fn render(cell: &Cell, first: bool, width: usize) -> Vec<Line<'static>> {
+/// `view` decides whether the developer rows print, and `indent` says
+/// whether a step is active; under `Normal` neither shows.
+pub fn render(
+    cell: &Cell,
+    first: bool,
+    view: View,
+    indent: bool,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let indent = indent && view == View::Dev && indents(cell);
+    let width = if indent {
+        width.saturating_sub(2).max(1)
+    } else {
+        width
+    };
+    let rows = render_cell(cell, first, width, view);
+    if indent { prefix_two(rows) } else { rows }
+}
+
+fn render_cell(cell: &Cell, first: bool, width: usize, view: View) -> Vec<Line<'static>> {
     match cell {
         Cell::User(text) => {
             let style = Style::default().bg(USER_BG).fg(USER_FG);
@@ -180,59 +278,75 @@ pub fn render(cell: &Cell, first: bool, width: usize) -> Vec<Line<'static>> {
             full: _,
             state,
             output,
+            detail,
         } => {
             let mut spans = head_spans(name, summary);
-            match state {
-                ToolState::Err => {
-                    spans.push(Span::styled(" · failed", Style::default().fg(Color::Red)));
-                    let mut lines = hang(Line::from(spans), dot(Color::Red), width);
-                    let rows: Vec<&str> = output.lines().collect();
-                    for r in rows.iter().skip(rows.len().saturating_sub(FAILED_TAIL)) {
-                        lines.extend(
-                            hang(
-                                Line::from(Span::styled((*r).to_owned(), dim())),
-                                Span::styled("└ ", dim()),
-                                width.saturating_sub(2),
-                            )
-                            .into_iter()
-                            .map(|l| {
-                                let mut s = vec![Span::raw("  ")];
-                                s.extend(l.spans);
-                                Line::from(s)
-                            }),
-                        );
-                    }
-                    lines
-                }
-                _ => {
-                    spans.push(Span::styled(count(output.lines().count()), dim()));
-                    hang(Line::from(spans), dot(Color::Green), width)
-                }
+            let failed = matches!(state, ToolState::Err);
+            if failed {
+                spans.push(Span::styled(" · failed", Style::default().fg(Color::Red)));
+            } else {
+                spans.push(Span::styled(count(output.lines().count()), dim()));
             }
+            if view == View::Dev
+                && let Some(detail) = detail
+            {
+                spans.push(Span::styled(detail.tail(), dim()));
+            }
+            if !failed {
+                return hang(Line::from(spans), dot(Color::Green), width);
+            }
+            let mut lines = hang(Line::from(spans), dot(Color::Red), width);
+            let rows: Vec<&str> = output.lines().collect();
+            for r in rows.iter().skip(rows.len().saturating_sub(FAILED_TAIL)) {
+                lines.extend(
+                    hang(
+                        Line::from(Span::styled((*r).to_owned(), dim())),
+                        Span::styled("└ ", dim()),
+                        width.saturating_sub(2),
+                    )
+                    .into_iter()
+                    .map(|l| {
+                        let mut s = vec![Span::raw("  ")];
+                        s.extend(l.spans);
+                        Line::from(s)
+                    }),
+                );
+            }
+            lines
         }
         Cell::Explored(entries) => entries
             .iter()
             .flat_map(|e| {
-                let (main, tail) = match e.split_once(" · ") {
+                let (main, tail) = match e.line.split_once(" · ") {
                     Some((m, t)) => (m.to_owned(), format!(" · {t}")),
-                    None => (e.clone(), String::new()),
+                    None => (e.line.clone(), String::new()),
                 };
                 let (v, rest) = main.split_once(' ').unwrap_or((main.as_str(), ""));
-                let line = Line::from(vec![
+                let mut spans = vec![
                     Span::styled(v.to_owned(), bold()),
                     Span::raw(format!(" {rest}")),
                     Span::styled(tail, dim()),
-                ]);
-                hang(line, dot(Color::Green), width)
+                ];
+                if view == View::Dev
+                    && let Some(detail) = &e.detail
+                {
+                    spans.push(Span::styled(detail.tail(), dim()));
+                }
+                hang(Line::from(spans), dot(Color::Green), width)
             })
             .collect(),
-        Cell::Edit(edit) => {
-            let head = Line::from(vec![
+        Cell::Edit { edit, detail } => {
+            let mut head = vec![
                 Span::styled("Edited", bold()),
                 Span::raw(format!(" {}", edit.path)),
                 Span::styled(format!(" (+{} −{})", edit.added, edit.removed), dim()),
-            ]);
-            let mut lines = hang(head, dot(Color::Green), width);
+            ];
+            if view == View::Dev
+                && let Some(detail) = detail
+            {
+                head.push(Span::styled(detail.tail(), dim()));
+            }
+            let mut lines = hang(Line::from(head), dot(Color::Green), width);
             let body: Vec<&str> = edit
                 .diff
                 .lines()
@@ -251,6 +365,39 @@ pub fn render(cell: &Cell, first: bool, width: usize) -> Vec<Line<'static>> {
             }
             lines
         }
+        Cell::Call(line) => match view {
+            View::Dev => hang(
+                Line::from(Span::styled(line.text(), dim())),
+                Span::raw(""),
+                width,
+            ),
+            View::Normal => Vec::new(),
+        },
+        Cell::Step { index, total, text } => match view {
+            View::Dev => hang(
+                Line::from(vec![
+                    Span::styled("▸ ", dim()),
+                    Span::styled(format!("{index}/{total} "), dim()),
+                    Span::styled(text.clone(), bold()),
+                ]),
+                Span::raw(""),
+                width,
+            ),
+            View::Normal => Vec::new(),
+        },
+        Cell::System(text) => match view {
+            View::Dev => text
+                .lines()
+                .flat_map(|l| {
+                    hang(
+                        Line::from(Span::styled(format!("· {l}"), dim())),
+                        Span::raw(""),
+                        width,
+                    )
+                })
+                .collect(),
+            View::Normal => Vec::new(),
+        },
         Cell::Done(text) => vec![Line::from(vec![
             Span::styled("✓ ", dim()),
             Span::raw(text.clone()),
@@ -309,6 +456,7 @@ pub fn welcome(lines: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::cells::{CallLine, ToolDetail};
 
     fn text(lines: &[Line<'_>]) -> Vec<String> {
         lines
@@ -324,16 +472,16 @@ mod tests {
             fenced: false,
         };
         assert_eq!(
-            text(&render(&cell, true, 14)),
+            text(&render(&cell, true, View::Normal, false, 14)),
             vec!["⏺ one two", "  three four", "  five"]
         );
         assert_eq!(
-            text(&render(&cell, false, 40)),
+            text(&render(&cell, false, View::Normal, false, 40)),
             vec!["  one two three four five"]
         );
         // The bullet is violet (issue #21): red is for failures
         // alone, and clay reads as red.
-        let lines = render(&cell, true, 40);
+        let lines = render(&cell, true, View::Normal, false, 40);
         assert_eq!(lines[0].spans[0].style.fg, Some(REPLY));
         assert_ne!(REPLY, CLAY);
         assert_ne!(REPLY, Color::Red);
@@ -344,8 +492,9 @@ mod tests {
             full: None,
             state: ToolState::Err,
             output: "error".into(),
+            detail: None,
         };
-        let lines = render(&failed, true, 80);
+        let lines = render(&failed, true, View::Normal, false, 80);
         assert_eq!(lines[0].spans[0].style.fg, Some(Color::Red));
     }
 
@@ -357,9 +506,10 @@ mod tests {
             full: None,
             state: ToolState::Ok,
             output: "a\nb\nc".into(),
+            detail: None,
         };
         assert_eq!(
-            text(&render(&ok, false, 80)),
+            text(&render(&ok, false, View::Normal, false, 80)),
             vec!["⏺ git log --oneline -15 · 3 lines"]
         );
         let failed = Cell::Tool {
@@ -368,9 +518,10 @@ mod tests {
             full: None,
             state: ToolState::Err,
             output: "1\n2\n3\n4\nerror: 1 failed".into(),
+            detail: None,
         };
         assert_eq!(
-            text(&render(&failed, false, 80)),
+            text(&render(&failed, false, View::Normal, false, 80)),
             vec![
                 "⏺ cargo test · failed",
                 "  └ 3",
@@ -386,18 +537,32 @@ mod tests {
 
     #[test]
     fn the_person_is_a_full_width_block_and_notes_lose_their_brackets() {
-        let rows = text(&render(&Cell::User("hi".into()), false, 10));
+        let rows = text(&render(
+            &Cell::User("hi".into()),
+            false,
+            View::Normal,
+            false,
+            10,
+        ));
         assert_eq!(rows, vec![" hi       "]);
         assert_eq!(
             text(&render(
                 &Cell::Note("[sent: reaches the agent at its next step]".into()),
+                false,
+                View::Normal,
                 false,
                 80
             )),
             vec!["  sent: reaches the agent at its next step"]
         );
         assert_eq!(
-            text(&render(&Cell::Summary("─ 3s · 1 tool".into()), false, 80)),
+            text(&render(
+                &Cell::Summary("─ 3s · 1 tool".into()),
+                false,
+                View::Normal,
+                false,
+                80
+            )),
             vec!["  3s · 1 tool"]
         );
     }
@@ -407,5 +572,125 @@ mod tests {
         let w = welcome(&["aigentic · steve".into(), "keys".into()]);
         assert!(w.contains("|___/"));
         assert!(w.contains("aigentic · steve\n"));
+    }
+
+    // T3 (issue #115): the developer view adds the tool detail; Normal
+    // is the bare cell; the step indent shifts every row and passes
+    // `width - 2` into the leaf.
+
+    use crate::app::cells::{bytes_short, secs_ms};
+    use std::time::Duration;
+
+    fn a_tool(detail: Option<ToolDetail>) -> Cell {
+        Cell::Tool {
+            name: "read_file".into(),
+            summary: "src/x.rs".into(),
+            full: None,
+            state: ToolState::Ok,
+            output: "a\nb".into(),
+            detail,
+        }
+    }
+
+    #[test]
+    fn the_developer_view_adds_the_tool_detail_and_normal_is_the_bare_cell() {
+        let cell = a_tool(Some(ToolDetail {
+            took: Some(Duration::from_millis(1_200)),
+            bytes: 3_400,
+            policy: Some("rule read_only".into()),
+        }));
+        let dev = text(&render(&cell, false, View::Dev, false, 80));
+        let normal = text(&render(&cell, false, View::Normal, false, 80));
+        let bare = text(&render(&a_tool(None), false, View::Normal, false, 80));
+        // Normal's rows are the cell with no detail at all.
+        assert_eq!(normal, bare);
+        assert!(dev[0].contains("rule read_only"));
+        assert!(dev[0].contains(&bytes_short(3_400)));
+        assert!(dev[0].contains(&secs_ms(1_200)));
+    }
+
+    #[test]
+    fn the_step_indent_shifts_every_row_and_passes_width_minus_two() {
+        let cell = Cell::Tool {
+            name: "bash".into(),
+            summary: "one two three four five six seven eight".into(),
+            full: None,
+            state: ToolState::Ok,
+            output: "x".into(),
+            detail: None,
+        };
+        let stepped = text(&render(&cell, false, View::Dev, true, 20));
+        // Every row takes two columns...
+        for row in &stepped {
+            assert!(row.starts_with("  "), "{row:?}");
+        }
+        // ...and the leaf wraps as if it had two fewer columns, so each
+        // level does not shorten the wrap by two twice.
+        let inner = text(&render(&cell, false, View::Normal, false, 18));
+        let stripped: Vec<String> = stepped.iter().map(|r| r[2..].to_owned()).collect();
+        assert_eq!(stripped, inner);
+        assert!(stepped.len() > 1);
+    }
+
+    #[test]
+    fn a_failed_tool_nests_its_tail_inside_the_step_indent() {
+        let failed = Cell::Tool {
+            name: "bash".into(),
+            summary: "cargo test".into(),
+            full: None,
+            state: ToolState::Err,
+            output: "1\n2\nerror".into(),
+            detail: None,
+        };
+        let rows = text(&render(&failed, false, View::Dev, true, 80));
+        assert_eq!(rows[0], "  ⏺ cargo test · failed");
+        // The failed path's own two-column nest sits inside the step's.
+        assert_eq!(rows[1], "    └ 1");
+        assert_eq!(rows[3], "    └ error");
+    }
+
+    #[test]
+    fn an_edit_diff_preview_lines_up_under_the_step_indent() {
+        let edit = diff::parse_edit_result("--- a\n+++ b/src/x.rs\n@@\n-old\n+new\n").unwrap();
+        let cell = Cell::Edit { edit, detail: None };
+        let rows = text(&render(&cell, false, View::Dev, true, 80));
+        assert!(rows[0].starts_with("  ⏺ Edited src/x.rs"), "{:?}", rows[0]);
+        // The edit path's own two-column marker sits inside the step's.
+        assert_eq!(rows[1], "    @@");
+        assert_eq!(rows[2], "    -old");
+        assert_eq!(rows[3], "    +new");
+    }
+
+    #[test]
+    fn a_step_header_prints_only_under_the_developer_view() {
+        let step = Cell::Step {
+            index: 2,
+            total: 5,
+            text: "Read key code regions".into(),
+        };
+        assert_eq!(
+            text(&render(&step, false, View::Dev, false, 80)),
+            vec!["▸ 2/5 Read key code regions"]
+        );
+        assert!(render(&step, false, View::Normal, false, 80).is_empty());
+        // The pager always shows it (Design 3): `full()` is not view-led.
+        assert_eq!(step.plain(), vec!["▸ 2/5 Read key code regions"]);
+    }
+
+    #[test]
+    fn a_call_and_a_system_line_print_only_under_the_developer_view() {
+        let call = Cell::Call(CallLine {
+            n: 3,
+            ..Default::default()
+        });
+        assert!(text(&render(&call, false, View::Dev, false, 80))[0].starts_with("◦ call 3"));
+        assert!(render(&call, false, View::Normal, false, 80).is_empty());
+
+        let system = Cell::System("retry 1/3 in 2.0s: transport reset".into());
+        assert_eq!(
+            text(&render(&system, false, View::Dev, false, 80)),
+            vec!["· retry 1/3 in 2.0s: transport reset"]
+        );
+        assert!(render(&system, false, View::Normal, false, 80).is_empty());
     }
 }

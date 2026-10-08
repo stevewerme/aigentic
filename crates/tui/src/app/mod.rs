@@ -30,11 +30,12 @@ use crossterm::event::{Event, EventStream, KeyCode as K, KeyEventKind};
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
 
-use crate::app::cells::{Cell, ToolState, is_read_tool};
+use crate::app::cells::{Cell, ExploredRow, ToolState, is_read_tool};
 use crate::app::completion::{FileIndex, Popup};
 use crate::app::composer::Composer;
 use crate::app::engine::{ClientRepl, MenuKey, Printer, TurnStats};
 use crate::app::keymap::{Action, KeyContext, action_for};
+use crate::app::look::View;
 use crate::app::menu::{Menu, Pick};
 use crate::app::pager::Pager;
 use crate::app::status::Status;
@@ -122,7 +123,7 @@ struct ShellOut {
     /// Committed lines the next draw flushes.
     pending: Vec<Line<'static>>,
     /// Reads not yet committed as one `Explored`.
-    explored: Vec<String>,
+    explored: Vec<ExploredRow>,
     /// The running tool, if any.
     running: Option<Cell>,
     /// The assistant's text since its last newline.
@@ -134,6 +135,13 @@ struct ShellOut {
     /// The kind of the last committed block, for spacing and the reply
     /// marker.
     last: Option<look::Group>,
+    /// The transcript view committed cells are rendered under (issue
+    /// #115). A switch applies from then on; scrollback is never
+    /// redrawn, the viewport is (it is not scrollback).
+    view: View,
+    /// Whether a step header is open, so the cells under it indent. Set
+    /// on a committed `Step`, cleared by the next header or a `Done`.
+    in_step: bool,
 }
 
 impl ShellOut {
@@ -150,6 +158,8 @@ impl ShellOut {
             fenced: false,
             page: None,
             last: None,
+            view: View::default(),
+            in_step: false,
         }
     }
 
@@ -158,18 +168,38 @@ impl ShellOut {
         // the order the work happened in.
         self.flush_explored();
         let width = self.width;
-        let group = look::group(&cell);
-        // A blank line between blocks of different kinds.
-        if self.last.is_some_and(|last| last != group) {
-            self.pending.push(Line::raw(""));
-        }
         let first = self.last != Some(look::Group::Assistant);
-        self.pending.extend(look::render(&cell, first, width));
-        self.last = Some(group);
-        self.transcript.push(cell);
+        let rendered = look::render(&cell, first, self.view, self.in_step, width);
+        // The cell is stored whatever the view draws for it: the pager
+        // reads `full()`, which always holds the detail (design 3).
+        self.transcript.push(cell.clone());
         if self.transcript.len() > TRANSCRIPT_KEEP {
             self.transcript.remove(0);
         }
+        // A step header opens the group (indented), a `Done` closes it.
+        if matches!(cell, Cell::Step { .. }) {
+            self.in_step = true;
+        } else if matches!(cell, Cell::Done(_)) {
+            self.in_step = false;
+        }
+        // A cell the current view draws nothing for stops here: no
+        // blank-line separator, no `last` update, no `pending` push
+        // (design 8), so a `Normal` turn gains no extra blank rows.
+        if rendered.is_empty() {
+            return;
+        }
+        let group = look::group(&cell);
+        // A blank line before a step header, and between blocks of
+        // different kinds; never one between a header and its items.
+        if matches!(cell, Cell::Step { .. }) {
+            if self.last.is_some() {
+                self.pending.push(Line::raw(""));
+            }
+        } else if self.last.is_some_and(|last| last != group) {
+            self.pending.push(Line::raw(""));
+        }
+        self.pending.extend(rendered);
+        self.last = Some(group);
     }
 
     /// Whether `text` draws nothing (issue #43): a text block that is
@@ -205,6 +235,8 @@ impl ShellOut {
             lines.extend(look::render(
                 &Cell::Explored(self.explored.clone()),
                 false,
+                self.view,
+                self.in_step,
                 width,
             ));
         }
@@ -217,7 +249,7 @@ impl ShellOut {
             if first && self.last.is_some() && lines.is_empty() {
                 lines.push(Line::raw(""));
             }
-            lines.extend(tail_rows(&tail, first, width));
+            lines.extend(tail_rows(&tail, first, self.view, self.in_step, width));
         }
         if phase == LivePhase::Writing {
             while lines.len() < TAIL_ROWS {
@@ -233,8 +265,14 @@ impl ShellOut {
 /// are the scrollback's once its line completes, so keeping them in
 /// the pane would only hold its height up and, with the line gone,
 /// pad the difference with blanks.
-fn tail_rows(cell: &Cell, first: bool, width: usize) -> Vec<Line<'static>> {
-    let rendered = look::render(cell, first, width);
+fn tail_rows(
+    cell: &Cell,
+    first: bool,
+    view: View,
+    indent: bool,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let rendered = look::render(cell, first, view, indent, width);
     let skip = rendered.len().saturating_sub(TAIL_ROWS);
     rendered.into_iter().skip(skip).collect()
 }
@@ -279,6 +317,15 @@ impl Printer for ShellOut {
         self.pending.clear();
         self.fenced = false;
         self.last = None;
+        self.in_step = false;
+    }
+
+    fn view(&self) -> View {
+        self.view
+    }
+
+    fn set_view(&mut self, view: View) {
+        self.view = view;
     }
 
     fn tail(&mut self, text: &str) {
@@ -323,13 +370,16 @@ impl Printer for ShellOut {
                     full: _,
                     state,
                     output,
+                    detail,
                 },
                 true,
             ) => {
                 self.running = None;
                 if is_read_tool(name) && *state == ToolState::Ok {
-                    self.explored
-                        .push(look::explored_entry(name, summary, output));
+                    self.explored.push(ExploredRow {
+                        line: look::explored_entry(name, summary, output),
+                        detail: detail.clone(),
+                    });
                 } else {
                     self.flush_explored();
                     self.commit(cell);
@@ -544,14 +594,36 @@ fn next_phase(prev: LivePhase, state: &ThreadState, turn: Option<&TurnStats>) ->
 /// [`TAIL_ROWS`] rows while writing, and the compact task list is
 /// added as #21 draws it (at most three rows). Each row is one line:
 /// the full command is the pager's to show.
+#[cfg(test)]
 fn live_block(
     phase: LivePhase,
     running: Option<&Cell>,
     tasks: &[aigentic_runtime::harness_tools::Task],
     width: usize,
 ) -> Vec<Line<'static>> {
+    // The pure tests build it with no dev row: `Normal`, no step open.
+    live_block_in(phase, running, tasks, width, View::Normal, false)
+}
+
+/// The live area's rows, under a view and a possibly open step
+/// (issue #115): the same rows, with the running row indented while a
+/// step is open.
+fn live_block_in(
+    phase: LivePhase,
+    running: Option<&Cell>,
+    tasks: &[aigentic_runtime::harness_tools::Task],
+    width: usize,
+    view: View,
+    in_step: bool,
+) -> Vec<Line<'static>> {
     let one = |l: Line<'static>| -> Line<'static> {
         wrap_line(&l, width).into_iter().next().unwrap_or(l)
+    };
+    let row = |name: &str, summary: &str| {
+        one(look::running(name, summary, view, in_step, width)
+            .into_iter()
+            .next()
+            .unwrap_or_default())
     };
     let mut live: Vec<Line<'static>> = Vec::new();
     match phase {
@@ -560,19 +632,13 @@ fn live_block(
         // between its start and its cell.
         LivePhase::Tool => {
             live.push(match running {
-                Some(Cell::Tool { name, summary, .. }) => one(look::running(name, summary, width)
-                    .into_iter()
-                    .next()
-                    .unwrap_or_default()),
+                Some(Cell::Tool { name, summary, .. }) => row(name, summary),
                 _ => Line::raw(""),
             });
         }
         LivePhase::Writing | LivePhase::Thinking => {
             if let Some(Cell::Tool { name, summary, .. }) = running {
-                live.push(one(look::running(name, summary, width)
-                    .into_iter()
-                    .next()
-                    .unwrap_or_default()));
+                live.push(row(name, summary));
             }
         }
     }
@@ -740,8 +806,14 @@ async fn run_shell(
         // two rows while writing. The one blank row the layout puts
         // above them stays one.
         phase = next_phase(phase, &state, engine.turn());
-        let mut block: Vec<Line<'static>> =
-            live_block(phase, out.running.as_ref(), engine.tasks(), out.width);
+        let mut block: Vec<Line<'static>> = live_block_in(
+            phase,
+            out.running.as_ref(),
+            engine.tasks(),
+            out.width,
+            out.view,
+            out.in_step,
+        );
         block.extend(
             engine
                 .menu()
@@ -999,6 +1071,8 @@ async fn run_shell(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::cells::CallLine;
+    use crate::app::look::View;
     use crate::app::menu::Menu;
     use aigentic_runtime::aigentic_core::{Author, RiskClass, ToolCall};
     use serde_json::json;
@@ -1031,6 +1105,107 @@ mod tests {
         )
     }
 
+    /// T3/T6/T7 (issue #115): at the commit seam, a developer cell
+    /// draws a row under `Dev` and, under `Normal`, draws nothing and
+    /// leaves no blank-line separator behind — no `pending` push, no
+    /// `last` update, so a `Normal` turn gains no extra blank rows.
+    #[test]
+    fn a_developer_cell_leaves_no_separator_when_it_renders_nothing() {
+        use aigentic_runtime::aigentic_log::Usage;
+        let usage = Usage {
+            input_tokens: 41_200,
+            output_tokens: 812,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: None,
+            estimated: false,
+            profile: None,
+            model: Some("deepseek-v4.1-flash".into()),
+            effort: None,
+            latency_ms: None,
+            ttft_ms: None,
+            cost_usd: Some(0.0141),
+        };
+        for cell in [
+            Cell::Call(CallLine::from_usage(1, &usage, Some("deepseek-v4.1-flash"))),
+            Cell::Step {
+                index: 2,
+                total: 5,
+                text: "Read key code regions".into(),
+            },
+            Cell::System("retry 1/3 in 2.0s: overloaded".into()),
+        ] {
+            let label = format!("{cell:?}");
+            let mut dev = out_at(80);
+            dev.view = View::Dev;
+            dev.commit(cell.clone());
+            assert!(!dev.pending.is_empty(), "Dev draws {label}");
+            let mut normal = out_at(80);
+            normal.view = View::Normal;
+            normal.commit(cell.clone());
+            assert!(normal.pending.is_empty(), "Normal draws no {label}");
+            assert!(normal.last.is_none(), "and leaves no separator for {label}");
+        }
+    }
+
+    /// T4 (issue #115): the pager keeps the step headers. `full()` has
+    /// no view, so both views see them.
+    #[test]
+    fn the_pager_keeps_the_step_headers() {
+        let lines = text(&transcript_lines(
+            &[Cell::Step {
+                index: 2,
+                total: 5,
+                text: "Read key code regions".into(),
+            }],
+            &[],
+        ));
+        assert_eq!(lines, vec!["▸ 2/5 Read key code regions".to_owned()]);
+    }
+
+    /// T1 (issue #115): `/view` decides the cells committed from then on.
+    /// Scrollback is never redrawn: a cell committed under `Dev` keeps
+    /// its developer row, and one committed after the switch to
+    /// `Normal` adds none.
+    #[test]
+    fn switching_the_view_only_changes_cells_committed_after_it() {
+        use aigentic_runtime::aigentic_log::Usage;
+        let usage = Usage {
+            input_tokens: 41_200,
+            output_tokens: 812,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: None,
+            estimated: false,
+            profile: None,
+            model: Some("m".into()),
+            effort: None,
+            latency_ms: None,
+            ttft_ms: None,
+            cost_usd: Some(0.0141),
+        };
+        let mut out = out_at(80);
+        out.view = View::Dev;
+        out.commit(Cell::Call(CallLine::from_usage(1, &usage, Some("m"))));
+        let dev_rows = text(&out.pending);
+        assert!(
+            dev_rows.iter().any(|r| r.contains("◦ call 1")),
+            "the call committed under Dev draws its row: {dev_rows:#?}"
+        );
+        // The view changes; the already-committed cell stays as it was
+        // drawn, and the next call adds no developer row.
+        out.view = View::Normal;
+        let before = out.transcript.len();
+        out.pending.clear();
+        out.commit(Cell::Call(CallLine::from_usage(2, &usage, Some("m"))));
+        assert_eq!(out.transcript.len(), before + 1, "the cell is still stored");
+        let normal_rows = text(&out.pending);
+        assert!(
+            !normal_rows.iter().any(|r| r.contains("◦ call ")),
+            "the cell committed under Normal draws none: {normal_rows:#?}"
+        );
+    }
+
     /// T6 (issue #89): `/new` tells the printer the thread changed, and
     /// that clears the live state of the thread just left — the running
     /// tool, the unfinished line, the folded reads, the fenced flag.
@@ -1039,7 +1214,10 @@ mod tests {
         let mut out = out_at(80);
         out.running = Some(Cell::Note("a tool".into()));
         out.tail = "half a sentence".into();
-        out.explored = vec!["a read".into()];
+        out.explored = vec![ExploredRow {
+            line: "a read".into(),
+            detail: None,
+        }];
         out.pending = vec![Line::from("a pending line")];
         out.fenced = true;
         out.thread_changed();
@@ -1099,6 +1277,7 @@ mod tests {
             full: None,
             state: ToolState::Running,
             output: String::new(),
+            detail: None,
         };
         // Idle and Thinking reserve nothing: no turn, no rows.
         assert!(live_block(LivePhase::Idle, None, &[], 80).is_empty());
@@ -1188,6 +1367,7 @@ mod tests {
             full: None,
             state: ToolState::Running,
             output: String::new(),
+            detail: None,
         };
         // What the pane's own height is: the live block's rows plus
         // the tail slot. The layout's one blank row above them and the
@@ -1204,6 +1384,8 @@ mod tests {
                         fenced: tail.fenced,
                     },
                     false,
+                    tail.view,
+                    tail.in_step,
                     tail.width,
                 )
                 .len()
@@ -1307,8 +1489,8 @@ mod tests {
             text: "one two three four five six seven".into(),
             fenced: false,
         };
-        let full = text(&look::render(&cell, false, 12));
-        let last = tail_rows(&cell, false, 12);
+        let full = text(&look::render(&cell, false, View::Normal, false, 12));
+        let last = tail_rows(&cell, false, View::Normal, false, 12);
         assert_eq!(text(&last), full[full.len() - 2..].to_vec());
         assert_eq!(last.len(), 2);
         assert!(
@@ -1318,7 +1500,7 @@ mod tests {
         );
         // The reply's first row marker is elision's business, not the
         // cap's: the cap still keeps two rows.
-        assert_eq!(tail_rows(&cell, true, 12).len(), 2);
+        assert_eq!(tail_rows(&cell, true, View::Normal, false, 12).len(), 2);
     }
 
     /// The pane's own rows: what the viewport draws above the composer,
@@ -1341,6 +1523,8 @@ mod tests {
                     fenced: false,
                 },
                 first,
+                View::Normal,
+                false,
                 width,
             ))
         };
@@ -1403,6 +1587,8 @@ mod tests {
         let note = text(&look::render(
             &Cell::Note("[title set]".into()),
             false,
+            View::Normal,
+            false,
             width,
         ));
         assert_eq!(
@@ -1432,6 +1618,8 @@ mod tests {
                 fenced: false,
             },
             true,
+            View::Normal,
+            false,
             out.width,
         );
         assert_eq!(out.pending, rendered, "the block draws as it renders");
@@ -1455,6 +1643,7 @@ mod tests {
             full: None,
             state,
             output: "ok".into(),
+            detail: None,
         };
         let blank = || Cell::Assistant {
             text: "\n\n".into(),
@@ -1501,6 +1690,7 @@ mod tests {
             full: Some(chain.to_owned()),
             state: ToolState::Ok,
             output: "test result: ok".into(),
+            detail: None,
         };
         let done = Cell::Done("read the plan".into());
         let reply = Cell::Assistant {

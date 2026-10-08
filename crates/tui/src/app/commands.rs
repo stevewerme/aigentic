@@ -38,6 +38,9 @@ pub enum Command<'a> {
     Skill(&'a str, &'a str),
     /// The key table.
     Keys,
+    /// The transcript view: `/view` prints it, `/view dev|normal` sets
+    /// it (issue #115).
+    View(Option<&'a str>),
     /// The project's working-tree diff, in the pager.
     Diff,
     /// Set the thread's title.
@@ -69,6 +72,8 @@ pub fn parse_line<'a>(line: &'a str, skills: &[String]) -> Command<'a> {
         ("quit" | "exit", _) => Command::Quit,
         ("help", _) => Command::Help,
         ("keys", _) => Command::Keys,
+        ("view", "") => Command::View(None),
+        ("view", name) => Command::View(Some(name)),
         ("diff", _) => Command::Diff,
         ("rename", title) if !title.is_empty() => Command::Rename(title),
         ("skills", _) => Command::Skills,
@@ -146,6 +151,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("diff", "the project's working-tree diff, in the pager"),
     ("copy", "copy a code block of the last reply: /copy [n|all]"),
     ("rename", "set the thread's title: /rename <title>"),
+    ("view", "show or set the transcript view: dev, normal"),
     ("keys", "the key table: interrupt, recall, quit"),
     ("help", "the command list"),
     ("quit", "exit (Ctrl-D too)"),
@@ -172,6 +178,7 @@ pub const HELP: &str = "\
 /<skill> [args]  run a user-invoked skill
 /diff            the project's working-tree diff, untracked files included
 /rename <title>  set the thread's title (one is proposed after the first turn)
+/view [dev|normal] show the transcript view, or set it (dev is the default)
 /copy [n|all]    copy the n-th code block of the last reply (default: the last); \"all\" for the whole reply, without the decorations
 /keys            the key table: interrupt, recall, quit
 /help            this list
@@ -303,6 +310,32 @@ mod tests {
             "{COMMANDS:#?}"
         );
         assert!(HELP.contains(SAID), "{HELP}");
+    }
+
+    /// T1 (issue #115): `/view` parses, and is discoverable in the
+    /// completion table, HELP and KEYS.
+    #[test]
+    fn view_parses_and_is_listed_in_commands_help_and_keys() {
+        let none: Vec<String> = vec![];
+        assert_eq!(parse_line("/view", &none), Command::View(None));
+        assert_eq!(parse_line("/view dev", &none), Command::View(Some("dev")));
+        assert_eq!(
+            parse_line("/view normal", &none),
+            Command::View(Some("normal"))
+        );
+        // An argument the design never named still parses; the engine
+        // answers it, not the grammar.
+        assert_eq!(parse_line("/view wat", &none), Command::View(Some("wat")));
+        assert!(
+            COMMANDS.iter().any(|(name, _)| *name == "view"),
+            "{COMMANDS:#?}"
+        );
+        assert!(HELP.contains("/view"), "{HELP}");
+        assert!(
+            crate::app::keymap::KEYS.contains("/view"),
+            "{}",
+            crate::app::keymap::KEYS
+        );
     }
 
     #[test]

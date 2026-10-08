@@ -112,6 +112,7 @@ Ctrl-A / Ctrl-E  start / end of the line
 Ctrl-U           clear the draft
 Ctrl-T           the transcript pager: the whole checklist, then the run in full
 Ctrl-D           quit when the composer is empty
+/view [dev|normal] the transcript view: dev (default) or normal
 /copy [n|all]    the n-th code block of the last reply to the clipboard (\"all\" for the whole reply)
 y / a / n        a permission menu, hidden: once / allow more / no";
 

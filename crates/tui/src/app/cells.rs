@@ -5,11 +5,14 @@
 //! `… +N lines`. Consecutive reads fold into one `Explored` cell.
 
 use aigentic_runtime::aigentic_core::ToolCall;
+use aigentic_runtime::aigentic_log::Usage;
 use aigentic_runtime::harness_tools::{Task, TaskState};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use std::time::Duration;
 
-use crate::app::{diff, markdown};
+use crate::app::{diff, markdown, status};
+use crate::stats;
 
 /// Head and tail rows a tool result shows before `… +N lines`.
 pub const RESULT_HEAD: usize = 3;
@@ -18,6 +21,154 @@ pub const RESULT_TAIL: usize = 2;
 const ARGS_WIDTH: usize = 120;
 /// Diff lines an edit cell previews (hunk lines, headers skipped).
 pub const EDIT_PREVIEW: usize = 3;
+/// Milliseconds as `1.2s`. One vocabulary for a call's latency, its
+/// first token and a tool's run time (issue #115).
+pub fn secs_ms(ms: u64) -> String {
+    format!("{:.1}s", ms as f64 / 1000.0)
+}
+
+/// A size in bytes: `512 B`, `3.4 KB`, `128 KB`, `1.3 MB`. Decimal
+/// thousands, the vocabulary [`status::count_short`] uses, so a result
+/// size and a token count are read the same way.
+pub fn bytes_short(n: usize) -> String {
+    if n < 1000 {
+        format!("{n} B")
+    } else if n < 10_000 {
+        format!("{:.1} KB", n as f64 / 1000.0)
+    } else if n < 1_000_000 {
+        format!("{} KB", n / 1000)
+    } else {
+        format!("{:.1} MB", n as f64 / 1_000_000.0)
+    }
+}
+
+/// What the log holds about one tool call, for the developer view
+/// (issue #115). Built from the events themselves, never estimated:
+/// a part the log does not hold is `None`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ToolDetail {
+    /// The result's `created_at` minus that of the assistant message
+    /// its `parent_event` names. For a batch run in parallel the parent
+    /// is the message that carried the batch, so this is "done after"
+    /// it, not each call's own run time.
+    pub took: Option<Duration>,
+    /// The result content's length.
+    pub bytes: usize,
+    /// Who or what allowed the call, already worded for the reader:
+    /// `rule read_only`, `denied: rule …`, `you allowed`, `you denied`.
+    pub policy: Option<String>,
+}
+
+impl ToolDetail {
+    /// ` · 1.2s · 3.4 KB · rule read_only`: the dim tail a head line
+    /// carries under the developer view, empty when the log held
+    /// nothing.
+    pub fn tail(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(took) = self.took {
+            parts.push(secs_ms(took.as_millis() as u64));
+        }
+        parts.push(bytes_short(self.bytes));
+        if let Some(policy) = &self.policy {
+            parts.push(policy.clone());
+        }
+        format!(" · {}", parts.join(" · "))
+    }
+}
+
+/// One model call's line (issue #115): which call it was, what ran it,
+/// what it read and wrote, how long it took and what it cost. Every
+/// part appears only when the log holds it.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct CallLine {
+    /// The call's 1-based ordinal in its turn.
+    pub n: u32,
+    /// The profile that ran the call, set only when it differs from the
+    /// one this client is attached to (a title or memory call). The
+    /// attached profile stays unnamed.
+    pub profile: Option<String>,
+    /// The model that ran the call.
+    pub model: Option<String>,
+    /// Prompt tokens: input plus both cache counts, the way the turn
+    /// summary counts them.
+    pub prompt_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_tokens: Option<u64>,
+    /// Read cache as a share of the prompt, `None` when the log held
+    /// no cache fields — the rule the turn summary uses.
+    pub cache_pct: Option<u32>,
+    pub latency_ms: Option<u64>,
+    pub ttft_ms: Option<u64>,
+    pub cost_usd: Option<f64>,
+    pub estimated: bool,
+}
+
+impl CallLine {
+    /// The line for one call's usage. `attached` is the profile this
+    /// client is attached to; a call on any other profile is named.
+    pub fn from_usage(n: u32, u: &Usage, attached: Option<&str>) -> Self {
+        let prompt = u.input_tokens + u.cache_read_tokens + u.cache_write_tokens;
+        let cache_seen = u.cache_read_tokens > 0 || u.cache_write_tokens > 0;
+        let cache_pct = (prompt > 0 && cache_seen)
+            .then(|| (100.0 * u.cache_read_tokens as f64 / prompt as f64).round() as u32);
+        let profile = match (u.profile.as_deref(), attached) {
+            (Some(p), Some(a)) if p == a => None,
+            (Some(p), _) => Some(p.to_owned()),
+            (None, _) => None,
+        };
+        Self {
+            n,
+            profile,
+            model: u.model.clone(),
+            prompt_tokens: prompt,
+            output_tokens: u.output_tokens,
+            reasoning_tokens: u.reasoning_tokens,
+            cache_pct,
+            latency_ms: u.latency_ms,
+            ttft_ms: u.ttft_ms,
+            cost_usd: u.cost_usd,
+            estimated: u.estimated,
+        }
+    }
+
+    /// The line after `call N`: the model, tokens, cache, time and
+    /// dollars, each part only when it has something to say.
+    pub fn body(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(profile) = &self.profile {
+            parts.push(profile.clone());
+        }
+        if let Some(model) = &self.model {
+            parts.push(model.clone());
+        }
+        parts.push(format!("{} in", status::count_short(self.prompt_tokens)));
+        if let Some(pct) = self.cache_pct {
+            parts.push(format!("{pct}% cached"));
+        }
+        parts.push(format!("{} out", self.output_tokens));
+        if let Some(reasoning) = self.reasoning_tokens.filter(|r| *r > 0) {
+            parts.push(format!("{reasoning} reasoning"));
+        }
+        if let Some(ms) = self.latency_ms {
+            let mut took = secs_ms(ms);
+            if let Some(ttft) = self.ttft_ms {
+                took.push_str(&format!(" (first token {})", secs_ms(ttft)));
+            }
+            parts.push(took);
+        }
+        match (self.cost_usd, self.estimated) {
+            (Some(usd), false) => parts.push(stats::money(Some(usd), None)),
+            (Some(usd), true) => parts.push(stats::money(None, Some(usd))),
+            (None, _) => parts.push("unpriced".into()),
+        }
+        parts.join(" · ")
+    }
+
+    /// The whole line: `◦ call 3 · …`.
+    pub fn text(&self) -> String {
+        format!("◦ call {} · {}", self.n, self.body())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolState {
@@ -26,7 +177,7 @@ pub enum ToolState {
     Err,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Cell {
     /// The person's own message, `> ` prefixed.
     User(String),
@@ -44,12 +195,32 @@ pub enum Cell {
         state: ToolState,
         /// The result, whole; rendering cuts it.
         output: String,
+        /// What the log held about the call (issue #115): the run time,
+        /// the result's size and the policy that allowed it. `None`
+        /// when the engine had nothing to read.
+        detail: Option<ToolDetail>,
     },
     /// Folded reads: the tool name and what it looked at, in order.
-    Explored(Vec<String>),
+    Explored(Vec<ExploredRow>),
     /// An edit_file or write_file result: the diff, previewed at a few
-    /// lines, whole in the pager.
-    Edit(diff::Edit),
+    /// lines, whole in the pager; the same call detail as a `Tool`.
+    Edit {
+        edit: diff::Edit,
+        detail: Option<ToolDetail>,
+    },
+    /// One model call's line (issue #115), dim. Developer view only.
+    Call(CallLine),
+    /// A checklist step the calls under it served (issue #115):
+    /// `▸ 2/5 Read key code regions`. Developer view only.
+    Step {
+        index: usize,
+        total: usize,
+        text: String,
+    },
+    /// What the harness did on its own (issue #115): a retry, a sweep,
+    /// a memory write, a decision. Dim, `·` led, so it never reads as
+    /// the model's words. Developer view only.
+    System(String),
     /// A `[bracketed]` notice, a report line, anything else.
     Note(String),
     /// A turn's figures when it ends, dim.
@@ -59,6 +230,28 @@ pub enum Cell {
     /// A lead's line, from the shared run view (issue #68): dim, each
     /// line `▸ ` prefixed. The text may hold several lines.
     Run(String),
+}
+
+/// One folded read: what it looked at, and what the log held about the
+/// call (issue #115). A row built from a bare string is a fixture's or
+/// an old caller's, with no detail.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ExploredRow {
+    /// `read_file src/x.rs`.
+    pub line: String,
+    pub detail: Option<ToolDetail>,
+}
+
+impl From<String> for ExploredRow {
+    fn from(line: String) -> Self {
+        Self { line, detail: None }
+    }
+}
+
+impl From<&str> for ExploredRow {
+    fn from(line: &str) -> Self {
+        Self::from(line.to_owned())
+    }
 }
 
 /// The checklist's lines: a head with the count, then one line a step.
@@ -220,6 +413,7 @@ impl Cell {
                 full: _,
                 state,
                 output,
+                detail: _,
             } => {
                 let mut lines = vec![tool_head(name, summary, state)];
                 let rows: Vec<&str> = output.lines().collect();
@@ -252,11 +446,11 @@ impl Cell {
                 ])];
                 let dim = Style::default().add_modifier(Modifier::DIM);
                 for e in entries {
-                    lines.push(Line::from(Span::styled(format!("  └ {e}"), dim)));
+                    lines.push(Line::from(Span::styled(format!("  └ {}", e.line), dim)));
                 }
                 lines
             }
-            Cell::Edit(edit) => {
+            Cell::Edit { edit, detail: _ } => {
                 let mut lines = vec![edit_head(edit)];
                 let body: Vec<&str> = hunk_lines(&edit.diff);
                 for l in body.iter().take(EDIT_PREVIEW) {
@@ -270,6 +464,27 @@ impl Cell {
                 }
                 lines
             }
+            Cell::Call(line) => vec![Line::from(Span::styled(
+                line.text(),
+                Style::default().add_modifier(Modifier::DIM),
+            ))],
+            Cell::Step { index, total, text } => vec![Line::from(vec![
+                Span::styled("▸ ", Style::default().add_modifier(Modifier::DIM)),
+                Span::styled(
+                    format!("{index}/{total} "),
+                    Style::default().add_modifier(Modifier::DIM),
+                ),
+                Span::styled(text.clone(), Style::default().add_modifier(Modifier::BOLD)),
+            ])],
+            Cell::System(text) => text
+                .lines()
+                .map(|l| {
+                    Line::from(Span::styled(
+                        format!("· {l}"),
+                        Style::default().add_modifier(Modifier::DIM),
+                    ))
+                })
+                .collect(),
             Cell::Done(text) => vec![Line::from(vec![
                 Span::styled("✓ ", Style::default().add_modifier(Modifier::DIM)),
                 Span::raw(text.clone()),
@@ -308,22 +523,43 @@ impl Cell {
                 full,
                 state,
                 output,
+                detail,
             } => {
-                let mut lines = vec![tool_head(name, full.as_deref().unwrap_or(summary), state)];
+                let head = head_with_detail(
+                    tool_head(name, full.as_deref().unwrap_or(summary), state),
+                    detail.as_ref(),
+                );
+                let mut lines = vec![head];
                 let dim = Style::default().add_modifier(Modifier::DIM);
                 for r in output.lines() {
                     lines.push(Line::from(Span::styled(format!("  └ {r}"), dim)));
                 }
                 lines
             }
-            Cell::Edit(edit) => {
-                let mut lines = vec![edit_head(edit)];
+            Cell::Edit { edit, detail } => {
+                let mut lines = vec![head_with_detail(edit_head(edit), detail.as_ref())];
                 lines.extend(diff::lines(&edit.diff));
                 lines
             }
             other => other.styled(usize::MAX),
         }
     }
+}
+
+/// The head line with the call's detail appended, dim (issue #115):
+/// the pager and the developer view both read it this way, so a tool's
+/// run time, size and policy sit on its own row.
+pub(crate) fn head_with_detail(
+    mut head: Line<'static>,
+    detail: Option<&ToolDetail>,
+) -> Line<'static> {
+    if let Some(detail) = detail {
+        head.spans.push(Span::styled(
+            detail.tail(),
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+    }
+    head
 }
 
 /// The diff's hunk lines: everything after the `+++` header.
@@ -416,6 +652,7 @@ mod tests {
             full: full_command(&cell),
             state: ToolState::Ok,
             output: "ok".into(),
+            detail: None,
         };
         let full = cell.full();
         assert_eq!(plain_line(&full[0]), format!("• Ran bash {command}"));
@@ -454,6 +691,7 @@ mod tests {
             full: None,
             state: ToolState::Ok,
             output,
+            detail: None,
         };
         let plain = cell.plain();
         assert_eq!(plain[0], "• Ran bash ls");
@@ -470,6 +708,7 @@ mod tests {
             full: None,
             state: ToolState::Err,
             output: "a\nb".into(),
+            detail: None,
         };
         assert_eq!(short.plain(), vec!["• Failed bash x", "  └ a", "  └ b"]);
     }
@@ -480,7 +719,7 @@ mod tests {
             "--- a/f.rs\n+++ b/f.rs\n@@ -1,4 +1,4 @@\n a\n-b\n+B\n c\n d\nedited f.rs at line 2",
         )
         .unwrap();
-        let cell = Cell::Edit(edit);
+        let cell = Cell::Edit { edit, detail: None };
         let plain = cell.plain();
         assert_eq!(plain[0], "• Edited f.rs (+1 −1)");
         assert_eq!(plain[1], "@@ -1,4 +1,4 @@");
@@ -572,5 +811,171 @@ mod tests {
         assert_eq!(u.plain(), vec!["> one", "  two"]);
         assert!(is_read_tool("grep"));
         assert!(!is_read_tool("bash"));
+    }
+
+    // T2 (issue #115): the call line is a pure function of a `Usage`.
+    // Every expected string is derived from the shared formatters and
+    // the fixture, never written by hand.
+
+    /// A `Usage` with every field the log can hold (issue #115).
+    fn full_usage() -> Usage {
+        Usage {
+            input_tokens: 5_300,
+            output_tokens: 812,
+            cache_read_tokens: 35_700,
+            cache_write_tokens: 0,
+            reasoning_tokens: Some(300),
+            estimated: false,
+            profile: Some("flash".into()),
+            model: Some("deepseek-v4.1-flash".into()),
+            effort: Some("high".into()),
+            latency_ms: Some(2_400),
+            ttft_ms: Some(900),
+            cost_usd: Some(0.0141),
+        }
+    }
+
+    /// The line derived from the fixture, so a formatter change moves
+    /// the expectation with it.
+    fn expected_call_text(n: u32, u: &Usage, profile: Option<&str>) -> String {
+        let prompt = u.input_tokens + u.cache_read_tokens + u.cache_write_tokens;
+        let mut parts = Vec::new();
+        if let Some(p) = profile {
+            parts.push(p.to_owned());
+        }
+        parts.push(u.model.clone().unwrap());
+        parts.push(format!("{} in", status::count_short(prompt)));
+        let pct = (100.0 * u.cache_read_tokens as f64 / prompt as f64).round() as u32;
+        parts.push(format!("{pct}% cached"));
+        parts.push(format!("{} out", u.output_tokens));
+        parts.push(format!("{} reasoning", u.reasoning_tokens.unwrap()));
+        let mut took = secs_ms(u.latency_ms.unwrap());
+        took.push_str(&format!(" (first token {})", secs_ms(u.ttft_ms.unwrap())));
+        parts.push(took);
+        parts.push(stats::money(u.cost_usd, None));
+        format!("◦ call {n} · {}", parts.join(" · "))
+    }
+
+    #[test]
+    fn a_call_line_with_every_field_reads_its_figures() {
+        let u = full_usage();
+        let line = CallLine::from_usage(3, &u, Some("flash"));
+        // The attached profile is not named.
+        assert_eq!(line.profile, None);
+        assert_eq!(line.text(), expected_call_text(3, &u, None));
+    }
+
+    #[test]
+    fn a_side_profile_is_named_and_the_attached_one_is_not() {
+        let u = full_usage();
+        // The attached profile differs: the call names its own.
+        let side = CallLine::from_usage(1, &u, Some("kimi"));
+        assert_eq!(side.profile.as_deref(), Some("flash"));
+        assert!(side.text().contains("flash · deepseek-v4.1-flash"));
+        // The attached profile matches: nothing extra.
+        let mine = CallLine::from_usage(1, &u, Some("flash"));
+        assert_eq!(mine.profile, None);
+        assert!(!mine.text().contains("kimi"));
+    }
+
+    #[test]
+    fn each_optional_part_drops_when_the_log_lacks_it() {
+        let mut u = full_usage();
+        u.reasoning_tokens = None;
+        assert!(
+            !CallLine::from_usage(1, &u, None)
+                .text()
+                .contains("reasoning")
+        );
+
+        u = full_usage();
+        u.latency_ms = None;
+        let text = CallLine::from_usage(1, &u, None).text();
+        assert!(!text.contains("s (first token"));
+        assert!(!text.contains("2.4s"));
+
+        u = full_usage();
+        u.ttft_ms = None;
+        let text = CallLine::from_usage(1, &u, None).text();
+        assert!(text.contains(&secs_ms(2_400)));
+        assert!(!text.contains("first token"));
+
+        u = full_usage();
+        u.model = None;
+        assert!(
+            !CallLine::from_usage(1, &u, None)
+                .text()
+                .contains("deepseek")
+        );
+
+        // No cache fields at all: no share is claimed.
+        u = full_usage();
+        u.cache_read_tokens = 0;
+        u.cache_write_tokens = 0;
+        assert!(
+            !CallLine::from_usage(1, &u, None)
+                .text()
+                .contains("% cached")
+        );
+    }
+
+    #[test]
+    fn an_estimated_call_says_so_and_an_unpriced_one_says_that() {
+        let mut u = full_usage();
+        u.estimated = true;
+        assert!(
+            CallLine::from_usage(1, &u, None)
+                .text()
+                .contains(&stats::money(None, Some(0.0141)))
+        );
+
+        u = full_usage();
+        u.cost_usd = None;
+        assert!(
+            CallLine::from_usage(1, &u, None)
+                .text()
+                .contains("unpriced")
+        );
+    }
+
+    #[test]
+    fn reasoning_tokens_of_zero_adds_nothing() {
+        let mut u = full_usage();
+        u.reasoning_tokens = Some(0);
+        assert!(
+            !CallLine::from_usage(1, &u, None)
+                .text()
+                .contains("reasoning")
+        );
+    }
+
+    // T3 (issue #115): the tool detail's tail is bytes, took and the
+    // policy word, each only when the log held it.
+
+    #[test]
+    fn a_tool_detail_tail_reads_its_parts() {
+        let d = ToolDetail {
+            took: Some(std::time::Duration::from_millis(1_200)),
+            bytes: 3_400,
+            policy: Some("rule read_only".into()),
+        };
+        assert_eq!(
+            d.tail(),
+            format!(
+                " · {} · {} · rule read_only",
+                secs_ms(1_200),
+                bytes_short(3_400)
+            )
+        );
+    }
+
+    #[test]
+    fn a_tool_detail_tail_drops_what_the_log_lacked() {
+        let d = ToolDetail {
+            took: None,
+            bytes: 42,
+            policy: None,
+        };
+        assert_eq!(d.tail(), format!(" · {}", bytes_short(42)));
     }
 }
