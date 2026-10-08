@@ -15,9 +15,11 @@ mod progress;
 mod project_cmd;
 mod run_view;
 mod skills_cmd;
+mod start_ask;
 mod stats;
 mod threads_index;
 
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use aigentic_api::client::{Addr, Client};
@@ -592,17 +594,17 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     // `exec` never lands in a project by accident: it needs one named, a
-    // project file here, or a thread to continue.
-    if exec_args.is_some() && cli.project.is_none() && opened.is_none() && cli.thread.is_none() {
-        let names: Vec<&str> = welcome.projects.iter().map(|p| p.name.as_str()).collect();
-        bail!(
-            "exec needs a project: pass --project (one of: {}), run it in a project directory, or pass --thread",
-            if names.is_empty() {
-                "none".to_owned()
-            } else {
-                names.join(", ")
-            }
-        );
+    // project file here, or a thread to continue. A workspace's folder
+    // (issue #121) names the group and not the project, so it is not a
+    // project either: the refusal lists that workspace's projects first.
+    if exec_args.is_some() {
+        let known: Vec<String> = welcome.projects.iter().map(|p| p.name.clone()).collect();
+        let settled = cli.project.is_some() || cli.thread.is_some();
+        if let Some(message) =
+            start_ask::exec_guard(&cwd, &workspaces, &known, settled, opened.is_some())
+        {
+            bail!("{message}");
+        }
     }
     // The folder's project: what a client would have created in today,
     // and `exec`'s project. A plain run resumes the front thread in
@@ -639,19 +641,54 @@ async fn main() -> anyhow::Result<()> {
         drop(embedded);
         std::process::exit(outcome.code);
     }
+    // The start-up ask (issue #121): which project when the folder
+    // doesn't say. It runs before `pick_thread` and before the banner,
+    // and its answer rides `Front` so the daemon logs it as a decision.
+    let here = front::here_project(cli.project.as_deref(), opened.as_ref());
+    let launch = start_ask::Launch {
+        project: cli.project.as_deref(),
+        thread: cli.thread,
+        exec: exec_args.is_some(),
+        interactive: std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
+    };
+    let asked = start_ask::run(&client, &cwd, &workspaces, &project_name, launch).await?;
+    let (project_name, here, asked) = match asked {
+        start_ask::Prompting::Answered(a) => {
+            let chosen = a.chosen.clone();
+            (chosen.clone(), Some(chosen), Some(*a))
+        }
+        start_ask::Prompting::Quit => {
+            // No thread opened, and nothing to resume later: `q` leaves
+            // the log exactly as it was.
+            println!("[nothing chosen; no thread opened]");
+            std::process::exit(0);
+        }
+        start_ask::Prompting::None => (project_name, here, None),
+    };
     // One pick serves the REPL, plain mode and `exec` (issue #89):
     // `--thread X` opens X; `exec` creates a thread in the folder's
     // project; anything else resumes (or starts) the front thread.
     // `here` is the folder's project, sent on `Front` only (issue #92).
-    let here = front::here_project(cli.project.as_deref(), opened.as_ref());
     let picked = front::pick_thread(
         &client,
         cli.thread,
         exec_args.is_some(),
         &project_name,
         here.as_deref(),
+        asked.clone(),
     )
     .await?;
+    // The server judges a busy front thread (issue #121, design 5): it
+    // resumes where the thread is and ignores the answer. Say so, rather
+    // than looking as if the choice had been honoured.
+    if let (Some(a), Some(info)) = (&asked, picked.info.as_ref())
+        && info.project.as_deref().is_some_and(|p| p != a.chosen)
+    {
+        eprintln!(
+            "[the front thread is busy in {}; resumed it there — your choice was not applied]",
+            info.project.as_deref().unwrap_or("another project")
+        );
+    }
     let thread_id = picked.id;
     let (state, events, mode, identity) = match client
         .request(Request::Open {
@@ -747,7 +784,6 @@ async fn main() -> anyhow::Result<()> {
         }),
         _ => None,
     };
-    use std::io::IsTerminal;
     if std::io::stdout().is_terminal() && std::io::stdin().is_terminal() {
         // At a terminal: the logo and three short lines.
         let mut lines = vec![format!(

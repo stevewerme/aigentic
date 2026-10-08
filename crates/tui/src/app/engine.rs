@@ -7750,7 +7750,7 @@ mod tests {
         let (client, welcome) = Client::connect(&addr, "t").await.unwrap();
         // A thread in each project, and this user's front thread in `b`.
         let (in_a, _, _) = open(&client, "a", None).await;
-        let front = crate::front::pick_thread(&client, None, false, "b", None)
+        let front = crate::front::pick_thread(&client, None, false, "b", None, None)
             .await
             .unwrap();
         // The REPL's own thread, in `b`, newer than `a`'s.
@@ -7819,7 +7819,7 @@ mod tests {
             .iter()
             .find(|p| p.name == "b")
             .and_then(|p| p.role.clone());
-        let front = crate::front::pick_thread(&client, None, false, "b", None)
+        let front = crate::front::pick_thread(&client, None, false, "b", None, None)
             .await
             .unwrap();
         let (old, state, mode) = open(&client, "b", Some(front.id)).await;
@@ -7870,7 +7870,7 @@ mod tests {
         // A second client: the new thread is the front one, in `a`, in
         // auto, and both threads are listed there.
         let (second, _) = Client::connect(&addr, "t").await.unwrap();
-        let resumed = crate::front::pick_thread(&second, None, false, "a", None)
+        let resumed = crate::front::pick_thread(&second, None, false, "a", None, None)
             .await
             .unwrap();
         assert_eq!(resumed.info.as_ref().unwrap().id, new);

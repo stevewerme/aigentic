@@ -2931,3 +2931,37 @@ async fn t4_ask_g_first_creates_in_the_chosen_project_and_logs_the_pair() {
     assert_eq!(answered.correction.as_deref(), Some("b"));
     assert_eq!(open_state(&mut steve, t).await, ThreadState::Idle);
 }
+
+/// T1, the cost side (issue #121): `ListThreads` over a fixture of ~500
+/// threads on disk. The time is printed, never asserted: the spec
+/// accepts this read for v1 and makes a lighter one a follow-up if it
+/// exceeds 300 ms.
+#[tokio::test]
+async fn t1_m_listing_500_threads_on_disk_is_timed() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("threads");
+    let root = project(dir.path(), "p", "");
+    for i in 0..500u64 {
+        let id = Ulid::from_parts(1_700_000_000_000 + i, u128::from(i) + 1);
+        let mut log = hand_log(&base, id);
+        append_started(&mut log, Some("p"), &root, "steve", i == 0);
+    }
+
+    let plain = Plain::new(dir.path(), &root, "steve").await;
+    let client = plain.connect().await;
+    let started = std::time::Instant::now();
+    let Response::Threads { threads } = client
+        .request(Request::ListThreads { project: None })
+        .await
+        .unwrap()
+    else {
+        panic!("a listing")
+    };
+    let took = started.elapsed();
+    eprintln!(
+        "ListThreads over 500 threads on disk: {} ms, {} rows",
+        took.as_millis(),
+        threads.len()
+    );
+    assert_eq!(threads.len(), 500, "every thread on disk is listed");
+}

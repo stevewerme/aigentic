@@ -3,7 +3,7 @@
 //! line. `main.rs` wires these; the daemon side is #84's.
 
 use aigentic_api::client::Client;
-use aigentic_api::{FrontOutcome, ProjectInfo, Request, Response, ThreadInfo};
+use aigentic_api::{FrontOutcome, ProjectInfo, Request, Response, StartAsk, ThreadInfo};
 use aigentic_runtime::Project;
 use aigentic_runtime::aigentic_core::Event;
 use ulid::Ulid;
@@ -35,12 +35,15 @@ pub fn here_project(project: Option<&str>, opened: Option<&Project>) -> Option<S
 /// thread, or the user's front thread, which a plain launch resumes.
 /// `here` is the folder's project (issue #92), sent on `Front` only so
 /// the daemon can offer a switch; `exec` and `--thread` never send it.
+/// `asked` is the start-up ask's answer (issue #121), sent with `Front`
+/// so the daemon honours it and logs it as a decision.
 pub async fn pick_thread(
     client: &Client,
     thread: Option<Ulid>,
     exec: bool,
     project: &str,
     here: Option<&str>,
+    asked: Option<StartAsk>,
 ) -> anyhow::Result<Picked> {
     if let Some(id) = thread {
         return Ok(Picked {
@@ -57,7 +60,7 @@ pub async fn pick_thread(
         Request::Front {
             project: project.to_owned(),
             here: here.map(str::to_owned),
-            asked: None,
+            asked,
         }
     };
     match client.request(request).await? {
@@ -182,14 +185,18 @@ mod tests {
         let root = project(dir.path(), "p", "");
         let addr = daemon(dir.path(), &[("steve", "t")], &[("p", root)]).await;
         let (client, _) = Client::connect(&addr, "t").await.unwrap();
-        let first = pick_thread(&client, None, false, "p", None).await.unwrap();
+        let first = pick_thread(&client, None, false, "p", None, None)
+            .await
+            .unwrap();
         assert_eq!(first.outcome, Some(FrontOutcome::First));
         assert_eq!(
             first.info.as_ref().unwrap().project.as_deref(),
             Some("p"),
             "a new front thread is in the project asked for"
         );
-        let again = pick_thread(&client, None, false, "p", None).await.unwrap();
+        let again = pick_thread(&client, None, false, "p", None, None)
+            .await
+            .unwrap();
         assert_eq!(again.outcome, Some(FrontOutcome::Resumed));
         assert_eq!(again.id, first.id);
     }
@@ -201,12 +208,18 @@ mod tests {
         let root = project(dir.path(), "p", "");
         let addr = daemon(dir.path(), &[("steve", "t")], &[("p", root)]).await;
         let (client, _) = Client::connect(&addr, "t").await.unwrap();
-        let front = pick_thread(&client, None, false, "p", None).await.unwrap();
-        let exec = pick_thread(&client, None, true, "p", None).await.unwrap();
+        let front = pick_thread(&client, None, false, "p", None, None)
+            .await
+            .unwrap();
+        let exec = pick_thread(&client, None, true, "p", None, None)
+            .await
+            .unwrap();
         assert!(exec.outcome.is_none());
         assert!(exec.info.is_some());
         assert_ne!(exec.id, front.id);
-        let again = pick_thread(&client, None, false, "p", None).await.unwrap();
+        let again = pick_thread(&client, None, false, "p", None, None)
+            .await
+            .unwrap();
         assert_eq!(again.outcome, Some(FrontOutcome::Resumed));
         assert_eq!(again.id, front.id);
     }
@@ -218,15 +231,19 @@ mod tests {
         let root = project(dir.path(), "p", "");
         let addr = daemon(dir.path(), &[("steve", "t")], &[("p", root)]).await;
         let (client, _) = Client::connect(&addr, "t").await.unwrap();
-        let front = pick_thread(&client, None, false, "p", None).await.unwrap();
+        let front = pick_thread(&client, None, false, "p", None, None)
+            .await
+            .unwrap();
         let (other, _, _) = open(&client, "p", None).await;
-        let picked = pick_thread(&client, Some(other), false, "p", None)
+        let picked = pick_thread(&client, Some(other), false, "p", None, None)
             .await
             .unwrap();
         assert_eq!(picked.id, other);
         assert!(picked.info.is_none());
         assert!(picked.outcome.is_none());
-        let again = pick_thread(&client, None, false, "p", None).await.unwrap();
+        let again = pick_thread(&client, None, false, "p", None, None)
+            .await
+            .unwrap();
         assert_eq!(again.id, front.id);
     }
 
@@ -246,7 +263,7 @@ mod tests {
         )
         .await;
         let (client, _) = Client::connect(&addr, "m").await.unwrap();
-        let err = pick_thread(&client, None, false, "p", None)
+        let err = pick_thread(&client, None, false, "p", None, None)
             .await
             .unwrap_err()
             .to_string();
@@ -279,14 +296,16 @@ mod tests {
         .await;
         // First pick, standing in `a`: the front thread is created there.
         let (first_client, _) = Client::connect(&addr, "m").await.unwrap();
-        let first = pick_thread(&first_client, None, false, "a", None)
+        let first = pick_thread(&first_client, None, false, "a", None, None)
             .await
             .unwrap();
         assert_eq!(first.outcome, Some(FrontOutcome::First));
 
         // Now standing in `b`: the front thread is still the one in `a`.
         let (client, welcome) = Client::connect(&addr, "m").await.unwrap();
-        let picked = pick_thread(&client, None, false, "b", None).await.unwrap();
+        let picked = pick_thread(&client, None, false, "b", None, None)
+            .await
+            .unwrap();
         assert_eq!(picked.outcome, Some(FrontOutcome::Resumed));
         assert_eq!(picked.id, first.id);
         let events = events_of(&client, picked.id).await;
@@ -324,7 +343,7 @@ mod tests {
             matches!(moved, Response::Ok),
             "the switch landed: {moved:?}"
         );
-        let picked = pick_thread(&client, Some(id), false, "b", None)
+        let picked = pick_thread(&client, Some(id), false, "b", None, None)
             .await
             .unwrap();
         assert!(picked.info.is_none(), "a --thread pick has no listing");
