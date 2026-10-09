@@ -21,7 +21,8 @@ pub use bash::{BashArgs, BashTool, DEFAULT_TIMEOUT, MAX_TIMEOUT_SECS};
 pub use files::{ReadFileTool, WriteFileTool};
 pub use fs::{DEFAULT_GREP_MATCHES, EditFileTool, GrepTool, ListDirTool};
 pub use knowledge::{
-    KnowledgeSnapshot, SEARCH_KNOWLEDGE, SearchKnowledgeTool, Section, search, split_sections,
+    KnowledgeSnapshot, KnowledgeSources, SEARCH_KNOWLEDGE, SearchKnowledgeTool, Section, search,
+    split_sections,
 };
 pub use mcp::{McpError, McpServer, McpServerConfig, McpTool, McpTransport};
 pub use registry::{RegistryError, ToolRegistry};

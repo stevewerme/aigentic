@@ -47,6 +47,7 @@ type RequestSeen = (Vec<Message>, Vec<String>);
 struct Recording {
     script: Arc<Mutex<VecDeque<Vec<ProviderEvent>>>>,
     seen: Arc<Mutex<Vec<RequestSeen>>>,
+    descriptions: Arc<Mutex<Vec<Vec<String>>>>,
 }
 
 impl Provider for Recording {
@@ -58,6 +59,13 @@ impl Provider for Recording {
             request.messages.to_vec(),
             request.tools.iter().map(|t| t.name.clone()).collect(),
         ));
+        self.descriptions.lock().unwrap().push(
+            request
+                .tools
+                .iter()
+                .map(|t| t.description.clone())
+                .collect(),
+        );
         let events = self.script.lock().unwrap().pop_front().unwrap_or_default();
         Box::pin(futures_util::stream::iter(events))
     }
@@ -79,6 +87,7 @@ impl Provider for Recording {
 struct RecordingFactory {
     script: Arc<Mutex<VecDeque<Vec<ProviderEvent>>>>,
     seen: Arc<Mutex<Vec<RequestSeen>>>,
+    descriptions: Arc<Mutex<Vec<Vec<String>>>>,
 }
 
 impl ProviderFactory for RecordingFactory {
@@ -87,6 +96,7 @@ impl ProviderFactory for RecordingFactory {
             Box::new(Recording {
                 script: self.script.clone(),
                 seen: self.seen.clone(),
+                descriptions: self.descriptions.clone(),
             }),
             "scripted".into(),
         ))
@@ -98,6 +108,14 @@ struct Daemon {
     threads_base: std::path::PathBuf,
     dir: tempfile::TempDir,
     seen: Arc<Mutex<Vec<RequestSeen>>>,
+    descriptions: Arc<Mutex<Vec<Vec<String>>>>,
+}
+
+/// Write `rel` under `root`, making the folders on the way.
+fn write_file(root: &std::path::Path, rel: &str, text: &str) {
+    let path = root.join(rel);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, text).unwrap();
 }
 
 /// A project `name` under `dir` with `brief` as its `.aigentic/brief.md`
@@ -115,7 +133,8 @@ fn project(dir: &std::path::Path, name: &str, brief: &str) -> std::path::PathBuf
 }
 
 /// A daemon over a two-project workspace `w`: `p` and `q` both carry a
-/// brief, and so does `w`.
+/// brief, `w` carries knowledge, memory and a brief, and workspace `v`
+/// with project `r` sits outside it.
 async fn daemon(script: Vec<Vec<ProviderEvent>>) -> Daemon {
     let dir = tempfile::tempdir().unwrap();
     let p = project(
@@ -123,23 +142,46 @@ async fn daemon(script: Vec<Vec<ProviderEvent>>) -> Daemon {
         "p",
         "# Project P\n\nP consumes getscale's API.\n",
     );
+    // A small file, so `p` keeps its knowledge inline and the search
+    // tool is offered for what the sibling and the workspace hold.
+    write_file(
+        &p,
+        ".aigentic/knowledge/notes.md",
+        "# Notes\n\nP talks to the gateway.\n",
+    );
     let q = project(
         dir.path(),
         "q",
         "# The marketing site\n\nNext.js on Vercel.\n",
     );
+    write_file(
+        &q,
+        ".aigentic/knowledge/ops.md",
+        "# Ops\n\nQ builds with the vercel flag set.\n",
+    );
+    write_file(
+        &q,
+        ".aigentic/memory/decisions.md",
+        "# Choice\n\nWe chose vercel for marketing.\n",
+    );
     let shared = dir.path().join("shared");
     std::fs::create_dir_all(shared.join("workspace")).unwrap();
-    std::fs::write(
-        shared.join("workspace/instructions.md"),
-        "Workspace W voice.",
-    )
-    .unwrap();
-    std::fs::write(
-        shared.join("workspace/brief.md"),
+    write_file(&shared, "workspace/instructions.md", "Workspace W voice.");
+    write_file(
+        &shared,
+        "workspace/brief.md",
         "# Workspace W\n\nThe group of projects.\n",
-    )
-    .unwrap();
+    );
+    write_file(
+        &shared,
+        "workspace/knowledge/notes.md",
+        "# Notes\n\nW requires the gateway flag.\n",
+    );
+    write_file(
+        &shared,
+        "workspace/memory/facts.md",
+        "# Fact\n\nWe keep one gateway.\n",
+    );
     let cfg_dir = dir.path().join("cfg");
     std::fs::create_dir_all(cfg_dir.join("workspaces")).unwrap();
     std::fs::write(
@@ -152,6 +194,25 @@ async fn daemon(script: Vec<Vec<ProviderEvent>>) -> Daemon {
         ),
     )
     .unwrap();
+    // Workspace `v` and its project `r`: in reach by role, outside what
+    // a thread in `w` understands.
+    let r = project(dir.path(), "r", "# Project R\n\nR is elsewhere.\n");
+    write_file(
+        &r,
+        ".aigentic/knowledge/ops.md",
+        "# R ops\n\nR deploys on its own.\n",
+    );
+    std::fs::create_dir_all(dir.path().join("v-shared/workspace")).unwrap();
+    std::fs::write(
+        cfg_dir.join("workspaces/v.toml"),
+        format!(
+            "name = \"v\"\nshared = {:?}\nprojects = [{:?}]\n",
+            dir.path().join("v-shared").display().to_string(),
+            r.display().to_string()
+        ),
+    )
+    .unwrap();
+
     let threads_base = dir.path().join("threads");
     let config = Config::parse(&format!(
         "threads_dir = {:?}\nbundled_dir = {:?}\n[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n",
@@ -171,6 +232,7 @@ async fn daemon(script: Vec<Vec<ProviderEvent>>) -> Daemon {
         resume_runs: false,
     };
     let seen: Arc<Mutex<Vec<RequestSeen>>> = Arc::new(Mutex::new(Vec::new()));
+    let descriptions: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
     let server = Arc::new(Server::new(
         config,
         cfg_dir,
@@ -178,6 +240,7 @@ async fn daemon(script: Vec<Vec<ProviderEvent>>) -> Daemon {
         Arc::new(RecordingFactory {
             script: Arc::new(Mutex::new(VecDeque::from(script))),
             seen: seen.clone(),
+            descriptions: descriptions.clone(),
         }),
         Arc::new(NoReports),
     ));
@@ -194,6 +257,7 @@ async fn daemon(script: Vec<Vec<ProviderEvent>>) -> Daemon {
         threads_base,
         dir,
         seen,
+        descriptions,
     }
 }
 
@@ -330,4 +394,189 @@ async fn t5_a_thread_carries_both_briefs_names_the_sibling_and_can_read_it() {
         "{}",
         result.result.content
     );
+}
+
+/// A thread in `project` whose turn runs `script`; what the daemon saw
+/// and wrote.
+struct Run {
+    prefix: String,
+    tools: Vec<String>,
+    descriptions: Vec<String>,
+    results: Vec<ToolResultPayload>,
+    /// Holds the daemon's temp dirs for the test's lifetime.
+    _daemon: Daemon,
+}
+
+/// One thread, one posted turn, then idle.
+async fn run(script: Vec<Vec<ProviderEvent>>, project: &str) -> Run {
+    let rig = daemon(script).await;
+    let (client, _welcome) = Client::connect(&Addr::Unix(rig.socket.clone()), "tok")
+        .await
+        .unwrap();
+    let Response::Thread { thread } = client
+        .request(Request::CreateThread {
+            project: project.into(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("a thread")
+    };
+    let id = thread.id;
+    assert!(matches!(
+        client
+            .request(Request::Open {
+                thread: id,
+                from_seq: 0
+            })
+            .await
+            .unwrap(),
+        Response::Opened { .. }
+    ));
+    let mut notices = client.take_notices().unwrap();
+    assert_eq!(
+        client
+            .request(Request::Post {
+                thread: id,
+                blocks: vec![ContentBlock::Text("go".into())],
+                interrupt: false,
+            })
+            .await
+            .unwrap(),
+        Response::Ok
+    );
+    until_idle(&mut notices).await;
+    let log = ThreadLog::open(rig.threads_base.clone(), id).unwrap();
+    let results = log
+        .read_all()
+        .unwrap()
+        .into_iter()
+        .filter_map(|e| serde_json::from_value::<ToolResultPayload>(e.payload).ok())
+        .collect();
+    let (messages, tools) = rig.seen.lock().unwrap()[0].clone();
+    let descriptions = rig.descriptions.lock().unwrap()[0].clone();
+    let prefix = systems(&messages);
+    Run {
+        prefix,
+        tools,
+        descriptions,
+        results,
+        _daemon: rig,
+    }
+}
+
+/// One tool call for `args`, then a reply.
+fn search_turn(args: serde_json::Value) -> Vec<Vec<ProviderEvent>> {
+    vec![
+        vec![
+            ProviderEvent::ToolCall(ToolCall {
+                id: "s1".into(),
+                name: "search_knowledge".into(),
+                args,
+            }),
+            tool_use(),
+        ],
+        vec![text("seen"), done()],
+    ]
+}
+
+/// The description of `name` in the tool list the model was offered.
+fn description_of(tools: &[String], descriptions: &[String], name: &str) -> String {
+    let i = tools.iter().position(|t| t == name).expect("offered");
+    descriptions[i].clone()
+}
+
+#[tokio::test]
+async fn t6_a_sibling_is_searched_by_name_and_marked_read_only() {
+    let run = run(search_turn(json!({"query": "vercel", "project": "q"})), "p").await;
+    let content = &run.results[0].result.content;
+    assert!(!run.results[0].result.is_error, "{content}");
+    assert!(content.starts_with("[read-only · q]\n"), "{content}");
+    assert!(
+        content.contains("Q builds with the vercel flag set."),
+        "{content}"
+    );
+    assert!(content.contains("memory/decisions.md"), "{content}");
+    assert!(
+        content.contains("We chose vercel for marketing."),
+        "{content}"
+    );
+    // The sibling's knowledge was never inline: only the tool reaches it.
+    assert!(
+        !run.prefix.contains("Q builds with the vercel flag set."),
+        "{}",
+        run.prefix
+    );
+}
+
+#[tokio::test]
+async fn t6_the_workspace_is_searched_with_workspace_true() {
+    let run = run(
+        search_turn(json!({"query": "gateway", "workspace": true})),
+        "p",
+    )
+    .await;
+    let content = &run.results[0].result.content;
+    assert!(!run.results[0].result.is_error, "{content}");
+    assert!(
+        content.starts_with("[read-only · workspace w]\n"),
+        "{content}"
+    );
+    assert!(
+        content.contains("W requires the gateway flag."),
+        "{content}"
+    );
+    assert!(content.contains("memory/facts.md"), "{content}");
+    assert!(content.contains("We keep one gateway."), "{content}");
+    assert!(
+        run.prefix.contains("# Workspace knowledge: w"),
+        "{}",
+        run.prefix
+    );
+}
+
+#[tokio::test]
+async fn t6_a_project_in_another_workspace_is_refused() {
+    let run = run(
+        search_turn(json!({"query": "deploys", "project": "r"})),
+        "p",
+    )
+    .await;
+    let result = &run.results[0].result;
+    assert!(result.is_error, "{}", result.content);
+    assert!(
+        result
+            .content
+            .contains("`r` is not a project this thread understands"),
+        "{}",
+        result.content
+    );
+    // The refusal offers only the projects this thread understands.
+    assert!(
+        result.content.contains("searchable: p, q"),
+        "{}",
+        result.content
+    );
+    // The refused project is still named in the block, as any other
+    // workspace's projects are.
+    assert!(
+        run.prefix.contains("Other workspaces: v: r"),
+        "{}",
+        run.prefix
+    );
+}
+
+#[tokio::test]
+async fn t6_an_inline_project_offered_the_tool_names_both_arguments() {
+    let run = run(vec![vec![text("nothing to do"), done()]], "p").await;
+    // `p`'s own knowledge is inline, yet a sibling's corpus offers it.
+    assert!(
+        run.tools.contains(&"search_knowledge".to_string()),
+        "{:?}",
+        run.tools
+    );
+    let description = description_of(&run.tools, &run.descriptions, "search_knowledge");
+    for argument in ["query", "project", "workspace"] {
+        assert!(description.contains(argument), "{description}");
+    }
 }

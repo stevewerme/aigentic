@@ -458,6 +458,10 @@ impl ThreadTable {
                 })
             })
         });
+        // The workspace a thread understands beyond its own project: the
+        // workspace of the project it is in. Rows outside it stay in the
+        // block, so the model still sees them, but no tool opens them.
+        let here_workspace = current.as_ref().and_then(|c| c.workspace.as_deref());
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let block = projects_listing(&all, current.as_ref(), home.as_deref())?;
         Some((
@@ -468,6 +472,8 @@ impl ThreadTable {
                     root: l.root.clone(),
                     workspace: l.workspace.clone(),
                     one_line: l.one_line.clone(),
+                    understood: current.as_ref().is_some_and(|c| c.name == l.name)
+                        || (here_workspace.is_some() && l.workspace.as_deref() == here_workspace),
                 })
                 .collect(),
         ))

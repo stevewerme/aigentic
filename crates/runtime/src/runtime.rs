@@ -124,6 +124,13 @@ pub struct Runtime {
     pub(crate) knowledge: Knowledge,
     pub(crate) knowledge_mode: KnowledgeMode,
     pub(crate) knowledge_snapshot: KnowledgeSnapshot,
+    /// The workspace's knowledge, inline or indexed; `None` when the
+    /// thread has no workspace or it has no knowledge.
+    pub(crate) workspace_knowledge_mode: Option<KnowledgeMode>,
+    /// What `search_knowledge` may reach beyond the snapshot: the thread's
+    /// own memory, the understood siblings, the workspace. The tool holds
+    /// the same handle, so installing scopes also reaches the tool.
+    pub(crate) sources: Arc<crate::knowledge::ScopeSources>,
     pub(crate) compaction: CompactionSettings,
     /// Label recorded on summaries; the provider trait has no name.
     pub(crate) model_label: String,
@@ -253,6 +260,8 @@ impl Runtime {
             knowledge: Knowledge::default(),
             knowledge_mode: KnowledgeMode::Inline,
             knowledge_snapshot: KnowledgeSnapshot::default(),
+            workspace_knowledge_mode: None,
+            sources: Arc::new(crate::knowledge::ScopeSources::new()),
             compaction: DEFAULT_COMPACTION,
             model_label: "unknown".into(),
             profile: None,
@@ -745,11 +754,25 @@ impl Runtime {
         self.projects = projects;
         self.project_rows = rows;
         self.measured = None;
+        // The rows arrive after `with_layers` (the daemon builds the
+        // layers first), so the resolver and registration catch up here:
+        // a sibling's knowledge must be reachable from the next call.
+        self.install_scopes();
+        let max_hits = self
+            .layers
+            .project
+            .as_ref()
+            .map(|p| p.file.knowledge.max_hits);
+        if let Some(max_hits) = max_hits {
+            self.measure_registration(max_hits);
+        }
         self
     }
 
-    /// Read the knowledge folder, count it with the provider, decide the
-    /// mode, and register or remove `search_knowledge` accordingly.
+    /// Read the knowledge folders, count them with the provider, decide
+    /// the modes, and register or remove `search_knowledge` accordingly.
+    /// The project's folder is read first, so its mode decides how much
+    /// room the workspace's knowledge has.
     pub fn reload_knowledge(&mut self) -> Result<(), crate::ProjectError> {
         let Some(project) = self.layers.project.as_ref() else {
             return Ok(());
@@ -772,20 +795,77 @@ impl Runtime {
             .knowledge_snapshot
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = knowledge.sections();
-        match mode {
-            KnowledgeMode::Index if self.registry.get(SEARCH_KNOWLEDGE).is_none() => {
-                let tool = SearchKnowledgeTool::new(self.knowledge_snapshot.clone(), max_hits);
-                let _ = self.registry.register(Box::new(tool));
-            }
-            KnowledgeMode::Inline => {
-                self.registry.remove(SEARCH_KNOWLEDGE);
-            }
-            KnowledgeMode::Index => {}
-        }
         self.knowledge = knowledge;
         self.knowledge_mode = mode;
+
+        // The workspace's knowledge, reloaded when its folder changes.
+        // The whole shared dir is the workspace's own, so it is read
+        // without a boundary walk.
+        let mut workspace_mode = None;
+        if let Some(workspace) = self.layers.workspace.as_mut() {
+            let ws_dir = workspace.knowledge_dir();
+            let stale = match (workspace.knowledge.as_ref(), ws_dir.as_deref()) {
+                (Some(loaded), Some(dir)) => loaded.changed(dir),
+                (None, Some(dir)) => crate::knowledge::holds_markdown(dir),
+                (_, None) => false,
+            };
+            if stale {
+                workspace.knowledge = match ws_dir.as_deref() {
+                    Some(dir) => {
+                        let loaded = Knowledge::load(dir, &count)?;
+                        (!loaded.is_empty()).then_some(loaded)
+                    }
+                    None => None,
+                };
+            }
+            // The project's mode is decided first; the workspace only
+            // gets what the project's inline block left of the line.
+            let taken = match mode {
+                KnowledgeMode::Inline => self.knowledge.tokens,
+                KnowledgeMode::Index => 0,
+            };
+            let room = (window as f64 * f64::from(threshold)).round() as u64 - taken;
+            workspace_mode = workspace.knowledge.as_ref().map(|k| {
+                if k.tokens <= room {
+                    KnowledgeMode::Inline
+                } else {
+                    KnowledgeMode::Index
+                }
+            });
+        }
+        self.workspace_knowledge_mode = workspace_mode;
+
+        self.install_scopes();
+        self.measure_registration(max_hits);
         self.measured = None;
         Ok(())
+    }
+
+    /// Tell the resolver which scopes this thread may search, and whether
+    /// any of them has anything: the rows and layers as they stand now.
+    fn install_scopes(&mut self) {
+        self.sources.install(
+            self.layers.project.as_ref(),
+            &self.knowledge.sections(),
+            &self.project_rows,
+            self.layers.workspace.as_ref(),
+        );
+    }
+
+    /// Offer `search_knowledge` when the thread's own knowledge is
+    /// indexed or something it may search has knowledge or memory, and
+    /// take it away when neither holds.
+    fn measure_registration(&mut self, max_hits: usize) {
+        let indexed = self.knowledge_mode == KnowledgeMode::Index;
+        if indexed || self.sources.has_reach() {
+            if self.registry.get(SEARCH_KNOWLEDGE).is_none() {
+                let tool = SearchKnowledgeTool::new(self.knowledge_snapshot.clone(), max_hits)
+                    .with_sources(self.sources.clone());
+                let _ = self.registry.register(Box::new(tool));
+            }
+        } else {
+            self.registry.remove(SEARCH_KNOWLEDGE);
+        }
     }
 
     /// Re-read this project's brief at the start of a turn (issue
@@ -806,23 +886,26 @@ impl Runtime {
     /// Whether `read_brief` is in the tool list the model sees (issue
     /// #123): some project in reach other than this thread's own carries
     /// a brief. A project's own brief is no reason to offer it — that
-    /// brief is already inline. Whether the layers let the tool through
-    /// is `tool_visible`'s, checked where every other spec is.
+    /// brief is already inline. Only an understood project offers it: a
+    /// row in another workspace is listed but refused. Whether the
+    /// layers let the tool through is `tool_visible`'s, checked where
+    /// every other spec is.
     pub fn read_brief_offered(&self) -> bool {
         let here = self.current_project();
-        self.project_rows
-            .iter()
-            .any(|row| row.one_line.is_some() && here.as_deref() != Some(row.name.as_str()))
+        self.project_rows.iter().any(|row| {
+            row.understood && row.one_line.is_some() && here.as_deref() != Some(row.name.as_str())
+        })
     }
 
-    /// What `read_brief` answers for `project` (issue #123): the named
-    /// project's whole brief as `[read-only · <project>]` and its text,
-    /// or the message a refusal carries. The name is matched exactly
-    /// against the reach rows and this thread's own project, and the path
+    /// What `read_brief` answers for `project`: the named project's whole
+    /// brief as `[read-only · <project>]` and its text, or the message a
+    /// refusal carries. The name is matched exactly against the
+    /// understood reach rows and this thread's own project, and the path
     /// is built from the matched row's root, so a name that looks like a
     /// path is refused rather than joined onto a root, and a file outside
-    /// the reach is never opened. Reading this thread's own project is
-    /// symmetry: its brief is already inline.
+    /// the reach — or in a workspace this thread does not understand — is
+    /// never opened. Reading this thread's own project is symmetry: its
+    /// brief is already inline.
     pub fn read_brief(&self, project: &str) -> Result<String, String> {
         if !self.read_brief_offered() {
             return Err(crate::harness_tools::NO_BRIEF_IN_REACH.into());
@@ -835,7 +918,7 @@ impl Runtime {
         let text = self
             .project_rows
             .iter()
-            .find(|row| row.name == project)
+            .find(|row| row.understood && row.name == project)
             .and_then(|row| crate::brief::project_brief(&row.root));
         match text {
             Some(text) => Ok(crate::harness_tools::brief_result(project, &text)),
@@ -843,13 +926,13 @@ impl Runtime {
         }
     }
 
-    /// The names `read_brief` would serve: the reach rows that carry a
-    /// brief, then this thread's own project when it has one.
+    /// The names `read_brief` would serve: the understood reach rows that
+    /// carry a brief, then this thread's own project when it has one.
     fn brief_names(&self) -> Vec<String> {
         let mut names: Vec<String> = self
             .project_rows
             .iter()
-            .filter(|row| row.one_line.is_some())
+            .filter(|row| row.understood && row.one_line.is_some())
             .map(|row| row.name.clone())
             .collect();
         if let Some(here) = self.current_project()
@@ -866,9 +949,9 @@ impl Runtime {
         names
     }
 
-    /// The refusal a `read_brief` call gets (issue #123): why the name
-    /// does not work, and the names that would. A name with a separator
-    /// in it is a path, and the tool never takes one.
+    /// The refusal a `read_brief` call gets: why the name does not work,
+    /// and the names that would. A name with a separator in it is a path,
+    /// and the tool never takes one.
     fn no_brief_error(&self, project: &str) -> String {
         let names = self.brief_names();
         let listed = if names.is_empty() {
@@ -895,8 +978,26 @@ impl Runtime {
             .project
             .as_ref()
             .is_some_and(|p| self.knowledge.changed(&p.knowledge_dir()));
-        if changed {
+        let workspace_changed = self.layers.workspace.as_ref().is_some_and(|w| {
+            match (w.knowledge.as_ref(), w.knowledge_dir()) {
+                (Some(loaded), Some(dir)) => loaded.changed(&dir),
+                (None, Some(dir)) => crate::knowledge::holds_markdown(&dir),
+                _ => false,
+            }
+        });
+        if changed || workspace_changed {
             self.reload_knowledge()?;
+        }
+        // The rows have not moved since the last turn, but a sibling's
+        // memory folder may have: registration is a probe, so run it.
+        if let Some(max_hits) = self
+            .layers
+            .project
+            .as_ref()
+            .map(|p| p.file.knowledge.max_hits)
+        {
+            self.install_scopes();
+            self.measure_registration(max_hits);
         }
         Ok(())
     }
@@ -918,6 +1019,12 @@ impl Runtime {
 
     pub fn knowledge(&self) -> &Knowledge {
         &self.knowledge
+    }
+
+    /// The resolver the search tool reaches a sibling or the workspace
+    /// through; the runtime's own handle on the scopes it installed.
+    pub fn scope_sources(&self) -> Arc<crate::knowledge::ScopeSources> {
+        self.sources.clone()
     }
 
     /// The window fill for `context`, against the ceiling the client
@@ -972,6 +1079,16 @@ impl Runtime {
             }),
             participants: self.participants_line(),
             projects: self.projects.clone(),
+            workspace_knowledge: match (
+                self.layers.workspace.as_ref(),
+                self.workspace_knowledge_mode,
+            ) {
+                (Some(workspace), Some(mode)) => workspace
+                    .knowledge
+                    .as_ref()
+                    .and_then(|k| k.workspace_prefix(&workspace.name, mode)),
+                _ => None,
+            },
             knowledge: self.knowledge.prefix(self.knowledge_mode),
             memory: self.layers.memory_prefix(),
             skills: self.skills_prefix(),
@@ -1071,6 +1188,10 @@ pub struct ProjectRow {
     pub workspace: Option<String>,
     /// The brief's first line, `None` when the project has no brief.
     pub one_line: Option<String>,
+    /// Whether this thread may read the project at all: its own project,
+    /// or one in the thread's own workspace. The daemon decides; a row
+    /// outside it is listed but never opened.
+    pub understood: bool,
 }
 
 /// What a thread takes from its project, built by the daemon and swapped
@@ -1300,18 +1421,21 @@ mod tests {
             root: dir.path().to_path_buf(),
             workspace: None,
             one_line: Some("Here.".into()),
+            understood: true,
         };
         let sibling = crate::ProjectRow {
             name: "web".into(),
             root: "/nowhere/web".into(),
             workspace: None,
             one_line: Some("The site.".into()),
+            understood: true,
         };
         let briefless = crate::ProjectRow {
             name: "old".into(),
             root: "/nowhere/old".into(),
             workspace: None,
             one_line: None,
+            understood: true,
         };
 
         // The thread's own brief alone is no reason to offer it.

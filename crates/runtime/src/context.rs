@@ -34,6 +34,11 @@ pub struct Prefix<'a> {
     /// which is the only thing that knows every project; absent when the
     /// thread has no listing.
     pub projects: Option<String>,
+    /// The workspace's knowledge, from the layer the thread shares with
+    /// its siblings. Inline under the threshold, else indexed and reached
+    /// with `search_knowledge(…, workspace: true)`. Absent when the
+    /// workspace has no knowledge; it sits before `knowledge`.
+    pub workspace_knowledge: Option<String>,
     pub knowledge: Option<String>,
     pub memory: Option<String>,
     pub skills: Option<String>,
@@ -94,6 +99,9 @@ pub fn build_context(prefix: &Prefix<'_>, events: &[Event]) -> Result<Vec<Messag
         context.push(system(text.clone()));
     }
     if let Some(text) = &prefix.projects {
+        context.push(system(text.clone()));
+    }
+    if let Some(text) = &prefix.workspace_knowledge {
         context.push(system(text.clone()));
     }
     if let Some(text) = &prefix.knowledge {
@@ -199,6 +207,7 @@ mod tests {
             participants: None,
             project_brief: None,
             projects: None,
+            workspace_knowledge: None,
             knowledge: Some("# Knowledge\n\n...".into()),
             memory: Some("# Project memory\n\n- Use Swedish.".into()),
             skills: Some("# Skills\n\n- tdd: x".into()),

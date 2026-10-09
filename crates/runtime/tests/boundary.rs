@@ -487,12 +487,14 @@ async fn t6_read_brief_still_works_and_read_file_on_it_asks() {
             root: q.clone(),
             workspace: None,
             one_line: Some("The marketing site.".into()),
+            understood: true,
         },
         ProjectRow {
             name: "p".into(),
             root: f.project.clone(),
             workspace: None,
             one_line: None,
+            understood: true,
         },
     ];
     let mut r = Rig::new(

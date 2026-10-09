@@ -45,10 +45,13 @@ impl GlobalLayer {
 
 /// A workspace's layer (phase 6 step 10): what every project in it
 /// shares. Its files live in `<shared>/workspace/`: `instructions.md`,
-/// `brief.md` and `memory/*.md` now, knowledge in step 12.
+/// `brief.md`, `memory/*.md` and `knowledge/*.md`.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct WorkspaceLayer {
     pub name: String,
+    /// The folder the layer was read from, kept so the runtime can reload
+    /// and stat the knowledge beside the project's.
+    pub shared: Option<std::path::PathBuf>,
     pub instructions: Option<String>,
     /// `brief.md` beside `instructions.md` (issue #123), read in `load`
     /// and kept here, so the prefix is a getter, not a live read. A
@@ -56,12 +59,23 @@ pub struct WorkspaceLayer {
     pub brief: Option<String>,
     /// Memory files, name and text, in name order.
     pub memory: Vec<(String, String)>,
+    /// The workspace's knowledge folder, loaded and reloaded by the
+    /// runtime. The whole shared dir is trusted, so no boundary walk.
+    pub knowledge: Option<crate::knowledge::Knowledge>,
 }
 
 impl WorkspaceLayer {
     /// The folder under `shared` that holds the workspace's own files.
     pub fn dir(shared: &Path) -> std::path::PathBuf {
         shared.join("workspace")
+    }
+
+    /// The folder the workspace's knowledge lives in, under the shared
+    /// dir the layer was read from.
+    pub fn knowledge_dir(&self) -> Option<std::path::PathBuf> {
+        self.shared
+            .as_ref()
+            .map(|shared| Self::dir(shared).join(crate::project::KNOWLEDGE_DIR))
     }
 
     /// Read the layer; missing files are an empty layer.
@@ -73,6 +87,7 @@ impl WorkspaceLayer {
         let Some(shared) = shared else {
             return Ok(layer);
         };
+        layer.shared = Some(shared.to_path_buf());
         let dir = Self::dir(shared);
         let read = |path: &Path| match std::fs::read_to_string(path) {
             Ok(t) => Ok(Some(t)),

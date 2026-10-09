@@ -58,7 +58,7 @@ pub use evict::{
     calibrated, calibrated_delta, min_free, next_ratio, schemas_tokens,
 };
 pub use harness_tools::{IdleProposal, NOT_RUN_LENGTH, NOT_RUN_OVER_LIMIT, NOT_RUN_SOLO, Settled};
-pub use knowledge::{Knowledge, KnowledgeMode};
+pub use knowledge::{Knowledge, KnowledgeMode, ScopeSources};
 pub use layers::{Decided, GlobalLayer, Layers, WorkspaceLayer};
 pub use memory::{MEMORY_FILES, MEMORY_PROMPT};
 pub use mode::Mode;

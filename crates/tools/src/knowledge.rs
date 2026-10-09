@@ -1,8 +1,11 @@
 //! `search_knowledge`: ranked sections over a snapshot of a project's
-//! knowledge folder. The runtime builds and refreshes the snapshot; the
-//! tool never reads the filesystem itself. Ranking is an IDF-weighted
-//! term count over sections: BM25's shape without length normalisation,
-//! which a folder of a hundred sections does not need.
+//! knowledge folder, or over a corpus a resolver hands in for a sibling
+//! project or the workspace. The runtime builds and refreshes the
+//! snapshot and resolves the scopes; the tool never reads the
+//! filesystem itself, and never builds a path from an argument. Ranking
+//! is an IDF-weighted term count over sections: BM25's shape without
+//! length normalisation, which a folder of a hundred sections does not
+//! need.
 
 use std::sync::{Arc, Mutex};
 
@@ -188,6 +191,43 @@ pub fn search<'a>(sections: &'a [Section], query: &str, max_hits: usize) -> Vec<
 /// when the folder changes.
 pub type KnowledgeSnapshot = Arc<Mutex<Vec<Section>>>;
 
+/// Resolves a search scope to the corpus it covers. The runtime
+/// implements this over the daemon's rows and workspace; a tool built
+/// without one reaches no scope at all.
+pub trait KnowledgeSources: Send + Sync {
+    /// The label and sections of a scope. The label's first line names
+    /// the scope (`q`, `workspace ops`) — the result marks itself with
+    /// it and a miss names it — and a further line is a note for the
+    /// reader, such as files the resolver had to leave out. An
+    /// unresolvable scope is the message the call answers with.
+    fn resolve(
+        &self,
+        project: Option<&str>,
+        workspace: bool,
+    ) -> Result<(String, Vec<Section>), String>;
+}
+
+/// Refuses every scope: what a tool with no resolver reaches. The tool
+/// tests and any caller that has only a snapshot get this.
+#[derive(Debug)]
+struct NoSources;
+
+impl KnowledgeSources for NoSources {
+    fn resolve(
+        &self,
+        project: Option<&str>,
+        workspace: bool,
+    ) -> Result<(String, Vec<Section>), String> {
+        let scope = match (project, workspace) {
+            (Some(name), _) => format!("project `{name}`"),
+            _ => "the workspace".to_owned(),
+        };
+        Err(format!(
+            "this thread has no way to reach {scope}: only its own knowledge is searchable here"
+        ))
+    }
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct SearchArgs {
@@ -196,13 +236,21 @@ struct SearchArgs {
     /// At most this many sections (default from the project file).
     #[serde(default)]
     max_hits: Option<usize>,
+    /// A project this thread understands, by the name the system prompt
+    /// lists it under; searches that project's knowledge and memory.
+    #[serde(default)]
+    project: Option<String>,
+    /// Search the thread's workspace instead of a project.
+    #[serde(default)]
+    workspace: Option<bool>,
 }
 
-/// Search the project's knowledge folder.
+/// Search a knowledge folder and the memory beside it.
 pub struct SearchKnowledgeTool {
     snapshot: KnowledgeSnapshot,
     max_hits: usize,
     output_cap: usize,
+    sources: Arc<dyn KnowledgeSources>,
 }
 
 impl std::fmt::Debug for SearchKnowledgeTool {
@@ -221,8 +269,28 @@ impl SearchKnowledgeTool {
             snapshot,
             max_hits,
             output_cap: DEFAULT_OUTPUT_CAP,
+            sources: Arc::new(NoSources),
         }
     }
+
+    /// Install the resolver that reaches a sibling project or the
+    /// workspace. Without it, only the snapshot is searchable.
+    pub fn with_sources(mut self, sources: Arc<dyn KnowledgeSources>) -> Self {
+        self.sources = sources;
+        self
+    }
+}
+
+/// The read-only line a scoped result opens with, and any note the
+/// resolver added after the scope's name.
+fn scope_header(label: &str) -> String {
+    let mut lines = label.lines();
+    let mut header = format!("[read-only · {}]", lines.next().unwrap_or_default());
+    for note in lines {
+        header.push('\n');
+        header.push_str(note);
+    }
+    header
 }
 
 impl Tool for SearchKnowledgeTool {
@@ -231,7 +299,7 @@ impl Tool for SearchKnowledgeTool {
     }
 
     fn description(&self) -> &str {
-        "Search the project's knowledge folder, whose files are listed in the system prompt. Returns the best-matching sections as `path#heading` followed by the text."
+        "Search knowledge and memory for the sections matching `query`. `query` is required; `project` names another project this thread understands, by the name the system prompt lists it under; `workspace: true` searches the thread's workspace. Returns the best-matching sections as `path#heading` followed by the text."
     }
 
     fn schema(&self) -> schemars::schema::RootSchema {
@@ -245,16 +313,56 @@ impl Tool for SearchKnowledgeTool {
     fn call(&self, args: serde_json::Value) -> BoxFuture<'_, Result<ToolOutput, ToolError>> {
         Box::pin(async move {
             let args: SearchArgs = parse_args(args)?;
+            if args.project.is_some() && args.workspace == Some(true) {
+                return Err(ToolError::InvalidArgs(
+                    "`project` and `workspace` name one scope each: pass one of them, not both"
+                        .into(),
+                ));
+            }
             let max = args.max_hits.unwrap_or(self.max_hits).max(1);
-            let sections = self.snapshot.lock().unwrap_or_else(|e| e.into_inner());
-            let hits = search(&sections, &args.query, max);
-            let content = if hits.is_empty() {
-                format!("no sections match {:?}", args.query)
+            let scope = if args.project.is_some() || args.workspace == Some(true) {
+                match self
+                    .sources
+                    .resolve(args.project.as_deref(), args.workspace == Some(true))
+                {
+                    Ok(scope) => Some(scope),
+                    Err(message) => {
+                        return Ok(ToolOutput {
+                            content: message,
+                            is_error: true,
+                        });
+                    }
+                }
+            } else {
+                None
+            };
+            let own;
+            let sections: &[Section] = match &scope {
+                Some((_, sections)) => sections,
+                None => {
+                    own = self.snapshot.lock().unwrap_or_else(|e| e.into_inner());
+                    own.as_slice()
+                }
+            };
+            let hits = search(sections, &args.query, max);
+            let body = if hits.is_empty() {
+                match &scope {
+                    Some((label, _)) => format!(
+                        "no sections match {:?} in {}",
+                        args.query,
+                        label.lines().next().unwrap_or_default()
+                    ),
+                    None => format!("no sections match {:?}", args.query),
+                }
             } else {
                 hits.iter()
                     .map(|s| format!("{}\n{}", s.locator(), s.text))
                     .collect::<Vec<_>>()
                     .join("\n\n---\n\n")
+            };
+            let content = match &scope {
+                Some((label, _)) => format!("{}\n{body}", scope_header(label)),
+                None => body,
             };
             Ok(ToolOutput {
                 content: truncate_output(&content, self.output_cap),
@@ -377,5 +485,251 @@ mod tests {
             tool.call(json!({})).await.unwrap_err(),
             ToolError::InvalidArgs(_)
         ));
+    }
+
+    /// A section with just enough of a body to be found.
+    fn section(file: &str, heading: &str, text: &str) -> Section {
+        Section {
+            file: file.to_owned(),
+            heading: heading.to_owned(),
+            text: text.to_owned(),
+            line: 1,
+        }
+    }
+
+    /// The scopes a thread may reach, as the runtime would resolve them.
+    #[derive(Debug)]
+    struct Scopes {
+        project: Option<(String, Vec<Section>)>,
+        workspace: Option<(String, Vec<Section>)>,
+    }
+
+    impl KnowledgeSources for Scopes {
+        fn resolve(
+            &self,
+            project: Option<&str>,
+            workspace: bool,
+        ) -> Result<(String, Vec<Section>), String> {
+            if workspace {
+                return self
+                    .workspace
+                    .clone()
+                    .map(|(name, sections)| (format!("workspace {name}"), sections))
+                    .ok_or_else(|| "this thread is in no workspace".to_owned());
+            }
+            let name = project.unwrap_or_default();
+            if name.contains('/') {
+                return Err(format!("`{name}` is a path, not a project name"));
+            }
+            match &self.project {
+                Some((n, sections)) if n == name => Ok((n.clone(), sections.clone())),
+                _ => Err(format!("{name} is not a project this thread understands")),
+            }
+        }
+    }
+
+    /// The tool over `DOC`, reaching a sibling `q` and the workspace `ops`.
+    fn scoped() -> SearchKnowledgeTool {
+        let sibling = vec![
+            section("deploy.md", "Deploys", "We deploy on Fridays."),
+            section(
+                "memory/decisions.md",
+                "Storage",
+                "We chose Postgres for storage.",
+            ),
+        ];
+        let workspace = vec![section(
+            "speed.md",
+            "Speed",
+            "The workspace deploys twice a day.",
+        )];
+        SearchKnowledgeTool::new(Arc::new(Mutex::new(split_sections("ops.md", DOC))), 5)
+            .with_sources(Arc::new(Scopes {
+                project: Some(("q".to_owned(), sibling)),
+                workspace: Some(("ops".to_owned(), workspace)),
+            }))
+    }
+
+    #[test]
+    fn the_schema_has_the_two_new_optional_properties() {
+        let schema = SearchKnowledgeTool::new(Arc::new(Mutex::new(Vec::new())), 5).schema();
+        let mut props: Vec<&str> = schema
+            .schema
+            .object
+            .as_ref()
+            .unwrap()
+            .properties
+            .keys()
+            .map(String::as_str)
+            .collect();
+        props.sort_unstable();
+        assert_eq!(props, vec!["max_hits", "project", "query", "workspace"]);
+        let mut required: Vec<&str> = schema
+            .schema
+            .object
+            .as_ref()
+            .unwrap()
+            .required
+            .iter()
+            .map(String::as_str)
+            .collect();
+        required.sort_unstable();
+        assert_eq!(required, vec!["query"]);
+        let bare = SearchKnowledgeTool::new(Arc::new(Mutex::new(Vec::new())), 5);
+        let description = bare.description();
+        for argument in ["query", "project", "workspace"] {
+            assert!(description.contains(argument), "{description}");
+        }
+    }
+
+    #[test]
+    fn project_and_workspace_parse_and_a_stranger_key_does_not() {
+        let args = parse_args::<SearchArgs>(json!({"query": "x", "project": "q"})).unwrap();
+        assert_eq!(args.project.as_deref(), Some("q"));
+        let args = parse_args::<SearchArgs>(json!({"query": "x", "workspace": true})).unwrap();
+        assert_eq!(args.workspace, Some(true));
+        let args = parse_args::<SearchArgs>(json!({"query": "x", "workspace": false})).unwrap();
+        assert_eq!(args.workspace, Some(false));
+        let err = parse_args::<SearchArgs>(json!({"query": "x", "scope": "q"})).unwrap_err();
+        assert!(err.to_string().contains("scope"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn passing_both_project_and_workspace_is_refused() {
+        let tool = scoped();
+        let err = tool
+            .call(json!({"query": "deploy", "project": "q", "workspace": true}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgs(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn workspace_false_is_the_same_call_as_absent() {
+        let tool = scoped();
+        let absent = tool.call(json!({"query": "rollback"})).await.unwrap();
+        let false_ = tool
+            .call(json!({"query": "rollback", "workspace": false}))
+            .await
+            .unwrap();
+        assert_eq!(absent.content, false_.content);
+        assert!(!false_.content.starts_with("[read-only"));
+    }
+
+    #[tokio::test]
+    async fn a_project_scope_marks_its_hits_read_only_and_locates_memory() {
+        let out = scoped()
+            .call(json!({"query": "storage postgres", "project": "q"}))
+            .await
+            .unwrap();
+        assert!(
+            out.content
+                .starts_with("[read-only · q]\nmemory/decisions.md#Storage\n"),
+            "{}",
+            out.content
+        );
+        let out = scoped()
+            .call(json!({"query": "fridays deploy", "project": "q"}))
+            .await
+            .unwrap();
+        assert!(
+            out.content
+                .starts_with("[read-only · q]\ndeploy.md#Deploys"),
+            "{}",
+            out.content
+        );
+    }
+
+    #[tokio::test]
+    async fn the_workspace_scope_names_the_workspace() {
+        let out = scoped()
+            .call(json!({"query": "deploys twice", "workspace": true}))
+            .await
+            .unwrap();
+        assert!(
+            out.content
+                .starts_with("[read-only · workspace ops]\nspeed.md#Speed"),
+            "{}",
+            out.content
+        );
+    }
+
+    #[tokio::test]
+    async fn a_miss_names_the_scope_it_searched() {
+        let out = scoped()
+            .call(json!({"query": "kubernetes", "project": "q"}))
+            .await
+            .unwrap();
+        assert!(!out.is_error);
+        assert_eq!(
+            out.content,
+            "[read-only · q]\nno sections match \"kubernetes\" in q"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_scope_the_resolver_cannot_reach_is_an_error() {
+        let out = scoped()
+            .call(json!({"query": "x", "workspace": true}))
+            .await
+            .unwrap();
+        assert!(
+            out.content.starts_with("[read-only · workspace ops]"),
+            "{}",
+            out.content
+        );
+        let tool = SearchKnowledgeTool::new(Arc::new(Mutex::new(Vec::new())), 5).with_sources(
+            Arc::new(Scopes {
+                project: None,
+                workspace: None,
+            }),
+        );
+        let out = tool
+            .call(json!({"query": "x", "workspace": true}))
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert!(out.content.contains("no workspace"), "{}", out.content);
+        let out = tool
+            .call(json!({"query": "x", "project": "q"}))
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert!(
+            out.content
+                .contains("not a project this thread understands"),
+            "{out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_path_like_project_name_is_refused() {
+        let out = scoped()
+            .call(json!({"query": "x", "project": "../q"}))
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert!(
+            out.content.contains("is a path, not a project name"),
+            "{}",
+            out.content
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tool_with_no_resolver_refuses_a_scope() {
+        let tool = SearchKnowledgeTool::new(Arc::new(Mutex::new(split_sections("ops.md", DOC))), 5);
+        let out = tool
+            .call(json!({"query": "rollback", "project": "q"}))
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert!(out.content.contains("no way to reach"), "{}", out.content);
+        let out = tool.call(json!({"query": "rollback"})).await.unwrap();
+        assert!(
+            out.content.starts_with("ops.md#Rollback"),
+            "{}",
+            out.content
+        );
     }
 }
