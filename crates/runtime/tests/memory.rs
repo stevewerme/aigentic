@@ -864,6 +864,153 @@ async fn remember_files_a_line_directly_without_a_model_call() {
     );
 }
 
+/// The `memory_remembered` event a `/remember` call appended, last.
+fn last_remembered(rt: &Runtime) -> MemoryRememberedPayload {
+    let events = rt.log().read_all().unwrap();
+    let e = events
+        .iter()
+        .rev()
+        .find(|e| e.kind == EventKind::MemoryRemembered)
+        .expect("a memory_remembered event");
+    serde_json::from_value(e.payload.clone()).unwrap()
+}
+
+#[tokio::test]
+async fn remember_takes_a_leading_home_word_and_reports_it() {
+    let dir = project_dir("");
+    let (mut rt, _) = rig(&dir, one_turn());
+
+    rt.remember(steve(), "person decision We ship from main", &mut |_| {})
+        .unwrap();
+    let p = last_remembered(&rt);
+    assert_eq!(p.home, MemoryHome::Person);
+    assert_eq!(p.file, memory_file("decision"));
+    assert_eq!(p.text, "We ship from main");
+    assert!(p.written);
+    let person =
+        std::fs::read_to_string(person_memory(&dir).join(memory_file("decision"))).unwrap();
+    assert!(person.contains("- We ship from main"), "{person}");
+
+    rt.remember(steve(), "workspace fact The fleet runs Debian", &mut |_| {})
+        .unwrap();
+    let p = last_remembered(&rt);
+    assert_eq!(p.home, MemoryHome::Workspace);
+    assert_eq!(p.file, memory_file("fact"));
+    let shared = std::fs::read_to_string(workspace_memory(&dir).join(memory_file("fact"))).unwrap();
+    assert!(shared.contains("- The fleet runs Debian"), "{shared}");
+
+    // A kind word without a home word is still the project's.
+    rt.remember(steve(), "decision We ship on Fridays", &mut |_| {})
+        .unwrap();
+    let p = last_remembered(&rt);
+    assert_eq!(p.home, MemoryHome::Project);
+    assert_eq!(p.file, memory_file("decision"));
+
+    // A home word with no kind word after it is the whole line, a project
+    // fact.
+    rt.remember(steve(), "workspace is noisy this week", &mut |_| {})
+        .unwrap();
+    let p = last_remembered(&rt);
+    assert_eq!(p.home, MemoryHome::Project);
+    assert_eq!(p.file, memory_file("fact"));
+    assert_eq!(p.text, "workspace is noisy this week");
+    let facts =
+        std::fs::read_to_string(dir.path().join(PROJECT_MEMORY).join(memory_file("fact"))).unwrap();
+    assert!(facts.contains("- workspace is noisy this week"), "{facts}");
+
+    // And so is a kind word with nothing after it.
+    rt.remember(steve(), "person fact", &mut |_| {}).unwrap();
+    let p = last_remembered(&rt);
+    assert_eq!(p.home, MemoryHome::Project);
+    assert_eq!(p.file, memory_file("fact"));
+    assert_eq!(p.text, "person fact");
+    assert!(
+        !workspace_memory(&dir)
+            .join(memory_file("decision"))
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn remember_names_a_home_this_thread_has_not_got() {
+    // No workspace loaded.
+    let dir = project_dir("");
+    let (mut rt, _) = rig_without(
+        &dir,
+        one_turn(),
+        Homes {
+            person_dir: true,
+            owner: Some(common::STEVE),
+            workspace: false,
+        },
+    );
+    let err = rt
+        .remember(steve(), "workspace fact The fleet runs Debian", &mut |_| {})
+        .unwrap_err();
+    assert!(
+        matches!(err, RuntimeError::NoMemoryHome(MemoryHome::Workspace)),
+        "{err}"
+    );
+    assert!(!shared_dir(&dir).exists());
+
+    // A person's folder, but no owner: nobody's home.
+    let dir = project_dir("");
+    let (mut rt, _) = rig_without(
+        &dir,
+        one_turn(),
+        Homes {
+            person_dir: true,
+            owner: None,
+            workspace: true,
+        },
+    );
+    let err = rt
+        .remember(steve(), "person fact We ship from main", &mut |_| {})
+        .unwrap_err();
+    assert!(
+        matches!(err, RuntimeError::NoMemoryHome(MemoryHome::Person)),
+        "{err}"
+    );
+    assert!(!person_memory(&dir).exists(), "nothing was written");
+}
+
+#[tokio::test]
+async fn remember_person_is_refused_for_anyone_but_the_owner() {
+    let dir = project_dir("");
+    let (mut rt, _) = rig(&dir, one_turn());
+    let err = rt
+        .remember(
+            common::magnus(),
+            "person fact We ship from main",
+            &mut |_| {},
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, RuntimeError::NoMemoryHome(MemoryHome::Person)),
+        "{err}"
+    );
+    assert!(!person_memory(&dir).exists(), "nothing was written");
+
+    // Nobody owns the home, so nobody may file there.
+    let dir = project_dir("");
+    let (mut rt, _) = rig_without(
+        &dir,
+        one_turn(),
+        Homes {
+            person_dir: true,
+            owner: None,
+            workspace: true,
+        },
+    );
+    let err = rt
+        .remember(steve(), "person fact We ship from main", &mut |_| {})
+        .unwrap_err();
+    assert!(
+        matches!(err, RuntimeError::NoMemoryHome(MemoryHome::Person)),
+        "{err}"
+    );
+}
+
 #[test]
 fn remember_without_a_project_is_an_error() {
     let dir = tempfile::tempdir().unwrap();

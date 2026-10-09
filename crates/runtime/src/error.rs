@@ -1,5 +1,6 @@
 use aigentic_core::ProviderError;
 use aigentic_log::LogError;
+use aigentic_log::MemoryHome;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeError {
@@ -15,6 +16,11 @@ pub enum RuntimeError {
     /// the project's `.aigentic/`, and this thread has none.
     #[error("no project: no memory files to remember into")]
     NoProject,
+    /// `/remember` aimed at a home this thread has not got: no folder
+    /// for it, or the person's home without an owner to own it. A
+    /// person's home too, for anyone but the owner.
+    #[error("no {0} memory in this thread")]
+    NoMemoryHome(MemoryHome),
     #[error(transparent)]
     Project(#[from] crate::ProjectError),
     /// A step thread may not switch project (issue #55): the move would

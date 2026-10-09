@@ -28,6 +28,7 @@
 //! model in between.
 
 use std::io::Write as _;
+use std::path::PathBuf;
 
 use aigentic_core::{
     Author, CompletionRequest, ContentBlock, Event, EventKind, Message, ProviderEvent, Role, Usage,
@@ -448,20 +449,26 @@ impl Runtime {
 
     /// `/remember <text>` (issue #14): the person files a line
     /// themselves — no model call, no filter, because the command is
-    /// the statement. An optional first word (`decision`, `constraint`
-    /// or `fact`) picks the file; without one the line lands in
-    /// `facts.md`. Appends a `memory_remembered` event (the audit, and
-    /// what the client prints) and reloads the prefix.
+    /// the statement. A leading home word (`person`, `workspace`,
+    /// `project`) picks the home, and an optional kind word
+    /// (`decision`, `constraint` or `fact`) picks the file; without one
+    /// the line lands in `facts.md`. Refuses a home this thread has not
+    /// got, and the person's home for anyone but the owner. Appends a
+    /// `memory_remembered` event (the audit, and what the client
+    /// prints) and reloads the homes.
     pub fn remember(
         &mut self,
         author: Author,
         text: &str,
         observe: &mut (dyn FnMut(Signal<'_>) + Send),
     ) -> Result<(), RuntimeError> {
-        let Some(project) = self.layers.project.as_ref() else {
+        let (home, text) = split_home(text);
+        if home == MemoryHome::Project && self.layers.project.is_none() {
             return Err(RuntimeError::NoProject);
-        };
-        let memory_dir = project.memory_dir();
+        }
+        let memory_dir = self
+            .writable_home(home, &author)
+            .ok_or(RuntimeError::NoMemoryHome(home))?;
 
         let (file, text) = split_kind(text);
         let (file, text) = (file.to_owned(), text.to_owned());
@@ -475,7 +482,7 @@ impl Runtime {
         let thread = self.log.thread_id().to_string();
         let line = MemoryLine {
             file: file.clone(),
-            home: MemoryHome::Project,
+            home,
             text: text.clone(),
             stated_by: author.clone(),
             at_seq,
@@ -484,7 +491,7 @@ impl Runtime {
 
         let payload = MemoryRememberedPayload {
             file,
-            home: MemoryHome::Project,
+            home,
             text,
             written: !written.is_empty(),
         };
@@ -495,12 +502,48 @@ impl Runtime {
             None,
             observe,
         )?;
-        if let Some(project) = self.layers.project.as_mut() {
-            project.reload_memory()?;
-        }
+        self.layers.reload_memory()?;
         self.measured = None;
         Ok(())
     }
+
+    /// The folder a line in `home` goes to, when this thread may file
+    /// there: the folder must be known, and the person's home is the
+    /// owner's alone.
+    fn writable_home(&self, home: MemoryHome, by: &Author) -> Option<PathBuf> {
+        let owner = self.layers.global.owner.as_deref();
+        match (home, by) {
+            (MemoryHome::Person, Author::User(id)) if owner == Some(id.0.as_str()) => {
+                self.layers.memory_home(home)
+            }
+            (MemoryHome::Person, _) => None,
+            _ => self.layers.memory_home(home),
+        }
+    }
+}
+
+/// Split a leading home word off a `/remember` line. The word counts
+/// only when a kind word with a line after it follows, so
+/// `/remember workspace is noisy this week` stays a project fact.
+pub(crate) fn split_home(text: &str) -> (MemoryHome, &str) {
+    let trimmed = text.trim();
+    let Some((word, rest)) = trimmed.split_once(char::is_whitespace) else {
+        return (MemoryHome::Project, trimmed);
+    };
+    let Some(home) = home_word(word) else {
+        return (MemoryHome::Project, trimmed);
+    };
+    let rest = rest.trim();
+    let Some((kind, line)) = rest.split_once(char::is_whitespace) else {
+        return (MemoryHome::Project, trimmed);
+    };
+    let kind_known = MEMORY_FILES
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case(kind));
+    if !kind_known || line.trim().is_empty() {
+        return (MemoryHome::Project, trimmed);
+    }
+    (home, rest)
 }
 
 /// Split an optional kind word off the front of a `/remember` line:
