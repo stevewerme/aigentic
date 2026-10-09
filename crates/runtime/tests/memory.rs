@@ -8,7 +8,11 @@ mod common;
 
 use aigentic_core::{ContentBlock, EventKind, Message, ProviderEvent, Role, ToolCall};
 use aigentic_log::{MemoryExtractedPayload, MemoryRememberedPayload, ThreadLog};
-use aigentic_runtime::{Layers, MEMORY_PROMPT, Prices, Project, Runtime, RuntimeError};
+use aigentic_runtime::project::{MEMORY_DIR, person_memory_dir};
+use aigentic_runtime::{
+    GlobalLayer, Layers, MEMORY_PROMPT, PERSON_MEMORY_HEADING, Prices, Project, Runtime,
+    RuntimeError, WorkspaceLayer,
+};
 use aigentic_tools::ToolRegistry;
 use common::{EchoTool, Seen, done, scripted, steve, usage};
 use serde_json::json;
@@ -28,8 +32,35 @@ fn project_dir(memory_section: &str) -> tempfile::TempDir {
     dir
 }
 
-/// The shared runtime shape: one thread provider, one model label, the
-/// project's layers and an echo tool.
+/// The fixture's workspace name, as its layer renders it.
+const WORKSPACE: &str = "ws";
+
+/// The config directory the fixture's person memory lives under, below
+/// the project's temp dir so a test can reach the folder it wrote to.
+fn config_dir(dir: &tempfile::TempDir) -> std::path::PathBuf {
+    dir.path().join("config")
+}
+
+/// The shared directory the fixture's workspace layer was read from.
+fn shared_dir(dir: &tempfile::TempDir) -> std::path::PathBuf {
+    dir.path().join("shared")
+}
+
+/// The workspace's memory folder, as the fixture's `WorkspaceLayer`
+/// looks it up.
+fn workspace_memory(dir: &tempfile::TempDir) -> std::path::PathBuf {
+    WorkspaceLayer::dir(&shared_dir(dir)).join(MEMORY_DIR)
+}
+
+/// The person's memory folder, as the fixture's `GlobalLayer` looks it
+/// up.
+fn person_memory(dir: &tempfile::TempDir) -> std::path::PathBuf {
+    person_memory_dir(&config_dir(dir))
+}
+
+/// The shared runtime shape: one thread provider, one model label, an
+/// echo tool and all three layers — the owner's person memory, a
+/// workspace memory and the project's.
 fn runtime_with(
     dir: &tempfile::TempDir,
     provider: Box<dyn aigentic_core::Provider>,
@@ -40,13 +71,26 @@ fn runtime_with(
     let registry: ToolRegistry =
         vec![Box::new(EchoTool(Arc::new(Mutex::new(Vec::new())))) as Box<dyn aigentic_core::Tool>]
             .into();
+    let global = GlobalLayer::load(
+        &config_dir(dir).join("instructions.md"),
+        Some(&person_memory(dir)),
+        Some(common::STEVE),
+        Vec::new(),
+        Vec::new(),
+    )
+    .unwrap();
+    let workspace = WorkspaceLayer::load(WORKSPACE, Some(&shared_dir(dir))).unwrap();
     Runtime::new(
         provider,
         registry,
         log,
         aigentic_core::AgentId("worker".into()),
     )
-    .with_layers(Layers::default().with_project(project))
+    .with_layers(Layers {
+        global,
+        workspace: Some(workspace),
+        project: Some(project),
+    })
     .with_model_label(label)
 }
 
@@ -221,6 +265,72 @@ async fn a_hand_edited_file_changes_the_next_prefix() {
         .expect("memory block");
     assert!(texts(memory).contains("Use Finnish"));
     assert!(!texts(memory).contains("Use Swedish"));
+}
+
+/// A file edited by hand reaches the next turn's prefix in every home,
+/// not only the project's.
+#[tokio::test]
+async fn a_turn_start_reloads_all_three_homes() {
+    let dir = project_dir("");
+    let (mut rt, seen) = rig(&dir, vec![vec![text("ok"), done("stop")]]);
+
+    // All three folders appear after the runtime was built.
+    for folder in [
+        person_memory(&dir),
+        workspace_memory(&dir),
+        dir.path().join(".aigentic").join(MEMORY_DIR),
+    ] {
+        std::fs::create_dir_all(&folder).unwrap();
+    }
+    std::fs::write(
+        person_memory(&dir).join("facts.md"),
+        "- The person works from the terminal.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        workspace_memory(&dir).join("constraints.md"),
+        "- The fleet runs Debian.\n",
+    )
+    .unwrap();
+    let project = dir
+        .path()
+        .join(".aigentic")
+        .join(MEMORY_DIR)
+        .join("decisions.md");
+    std::fs::write(&project, "- We ship on Fridays.\n").unwrap();
+
+    // No explicit reload: the turn start re-reads all three.
+    say(&mut rt, "next").await;
+
+    let ctx = seen.lock().unwrap()[0].clone();
+    let blocks: Vec<String> = ctx.iter().map(texts).collect();
+    let person = blocks
+        .iter()
+        .position(|b| b.starts_with(PERSON_MEMORY_HEADING))
+        .expect("the person's block is in the prefix");
+    assert!(
+        blocks[person].contains("The person works from the terminal."),
+        "{}",
+        blocks[person]
+    );
+    // The workspace's and the project's blocks share one message, the
+    // workspace's first.
+    let memory = blocks
+        .iter()
+        .position(|b| b.starts_with(&format!("# Workspace memory ({WORKSPACE})")))
+        .expect("the workspace's and the project's block is in the prefix");
+    assert!(
+        blocks[memory].contains("The fleet runs Debian."),
+        "{}",
+        blocks[memory]
+    );
+    let shared = blocks[memory]
+        .find("The fleet runs Debian.")
+        .expect("reload did not reach the prefix");
+    let own = blocks[memory]
+        .find("We ship on Fridays.")
+        .expect("the project's memory did not reach the prefix");
+    assert!(person < memory && shared < own, "{}", blocks[memory]);
 }
 
 #[tokio::test]

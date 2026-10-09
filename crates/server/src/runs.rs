@@ -77,6 +77,9 @@ pub struct RunWorld {
     pub config: Arc<Config>,
     /// Where global instructions and the user's skills and workflows live.
     pub config_dir: PathBuf,
+    /// The daemon's owner, whose memory folder is the person's home.
+    /// `None` when server.toml lists no user.
+    pub owner: Option<String>,
     /// The profile's provider, built from the config.
     pub providers: Arc<dyn ProviderFactory>,
     /// The forge, installer and repo seams.
@@ -200,6 +203,7 @@ impl RunnerHost for ServerHost {
             let built = build_thread(
                 &world.config,
                 &world.config_dir,
+                world.owner.as_deref(),
                 &*world.providers,
                 &world.root,
                 &world.workspaces,

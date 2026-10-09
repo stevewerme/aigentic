@@ -27,6 +27,7 @@ use aigentic_api::{Request, Response, ThreadState};
 use aigentic_runtime::aigentic_core::AgentId;
 use aigentic_runtime::aigentic_log::ThreadLog;
 use aigentic_runtime::aigentic_tools::{ToolRegistry, Workdir};
+use aigentic_runtime::project::person_memory_dir;
 use aigentic_runtime::{GlobalLayer, Layers, Mode, Project, ProjectFile, Runtime};
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
@@ -492,8 +493,17 @@ async fn main() -> anyhow::Result<()> {
             // calls the model: the provider is built without a key so the
             // knowledge mode is decided for this profile's window.
             let (_, profile) = config.select(profile_arg)?;
+            // The daemon's owner, by the same rule `doctor` reports: the
+            // first user of a server.toml beside config.toml, else the
+            // config's user.
+            let owner = aigentic_server::ServerConfig::load(&config_dir.join("server.toml"))
+                .ok()
+                .and_then(|s| s.owner().map(str::to_owned))
+                .unwrap_or_else(|| config.user_name());
             let global = GlobalLayer::load(
                 &global_instructions,
+                Some(&person_memory_dir(&config_dir)),
+                Some(&owner),
                 config.denied_tools.clone(),
                 config.denied_skills.clone(),
             )?;

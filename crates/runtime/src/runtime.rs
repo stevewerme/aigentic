@@ -1006,12 +1006,26 @@ impl Runtime {
     /// between turns reaches the next prefix (done-when 4). A change
     /// resets the window measure like any other prefix change.
     pub(crate) fn refresh_memory(&mut self) -> Result<(), crate::ProjectError> {
-        let Some(project) = self.layers.project.as_mut() else {
-            return Ok(());
-        };
-        let before = project.memory.clone();
-        project.reload_memory()?;
-        if project.memory != before {
+        let before = (
+            self.layers.global.memory.clone(),
+            self.layers
+                .workspace
+                .as_ref()
+                .map(|w| w.memory.clone())
+                .unwrap_or_default(),
+            self.layers.project.as_ref().map(|p| p.memory.clone()),
+        );
+        self.layers.reload_memory()?;
+        let after = (
+            self.layers.global.memory.clone(),
+            self.layers
+                .workspace
+                .as_ref()
+                .map(|w| w.memory.clone())
+                .unwrap_or_default(),
+            self.layers.project.as_ref().map(|p| p.memory.clone()),
+        );
+        if before != after {
             self.measured = None;
         }
         Ok(())
@@ -1064,6 +1078,7 @@ impl Runtime {
     pub(crate) fn prefix(&self) -> crate::Prefix<'_> {
         crate::Prefix {
             global: self.layers.global.instructions.as_deref(),
+            person_memory: self.layers.global.memory_block(),
             harness: self.harness_instructions,
             workspace: self.layers.workspace_instructions(),
             workspace_brief: self.layers.workspace.as_ref().and_then(|w| {

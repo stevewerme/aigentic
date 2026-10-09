@@ -312,6 +312,7 @@ impl ThreadTable {
         let mut built = project_context(
             &self.config,
             &self.config_dir,
+            self.server.owner(),
             &*self.providers,
             &root,
             &self.workspaces,
@@ -910,6 +911,7 @@ impl ThreadTable {
         let built = build_thread(
             &self.config,
             &self.config_dir,
+            self.server.owner(),
             &*self.providers,
             &root,
             &self.workspaces,
@@ -1017,6 +1019,7 @@ impl ThreadTable {
         Ok(RunWorld {
             config: self.config.clone(),
             config_dir: self.config_dir.clone(),
+            owner: self.server.owner().map(str::to_owned),
             providers: self.providers.clone(),
             deps: self.run_deps(),
             guard: self.guard(),
@@ -1177,6 +1180,7 @@ impl ThreadTable {
         let built = build_thread(
             &self.config,
             &self.config_dir,
+            self.server.owner(),
             &*self.providers,
             &root,
             &self.workspaces,

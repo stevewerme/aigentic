@@ -379,6 +379,15 @@ pub fn harness_with_clock(
     }
 }
 
+/// The person the fixtures state lines as, and the owner of their
+/// person memory: one constant, so an author and an owner cannot drift.
+pub const STEVE: &str = "steve";
+
 pub fn steve() -> Author {
-    Author::User(UserId("steve".into()))
+    Author::User(UserId(STEVE.into()))
+}
+
+/// Someone who is not the owner, for the person-scoped rules.
+pub fn magnus() -> Author {
+    Author::User(UserId("magnus".into()))
 }

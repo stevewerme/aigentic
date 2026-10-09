@@ -235,6 +235,8 @@ pub async fn run(
     checks.push(check_skills(
         project.as_ref(),
         &config,
+        &config_dir,
+        Some(&owner),
         &global_instructions,
         &paths,
         cwd,

@@ -4,11 +4,17 @@ use aigentic_core::{Author, ContentBlock, Event, Message, Role};
 use aigentic_log::{LogError, Projection, project};
 
 /// The stable prefix, in the order the PRD fixes: global instructions,
-/// project instructions, knowledge, memory, then (from the log) pinned
-/// facts, then the skills block. Every block is one system message.
+/// the person's memory, project instructions, knowledge, memory, then
+/// (from the log) pinned facts, then the skills block. Every block is one
+/// system message.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Prefix<'a> {
     pub global: Option<&'a str>,
+    /// The person's memory (phase 6 step 12): the global layer's own
+    /// block, right after the global instructions and before the
+    /// harness's. [`Self::memory`] holds the workspace's and the
+    /// project's only.
+    pub person_memory: Option<String>,
     /// The harness's own standing instructions (phase 6 step 8c): how to
     /// use its tools. Fixed text, after the person's global block.
     pub harness: Option<&'a str>,
@@ -79,6 +85,9 @@ pub fn build_context(prefix: &Prefix<'_>, events: &[Event]) -> Result<Vec<Messag
     let mut context = Vec::with_capacity(body.len() + 8);
     if let Some(text) = prefix.global {
         context.push(system(text.to_owned()));
+    }
+    if let Some(text) = &prefix.person_memory {
+        context.push(system(text.clone()));
     }
     if let Some(text) = prefix.harness {
         context.push(system(text.to_owned()));
@@ -200,6 +209,7 @@ mod tests {
         ];
         let prefix = Prefix {
             global: Some("You are terse."),
+            person_memory: None,
             harness: Some("Keep a checklist."),
             workspace: None,
             project: Some("This is Vendela."),

@@ -560,6 +560,7 @@ async fn a_tool_the_layers_hide_is_not_offered_and_is_refused_as_unknown() {
             instructions: None,
             denied_tools: vec!["touch".into(), "mcp.*".into()],
             denied_skills: vec![],
+            ..GlobalLayer::default()
         },
         workspace: None,
         project: None,

@@ -13,7 +13,7 @@ use aigentic_runtime::aigentic_core::{
     UserId,
 };
 use aigentic_runtime::aigentic_tools::{ToolRegistry, Workdir};
-use aigentic_runtime::project::{DOT_DIR, FILE_NAME, INSTRUCTIONS_FILE};
+use aigentic_runtime::project::{DOT_DIR, FILE_NAME, INSTRUCTIONS_FILE, person_memory_dir};
 use aigentic_runtime::{GlobalLayer, Knowledge, KnowledgeMode, Layers, Project};
 use futures_util::StreamExt;
 
@@ -411,6 +411,8 @@ fn instructions_source(p: &Project) -> String {
 pub fn check_skills(
     project: Option<&Project>,
     config: &Config,
+    config_dir: &Path,
+    owner: Option<&str>,
     global_instructions: &Path,
     paths: &SkillPaths,
     cwd: &Path,
@@ -423,6 +425,8 @@ pub fn check_skills(
     }
     let global = match GlobalLayer::load(
         global_instructions,
+        Some(&person_memory_dir(config_dir)),
+        owner,
         config.denied_tools.clone(),
         config.denied_skills.clone(),
     ) {
@@ -1134,13 +1138,30 @@ mod tests {
         let config = Config::parse(GOOD).unwrap();
         let global = dir.path().join("instructions.md");
         assert_eq!(
-            check_skills(None, &config, &global, &paths, dir.path()).status,
+            check_skills(
+                None,
+                &config,
+                dir.path(),
+                None,
+                &global,
+                &paths,
+                dir.path()
+            )
+            .status,
             Status::Skip
         );
 
         std::fs::write(dir.path().join(FILE_NAME), "[project]\nname = \"p\"\n").unwrap();
         let p = Project::open_root(dir.path()).unwrap();
-        let c = check_skills(Some(&p), &config, &global, &paths, dir.path());
+        let c = check_skills(
+            Some(&p),
+            &config,
+            dir.path(),
+            None,
+            &global,
+            &paths,
+            dir.path(),
+        );
         assert_eq!(c.status, Status::Skip);
         assert_eq!(c.message, "none enabled");
 
@@ -1151,7 +1172,15 @@ mod tests {
         )
         .unwrap();
         let p = Project::open_root(dir.path()).unwrap();
-        let c = check_skills(Some(&p), &config, &global, &paths, dir.path());
+        let c = check_skills(
+            Some(&p),
+            &config,
+            dir.path(),
+            None,
+            &global,
+            &paths,
+            dir.path(),
+        );
         assert_eq!(c.status, Status::Fail);
         assert!(c.message.contains("ghost"), "{}", c.message);
 
@@ -1177,14 +1206,30 @@ mod tests {
         lock.save(&dir.path().join(crate::skills_cmd::LOCK_FILE))
             .unwrap();
         let p = Project::open_root(dir.path()).unwrap();
-        let c = check_skills(Some(&p), &config, &global, &paths, dir.path());
+        let c = check_skills(
+            Some(&p),
+            &config,
+            dir.path(),
+            None,
+            &global,
+            &paths,
+            dir.path(),
+        );
         assert_eq!(c.status, Status::Ok, "{}", c.message);
         assert_eq!(c.message, "1 loaded");
 
         // A global denial hides it: zero loaded, one denied.
         let mut denied = config.clone();
         denied.denied_skills = vec!["hello".into()];
-        let c = check_skills(Some(&p), &denied, &global, &paths, dir.path());
+        let c = check_skills(
+            Some(&p),
+            &denied,
+            dir.path(),
+            None,
+            &global,
+            &paths,
+            dir.path(),
+        );
         assert_eq!(c.status, Status::Ok, "{}", c.message);
         assert_eq!(c.message, "0 loaded, 1 denied by global");
     }

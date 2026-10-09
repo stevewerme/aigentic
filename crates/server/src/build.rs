@@ -10,6 +10,7 @@ use aigentic_runtime::aigentic_core::{AgentId, Provider};
 use aigentic_runtime::aigentic_log::{Repair, ThreadLog};
 use aigentic_runtime::aigentic_skills::SkillSet;
 use aigentic_runtime::aigentic_tools::{ToolRegistry, Workdir};
+use aigentic_runtime::project::person_memory_dir;
 use aigentic_runtime::{
     DEFAULT_COMPACTION, GlobalLayer, Layers, Project, ProjectContext, ProjectFile, ProjectRow,
     Runtime, WorkspaceLayer,
@@ -97,6 +98,7 @@ pub struct Context {
 pub async fn project_context(
     config: &Config,
     config_dir: &Path,
+    owner: Option<&str>,
     providers: &dyn ProviderFactory,
     root: &Root,
     workspaces: &[Workspace],
@@ -136,6 +138,8 @@ pub async fn project_context(
         .unwrap_or_else(|| config_dir.join("instructions.md"));
     let global = GlobalLayer::load(
         &global_instructions,
+        Some(&person_memory_dir(config_dir)),
+        owner,
         config.denied_tools.clone(),
         config.denied_skills.clone(),
     )?;
@@ -233,6 +237,7 @@ fn boundary_roots(file: &ProjectFile, root: &Path, skills: &SkillSet) -> Vec<Pat
 pub async fn build_thread(
     config: &Config,
     config_dir: &Path,
+    owner: Option<&str>,
     providers: &dyn ProviderFactory,
     root: &Root,
     workspaces: &[Workspace],
@@ -247,6 +252,7 @@ pub async fn build_thread(
     } = project_context(
         config,
         config_dir,
+        owner,
         providers,
         root,
         workspaces,
@@ -379,6 +385,7 @@ mod tests {
         let with_effort = project_context(
             &config,
             dir.path(),
+            None,
             &Stub,
             &root_of(&root),
             &[],
@@ -396,6 +403,7 @@ mod tests {
         let openai = project_context(
             &config,
             dir.path(),
+            None,
             &Stub,
             &root_of(&root),
             &[],
@@ -414,7 +422,7 @@ mod tests {
         );
 
         // The default profile sets no effort, and names none.
-        let plain = project_context(&config, dir.path(), &Stub, &root_of(&root), &[], None)
+        let plain = project_context(&config, dir.path(), None, &Stub, &root_of(&root), &[], None)
             .await
             .unwrap();
         assert_eq!(plain.ctx.effort, None);
@@ -451,6 +459,7 @@ mod tests {
             let built = build_thread(
                 &config,
                 dir.path(),
+                None,
                 &Stub,
                 &root,
                 &[],
@@ -469,6 +478,7 @@ mod tests {
         let plain = build_thread(
             &config,
             dir.path(),
+            None,
             &Stub,
             &root,
             &[],
@@ -512,6 +522,7 @@ mod tests {
         let project = build_thread(
             &config,
             dir.path(),
+            None,
             &Stub,
             &project_root,
             &[],
@@ -546,6 +557,7 @@ mod tests {
         let profile_only = build_thread(
             &config,
             dir.path(),
+            None,
             &Stub,
             &profile_only_root,
             &[],
@@ -566,6 +578,7 @@ mod tests {
         let bare = build_thread(
             &config,
             dir.path(),
+            None,
             &Stub,
             &bare_root,
             &[],
@@ -613,6 +626,7 @@ mod tests {
         let built = build_thread(
             &config,
             dir.path(),
+            None,
             &PerProfile,
             &root,
             &[],
@@ -629,6 +643,7 @@ mod tests {
         let plain = build_thread(
             &bare,
             dir.path(),
+            None,
             &PerProfile,
             &root,
             &[],

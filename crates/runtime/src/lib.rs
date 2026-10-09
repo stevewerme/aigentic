@@ -59,7 +59,7 @@ pub use evict::{
 };
 pub use harness_tools::{IdleProposal, NOT_RUN_LENGTH, NOT_RUN_OVER_LIMIT, NOT_RUN_SOLO, Settled};
 pub use knowledge::{Knowledge, KnowledgeMode, ScopeSources};
-pub use layers::{Decided, GlobalLayer, Layers, WorkspaceLayer};
+pub use layers::{Decided, GlobalLayer, Layers, PERSON_MEMORY_HEADING, WorkspaceLayer};
 pub use memory::{MEMORY_FILES, MEMORY_PROMPT};
 pub use mode::Mode;
 pub use project::{Project, ProjectError, ProjectFile};

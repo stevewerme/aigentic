@@ -18,6 +18,14 @@ pub const DOT_DIR: &str = ".aigentic";
 pub const INSTRUCTIONS_FILE: &str = "instructions.md";
 pub const KNOWLEDGE_DIR: &str = "knowledge";
 pub const MEMORY_DIR: &str = "memory";
+
+/// The person's memory folder: `memory/` under the config directory,
+/// beside `server.toml` and `instructions.md`. The same file layout as a
+/// project's, so one code path writes all the homes.
+pub fn person_memory_dir(config_dir: &Path) -> PathBuf {
+    config_dir.join(MEMORY_DIR)
+}
+
 /// The memory block's heading; says who writes the files so the model
 /// does not (phase 4 step 9).
 pub const MEMORY_HEADING: &str = "# Project memory\n\nWritten by the harness after each turn from what participants \
