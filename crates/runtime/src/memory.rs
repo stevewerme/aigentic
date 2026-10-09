@@ -33,8 +33,9 @@ use aigentic_core::{
     Author, CompletionRequest, ContentBlock, Event, EventKind, Message, ProviderEvent, Role, Usage,
 };
 use aigentic_log::{
-    AssistantMessagePayload, MemoryExtractedPayload, MemoryLine, MemoryRememberedPayload,
-    SkillLoadedPayload, ToolResultPayload, TurnEndedPayload, UserMessagePayload,
+    AssistantMessagePayload, MemoryExtractedPayload, MemoryHome, MemoryLine,
+    MemoryRememberedPayload, SkillLoadedPayload, ToolResultPayload, TurnEndedPayload,
+    UserMessagePayload,
 };
 use futures_util::StreamExt;
 use time::format_description::well_known::Rfc3339;
@@ -380,6 +381,7 @@ impl Runtime {
         let thread = self.log.thread_id().to_string();
         let line = MemoryLine {
             file: file.clone(),
+            home: MemoryHome::Project,
             text: text.clone(),
             stated_by: author.clone(),
             at_seq,
@@ -388,6 +390,7 @@ impl Runtime {
 
         let payload = MemoryRememberedPayload {
             file,
+            home: MemoryHome::Project,
             text,
             written: !written.is_empty(),
         };
@@ -607,6 +610,7 @@ pub(crate) fn filter_stated(
             };
             stated.then(|| MemoryLine {
                 file: p.file,
+                home: MemoryHome::Project,
                 text: p.text,
                 stated_by: e.author.clone(),
                 at_seq: p.at_seq,
@@ -1123,6 +1127,7 @@ with what changed and close it.";
         let mem = dir.path().join("memory");
         let line = |text: &str| MemoryLine {
             file: "decisions.md".into(),
+            home: MemoryHome::Project,
             text: text.into(),
             stated_by: steve(),
             at_seq: 0,

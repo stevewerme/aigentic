@@ -9261,7 +9261,7 @@ mod tests {
         use aigentic_runtime::aigentic_core::{Author, UserId};
         use aigentic_runtime::aigentic_log::{
             ContextEvictedPayload, DecisionAnsweredPayload, DecisionProposedPayload,
-            MemoryExtractedPayload, MemoryLine, MemoryRememberedPayload, PolicyRecord,
+            MemoryExtractedPayload, MemoryHome, MemoryLine, MemoryRememberedPayload, PolicyRecord,
             ProviderRetriedPayload, ResultsStubbedPayload, Usage,
         };
         use time::OffsetDateTime;
@@ -9461,12 +9461,14 @@ mod tests {
                         written: vec![
                             MemoryLine {
                                 file: "decisions.md".into(),
+                                home: MemoryHome::Project,
                                 text: "a".into(),
                                 stated_by: Author::User(UserId("steve".into())),
                                 at_seq: 2,
                             },
                             MemoryLine {
                                 file: "decisions.md".into(),
+                                home: MemoryHome::Project,
                                 text: "b".into(),
                                 stated_by: Author::User(UserId("steve".into())),
                                 at_seq: 2,
@@ -9482,6 +9484,7 @@ mod tests {
                     EventKind::MemoryRemembered,
                     serde_json::to_value(MemoryRememberedPayload {
                         file: "decisions.md".into(),
+                        home: MemoryHome::Project,
                         text: "x".into(),
                         written: true,
                     })
@@ -9492,6 +9495,7 @@ mod tests {
                     EventKind::MemoryRemembered,
                     serde_json::to_value(MemoryRememberedPayload {
                         file: "decisions.md".into(),
+                        home: MemoryHome::Project,
                         text: "x".into(),
                         written: false,
                     })

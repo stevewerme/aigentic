@@ -538,12 +538,38 @@ pub struct PermissionDecidedPayload {
     pub reason: Option<String>,
 }
 
+/// Which memory a line was filed in: the person's folder under the config
+/// directory, the workspace's shared folder, or the current project's
+/// `.aigentic/memory/`. A log line written before the field existed reads
+/// as `Project`, the only home there was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryHome {
+    #[default]
+    Project,
+    Workspace,
+    Person,
+}
+
+impl std::fmt::Display for MemoryHome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Project => "project",
+            Self::Workspace => "workspace",
+            Self::Person => "person",
+        })
+    }
+}
+
 /// One line memory extraction wrote, with where it was stated so the
 /// "only what a participant said" rule is auditable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryLine {
-    /// File under the project's memory folder, e.g. `decisions.md`.
+    /// File under the line's home folder, e.g. `decisions.md`.
     pub file: String,
+    /// The home `file` is relative to.
+    #[serde(default)]
+    pub home: MemoryHome,
     pub text: String,
     pub stated_by: Author,
     /// The `user_message` (or a participant's `assistant_message`) seq
@@ -571,8 +597,11 @@ pub struct MemoryExtractedPayload {
 /// `/remember` and the runtime appended a line directly, no model call.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryRememberedPayload {
-    /// The file under `.aigentic/memory/` the line went to.
+    /// The file under the home's memory folder.
     pub file: String,
+    /// The home `file` is relative to.
+    #[serde(default)]
+    pub home: MemoryHome,
     pub text: String,
     /// `false` when the line was already present and nothing was
     /// written; the event still records the ask.
@@ -1243,6 +1272,7 @@ mod tests {
             through_seq: 12,
             written: vec![MemoryLine {
                 file: "decisions.md".into(),
+                home: MemoryHome::Project,
                 text: "Use Swedish.".into(),
                 stated_by: Author::User(aigentic_core::UserId("steve".into())),
                 at_seq: 3,
@@ -1265,6 +1295,26 @@ mod tests {
         }))
         .unwrap();
         assert!(bare.written.is_empty());
+    }
+
+    #[test]
+    fn an_old_line_without_a_home_reads_as_the_projects() {
+        // A log written before the field existed replays as the only home
+        // there was, so old threads still read their own memory.
+        let line: MemoryLine = serde_json::from_value(json!({
+            "file": "decisions.md",
+            "text": "Use Swedish.",
+            "stated_by": {"kind": "user", "id": "steve"},
+            "at_seq": 3
+        }))
+        .unwrap();
+        assert_eq!(line.home, MemoryHome::Project);
+
+        let remembered: MemoryRememberedPayload = serde_json::from_value(json!({
+            "file": "facts.md", "text": "the sky is blue", "written": true
+        }))
+        .unwrap();
+        assert_eq!(remembered.home, MemoryHome::Project);
     }
 
     #[test]
