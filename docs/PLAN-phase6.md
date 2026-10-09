@@ -1052,3 +1052,7 @@ with item 6's seam; then the pipeline job (#117), so the loop stops
 needing pasted prompts; item 7's label record; #12; then phase 7 with
 items 6 and 8; item 7's trait, profile and Laya after #12's labels;
 item 9's promotion from #12's data; item 1 when design work starts.
+
+**Revised 2026-10-09 (Steve): #8 split, and how siblings are read.** #10's ask landed as #121. #8 is split into five tickets, in this order: #123 (briefs in the prefix, siblings' one-liners, `read_brief`), #124 (read tools stay inside the project, so a sibling's files ask first; done-when 2's "touching does not" isn't enforced today), #125 (`search_knowledge` across siblings and the workspace, and `related` for links across workspaces), #126 (the utility model keeps a brief's current state fresh) and #127 (memory goes to the person, the workspace or the project). All five come before #77.
+
+Siblings are read **one line each, the whole brief on demand**: the projects block carries each project's brief's first line (as at §9b's projects block), and `read_brief(project)` returns a sibling's whole brief, read-only. That supersedes "their briefs inline" in step 12 and "each project's brief" in Scale, so five siblings cost about 150 tokens, not 2,500. The project's own brief and its workspace's stay inline, capped. A brief is `<root>/.aigentic/brief.md`, or `<shared>/workspace/brief.md` for a workspace. Its first line is its one-liner, which is also what item 7's classifier reads.
