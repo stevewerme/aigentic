@@ -1,0 +1,212 @@
+name = "loop"
+version = 1
+
+# The build loop of `.aigentic/knowledge/build-loop.md`, as a workflow:
+# spec → spec check → the person decides → merge → implement → judge,
+# and on `changes` a fix and a second judge. Every step is a fresh child
+# thread; each report is posted on the issue under the step's marker, and
+# the next step reads the issue.
+
+# Recorded with each run; the loop's steps are capped by their profile's
+# budget, not by these figures.
+[budget]
+trivial = 10.0
+full = 10.0
+max_raise = 1.0
+
+[[slots]]
+name = "issue"
+kind = "string"
+filled_by = "runner"
+
+[[slots]]
+name = "title"
+kind = "string"
+filled_by = "runner"
+
+[[slots]]
+name = "model"
+kind = "string"
+filled_by = "runner"
+
+[[slots]]
+name = "gate_log"
+kind = "string"
+filled_by = "runner"
+
+# The person's text when they answered the checkpoint `amend`.
+[[slots]]
+name = "amendment"
+kind = "string"
+required = false
+filled_by = "runner"
+
+# Filled by the runner only when a check sent a writing step back.
+[[slots]]
+name = "check_failures"
+kind = "string"
+required = false
+filled_by = "runner"
+
+# The commit subjects spec v2 names, one per line; the implementer's E2
+# check holds its commits to them.
+[[slots]]
+name = "commits"
+kind = "string"
+filled_by = "merge"
+
+[[steps]]
+id = "spec"
+role = "spec"
+profile = "flash"
+template = "templates/spec.md"
+marker = "## Spec"
+wall_secs = 3600
+deny = [
+    "git push",
+    "git commit",
+    "git reset",
+    "git checkout --",
+    "git stash",
+    "git clean",
+    "git add",
+    "copy .env",
+]
+next = "speccheck"
+
+[[steps]]
+id = "speccheck"
+role = "speccheck"
+profile = "flash"
+template = "templates/speccheck.md"
+marker = "## Spec check"
+wall_secs = 3600
+deny = [
+    "git push",
+    "git commit",
+    "git reset",
+    "git checkout --",
+    "git stash",
+    "git clean",
+    "git add",
+    "copy .env",
+]
+next = "decide"
+
+# The person reads the spec and the check, then answers `/answer go` (the
+# merger settles open choices itself) or `/answer amend <decisions>`.
+[[steps]]
+id = "decide"
+role = "person"
+profile = "flash"
+template = "templates/decide.md"
+marker = "## Decisions"
+checkpoint = true
+next = "merge"
+
+[[steps]]
+id = "merge"
+role = "merge"
+profile = "flash"
+template = "templates/merge.md"
+marker = "## Spec v2 (consolidated)"
+wall_secs = 1800
+deny = [
+    "git push",
+    "git commit",
+    "git reset",
+    "git checkout --",
+    "git stash",
+    "git clean",
+    "git add",
+    "copy .env",
+]
+next = "implement"
+
+[[steps]]
+id = "implement"
+role = "implementer"
+profile = "flash"
+template = "templates/implement.md"
+marker = "## Implementation"
+wall_secs = 7200
+writes = true
+checks = ["E1", "E2", "E3", "E4", "E5", "E7"]
+push = true
+ci = true
+install = false
+deny = [
+    "git push",
+    "git rebase",
+    "git reset",
+    "git checkout --",
+    "git stash",
+    "git clean",
+    "git add -A",
+    "copy .env",
+]
+next = "judge"
+
+[[steps]]
+id = "judge"
+role = "judge"
+profile = "flash"
+template = "templates/judge.md"
+marker = "## Review"
+wall_secs = 5400
+deny = [
+    "git push",
+    "git commit",
+    "git reset",
+    "git checkout --",
+    "git stash",
+    "git clean",
+    "git add",
+    "copy .env",
+]
+route_by = "verdict"
+routes = { approve = "done", changes = "fix" }
+
+[[steps]]
+id = "fix"
+role = "fixer"
+profile = "flash"
+template = "templates/fix.md"
+marker = "## Fix"
+wall_secs = 5400
+writes = true
+checks = ["E1", "E3", "E4", "E5", "E7"]
+push = true
+ci = true
+install = false
+deny = [
+    "git push",
+    "git rebase",
+    "git reset",
+    "git checkout --",
+    "git stash",
+    "git clean",
+    "git add -A",
+    "copy .env",
+]
+next = "rejudge"
+
+[[steps]]
+id = "rejudge"
+role = "judge"
+profile = "flash"
+template = "templates/rejudge.md"
+marker = "## Review of the fix"
+wall_secs = 3600
+deny = [
+    "git push",
+    "git commit",
+    "git reset",
+    "git checkout --",
+    "git stash",
+    "git clean",
+    "git add",
+    "copy .env",
+]
+route_by = "verdict"
+routes = { approve = "done", changes = "ask" }

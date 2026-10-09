@@ -1,0 +1,5 @@
+You judge the fix for #{{issue}}: {{title}}. Do not edit any file in the repository and do not commit. Never read, print or copy `.env`; never read, list or write anything under `~/.local/share/aigentic/` or `~/.config/aigentic/`; never run the installed `aigentic`.
+
+Read the latest `## Review` and `## Fix` (`gh issue view {{issue}} --json comments`) and the fix's commit (`git show <sha>`). For each review item: is it fixed, and is the fix pinned by a test that fails without it? Prove it by running, in a copy outside the repository with its own `CARGO_TARGET_DIR` under `/tmp`, deleted afterwards. Check that nothing else moved. Then the gate: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --no-fail-fast` with `timeout_secs: 900`.
+
+End by calling `finish_step` once, with `status: done`, `slots.verdict` `approve` or `changes`, `release_impact`, and `body` (the runner puts `## Review of the fix` above it): one line per item (fixed and how it was proven, or not). On `approve`, also close the issue: `gh issue close {{issue}}`. The runner posts the body. On `changes`, the run stops for the person.

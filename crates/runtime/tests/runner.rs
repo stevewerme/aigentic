@@ -3613,6 +3613,51 @@ async fn t18_a_budget_warning_between_the_failure_and_the_send_back_keeps_it() {
 // person's checkpoint, a push that isn't the last step, and CI.
 // ---------------------------------------------------------------------------
 
+/// The repository's own `loop` workflow loads: every template parses,
+/// every slot it uses is declared, every `next` and route names a step,
+/// and its checkpoint, pushes and CI waits are where the loop needs them.
+#[test]
+fn the_repositorys_loop_workflow_loads() {
+    let loaded = WorkflowFile::load_dir(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.aigentic/workflows/loop"),
+        WorkflowOrigin::Project,
+    )
+    .expect("the loop workflow loads");
+    let ids: Vec<&str> = loaded
+        .workflow
+        .steps
+        .iter()
+        .map(|step| step.id.as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        [
+            "spec",
+            "speccheck",
+            "decide",
+            "merge",
+            "implement",
+            "judge",
+            "fix",
+            "rejudge"
+        ]
+    );
+    assert!(loaded.step("decide").unwrap().checkpoint);
+    for id in ["implement", "fix"] {
+        let step = loaded.step(id).unwrap();
+        assert!(step.writes && step.push && step.ci && !step.install, "{id}");
+    }
+    assert_eq!(
+        loaded
+            .step("judge")
+            .unwrap()
+            .routes
+            .get("changes")
+            .map(String::as_str),
+        Some("fix")
+    );
+}
+
 const LOOP_TOML: &str = r###"
 name = "loop-test"
 version = 1
