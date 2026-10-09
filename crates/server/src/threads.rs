@@ -6,12 +6,13 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use aigentic_api::{
     CheckpointAnswer, Notice, ReportKind, StartRow, ThreadInfo, ThreadKind, ThreadState,
 };
 use aigentic_runtime::ProjectFile;
+use aigentic_runtime::ProjectRow;
 use aigentic_runtime::aigentic_core::{Author, ContentBlock, Event, EventKind, UserId};
 use aigentic_runtime::aigentic_log::{
     NewEvent, ProjectSwitchedPayload, Repair, RunStartedPayload, ThreadLog, ThreadStartedPayload,
@@ -90,6 +91,11 @@ pub struct Indexed {
     pub front: bool,
 }
 
+/// A brief's one-liner as the cache holds it (issue #123): the file's
+/// mtime when it was read, and the line — `None` when the project has no
+/// brief, which is worth caching too.
+type CachedBrief = (Option<SystemTime>, Option<String>);
+
 /// The table, shared by every session.
 pub struct ThreadTable {
     config: Arc<Config>,
@@ -122,6 +128,11 @@ pub struct ThreadTable {
     /// time: a test drives a daemon the way a client does, through
     /// `Server::new`.
     run_deps: Mutex<Arc<dyn RunDeps>>,
+    /// Each project's brief one-liner, by root and the mtime it was read
+    /// at (issue #123). A `stat` per project per build or switch is
+    /// cheap; a read happens only when the file changed, and `None` — no
+    /// brief — is cached too.
+    brief_cache: Mutex<HashMap<PathBuf, CachedBrief>>,
     /// Serialises the "is there an unfinished run for this issue?" check
     /// and the lead it creates under it within this process; the issue's
     /// OS lock ([`IssueLock`]) does the same across processes.
@@ -182,6 +193,7 @@ impl ThreadTable {
             guard: Mutex::new(guard),
             runs: Arc::new(Runs::new()),
             run_deps: Mutex::new(Arc::new(ProdDeps)),
+            brief_cache: Mutex::new(HashMap::new()),
             build_lock: AsyncMutex::new(()),
             profile_override: None,
             workspaces: Vec::new(),
@@ -306,7 +318,9 @@ impl ThreadTable {
             self.profile_override.as_deref(),
         )
         .await?;
-        built.ctx.projects = self.projects_in_reach(self.creator(thread).as_ref(), Some(project));
+        let reach = self.reach(self.creator(thread).as_ref(), Some(project));
+        built.ctx.projects = reach.as_ref().and_then(|(block, _)| block.clone());
+        built.ctx.project_rows = reach.map(|(_, rows)| rows).unwrap_or_default();
         Ok(built.ctx)
     }
 
@@ -399,13 +413,25 @@ impl ThreadTable {
 
     /// The listing for a creator: the projects where they hold any role
     /// — `read` counts — in the daemon's order, each with the workspace
-    /// naming it, and `project` as the thread's own. The rule is
-    /// `role_in_project`'s, the same one the client's project list uses.
+    /// naming it and its brief's one-liner (issue #123), and `project` as
+    /// the thread's own. The rule is `role_in_project`'s, the same one
+    /// the client's project list uses.
     pub(crate) fn projects_in_reach(
         &self,
         creator: Option<&UserId>,
         project: Option<&str>,
     ) -> Option<String> {
+        self.reach(creator, project).and_then(|(block, _)| block)
+    }
+
+    /// The same listing with the rows it was rendered from: the block is
+    /// what the prefix shows, the rows are what `read_brief` looks a
+    /// sibling up in (issue #123). `None` is nothing to list at all.
+    pub(crate) fn reach(
+        &self,
+        creator: Option<&UserId>,
+        project: Option<&str>,
+    ) -> Option<(Option<String>, Vec<ProjectRow>)> {
         let user = creator?.0.as_str();
         let all: Vec<Listed> = self
             .server
@@ -416,6 +442,7 @@ impl ThreadTable {
                 name: p.name.clone(),
                 root: p.root.clone(),
                 workspace: self.workspace_label(&p.name),
+                one_line: self.brief_one_line(&p.root),
             })
             .collect();
         let current = project.and_then(|name| {
@@ -427,11 +454,43 @@ impl ThreadTable {
                     name: p.name.clone(),
                     root: p.root.clone(),
                     workspace: self.workspace_label(&p.name),
+                    one_line: self.brief_one_line(&p.root),
                 })
             })
         });
         let home = std::env::var_os("HOME").map(PathBuf::from);
-        projects_listing(&all, current.as_ref(), home.as_deref())
+        let block = projects_listing(&all, current.as_ref(), home.as_deref())?;
+        Some((
+            Some(block),
+            all.iter()
+                .map(|l| ProjectRow {
+                    name: l.name.clone(),
+                    root: l.root.clone(),
+                    workspace: l.workspace.clone(),
+                    one_line: l.one_line.clone(),
+                })
+                .collect(),
+        ))
+    }
+
+    /// A project's brief one-liner (issue #123), by root. A `stat` is
+    /// cheap and the file is read only when its mtime changed since the
+    /// last read; no brief and no file are cached too.
+    fn brief_one_line(&self, root: &Path) -> Option<String> {
+        let mtime = std::fs::symlink_metadata(aigentic_runtime::brief::project_brief_path(root))
+            .ok()
+            .and_then(|meta| meta.modified().ok());
+        let mut cache = self.brief_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((seen, line)) = cache.get(root)
+            && *seen == mtime
+        {
+            return line.clone();
+        }
+        let line = aigentic_runtime::brief::project_brief(root)
+            .as_deref()
+            .and_then(aigentic_runtime::brief::one_line);
+        cache.insert(root.to_path_buf(), (mtime, line.clone()));
+        line
     }
 
     fn root_of(&self, project: &str) -> Result<Root, ThreadError> {
@@ -841,7 +900,7 @@ impl ThreadTable {
             threads_dir: dir,
             ..self.root_of(&project)?
         };
-        let projects = self.projects_in_reach(creator.as_ref(), Some(&project));
+        let reach = self.reach(creator.as_ref(), Some(&project));
         let built = build_thread(
             &self.config,
             &self.config_dir,
@@ -850,7 +909,7 @@ impl ThreadTable {
             &self.workspaces,
             thread,
             self.profile_override.as_deref(),
-            projects,
+            reach,
         )
         .await?;
         let (actor, mailbox) = ThreadActor::new(

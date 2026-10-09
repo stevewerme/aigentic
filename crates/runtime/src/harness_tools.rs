@@ -48,6 +48,15 @@ pub const FINISH_STEP: &str = "finish_step";
 /// Offered only in an ordinary thread; a step thread never sees the
 /// spec, and the switch itself is refused there.
 pub const SUGGEST_PROJECT: &str = "suggest_project";
+/// Opening a sibling's brief (issue #123): the one-line in the projects
+/// block is always there, the body on demand. Offered only when some
+/// project in reach other than this thread's own carries a brief.
+pub const READ_BRIEF: &str = "read_brief";
+pub const READ_BRIEF_DESCRIPTION: &str = "Read a project's brief: what it is, who it is for and where it stands, the same text this thread's own project carries inline. Call it with a project in reach, by the name the system prompt lists, before working on or messaging that project.";
+/// What an unoffered `read_brief` call answers (issue #123): the tool is
+/// always answered, so a caller that emits it anyway is told why there is
+/// nothing to read rather than left with an unknown-tool error.
+pub const NO_BRIEF_IN_REACH: &str = "no project in reach has a brief";
 
 /// What `suggest_project`'s description says (issue #7): call it first
 /// and alone, the person decides, and a no leaves the thread where it
@@ -76,6 +85,24 @@ pub struct SuggestProjectArgs {
     pub project: String,
     /// One line on why the message belongs there.
     pub reason: String,
+}
+
+/// A `read_brief` call's arguments (issue #123).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadBriefArgs {
+    /// A project in reach, by the name the system prompt lists it under.
+    pub project: String,
+}
+
+/// A brief as the model reads it: the read-only marker, the project and
+/// the text, cut at the tools' output cap — a brief is a file read, so it
+/// obeys the cap every other tool obeys.
+pub fn brief_result(project: &str, text: &str) -> String {
+    aigentic_tools::truncate_output(
+        &format!("[read-only · {project}]\n{text}"),
+        aigentic_tools::DEFAULT_OUTPUT_CAP,
+    )
 }
 
 /// The proposal as a person reads it in the log (`switch to getscale/site`).
@@ -475,14 +502,29 @@ impl From<FinishStepArgs> for StepReport {
     }
 }
 
-/// The harness tools' specs, in name order. `load_skill` is offered only
-/// when a model-invoked skill is enabled; `finish_step` only in a step
-/// thread (issue #55); `suggest_project` only when the runtime knows the
-/// projects in reach (issue #7).
+/// The harness tools' specs, in name order, with no `read_brief`: the
+/// shape every caller that has no reach rows (a library, a test) wants.
 pub fn harness_specs(
     offer_load_skill: bool,
     offer_finish_step: bool,
     offer_suggest_project: bool,
+) -> Vec<ToolSpec> {
+    harness_specs_with(
+        offer_load_skill,
+        offer_finish_step,
+        offer_suggest_project,
+        false,
+    )
+}
+
+/// The same, with `read_brief` offered when a sibling in reach carries a
+/// brief (issue #123). `Runtime::tool_specs` passes what `read_brief_offered`
+/// decides; the three-argument `harness_specs` is this with `false`.
+pub fn harness_specs_with(
+    offer_load_skill: bool,
+    offer_finish_step: bool,
+    offer_suggest_project: bool,
+    offer_read_brief: bool,
 ) -> Vec<ToolSpec> {
     let mut specs = vec![
         ToolSpec {
@@ -674,6 +716,20 @@ pub fn harness_specs(
             }),
         });
     }
+    if offer_read_brief {
+        specs.push(ToolSpec {
+            name: READ_BRIEF.into(),
+            description: READ_BRIEF_DESCRIPTION.into(),
+            schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "project": {"type": "string", "description": "A project in reach, by the name the system prompt lists it under."}
+                },
+                "required": ["project"]
+            }),
+        });
+    }
     specs.sort_by(|a, b| a.name.cmp(&b.name));
     specs
 }
@@ -685,6 +741,7 @@ pub fn harness_names() -> Vec<String> {
         ASK_HUMAN.into(),
         LOAD_SKILL.into(),
         PIN.into(),
+        READ_BRIEF.into(),
         RECALL.into(),
         SUGGEST_PROJECT.into(),
         UPDATE_TASKS.into(),
@@ -697,7 +754,13 @@ pub fn harness_names() -> Vec<String> {
 pub fn is_harness_tool(name: &str) -> bool {
     matches!(
         name,
-        PIN | ASK_HUMAN | LOAD_SKILL | RECALL | UPDATE_TASKS | FINISH_STEP | SUGGEST_PROJECT
+        PIN | ASK_HUMAN
+            | LOAD_SKILL
+            | READ_BRIEF
+            | RECALL
+            | UPDATE_TASKS
+            | FINISH_STEP
+            | SUGGEST_PROJECT
     )
 }
 
@@ -909,6 +972,17 @@ impl Runtime {
                 Ok(form) => match crate::recall_tool::output(self.log.events(), &form) {
                     Ok(text) => ok(text),
                     Err(e) => err(e),
+                },
+            },
+            // A sibling's brief, read-only (issue #123): the name is
+            // matched against the reach rows and the file is opened at
+            // the matched row's own path, never at a path the model
+            // wrote.
+            READ_BRIEF => match serde_json::from_value::<ReadBriefArgs>(call.args.clone()) {
+                Err(e) => err(format!("invalid arguments: {e}")),
+                Ok(args) => match self.read_brief(&args.project) {
+                    Ok(text) => ok(text),
+                    Err(message) => err(message),
                 },
             },
             // The project proposal (issue #7). A step thread refuses it

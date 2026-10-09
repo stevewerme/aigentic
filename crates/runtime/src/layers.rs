@@ -44,12 +44,16 @@ impl GlobalLayer {
 }
 
 /// A workspace's layer (phase 6 step 10): what every project in it
-/// shares. Its files live in `<shared>/workspace/`: `instructions.md`
-/// and `memory/*.md` now, knowledge and a brief in step 12.
+/// shares. Its files live in `<shared>/workspace/`: `instructions.md`,
+/// `brief.md` and `memory/*.md` now, knowledge in step 12.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct WorkspaceLayer {
     pub name: String,
     pub instructions: Option<String>,
+    /// `brief.md` beside `instructions.md` (issue #123), read in `load`
+    /// and kept here, so the prefix is a getter, not a live read. A
+    /// missing, empty or non-regular file is `None`.
+    pub brief: Option<String>,
     /// Memory files, name and text, in name order.
     pub memory: Vec<(String, String)>,
 }
@@ -79,6 +83,7 @@ impl WorkspaceLayer {
             }),
         };
         layer.instructions = read(&dir.join("instructions.md"))?.filter(|t| !t.trim().is_empty());
+        layer.brief = crate::brief::read_file(&crate::brief::workspace_brief_path(shared));
         if let Ok(entries) = std::fs::read_dir(dir.join("memory")) {
             let mut files: Vec<_> = entries
                 .filter_map(Result::ok)
@@ -97,6 +102,11 @@ impl WorkspaceLayer {
             }
         }
         Ok(layer)
+    }
+
+    /// The workspace's brief (issue #123), for the prefix block.
+    pub fn brief(&self) -> Option<&str> {
+        self.brief.as_deref()
     }
 
     /// The block the prefix carries after the global one.

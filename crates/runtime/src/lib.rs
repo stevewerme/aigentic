@@ -18,6 +18,7 @@ pub use aigentic_tools;
 
 mod approver;
 mod audit;
+pub mod brief;
 pub mod checks;
 mod compaction;
 pub mod config_keys;
@@ -44,6 +45,7 @@ pub mod workflow;
 pub use aigentic_core::CUT_STREAM;
 pub use approver::{Answer, Approver, DenyAll};
 pub use audit::audit_tool_results;
+pub use brief::{BRIEF_FILE, PROJECT_BRIEF_CAP, WORKSPACE_BRIEF_CAP};
 pub use compaction::{LINK_PROMPT, SUMMARY_PROMPT};
 pub use context::{Prefix, build_context};
 pub use decisions::{
@@ -64,7 +66,7 @@ pub use project::{Project, ProjectError, ProjectFile};
 pub use resume::{DAEMON_RESTARTED, INTERRUPTED_RESULT, Resumed};
 pub use runtime::{
     ASKED_HUMAN, CompactionSettings, DEFAULT_BUDGET, DEFAULT_COMPACTION, INTERRUPTED, LENGTH_STOP,
-    MAX_TOKENS_STOP, Prices, ProjectContext, Runtime, STEP_REPORTED, SUMMARY_LIMIT, Signal,
-    TurnOutcome, WindowUsage,
+    MAX_TOKENS_STOP, Prices, ProjectContext, ProjectRow, Runtime, STEP_REPORTED, SUMMARY_LIMIT,
+    Signal, TurnOutcome, WindowUsage,
 };
 pub use seams::{SessionGrant, Verdict};

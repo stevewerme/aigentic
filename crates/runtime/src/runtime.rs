@@ -177,6 +177,13 @@ pub struct Runtime {
     /// knows every project and which workspace each is in. `None` is no
     /// block at all, which is what the library and every test keep.
     pub(crate) projects: Option<String>,
+    /// The reach rows `projects` was rendered from (issue #123), which
+    /// `read_brief` looks a project's root up in. The block stays the
+    /// daemon's string; these carry only what a lookup needs.
+    pub(crate) project_rows: Vec<ProjectRow>,
+    /// This project's brief (issue #123), read live at build and switch
+    /// and re-read at the start of a turn. `None` is no block.
+    pub(crate) project_brief: Option<String>,
     /// The provider for side jobs (titles, memory extraction): the
     /// config's `utility_profile` when set, else the thread's own.
     pub(crate) utility: Option<Box<dyn Provider>>,
@@ -257,6 +264,8 @@ impl Runtime {
             thread_raw,
             harness_instructions: None,
             projects: None,
+            project_rows: Vec::new(),
+            project_brief: None,
             utility: None,
             utility_label: None,
             utility_prices: None,
@@ -305,12 +314,16 @@ impl Runtime {
             workspace: ctx.workspace.clone(),
         };
         self.layers = ctx.layers;
+        self.project_brief = self.layers.project.as_ref().and_then(crate::Project::brief);
         self.policy = ctx.policy;
         self.skills = ctx.skills;
         self.registry = ctx.registry;
         self.provider = ctx.provider;
         self.model_label = ctx.model_label;
+        // The reach moves with the project (issue #81, #123): the new
+        // project has its own listing and its own siblings' briefs.
         self.projects = ctx.projects;
+        self.project_rows = ctx.project_rows;
         self.profile = ctx.profile;
         self.effort = ctx.effort;
         self.prices = ctx.prices;
@@ -715,6 +728,7 @@ impl Runtime {
     /// the stable prefix and their denials narrow the tools the model sees.
     pub fn with_layers(mut self, layers: Layers) -> Self {
         self.layers = layers;
+        self.project_brief = self.layers.project.as_ref().and_then(crate::Project::brief);
         self.measured = None;
         // Knowledge cannot fail the constructor; an unreadable folder is
         // reported on the first turn by `refresh_knowledge`.
@@ -723,10 +737,13 @@ impl Runtime {
     }
 
     /// The daemon's listing of the projects in reach (issue #81), which
-    /// `ThreadTable` renders and hands to a first build. A runtime built
-    /// without it carries no projects block at all.
-    pub fn with_projects(mut self, projects: Option<String>) -> Self {
+    /// `ThreadTable` renders and hands to a first build, and the rows it
+    /// was rendered from (issue #123), which `read_brief` looks a
+    /// project's root up in. A runtime built without them carries no
+    /// projects block and can read no sibling's brief.
+    pub fn with_projects(mut self, projects: Option<String>, rows: Vec<ProjectRow>) -> Self {
         self.projects = projects;
+        self.project_rows = rows;
         self.measured = None;
         self
     }
@@ -769,6 +786,105 @@ impl Runtime {
         self.knowledge_mode = mode;
         self.measured = None;
         Ok(())
+    }
+
+    /// Re-read this project's brief at the start of a turn (issue
+    /// #123), so a hand edit between turns reaches the next prefix. An
+    /// unchanged read does not reload: like `refresh_memory`, a change
+    /// resets the window measure, and nothing else does.
+    pub(crate) fn refresh_brief(&mut self) {
+        let Some(project) = self.layers.project.as_ref() else {
+            return;
+        };
+        let brief = project.brief();
+        if brief != self.project_brief {
+            self.project_brief = brief;
+            self.measured = None;
+        }
+    }
+
+    /// Whether `read_brief` is in the tool list the model sees (issue
+    /// #123): some project in reach other than this thread's own carries
+    /// a brief. A project's own brief is no reason to offer it — that
+    /// brief is already inline. Whether the layers let the tool through
+    /// is `tool_visible`'s, checked where every other spec is.
+    pub fn read_brief_offered(&self) -> bool {
+        let here = self.current_project();
+        self.project_rows
+            .iter()
+            .any(|row| row.one_line.is_some() && here.as_deref() != Some(row.name.as_str()))
+    }
+
+    /// What `read_brief` answers for `project` (issue #123): the named
+    /// project's whole brief as `[read-only · <project>]` and its text,
+    /// or the message a refusal carries. The name is matched exactly
+    /// against the reach rows and this thread's own project, and the path
+    /// is built from the matched row's root, so a name that looks like a
+    /// path is refused rather than joined onto a root, and a file outside
+    /// the reach is never opened. Reading this thread's own project is
+    /// symmetry: its brief is already inline.
+    pub fn read_brief(&self, project: &str) -> Result<String, String> {
+        if !self.read_brief_offered() {
+            return Err(crate::harness_tools::NO_BRIEF_IN_REACH.into());
+        }
+        if self.current_project().as_deref() == Some(project)
+            && let Some(text) = self.layers.project.as_ref().and_then(crate::Project::brief)
+        {
+            return Ok(crate::harness_tools::brief_result(project, &text));
+        }
+        let text = self
+            .project_rows
+            .iter()
+            .find(|row| row.name == project)
+            .and_then(|row| crate::brief::project_brief(&row.root));
+        match text {
+            Some(text) => Ok(crate::harness_tools::brief_result(project, &text)),
+            None => Err(self.no_brief_error(project)),
+        }
+    }
+
+    /// The names `read_brief` would serve: the reach rows that carry a
+    /// brief, then this thread's own project when it has one.
+    fn brief_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .project_rows
+            .iter()
+            .filter(|row| row.one_line.is_some())
+            .map(|row| row.name.clone())
+            .collect();
+        if let Some(here) = self.current_project()
+            && !names.contains(&here)
+            && self
+                .layers
+                .project
+                .as_ref()
+                .and_then(crate::Project::brief)
+                .is_some()
+        {
+            names.push(here);
+        }
+        names
+    }
+
+    /// The refusal a `read_brief` call gets (issue #123): why the name
+    /// does not work, and the names that would. A name with a separator
+    /// in it is a path, and the tool never takes one.
+    fn no_brief_error(&self, project: &str) -> String {
+        let names = self.brief_names();
+        let listed = if names.is_empty() {
+            "none".to_owned()
+        } else {
+            names.join(", ")
+        };
+        if project.contains('/') || project.contains('\\') {
+            format!(
+                "`{project}` is a path, not a project name: read_brief takes the name a project is listed under, and opens it itself. The projects with a brief are: {listed}"
+            )
+        } else {
+            format!(
+                "no project in reach with a brief is named `{project}`; the projects with a brief are: {listed}"
+            )
+        }
     }
 
     /// Reload when the folder changed on disk. Called at the start of a
@@ -843,7 +959,17 @@ impl Runtime {
             global: self.layers.global.instructions.as_deref(),
             harness: self.harness_instructions,
             workspace: self.layers.workspace_instructions(),
+            workspace_brief: self.layers.workspace.as_ref().and_then(|w| {
+                w.brief
+                    .as_deref()
+                    .map(|text| crate::brief::workspace_block(&w.name, text))
+            }),
             project: self.layers.project_instructions(),
+            project_brief: self.layers.project.as_ref().and_then(|p| {
+                self.project_brief.as_deref().map(|text| {
+                    crate::brief::project_block(&p.name, text, self.read_brief_offered())
+                })
+            }),
             participants: self.participants_line(),
             projects: self.projects.clone(),
             knowledge: self.knowledge.prefix(self.knowledge_mode),
@@ -933,6 +1059,20 @@ pub enum Signal<'a> {
     Waiting(&'a Pending),
 }
 
+/// One project in reach, as `read_brief` needs it (issue #123): the name
+/// the model may ask for, the root the daemon resolved, the workspace it
+/// is in and its brief's one line. The daemon builds these; the runtime
+/// only looks names up in them, so the tool never follows a path the
+/// model wrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectRow {
+    pub name: String,
+    pub root: std::path::PathBuf,
+    pub workspace: Option<String>,
+    /// The brief's first line, `None` when the project has no brief.
+    pub one_line: Option<String>,
+}
+
 /// What a thread takes from its project, built by the daemon and swapped
 /// in whole by `Runtime::set_project` (phase 6 step 10).
 pub struct ProjectContext {
@@ -946,10 +1086,14 @@ pub struct ProjectContext {
     pub registry: ToolRegistry,
     pub provider: Box<dyn Provider>,
     pub model_label: String,
-    /// The projects in reach for this thread (issue #81), rendered by the
-    /// daemon's `ThreadTable`; `None` when the caller has no listing,
-    /// which is every caller that is not the daemon.
+    /// The projects in reach for this thread (issue #81, #123), rendered
+    /// by the daemon's `ThreadTable`; `None` when the caller has no
+    /// listing, which is every caller that is not the daemon.
     pub projects: Option<String>,
+    /// The rows the listing was rendered from, so `read_brief` can turn a
+    /// name into a root (issue #123); empty when the caller has no
+    /// listing.
+    pub project_rows: Vec<ProjectRow>,
     pub profile: Option<String>,
     /// The profile's reasoning effort, when it sets one. Carried to the
     /// wire so a client's footer can name it (issue #43); the runtime
@@ -1034,4 +1178,193 @@ pub struct TurnOutcome {
     /// Files written or edited without error this turn; see
     /// `TurnEndedPayload::touched`.
     pub touched: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aigentic_core::{Capabilities, CompletionRequest, ProviderEvent};
+    use aigentic_tools::ToolRegistry;
+
+    /// A provider that answers with an empty stream and counts with the
+    /// runtime's own estimator, so a test's expected values are the
+    /// runtime's arithmetic and never a literal.
+    struct Counter;
+
+    impl Provider for Counter {
+        fn complete(
+            &self,
+            _request: &CompletionRequest<'_>,
+        ) -> std::pin::Pin<Box<dyn futures_core::Stream<Item = ProviderEvent> + Send + '_>>
+        {
+            Box::pin(futures_util::stream::empty())
+        }
+        fn count_tokens(&self, context: &[aigentic_core::Message]) -> u64 {
+            aigentic_providers::estimate::estimate_tokens(context)
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                supports_tools: true,
+                supports_images: false,
+                supports_caching: false,
+                supports_structured_output: false,
+                max_context_tokens: 1_000,
+            }
+        }
+    }
+
+    /// A runtime over `root`, with a project there when the root has one.
+    fn rig(root: &std::path::Path) -> Runtime {
+        let log = aigentic_log::ThreadLog::open(root, ulid::Ulid::generate()).unwrap();
+        let mut rt = Runtime::new(
+            Box::new(Counter),
+            ToolRegistry::default(),
+            log,
+            AgentId("worker".into()),
+        );
+        if let Ok(Some(project)) = crate::Project::open(root) {
+            rt = rt.with_layers(Layers::default().with_project(project));
+        }
+        rt
+    }
+
+    /// A project root with `aigentic.toml` and a brief.
+    fn project_dir(brief: Option<&str>) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("aigentic.toml"),
+            "[project]\nname = \"p\"\n",
+        )
+        .unwrap();
+        if let Some(text) = brief {
+            let path = crate::brief::project_brief_path(dir.path());
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        dir
+    }
+
+    /// T2 (issue #123): the project's brief is read again at turn start,
+    /// and only a change reloads: an unchanged read leaves the window
+    /// measure alone, an edit resets it.
+    #[test]
+    fn refresh_brief_reloads_only_on_a_change() {
+        let dir = project_dir(Some("# Foundation\n\nThe site.\n"));
+        let mut rt = rig(dir.path());
+        rt.refresh_brief();
+        assert_eq!(
+            rt.project_brief.as_deref(),
+            Some("# Foundation\n\nThe site.\n"),
+            "the brief was read"
+        );
+
+        // A reported call's measure, as `turn.rs` records it: an
+        // unchanged read must not touch it.
+        rt.measured = Some((1234, 3));
+        rt.refresh_brief();
+        assert_eq!(
+            rt.measured,
+            Some((1234, 3)),
+            "an unchanged read does not reload"
+        );
+
+        let path = crate::brief::project_brief_path(dir.path());
+        std::fs::write(&path, "# Foundation\n\nThe site, now Next.js.\n").unwrap();
+        rt.refresh_brief();
+        assert_eq!(
+            rt.project_brief.as_deref(),
+            Some("# Foundation\n\nThe site, now Next.js.\n"),
+            "the edit reached the runtime"
+        );
+        assert_eq!(rt.measured, None, "a change resets the window measure");
+
+        // A project with no brief keeps none, and a brief that goes away
+        // is a change too.
+        std::fs::remove_file(&path).unwrap();
+        rt.measured = Some((9, 1));
+        rt.refresh_brief();
+        assert_eq!(rt.project_brief, None);
+        assert_eq!(rt.measured, None, "a removal is a change");
+    }
+
+    /// T4 (issue #123): the tool is offered only when some project in
+    /// reach other than this thread's own carries a brief, and the
+    /// refusal names the reach rows that do. A name that looks like a
+    /// path is refused rather than cleaned.
+    #[test]
+    fn read_brief_is_offered_only_for_a_siblings_brief_and_refuses_a_path() {
+        let dir = project_dir(Some("# Foundation\n\nHere.\n"));
+        let mut rt = rig(dir.path());
+        let here = crate::ProjectRow {
+            name: "p".into(),
+            root: dir.path().to_path_buf(),
+            workspace: None,
+            one_line: Some("Here.".into()),
+        };
+        let sibling = crate::ProjectRow {
+            name: "web".into(),
+            root: "/nowhere/web".into(),
+            workspace: None,
+            one_line: Some("The site.".into()),
+        };
+        let briefless = crate::ProjectRow {
+            name: "old".into(),
+            root: "/nowhere/old".into(),
+            workspace: None,
+            one_line: None,
+        };
+
+        // The thread's own brief alone is no reason to offer it.
+        rt = rt.with_projects(None, vec![here.clone()]);
+        assert!(!rt.read_brief_offered());
+        let specs = crate::harness_tools::harness_specs_with(false, false, false, false);
+        assert!(
+            specs
+                .iter()
+                .all(|s| s.name != crate::harness_tools::READ_BRIEF)
+        );
+
+        // A sibling's brief is.
+        rt = rt.with_projects(None, vec![here.clone(), sibling, briefless.clone()]);
+        assert!(rt.read_brief_offered());
+        let names: Vec<String> = crate::harness_tools::harness_specs_with(true, true, true, true)
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert!(
+            names.contains(&crate::harness_tools::READ_BRIEF.to_string()),
+            "{names:?}"
+        );
+
+        // The current project returns its own brief, as a sibling would.
+        let own = rt.read_brief("p").unwrap();
+        assert!(own.starts_with("[read-only · p]"), "{own}");
+        assert!(own.contains("Here."), "{own}");
+
+        // Out of reach, unknown, and a project with no brief: each names
+        // the rows that do have one — the sibling and this project — and
+        // never the brief-less row.
+        for name in ["other", "old"] {
+            let answer = rt.read_brief(name).unwrap_err();
+            // The list names the rows with a brief, `p` and `web`, and
+            // never the brief-less `old`.
+            let listed = answer.rsplit(": ").next().unwrap();
+            assert!(listed.contains("p") && listed.contains("web"), "{answer}");
+            assert!(!listed.contains("old"), "{answer}");
+        }
+
+        // A path, a traversal and a name with a separator: refused, not
+        // cleaned, and called a path.
+        for name in ["../x", "/etc/passwd", "web/../p"] {
+            let answer = rt.read_brief(name).unwrap_err();
+            assert!(
+                answer.contains("is a path, not a project name"),
+                "{name}: {answer}"
+            );
+            assert!(answer.contains("web"), "{name}: {answer}");
+        }
+        // An empty name is no path; it is simply not a project.
+        let answer = rt.read_brief("").unwrap_err();
+        assert!(answer.contains("is named ``"), "{answer}");
+    }
 }

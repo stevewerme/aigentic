@@ -24,8 +24,8 @@ use aigentic_runtime::harness_tools::{
 };
 use aigentic_runtime::project::ProjectFile;
 use aigentic_runtime::{
-    DAEMON_RESTARTED, Decisions, Layers, Project, ProjectContext, Resumed, Runtime, RuntimeError,
-    Settled, SwitchAnswer, SwitchCtx,
+    DAEMON_RESTARTED, Decisions, Layers, Project, ProjectContext, ProjectRow, Resumed, Runtime,
+    RuntimeError, Settled, SwitchAnswer, SwitchCtx,
 };
 use aigentic_tools::ToolRegistry;
 use common::{done, scripted, steve};
@@ -36,7 +36,16 @@ const HERE: &str = "here";
 const THERE: &str = "there";
 const REASON: &str = "the folder's project is where this belongs";
 const LISTING: &str = "Projects in reach. aigentic (here) ~/h · aigentic-web ~/t";
+
 const SUGGEST_PROJECT: &str = "suggest_project";
+
+/// The reach these fixtures carry: the daemon's rendered block, and no
+/// rows behind it (the pair `with_projects` takes, issue #123). No row
+/// means no sibling's brief is reachable, which is what these tests,
+/// about other things, want.
+fn reach() -> (Option<String>, Vec<ProjectRow>) {
+    (Some(LISTING.into()), Vec::new())
+}
 
 // ----------------------------------------------------------- the rig
 
@@ -64,7 +73,8 @@ fn target_context(name: &str, root: PathBuf) -> ProjectContext {
         registry: ToolRegistry::empty(),
         provider,
         model_label: "target-model".into(),
-        projects: Some(LISTING.into()),
+        projects: reach().0,
+        project_rows: reach().1,
         profile: None,
         effort: None,
         prices: None,
@@ -81,7 +91,7 @@ fn over(log: ThreadLog, dir: &Path) -> Runtime {
         AgentId("worker".into()),
     )
     .with_layers(Layers::default().with_project(project(HERE, dir)))
-    .with_projects(Some(LISTING.into()))
+    .with_projects(reach().0, reach().1)
 }
 
 /// A fresh log in `dir`, and a runtime over it. The thread id comes back
@@ -104,7 +114,7 @@ fn turn_rig(script: Vec<Vec<ProviderEvent>>, dir: &Path) -> Runtime {
         AgentId("worker".into()),
     )
     .with_layers(Layers::default().with_project(project(HERE, dir)))
-    .with_projects(Some(LISTING.into()))
+    .with_projects(reach().0, reach().1)
 }
 
 /// A step thread: `suggest_project` is unoffered there, but a call that
@@ -119,7 +129,7 @@ fn project_rig(script: Vec<Vec<ProviderEvent>>, dir: &Path) -> Runtime {
         AgentId("worker".into()),
     )
     .with_layers(Layers::default().with_project(project(HERE, dir)))
-    .with_projects(Some(LISTING.into()))
+    .with_projects(reach().0, reach().1)
     .with_step("implement", &[])
     .expect("a valid deny list")
 }

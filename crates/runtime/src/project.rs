@@ -577,6 +577,14 @@ impl Project {
         self.dot_dir().join(MEMORY_DIR)
     }
 
+    /// The project's brief (issue #123): `.aigentic/brief.md`, a regular
+    /// file. Read live rather than kept on `Project`, so a hand edit
+    /// shows in the next turn; the comparison that keeps an unchanged
+    /// read from reloading lives in `Runtime::refresh_brief`.
+    pub fn brief(&self) -> Option<String> {
+        crate::brief::project_brief(&self.root)
+    }
+
     /// Re-read the memory files: after an extraction, before the next turn.
     pub fn reload_memory(&mut self) -> Result<(), ProjectError> {
         self.memory = read_md_files(&self.memory_dir())?;

@@ -15,7 +15,15 @@ pub struct Prefix<'a> {
     /// The workspace's instructions (phase 6 step 10), before the
     /// project's.
     pub workspace: Option<String>,
+    /// The workspace's brief (issue #123): what the workspace is, whose
+    /// projects share one understanding. Between the workspace
+    /// instructions and the project instructions; absent when there is
+    /// no brief, so a context with no briefs is unchanged.
+    pub workspace_brief: Option<String>,
     pub project: Option<&'a str>,
+    /// The project's brief (issue #123): what this project is and where
+    /// it stands. Between the project instructions and `participants`.
+    pub project_brief: Option<String>,
     /// One line under the project instructions when the project names
     /// participants (phase 5): who is in it and their roles, so the
     /// model knows whom it may ask to approve.
@@ -73,8 +81,14 @@ pub fn build_context(prefix: &Prefix<'_>, events: &[Event]) -> Result<Vec<Messag
     if let Some(text) = &prefix.workspace {
         context.push(system(text.clone()));
     }
+    if let Some(text) = &prefix.workspace_brief {
+        context.push(system(text.clone()));
+    }
     if let Some(text) = prefix.project {
         context.push(system(text.to_owned()));
+    }
+    if let Some(text) = &prefix.project_brief {
+        context.push(system(text.clone()));
     }
     if let Some(text) = &prefix.participants {
         context.push(system(text.clone()));
@@ -181,7 +195,9 @@ mod tests {
             harness: Some("Keep a checklist."),
             workspace: None,
             project: Some("This is Vendela."),
+            workspace_brief: None,
             participants: None,
+            project_brief: None,
             projects: None,
             knowledge: Some("# Knowledge\n\n...".into()),
             memory: Some("# Project memory\n\n- Use Swedish.".into()),
@@ -294,6 +310,86 @@ mod tests {
             ]
         );
         assert_eq!(ctx[2].role, Role::System);
+    }
+
+    /// T2 (issue #123): the two brief blocks are system messages of
+    /// their own, each between the instructions it belongs to and the
+    /// one after: the workspace brief after the workspace instructions,
+    /// the project brief after the project instructions and before
+    /// `participants`. With neither, the built context is byte for byte
+    /// what it was before briefs existed.
+    #[test]
+    fn the_brief_blocks_sit_between_their_instructions_and_participants() {
+        let events = vec![by(0, "steve", "hej")];
+        let workspace_brief = crate::brief::workspace_block("w", "# Workspace brief\n\nShared.");
+        let project_brief = crate::brief::project_block("p", "# Foundation\n\nThe project.", true);
+        let prefix = Prefix {
+            global: Some("g"),
+            workspace: Some("wi".into()),
+            project: Some("p"),
+            participants: Some("Participants in this project: steve (admin)".into()),
+            workspace_brief: Some(workspace_brief.clone()),
+            project_brief: Some(project_brief.clone()),
+            ..Prefix::default()
+        };
+        let ctx = build_context(&prefix, &events).unwrap();
+        let texts: Vec<&str> = ctx.iter().map(text).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "g",
+                "wi",
+                workspace_brief.as_str(),
+                "p",
+                project_brief.as_str(),
+                "Participants in this project: steve (admin)",
+                "hej"
+            ]
+        );
+        assert_eq!(ctx[2].role, Role::System);
+        assert_eq!(ctx[4].role, Role::System);
+
+        // Neither brief: not one byte moves.
+        let plain = Prefix {
+            workspace_brief: None,
+            project_brief: None,
+            ..prefix
+        };
+        let bare = Prefix {
+            global: Some("g"),
+            workspace: Some("wi".into()),
+            project: Some("p"),
+            participants: Some("Participants in this project: steve (admin)".into()),
+            ..Prefix::default()
+        };
+        let with_briefs: Vec<Message> = build_context(&plain, &events).unwrap();
+        let without: Vec<Message> = build_context(&bare, &events).unwrap();
+        assert_eq!(with_briefs, without);
+        // Neither brief means neither block: not an empty message, no
+        // message at all, in the order they were before briefs existed.
+        assert_eq!(
+            with_briefs.iter().map(text).collect::<Vec<&str>>(),
+            vec![
+                "g",
+                "wi",
+                "p",
+                "Participants in this project: steve (admin)",
+                "hej"
+            ]
+        );
+
+        // A cut note counts inside the cap, so the block never exceeds
+        // it, and a project's note names its own project.
+        let long = "x".repeat(crate::brief::PROJECT_BRIEF_CAP * 2);
+        let cut = crate::brief::project_block("p", &long, true);
+        assert!(cut.len() <= crate::brief::PROJECT_BRIEF_CAP + "# Project brief: p\n\n".len());
+        assert!(
+            cut.ends_with("… (brief cut at 2000 bytes; read_brief(\"p\") has it all)"),
+            "{cut}"
+        );
+        let ws_cut = crate::brief::workspace_block("w", &long);
+        assert!(ws_cut.ends_with("… (brief cut at 1200 bytes)"), "{ws_cut}");
+        assert!(!ws_cut.contains("read_brief"));
     }
 
     /// T4 (issue #81): the projects block is a system message of its own,

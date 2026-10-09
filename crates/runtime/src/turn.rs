@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use aigentic_core::{
     Author, CUT_STREAM, CompletionRequest, ContentBlock, EventKind, Message, ProviderError,
-    ProviderEvent, Role, ToolCall, ToolResult, ToolSpec,
+    ProviderEvent, RiskClass, Role, ToolCall, ToolResult, ToolSpec,
 };
 use aigentic_log::{
     AssistantMessagePayload, InterruptedPayload, ProviderRetriedPayload, ToolResultPayload, Usage,
@@ -18,7 +18,8 @@ use aigentic_log::{Invoker, NewEvent, PolicyRecord};
 use crate::decisions::{CancelToken, Inbox, Queued};
 use crate::harness_tools::{
     ASK_HUMAN, FINISH_STEP, HARNESS_CLASS, NOT_RUN_LENGTH, NOT_RUN_OVER_LIMIT, NOT_RUN_SIBLING,
-    NOT_RUN_SOLO, SUGGEST_PROJECT, harness_specs, is_harness_tool, stale_tasks_reminder,
+    NOT_RUN_SOLO, READ_BRIEF, SUGGEST_PROJECT, harness_specs_with, is_harness_tool,
+    stale_tasks_reminder,
 };
 use crate::runtime::{ASKED_HUMAN, INTERRUPTED, LENGTH_STOP, MAX_TOKENS_STOP, STEP_REPORTED};
 use crate::seams::{Verdict, author_name, denial_text};
@@ -168,6 +169,7 @@ impl Runtime {
         };
         self.refresh_knowledge()?;
         self.refresh_memory()?;
+        self.refresh_brief();
         let specs: Vec<ToolSpec> = self.tool_specs();
         // What the request's schemas cost on the wire, at the estimator's
         // own rate, read here so a registry change between turns is
@@ -798,6 +800,11 @@ impl Runtime {
         // refusal as a name that was never registered.
         let class = if !self.tool_visible(&call.name) {
             None
+        } else if call.name == READ_BRIEF {
+            // `read_brief` is a harness tool that reads a file, so it
+            // carries `Read` rather than the safe class the others do
+            // (issue #123). The rules allow both by default.
+            Some(RiskClass::Read)
         } else if is_harness_tool(&call.name) {
             Some(HARNESS_CLASS)
         } else {
@@ -865,13 +872,16 @@ impl Runtime {
     /// sorted by name. What the model sees.
     pub fn tool_specs(&self) -> Vec<ToolSpec> {
         let mut specs = self.registry.specs();
-        specs.extend(harness_specs(
+        specs.extend(harness_specs_with(
             !self.skills.model_invoked().is_empty(),
             // Offered exactly in a step thread (issue #55).
             self.step.is_some(),
             // A proposal needs a person: offered in an ordinary thread,
             // never in a step thread, which nobody watches (issue #7).
             self.step.is_none(),
+            // A sibling's brief to read (issue #123): offered when
+            // some project in reach other than this one has one.
+            self.read_brief_offered(),
         ));
         specs.retain(|s| self.tool_visible(&s.name));
         specs.sort_by(|a, b| a.name.cmp(&b.name));

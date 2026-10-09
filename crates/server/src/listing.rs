@@ -18,6 +18,11 @@ pub struct Listed {
     /// The workspace naming it, `workspace_of`'s first match; `None`
     /// when no workspace does.
     pub workspace: Option<String>,
+    /// The brief's one-liner (issue #123): its first non-empty line,
+    /// hashes and spaces stripped, cut at `ONE_LINE_CAP` characters.
+    /// `None` is no brief, and no ` — ` on the row, which then reads as
+    /// today.
+    pub one_line: Option<String>,
 }
 
 /// The projects in reach, as one system block, or `None` when there is
@@ -28,6 +33,10 @@ pub struct Listed {
 /// is the thread's own project, named from itself so line 1 is right
 /// even when the thread's creator has no role there, and `home` is the
 /// value a root under it is shown as `~` against.
+///
+/// A row of this workspace carries its brief's one-liner after its root
+/// (issue #123). Other workspaces stay names only, and a project with no
+/// brief reads exactly as it did before the brief existed.
 pub fn projects_listing(
     all: &[Listed],
     current: Option<&Listed>,
@@ -75,7 +84,11 @@ pub fn projects_listing(
                     } else {
                         ""
                     };
-                    format!("{}{mark} {}", p.name, shown_root(&p.root, home))
+                    let line = match &p.one_line {
+                        Some(one) => format!(" — {one}"),
+                        None => String::new(),
+                    };
+                    format!("{}{mark} {}{line}", p.name, shown_root(&p.root, home))
                 })
                 .collect::<Vec<_>>()
                 .join(" · ");
@@ -141,7 +154,7 @@ mod tests {
     use super::*;
 
     /// A project `name` with the given workspace: its root is
-    /// `home/name`, or outside `home` when `outside`.
+    /// `home/name`, or outside `home` when `outside`, and no brief.
     fn listed(home: &Path, name: &str, workspace: Option<&str>, outside: bool) -> Listed {
         let root = if outside {
             PathBuf::from("/elsewhere").join(name)
@@ -152,7 +165,15 @@ mod tests {
             name: name.to_owned(),
             root,
             workspace: workspace.map(str::to_owned),
+            one_line: None,
         }
+    }
+
+    /// The same row, with a brief whose first line is `one_line` (issue
+    /// #123).
+    fn briefed(mut row: Listed, one_line: &str) -> Listed {
+        row.one_line = Some(one_line.to_owned());
+        row
     }
 
     /// What the listing shows for a root under `home`, from the fixture
@@ -261,6 +282,7 @@ mod tests {
                 name: "beta".into(),
                 root: home.clone(),
                 workspace: Some("one".into()),
+                one_line: None,
             },
         ];
         let current = all.iter().find(|p| p.name == "alpha").cloned();
@@ -272,5 +294,52 @@ mod tests {
         assert!(text.contains("beta /home/steve"), "{text}");
         let text = projects_listing(&all, current.as_ref(), None).unwrap();
         assert!(text.contains("alpha (here) /home/steve/alpha"), "{text}");
+    }
+
+    /// T3 (issue #123): a row of this workspace carries its brief's
+    /// one-liner after its root — the current project's row too — while
+    /// another workspace's row stays names only, and a project with no
+    /// brief reads as it did before briefs existed. Line 1's own project
+    /// is the brief-less `beta`, so nothing outside line 2 moves.
+    #[test]
+    fn the_one_line_goes_on_this_workspaces_rows_after_the_root() {
+        let home = PathBuf::from("/home/steve");
+        let all: Vec<Listed> = fixture(&home)
+            .into_iter()
+            .map(|row| match row.name.as_str() {
+                "alpha" => briefed(row, "the marketing site, Next.js on Vercel"),
+                // Another workspace, and the loose project: their
+                // one-liners are read, but the block renders names only.
+                "gamma" => briefed(row, "the billing service"),
+                "eta" => briefed(row, "the scratch project"),
+                _ => row,
+            })
+            .collect();
+        let current = all.iter().find(|p| p.name == "beta").cloned();
+        let text = projects_listing(&all, current.as_ref(), Some(&home)).unwrap();
+        let expected = format!(
+            "Projects in reach. This thread is in beta (one).\n\
+             one: alpha {} — the marketing site, Next.js on Vercel · beta (here) {}\n\
+             Other workspaces: three: epsilon, zeta · two: delta, gamma\n\
+             In no workspace: eta",
+            under_home("alpha"),
+            under_home("beta"),
+        );
+        assert_eq!(text, expected);
+
+        // No brief anywhere: exactly the text of the fixture without
+        // briefs, byte for byte (the test above, re-run here as the
+        // baseline).
+        let plain = fixture(&home);
+        let text = projects_listing(&plain, current.as_ref(), Some(&home)).unwrap();
+        let expected = format!(
+            "Projects in reach. This thread is in beta (one).\n\
+             one: alpha {} · beta (here) {}\n\
+             Other workspaces: three: epsilon, zeta · two: delta, gamma\n\
+             In no workspace: eta",
+            under_home("alpha"),
+            under_home("beta"),
+        );
+        assert_eq!(text, expected);
     }
 }

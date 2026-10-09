@@ -25,7 +25,8 @@ use aigentic_runtime::harness_tools::{
 use aigentic_runtime::project::ProjectFile;
 use aigentic_runtime::{
     ASKED_HUMAN, Answered, CancelToken, DAEMON_RESTARTED, Decisions, INTERRUPTED, Inbox, Layers,
-    Pending, Project, ProjectContext, Resumed, Runtime, Signal, SwitchAnswer, SwitchCtx,
+    Pending, Project, ProjectContext, ProjectRow, Resumed, Runtime, Signal, SwitchAnswer,
+    SwitchCtx,
 };
 use aigentic_tools::{DEFAULT_TIMEOUT, ToolRegistry, Workdir};
 use common::{done, scripted, steve};
@@ -37,6 +38,15 @@ const THERE: &str = "there";
 const HERE_RULES: &str = "here: answer in English";
 const THERE_RULES: &str = "there: answer in Swedish";
 const LISTING: &str = "Projects in reach. aigentic (here) ~/h · aigentic-web ~/t";
+
+/// The reach these fixtures carry: the daemon's rendered block, and no
+/// rows behind it (the pair `with_projects` takes, issue #123). No row
+/// means no sibling's brief is reachable, which is what these tests,
+/// about other things, want.
+fn reach() -> (Option<String>, Vec<ProjectRow>) {
+    (Some(LISTING.into()), Vec::new())
+}
+
 const SUGGEST_PROJECT: &str = "suggest_project";
 
 /// The call the model makes, and the reply that carries it.
@@ -85,7 +95,8 @@ fn target_context(name: &str, root: PathBuf) -> ProjectContext {
         registry: ToolRegistry::empty(),
         provider,
         model_label: "target-model".into(),
-        projects: Some(LISTING.into()),
+        projects: reach().0,
+        project_rows: reach().1,
         profile: None,
         effort: None,
         prices: None,
@@ -102,7 +113,7 @@ fn rig(script: Vec<Vec<ProviderEvent>>, dir: &std::path::Path) -> Runtime {
         .into();
     Runtime::new(provider, registry, log, AgentId("worker".into()))
         .with_layers(Layers::default().with_project(project(HERE, dir, HERE_RULES)))
-        .with_projects(Some(LISTING.into()))
+        .with_projects(Some(LISTING.into()), Vec::new())
 }
 
 fn go() -> Vec<ContentBlock> {
@@ -493,7 +504,7 @@ async fn t4_a_yes_that_cannot_switch_is_withdrawn_and_the_turn_continues() {
         AgentId("worker".into()),
     )
     .with_layers(Layers::default().with_project(project(HERE, dir.path(), HERE_RULES)))
-    .with_projects(Some(LISTING.into()))
+    .with_projects(Some(LISTING.into()), Vec::new())
     .with_step("implement", &[])
     .expect("a valid deny list");
     let decisions = Arc::new(Decisions::new());

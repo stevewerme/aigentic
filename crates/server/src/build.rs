@@ -10,8 +10,8 @@ use aigentic_runtime::aigentic_core::{AgentId, Provider};
 use aigentic_runtime::aigentic_log::{Repair, ThreadLog};
 use aigentic_runtime::aigentic_tools::{ToolRegistry, Workdir};
 use aigentic_runtime::{
-    DEFAULT_COMPACTION, GlobalLayer, Layers, Project, ProjectContext, ProjectFile, Runtime,
-    WorkspaceLayer,
+    DEFAULT_COMPACTION, GlobalLayer, Layers, Project, ProjectContext, ProjectFile, ProjectRow,
+    Runtime, WorkspaceLayer,
 };
 use ulid::Ulid;
 
@@ -179,6 +179,7 @@ pub async fn project_context(
             // The listing is the table's to render (issue #81), never
             // `project_context`'s: it has no creator and no home.
             projects: None,
+            project_rows: Vec::new(),
             profile: Some(profile_name.clone()),
             effort: config
                 .profiles
@@ -196,11 +197,12 @@ pub async fn project_context(
 }
 
 /// Open or create a thread's log in `root.threads_dir` and build its
-/// runtime from the project at `root.root`. `projects` is the daemon's
-/// listing of the projects in reach for this thread (issue #81), which
-/// `ThreadTable::shown_projects` renders; `None` leaves the prefix
-/// exactly as it was.
-// The listing is one argument beside the project's own (issue #81);
+/// runtime from the project at `root.root`. `reach` is the daemon's
+/// listing of the projects in reach for this thread (issue #81), with
+/// each row's brief one-liner and root (issue #123): the block is what
+/// `ThreadTable::shown_projects` renders, the rows are what `read_brief`
+/// looks a sibling up in. `None` leaves the prefix exactly as it was.
+// The reach is one argument beside the project's own (issue #81);
 // clippy counts eight, one past its threshold.
 #[allow(clippy::too_many_arguments)]
 pub async fn build_thread(
@@ -211,7 +213,7 @@ pub async fn build_thread(
     workspaces: &[Workspace],
     thread: Ulid,
     profile_override: Option<&str>,
-    projects: Option<String>,
+    reach: Option<(Option<String>, Vec<ProjectRow>)>,
 ) -> Result<Built, BuildError> {
     let Context {
         ctx,
@@ -252,7 +254,10 @@ pub async fn build_thread(
         .with_effort(ctx.effort)
         .with_policy(ctx.policy)
         .with_skills(ctx.skills)
-        .with_projects(projects)
+        .with_projects(
+            reach.as_ref().and_then(|(block, _)| block.clone()),
+            reach.map(|(_, rows)| rows).unwrap_or_default(),
+        )
         .with_harness_instructions()
         .with_compaction(compaction);
     if let Some(utility) = &config.utility_profile
