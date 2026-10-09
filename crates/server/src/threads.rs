@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use aigentic_api::{CheckpointAnswer, Notice, ReportKind, ThreadInfo, ThreadKind, ThreadState};
+use aigentic_api::{
+    CheckpointAnswer, Notice, ReportKind, StartRow, ThreadInfo, ThreadKind, ThreadState,
+};
 use aigentic_runtime::ProjectFile;
 use aigentic_runtime::aigentic_core::{Author, ContentBlock, Event, EventKind, UserId};
 use aigentic_runtime::aigentic_log::{
@@ -694,6 +696,44 @@ impl ThreadTable {
                 Ok(order_across_projects(rows))
             }
         }
+    }
+
+    /// The start-up ask's light listing (issue #121): this user's own
+    /// threads, from the index alone. Nothing here reads a log body —
+    /// no `summarise`, no `read_all` — so a bare-folder start-up does
+    /// not parse every thread on disk; `lookup` scans an unindexed log
+    /// exactly as it does today, one first line.
+    ///
+    /// A thread with no project (an agent's, or an unplaceable `_none`
+    /// one) has no row: the ask is about projects.
+    pub fn start_rows(&self, user: &str) -> Vec<StartRow> {
+        let mut rows: Vec<StartRow> = self
+            .known_ids()
+            .into_iter()
+            .filter_map(|id| {
+                let entry = self.lookup(id)?;
+                let creator = entry.creator.as_ref()?;
+                if creator.0.as_str() != user {
+                    return None;
+                }
+                let project = entry
+                    .switched
+                    .clone()
+                    .filter(|name| self.server.project(name).is_some())
+                    .or_else(|| entry.home.clone())?;
+                Some(StartRow {
+                    id,
+                    root: root_of_indexed(&entry, Some(&project)),
+                    workspace: self.workspace_label(&project),
+                    front: entry.front,
+                    project,
+                })
+            })
+            .collect();
+        // Newest first, so the ask's "last used" is the first id per
+        // project.
+        rows.sort_unstable_by_key(|r| std::cmp::Reverse(r.id));
+        rows
     }
 
     /// One row as `/threads` shows it (issue #86): `summarise`'s log

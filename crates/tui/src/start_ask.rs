@@ -1,9 +1,10 @@
 //! The start-up ask (issue #121): which project to work in when the
 //! folder doesn't say. One pure ladder decides whether to ask; the rows
-//! come from the daemon's listing, never from a side table (AGENTS.md:
-//! the log is the source of truth); the prompt goes through
-//! `init_cmd::Ask`, so it is scripted in tests and line-based at a
-//! terminal, and one keystroke takes the default.
+//! come from the daemon — its projects, matched by root, and the light
+//! `StartRows` listing — never from a side table (AGENTS.md: the log is
+//! the source of truth); the prompt goes through `init_cmd::Ask`, so it
+//! is scripted in tests and line-based at a terminal, and one keystroke
+//! takes the default.
 //!
 //! Nothing here opens a thread or moves one: it answers "which project",
 //! and the answer rides `Request::Front` as `asked` (issue #121's first
@@ -15,7 +16,7 @@ use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 use aigentic_api::client::Client;
-use aigentic_api::{Request, Response, StartAsk, ThreadInfo, ThreadKind};
+use aigentic_api::{ProjectInfo, Request, Response, StartAsk, StartRow};
 use aigentic_runtime::Project;
 use aigentic_server::workspaces::{Workspace, project_name};
 use anyhow::anyhow;
@@ -80,36 +81,78 @@ impl Row {
 }
 
 /// The ask: one flat list, grouped by workspace, every row shown and
-/// numbered `1..n`.
+/// numbered `1..n`, then the projects the daemon cannot reach.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ask {
     pub rows: Vec<Row>,
+    /// Workspace projects the daemon does not know (issue #121): a
+    /// same-named project in another workspace took the name, so
+    /// `workspaces::merge` dropped this one and no answer can reach it
+    /// (#122 is the daemon-side half). Shown as a dim line, never
+    /// numbered.
+    pub shadowed: Vec<Shadowed>,
     /// Why the ladder asked, in its own words, recorded on the decision.
+    pub reason: String,
+}
+
+/// A workspace project the daemon cannot reach (issue #121), and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Shadowed {
+    /// The workspace it belongs to, for the line's place in the block.
+    pub workspace: String,
+    /// The name it wanted.
+    pub project: String,
+    /// The plain-language reason: `not reachable: its name is also
+    /// getscale's web; rename one in its aigentic.toml`.
     pub reason: String,
 }
 
 impl Ask {
     /// The block the person reads, and the rows they answer by number.
     /// The question first, then the groups; no paging row, so a long
-    /// sheet is honest about its size.
+    /// sheet is honest about its size. Each group's unreachable
+    /// projects follow its rows as a dim, unnumbered line.
     pub fn render(&self, now: SystemTime) -> String {
         let labels: Vec<String> = self.rows.iter().map(Row::label).collect();
         let width = labels.iter().map(|l| l.chars().count()).max().unwrap_or(0);
-        let mut out = String::from("Which project? (Enter = 1)");
-        let mut heading: Option<&Option<String>> = None;
-        for (i, row) in self.rows.iter().enumerate() {
-            if heading != Some(&row.workspace) {
-                let name = row.workspace.as_deref().unwrap_or("other");
-                out.push_str(&format!("\n  {name}"));
-                heading = Some(&row.workspace);
+        // Every group, in the order its first row appears. A group whose
+        // projects are all unreachable has no rows of its own, so it
+        // comes last, and each group's unreachable projects follow its
+        // rows as a dim line: a row's shape without a number.
+        let mut groups: Vec<Option<String>> = Vec::new();
+        for row in &self.rows {
+            if !groups.contains(&row.workspace) {
+                groups.push(row.workspace.clone());
             }
-            out.push_str(&format!(
-                "\n    {:>2}  {:<width$}  {}",
-                i + 1,
-                labels[i],
-                row.note(now),
-                width = width
-            ));
+        }
+        for s in &self.shadowed {
+            let group = Some(s.workspace.clone());
+            if !groups.contains(&group) {
+                groups.push(group);
+            }
+        }
+        let mut out = String::from("Which project? (Enter = 1)");
+        for group in &groups {
+            out.push_str(&format!("\n  {}", group.as_deref().unwrap_or("other")));
+            for (i, row) in self.rows.iter().enumerate() {
+                if &row.workspace != group {
+                    continue;
+                }
+                out.push_str(&format!(
+                    "\n    {:>2}  {:<width$}  {}",
+                    i + 1,
+                    labels[i],
+                    row.note(now),
+                    width = width
+                ));
+            }
+            for s in self
+                .shadowed
+                .iter()
+                .filter(|s| group.as_deref() == Some(s.workspace.as_str()))
+            {
+                out.push_str(&format!("\n   {}  \u{b7} {}", s.project, s.reason));
+            }
         }
         out
     }
@@ -140,7 +183,8 @@ pub enum Prompting {
 
 /// The ladder (design 1). `folder` is the project the folder resolves to
 /// on its own — the embedded daemon's ad hoc project in a bare folder —
-/// and `front` is the front thread's row from the listing, if any.
+/// `projects` are the projects the daemon knows, and `threads` is the
+/// light `StartRows` listing.
 ///
 /// The spec's reasons for no ask are all here: `--project`, `--thread`,
 /// `exec`, a cwd inside a known project, a run that is not at a terminal
@@ -149,8 +193,8 @@ pub enum Prompting {
 pub fn ladder(
     cwd: &Path,
     workspaces: &[Workspace],
-    listing: &[ThreadInfo],
-    front: Option<&ThreadInfo>,
+    projects: &[ProjectInfo],
+    threads: &[StartRow],
     folder: &str,
     launch: &Launch<'_>,
 ) -> Ladder {
@@ -164,10 +208,10 @@ pub fn ladder(
         return Ladder::None;
     }
     let in_workspace = workspace_folder(cwd, workspaces);
-    let rows = rows(
-        listing,
+    let (rows, shadowed) = rows(
+        projects,
+        threads,
         workspaces,
-        front,
         in_workspace.map(|w| w.name.as_str()),
     );
     // Nothing to choose from: no workspace is configured and no project
@@ -185,7 +229,11 @@ pub fn ladder(
         ),
         None => "the folder doesn't say which project; asked at start-up".to_owned(),
     };
-    Ladder::Ask(Box::new(Ask { rows, reason }))
+    Ladder::Ask(Box::new(Ask {
+        rows,
+        shadowed,
+        reason,
+    }))
 }
 
 /// The project the folder is in: an `aigentic.toml` up the tree, or a
@@ -211,34 +259,76 @@ pub fn workspace_folder<'a>(cwd: &Path, workspaces: &'a [Workspace]) -> Option<&
     })
 }
 
-/// The rows: every known project, grouped by workspace, `other` last,
-/// each group by last used, never-used last by name. When the cwd is in a
-/// workspace, only that workspace's projects are listed.
+/// The rows: the projects the daemon knows, grouped by workspace, `other`
+/// last, each group by last used, never-used last by name. When the cwd
+/// is in a workspace, only that workspace's projects are listed.
+///
+/// A project is tied to a workspace, and to this user's threads, by
+/// **root**, never by name (issue #121): a name is not an identity, since
+/// two workspaces may each hold a `web`. A workspace project the daemon
+/// does not know — a same-named project elsewhere took the name, so
+/// `workspaces::merge` dropped this one — is not a row at all: it comes
+/// back as a `Shadowed` line, and answering for it re-asks.
 fn rows(
-    listing: &[ThreadInfo],
+    projects: &[ProjectInfo],
+    threads: &[StartRow],
     workspaces: &[Workspace],
-    front: Option<&ThreadInfo>,
     only: Option<&str>,
-) -> Vec<Row> {
-    // One row per (workspace, project), carrying the newest thread id
-    // seen for it.
+) -> (Vec<Row>, Vec<Shadowed>) {
+    let workspace_of = |root: &Path| -> Option<String> {
+        workspaces
+            .iter()
+            .find(|w| w.projects.iter().any(|p| same_root(p, root)))
+            .map(|w| w.name.clone())
+    };
+    // One row per known project, carrying the newest thread started in
+    // it. Only this user's threads are here; the daemon sent no others.
     let mut found: BTreeMap<(Option<String>, String), Option<SystemTime>> = BTreeMap::new();
-    for w in workspaces {
-        for root in &w.projects {
-            found
-                .entry((Some(w.name.clone()), project_name(root)))
-                .or_insert(None);
-        }
+    for p in projects {
+        found
+            .entry((workspace_of(&p.root), p.name.clone()))
+            .or_insert(None);
     }
-    for t in listing {
-        let Some(project) = t.project.clone() else {
+    for t in threads {
+        let Some(p) = projects
+            .iter()
+            .find(|p| p.name == t.project && root_matches(t.root.as_deref(), &p.root))
+        else {
             continue;
         };
         let at = SystemTime::UNIX_EPOCH + Duration::from_millis(t.id.timestamp_ms());
-        let key = (t.workspace.clone(), project);
-        let entry = found.entry(key).or_insert(Some(at));
+        let entry = found
+            .entry((workspace_of(&p.root), p.name.clone()))
+            .or_insert(Some(at));
         if entry.is_none_or(|l| at > l) {
             *entry = Some(at);
+        }
+    }
+    // A workspace project the daemon does not know, and the project that
+    // took its name, said plainly.
+    let mut shadowed: Vec<Shadowed> = Vec::new();
+    for w in workspaces {
+        if only.is_some_and(|name| name != w.name) {
+            continue;
+        }
+        for root in &w.projects {
+            if projects.iter().any(|p| same_root(&p.root, root)) {
+                continue;
+            }
+            let name = project_name(root);
+            let owner = projects
+                .iter()
+                .find(|p| p.name == name)
+                .and_then(|p| workspace_of(&p.root))
+                .unwrap_or_else(|| "another".to_owned());
+            shadowed.push(Shadowed {
+                workspace: w.name.clone(),
+                project: name.clone(),
+                reason: format!(
+                    "not reachable: its name is also {owner}'s {name}; \
+                     rename one in its aigentic.toml"
+                ),
+            });
         }
     }
     let mut rows: Vec<Row> = found
@@ -263,16 +353,23 @@ fn rows(
     // Row 1: the front thread's project when it is listed, else the most
     // recently used project. Its group leads the page too, so `Enter = 1`
     // is the default and the grouping still reads straight down.
-    let front_project = front.and_then(|t| t.project.as_deref());
-    let default = front_project
-        .and_then(|p| rows.iter().position(|r| r.project == p))
+    let front = threads.iter().find(|t| t.front);
+    let front_row = front.and_then(|f| {
+        let p = projects
+            .iter()
+            .find(|p| p.name == f.project && root_matches(f.root.as_deref(), &p.root))?;
+        let ws = workspace_of(&p.root);
+        rows.iter()
+            .position(|r| r.project == p.name && r.workspace == ws)
+    });
+    let default = front_row
         .or_else(|| rows.iter().position(|r| r.last.is_some()))
         .or_else(|| (!rows.is_empty()).then_some(0));
     let Some(d) = default else {
-        return rows;
+        return (rows, shadowed);
     };
     rows[d].default = true;
-    rows[d].continue_in = front_project == Some(rows[d].project.as_str());
+    rows[d].continue_in = front_row == Some(d);
     let group = rows[d].workspace.clone();
     let mut first: Vec<Row> = rows
         .iter()
@@ -289,7 +386,22 @@ fn rows(
         first.insert(0, d);
     }
     first.extend(rest);
-    first
+    (first, shadowed)
+}
+
+/// Two roots are the same project directory: canonicalised when both
+/// exist, compared as written otherwise (a workspace file may name a path
+/// that is not there yet).
+fn same_root(a: &Path, b: &Path) -> bool {
+    let norm = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    norm(a) == norm(b)
+}
+
+/// A thread's root (when it names one) matches a project's root. A thread
+/// that never moved has no root of its own, so its project's name — the
+/// daemon's own name for the log's `project` — is all there is to match.
+fn root_matches(thread: Option<&Path>, project: &Path) -> bool {
+    thread.is_none_or(|root| same_root(root, project))
 }
 
 /// What an answer means.
@@ -300,6 +412,10 @@ enum Picked {
     Quit,
     /// Unknown, ambiguous, or no such row.
     Bad,
+    /// A project the daemon cannot reach (issue #121, finding 1), with the
+    /// reason to show: its name is taken by a same-named project in
+    /// another workspace, so choosing it would pick the wrong project.
+    Unreachable(String),
 }
 
 /// Resolve one answer: a row number, a project name, or
@@ -319,24 +435,31 @@ fn resolve(ask: &Ask, answer: &str) -> Picked {
             Picked::Bad
         };
     }
-    let hits: Vec<usize> = match answer.split_once('/') {
-        Some((ws, project)) => ask
-            .rows
-            .iter()
-            .enumerate()
-            .filter(|(_, r)| r.workspace.as_deref() == Some(ws) && r.project == project)
-            .map(|(i, _)| i)
-            .collect(),
-        None => ask
-            .rows
-            .iter()
-            .enumerate()
-            .filter(|(_, r)| r.project == answer)
-            .map(|(i, _)| i)
-            .collect(),
+    let (ws, project) = match answer.split_once('/') {
+        Some((ws, project)) => (Some(ws), project),
+        None => (None, answer),
     };
+    let hits: Vec<usize> = ask
+        .rows
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| {
+            r.project == project && ws.is_none_or(|ws| r.workspace.as_deref() == Some(ws))
+        })
+        .map(|(i, _)| i)
+        .collect();
     match hits.as_slice() {
         [one] => Picked::Row(*one),
+        // No row: a project the daemon cannot reach says why, so an answer
+        // for it never lands in the same-named project that took its name.
+        [] => match ask
+            .shadowed
+            .iter()
+            .find(|s| s.project == project && ws.is_none_or(|ws| s.workspace == ws))
+        {
+            Some(s) => Picked::Unreachable(s.reason.clone()),
+            None => Picked::Bad,
+        },
         _ => Picked::Bad,
     }
 }
@@ -356,7 +479,12 @@ pub fn choose(ask: &Ask, ask_trait: &mut dyn Asker, now: SystemTime) -> anyhow::
                 ask_trait.show("[not one of the rows: try again, or Enter for 1]");
                 tried = true;
             }
-            Picked::Bad => {
+            Picked::Unreachable(reason) if !tried => {
+                ask_trait.show(&format!("[{reason}]"));
+                ask_trait.show("[try again, or Enter for 1]");
+                tried = true;
+            }
+            Picked::Bad | Picked::Unreachable(_) => {
                 ask_trait.show(&format!("[taking 1 — {}]", ask.rows[0].label()));
                 return Ok(Prompting::Answered(Box::new(answered(ask, 0))));
             }
@@ -381,6 +509,7 @@ pub async fn run(
     client: &Client,
     cwd: &Path,
     workspaces: &[Workspace],
+    projects: &[ProjectInfo],
     folder: &str,
     launch: Launch<'_>,
 ) -> anyhow::Result<Prompting> {
@@ -388,22 +517,22 @@ pub async fn run(
     if launch.settled() || project_here(cwd, workspaces).is_some() {
         return Ok(Prompting::None);
     }
-    let listing = client
-        .request(Request::ListThreads { project: None })
-        .await?;
-    let threads = match listing {
-        Response::Threads { threads } => threads,
+    // The ask's own light listing (issue #121, review finding 3): the
+    // index, never a log body. `ListThreads` stays what `/threads` reads.
+    let rows = match client.request(Request::StartRows).await? {
+        Response::StartRows { rows } => rows,
         other => return Err(anyhow!("unexpected reply listing threads: {other:?}")),
     };
-    let front = threads.iter().find(|t| t.kind == ThreadKind::Front);
-    match ladder(cwd, workspaces, &threads, front, folder, &launch) {
+    match ladder(cwd, workspaces, projects, &rows, folder, &launch) {
         Ladder::None => Ok(Prompting::None),
         Ladder::Hint => {
             // Say where this run lands, so a script's reader knows what
             // it got without asking: the front thread's project if one
             // resumes, else the folder's.
-            let into = front
-                .and_then(|t| t.project.clone())
+            let into = rows
+                .iter()
+                .find(|r| r.front)
+                .map(|r| r.project.clone())
                 .unwrap_or_else(|| folder.to_owned());
             println!("[starting in {into}; pass --project to choose]");
             Ok(Prompting::None)
@@ -458,8 +587,8 @@ pub fn exec_guard(
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::path::PathBuf;
 
-    use aigentic_api::{ThreadKind, ThreadState};
     use tempfile::TempDir;
 
     use super::*;
@@ -481,27 +610,53 @@ mod tests {
         Ulid::from_parts(ms, 7)
     }
 
-    /// A listing row in `project`, in `workspace`, its thread started
-    /// `secs_ago`.
-    fn thread(project: &str, workspace: Option<&str>, secs_ago: u64) -> ThreadInfo {
-        ThreadInfo {
+    /// One `StartRows` row: `project`, started `secs_ago` (issue #121's
+    /// light listing). No root, which matches by name — what a thread
+    /// that never moved does.
+    fn thread(project: &str, secs_ago: u64) -> StartRow {
+        StartRow {
             id: id_at(at(secs_ago)),
-            project: Some(project.to_owned()),
-            date: "2026-10-08".to_owned(),
-            events: 3,
-            first_line: "hello".to_owned(),
-            state: ThreadState::Idle,
-            title: None,
-            workspace: workspace.map(str::to_owned),
-            kind: ThreadKind::Thread,
+            project: project.to_owned(),
+            root: None,
+            workspace: None,
+            front: false,
         }
     }
 
-    fn front(project: &str, secs_ago: u64) -> ThreadInfo {
-        ThreadInfo {
-            kind: ThreadKind::Front,
-            ..thread(project, None, secs_ago)
+    /// The front thread's row.
+    fn front(project: &str, secs_ago: u64) -> StartRow {
+        StartRow {
+            front: true,
+            ..thread(project, secs_ago)
         }
+    }
+
+    /// A project the daemon knows, as `Welcome` lists it.
+    fn proj(name: &str, root: &Path) -> ProjectInfo {
+        ProjectInfo {
+            name: name.to_owned(),
+            root: root.to_path_buf(),
+            role: Some("write".to_owned()),
+            threads: 0,
+        }
+    }
+
+    /// The projects the daemon knows from these workspaces: one per root,
+    /// and a name that repeats is kept by the **first** — that is what
+    /// `workspaces::merge` does (issue #121, finding 1), so the daemon
+    /// knows only one `web` and the second is unreachable.
+    fn known(workspaces: &[Workspace]) -> Vec<ProjectInfo> {
+        let mut out: Vec<ProjectInfo> = Vec::new();
+        for w in workspaces {
+            for root in &w.projects {
+                let name = project_name(root);
+                if out.iter().any(|p| p.name == name) {
+                    continue;
+                }
+                out.push(proj(&name, root));
+            }
+        }
+        out
     }
 
     /// A workspace file's shape: a name, a shared folder, roots.
@@ -534,12 +689,13 @@ mod tests {
     }
 
     /// The two workspaces and folders #121 keeps using: getscale (web,
-    /// api) and vendela (site), with getscale's shared folder beside its
-    /// projects.
+    /// api) and vendela (site) — and each workspace holds a `web`, so one
+    /// of them is a project the daemon cannot reach (finding 1). getscale
+    /// comes first, so its `web` is the one that keeps the name.
     struct Fixture {
         _root: TempDir,
-        shared: std::path::PathBuf,
-        web: std::path::PathBuf,
+        shared: PathBuf,
+        web: PathBuf,
         workspaces: Vec<Workspace>,
     }
 
@@ -550,12 +706,13 @@ mod tests {
         let web = shared.join("web");
         let api = shared.join("api");
         let site = base.join("site");
-        for p in [&web, &api, &site] {
+        let vendela_web = base.join("vendela").join("web");
+        for p in [&web, &api, &site, &vendela_web] {
             std::fs::create_dir_all(p).unwrap();
         }
         let workspaces = vec![
             workspace("getscale", Some(&shared), &[&web, &api]),
-            workspace("vendela", None, &[&site]),
+            workspace("vendela", None, &[&site, &vendela_web]),
         ];
         Fixture {
             _root: root,
@@ -590,8 +747,8 @@ mod tests {
         let l = ladder(
             bare.path(),
             &f.workspaces,
+            &known(&f.workspaces),
             &[],
-            None,
             "bare",
             &interactive(),
         );
@@ -605,7 +762,14 @@ mod tests {
         let p = project_dir("random");
         let inside = p.path().join("src");
         std::fs::create_dir_all(&inside).unwrap();
-        let l = ladder(&inside, &f.workspaces, &[], None, "random", &interactive());
+        let l = ladder(
+            &inside,
+            &f.workspaces,
+            &known(&f.workspaces),
+            &[],
+            "random",
+            &interactive(),
+        );
         assert_eq!(l, Ladder::None);
     }
 
@@ -617,7 +781,14 @@ mod tests {
         let under = f.web.join("src");
         std::fs::create_dir_all(&under).unwrap();
         for cwd in [&f.web, &under] {
-            let l = ladder(cwd, &f.workspaces, &[], None, "web", &interactive());
+            let l = ladder(
+                cwd,
+                &f.workspaces,
+                &known(&f.workspaces),
+                &[],
+                "web",
+                &interactive(),
+            );
             assert_eq!(l, Ladder::None, "at {}", cwd.display());
         }
     }
@@ -630,7 +801,14 @@ mod tests {
         let child = p.path().join("child");
         std::fs::create_dir_all(&child).unwrap();
         let workspaces = vec![workspace("both", Some(p.path()), &[&child])];
-        let l = ladder(p.path(), &workspaces, &[], None, "both", &interactive());
+        let l = ladder(
+            p.path(),
+            &workspaces,
+            &known(&workspaces),
+            &[],
+            "both",
+            &interactive(),
+        );
         assert_eq!(l, Ladder::None);
     }
 
@@ -642,19 +820,40 @@ mod tests {
         let mut l = interactive();
         l.project = Some("web");
         assert_eq!(
-            ladder(bare.path(), &f.workspaces, &[], None, "bare", &l),
+            ladder(
+                bare.path(),
+                &f.workspaces,
+                &known(&f.workspaces),
+                &[],
+                "bare",
+                &l
+            ),
             Ladder::None
         );
         let mut l = interactive();
         l.thread = Some(Ulid::generate());
         assert_eq!(
-            ladder(bare.path(), &f.workspaces, &[], None, "bare", &l),
+            ladder(
+                bare.path(),
+                &f.workspaces,
+                &known(&f.workspaces),
+                &[],
+                "bare",
+                &l
+            ),
             Ladder::None
         );
         let mut l = interactive();
         l.exec = true;
         assert_eq!(
-            ladder(bare.path(), &f.workspaces, &[], None, "bare", &l),
+            ladder(
+                bare.path(),
+                &f.workspaces,
+                &known(&f.workspaces),
+                &[],
+                "bare",
+                &l
+            ),
             Ladder::None
         );
     }
@@ -668,7 +867,14 @@ mod tests {
         let mut l = interactive();
         l.interactive = false;
         assert_eq!(
-            ladder(bare.path(), &f.workspaces, &[], None, "bare", &l),
+            ladder(
+                bare.path(),
+                &f.workspaces,
+                &known(&f.workspaces),
+                &[],
+                "bare",
+                &l
+            ),
             Ladder::Hint
         );
     }
@@ -678,9 +884,17 @@ mod tests {
     #[test]
     fn t1_g_nothing_configured_asks_nothing() {
         let bare = TempDir::new().unwrap();
-        let listing = vec![thread("bare", None, 60)];
+        let projects = vec![proj("bare", bare.path())];
+        let listing = vec![thread("bare", 60)];
         assert_eq!(
-            ladder(bare.path(), &[], &listing, None, "bare", &interactive()),
+            ladder(
+                bare.path(),
+                &[],
+                &projects,
+                &listing,
+                "bare",
+                &interactive()
+            ),
             Ladder::None
         );
     }
@@ -690,12 +904,12 @@ mod tests {
     #[test]
     fn t1_h_a_shared_folder_lists_only_that_workspace() {
         let f = fixture();
-        let listing = vec![thread("site", Some("vendela"), 60)];
+        let listing = vec![thread("site", 60)];
         let l = ladder(
             &f.shared,
             &f.workspaces,
+            &known(&f.workspaces),
             &listing,
-            None,
             "getscale",
             &interactive(),
         );
@@ -709,8 +923,8 @@ mod tests {
         let l = ladder(
             &f.shared,
             &f.workspaces,
+            &known(&f.workspaces),
             &[],
-            None,
             "getscale",
             &interactive(),
         );
@@ -723,16 +937,14 @@ mod tests {
     fn t1_j_a_bare_folder_lists_every_project_grouped() {
         let f = fixture();
         let bare = TempDir::new().unwrap();
-        let listing = vec![
-            thread("web", Some("getscale"), 60),
-            thread("site", Some("vendela"), 30),
-            thread("loose", None, 10),
-        ];
+        let mut projects = known(&f.workspaces);
+        projects.push(proj("loose", &bare.path().join("loose")));
+        let listing = vec![thread("web", 60), thread("site", 30), thread("loose", 10)];
         let l = ladder(
             bare.path(),
             &f.workspaces,
+            &projects,
             &listing,
-            None,
             "bare",
             &interactive(),
         );
@@ -750,6 +962,48 @@ mod tests {
         assert_eq!(rows_of(&l), vec!["loose", "site", "web", "api"]);
     }
 
+    /// T1/T2 (issue #121, finding 1): a workspace project the daemon
+    /// cannot reach is not a row. Its name is taken by the same-named
+    /// project of the workspace that came first, so the daemon knows one
+    /// `web`, and vendela's is the one that lost.
+    #[test]
+    fn t1_k_a_project_the_daemon_cannot_reach_is_not_a_row() {
+        let f = fixture();
+        let bare = TempDir::new().unwrap();
+        let l = ladder(
+            bare.path(),
+            &f.workspaces,
+            &known(&f.workspaces),
+            &[],
+            "bare",
+            &interactive(),
+        );
+        let ask = ask_of(&l);
+        assert_eq!(
+            rows_of(&l),
+            vec!["api", "web", "site"],
+            "one `web`, not two"
+        );
+        assert_eq!(ask.shadowed.len(), 1, "{:?}", ask.shadowed);
+        assert_eq!(ask.shadowed[0].workspace, "vendela");
+        assert_eq!(ask.shadowed[0].project, "web");
+        assert_eq!(
+            ask.shadowed[0].reason,
+            "not reachable: its name is also getscale's web; \
+             rename one in its aigentic.toml"
+        );
+        // Inside getscale's own scope nothing is unreachable.
+        let inside = ladder(
+            &f.shared,
+            &f.workspaces,
+            &known(&f.workspaces),
+            &[],
+            "getscale",
+            &interactive(),
+        );
+        assert!(ask_of(&inside).shadowed.is_empty());
+    }
+
     // ---- T2: the rows ----
 
     /// T2: row 1 is the front thread's project when it is listed, read as
@@ -758,16 +1012,12 @@ mod tests {
     fn t2_a_row_one_is_the_front_threads_project_when_listed() {
         let f = fixture();
         let bare = TempDir::new().unwrap();
-        let listing = vec![
-            front("api", 10),
-            thread("web", Some("getscale"), 20),
-            thread("site", Some("vendela"), 30),
-        ];
+        let listing = vec![front("api", 10), thread("web", 20), thread("site", 30)];
         let l = ladder(
             bare.path(),
             &f.workspaces,
+            &known(&f.workspaces),
             &listing,
-            Some(&listing[0]),
             "bare",
             &interactive(),
         );
@@ -784,16 +1034,12 @@ mod tests {
     fn t2_b_row_one_is_the_newest_used_project_without_a_front_thread() {
         let f = fixture();
         let bare = TempDir::new().unwrap();
-        let listing = vec![
-            thread("web", Some("getscale"), 600),
-            thread("site", Some("vendela"), 60),
-            thread("api", Some("getscale"), 3000),
-        ];
+        let listing = vec![thread("web", 600), thread("site", 60), thread("api", 3000)];
         let l = ladder(
             bare.path(),
             &f.workspaces,
+            &known(&f.workspaces),
             &listing,
-            None,
             "bare",
             &interactive(),
         );
@@ -810,18 +1056,16 @@ mod tests {
     fn t2_c_the_rest_are_by_newest_thread_id_never_used_last_by_name() {
         let f = fixture();
         let bare = TempDir::new().unwrap();
+        let mut projects = known(&f.workspaces);
+        projects.push(proj("aaa", &bare.path().join("aaa")));
         // getscale: web used 60s ago, api never. vendela: site used
         // 600s ago. `other`: aaa used 30s ago.
-        let listing = vec![
-            thread("web", Some("getscale"), 60),
-            thread("site", Some("vendela"), 600),
-            thread("aaa", None, 30),
-        ];
+        let listing = vec![thread("web", 60), thread("site", 600), thread("aaa", 30)];
         let l = ladder(
             bare.path(),
             &f.workspaces,
+            &projects,
             &listing,
-            None,
             "bare",
             &interactive(),
         );
@@ -851,15 +1095,12 @@ mod tests {
     fn t2_d_groups_are_by_workspace_with_other_last() {
         let f = fixture();
         let bare = TempDir::new().unwrap();
-        let listing = vec![
-            thread("web", Some("getscale"), 600),
-            thread("site", Some("vendela"), 30),
-        ];
+        let listing = vec![thread("web", 600), thread("site", 30)];
         let l = ladder(
             bare.path(),
             &f.workspaces,
+            &known(&f.workspaces),
             &listing,
-            None,
             "bare",
             &interactive(),
         );
@@ -881,12 +1122,12 @@ mod tests {
     fn t2_e_every_row_is_shown_numbered_with_its_note() {
         let f = fixture();
         let bare = TempDir::new().unwrap();
-        let listing = vec![thread("web", Some("getscale"), 7200)];
+        let listing = vec![thread("web", 7200)];
         let l = ladder(
             bare.path(),
             &f.workspaces,
+            &known(&f.workspaces),
             &listing,
-            None,
             "bare",
             &interactive(),
         );
@@ -913,15 +1154,12 @@ mod tests {
         let f = fixture();
         let bare = TempDir::new().unwrap();
         // Two threads in web: the newest id wins.
-        let listing = vec![
-            thread("web", Some("getscale"), 90_000),
-            thread("web", Some("getscale"), 7200),
-        ];
+        let listing = vec![thread("web", 90_000), thread("web", 7200)];
         let l = ladder(
             bare.path(),
             &f.workspaces,
+            &known(&f.workspaces),
             &listing,
-            None,
             "bare",
             &interactive(),
         );
@@ -933,6 +1171,53 @@ mod tests {
         );
         let api = ask.rows.iter().find(|r| r.project == "api").unwrap();
         assert_eq!(api.note(now()), "· no threads yet");
+    }
+
+    /// T2 (issue #121, finding 1): the unreachable project is one dim
+    /// line under its workspace, and answering for it re-asks with that
+    /// reason — it never selects the workspace that took the name.
+    #[test]
+    fn t2_g_a_same_named_project_is_one_dim_line_and_its_name_re_asks() {
+        let f = fixture();
+        let bare = TempDir::new().unwrap();
+        let l = ladder(
+            bare.path(),
+            &f.workspaces,
+            &known(&f.workspaces),
+            &[],
+            "bare",
+            &interactive(),
+        );
+        let ask = ask_of(&l);
+        let text = ask.render(now());
+        assert!(
+            text.contains(
+                "not reachable: its name is also getscale's web; \
+                 rename one in its aigentic.toml"
+            ),
+            "{text}"
+        );
+        let site = ask.rows.iter().position(|r| r.project == "site").unwrap();
+        assert_ne!(ask.rows[site].project, "web");
+        // `vendela/web` is not a row: the ask gives the reason and
+        // re-asks. The next answer takes its own row.
+        let mut scripted = Scripted::new(&["vendela/web", &format!("{}", site + 1)]);
+        let out = choose(ask, &mut scripted, now()).unwrap();
+        match out {
+            Prompting::Answered(a) => {
+                assert_eq!(a.chosen, ask.rows[site].project);
+                assert_ne!(a.chosen, "web", "never the other workspace's `web`");
+            }
+            other => panic!("expected an answer, got {other:?}"),
+        }
+        assert!(
+            scripted
+                .shown
+                .iter()
+                .any(|s| s.contains("not reachable: its name is also getscale's web")),
+            "the re-ask carries the reason: {:?}",
+            scripted.shown
+        );
     }
 
     // ---- T3: the prompt ----
@@ -971,15 +1256,12 @@ mod tests {
     fn prompt_fixture() -> Ask {
         let f = fixture();
         let bare = TempDir::new().unwrap();
-        let listing = vec![
-            thread("web", Some("getscale"), 7200),
-            thread("site", Some("vendela"), 260_000),
-        ];
+        let listing = vec![thread("web", 7200), thread("site", 260_000)];
         let l = ladder(
             bare.path(),
             &f.workspaces,
+            &known(&f.workspaces),
             &listing,
-            None,
             "bare",
             &interactive(),
         );
@@ -1075,6 +1357,7 @@ mod tests {
                     continue_in: false,
                 },
             ],
+            shadowed: Vec::new(),
             reason: "test".to_owned(),
         };
         let mut scripted = Scripted::new(&["web"]);
@@ -1137,7 +1420,7 @@ mod tests {
         l.exec = true;
         l.interactive = false;
         assert_eq!(
-            ladder(&f.shared, &f.workspaces, &[], None, "getscale", &l),
+            ladder(&f.shared, &f.workspaces, &[], &[], "getscale", &l),
             Ladder::None
         );
     }

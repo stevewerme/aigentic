@@ -265,7 +265,7 @@ fn project_for(threads: &ThreadTable, request: &Request) -> Option<String> {
         // The front thread (issue #84): an existing one says its
         // project; a new one is made in the project asked for.
         Request::Front { project, .. } | Request::NewFront { project } => Some(project.clone()),
-        Request::Hello { .. } | Request::ListProjects => None,
+        Request::Hello { .. } | Request::ListProjects | Request::StartRows => None,
     }
 }
 
@@ -717,6 +717,20 @@ async fn handle(
         Request::ListProjects => Response::Projects {
             projects: project_infos(config, threads, user),
         },
+        // The start-up ask's light listing (issue #121): the index and
+        // one first line per unindexed log, never a whole log. Off the
+        // worker anyway, like the heavy listing.
+        Request::StartRows => {
+            let table = Arc::clone(threads);
+            let user = user.to_owned();
+            let rows = tokio::task::spawn_blocking(move || table.start_rows(&user)).await;
+            match rows {
+                Ok(rows) => Response::StartRows { rows },
+                Err(e) => Response::Refused {
+                    reason: format!("the listing failed: {e}"),
+                },
+            }
+        }
         Request::ListThreads { project } => {
             // A listing reads and parses a log per row — a whole tree
             // of them with no project (issue #86) — so it runs off the

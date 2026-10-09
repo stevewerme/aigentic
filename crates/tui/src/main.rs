@@ -651,7 +651,15 @@ async fn main() -> anyhow::Result<()> {
         exec: exec_args.is_some(),
         interactive: std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
     };
-    let asked = start_ask::run(&client, &cwd, &workspaces, &project_name, launch).await?;
+    let asked = start_ask::run(
+        &client,
+        &cwd,
+        &workspaces,
+        &welcome.projects,
+        &project_name,
+        launch,
+    )
+    .await?;
     let (project_name, here, asked) = match asked {
         start_ask::Prompting::Answered(a) => {
             let chosen = a.chosen.clone();
@@ -680,14 +688,13 @@ async fn main() -> anyhow::Result<()> {
     .await?;
     // The server judges a busy front thread (issue #121, design 5): it
     // resumes where the thread is and ignores the answer. Say so, rather
-    // than looking as if the choice had been honoured.
+    // than looking as if the choice had been honoured. The rule and its
+    // exact text live in `api` (`StartAsk::ignored_note`), where the
+    // `Plain` rig pins them.
     if let (Some(a), Some(info)) = (&asked, picked.info.as_ref())
-        && info.project.as_deref().is_some_and(|p| p != a.chosen)
+        && let Some(note) = a.ignored_note(info)
     {
-        eprintln!(
-            "[the front thread is busy in {}; resumed it there — your choice was not applied]",
-            info.project.as_deref().unwrap_or("another project")
-        );
+        eprintln!("{note}");
     }
     let thread_id = picked.id;
     let (state, events, mode, identity) = match client

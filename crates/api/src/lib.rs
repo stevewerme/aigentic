@@ -208,6 +208,11 @@ pub enum Request {
         thread: Ulid,
         report: ReportKind,
     },
+    /// The start-up ask's light listing (issue #121): this user's
+    /// threads, from the daemon's index alone — no thread's log body is
+    /// read. `ListThreads` is unchanged; the ask uses this so a bare
+    /// launch does not parse every log on disk.
+    StartRows,
     /// Start a run for `issue` in `project`, or resume the unfinished one
     /// (issue #58). Refused unless the user has `approve`: a build pushes
     /// to the main branch. `workflow` defaults to the bundled `build`.
@@ -271,6 +276,12 @@ pub enum Response {
     },
     Threads {
         threads: Vec<ThreadInfo>,
+    },
+    /// The answer to `StartRows` (issue #121): the same rows as
+    /// `ListThreads`, without reading a log. `ListThreads` still carries
+    /// the whole `ThreadInfo`.
+    StartRows {
+        rows: Vec<StartRow>,
     },
     Thread {
         thread: ThreadInfo,
@@ -342,6 +353,23 @@ pub struct StartAsk {
     pub offered: String,
     pub chosen: String,
     pub reason: String,
+}
+
+impl StartAsk {
+    /// The line a client prints when a sent answer did not land (issue
+    /// #121, finding 2): the daemon resumes a busy front thread where it
+    /// is, silently. The reply's row is built after any move the answer
+    /// applied (spec v2 decision 4), so a project that differs from
+    /// `chosen` means the answer was ignored. `None` when the answer
+    /// was applied — or when the row's project is unknown.
+    pub fn ignored_note(&self, thread: &ThreadInfo) -> Option<String> {
+        let project = thread.project.as_deref()?;
+        (project != self.chosen).then(|| {
+            format!(
+                "[the front thread is busy in {project}; resumed it there — your choice was not applied]"
+            )
+        })
+    }
 }
 
 /// How a `Front` request was answered (issue #84).
@@ -554,6 +582,24 @@ pub struct ProjectInfo {
     pub threads: u64,
 }
 
+/// One `StartRows` row (issue #121): what the start-up ask needs to
+/// draw its list, and nothing a log body has to be read for. The
+/// daemon builds it from its index.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartRow {
+    pub id: Ulid,
+    /// The thread's project, as the daemon knows it.
+    pub project: String,
+    /// `thread_started.root`, when the log recorded one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<PathBuf>,
+    /// The workspace naming that project, if one does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    /// This user's front thread (`thread_started.front`, issue #84).
+    pub front: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ThreadInfo {
     pub id: Ulid,
@@ -664,6 +710,9 @@ mod tests {
             // Issue #86: no project means every project the caller may
             // read, so the frame carries none.
             Request::ListThreads { project: None },
+            // Issue #121: the ask's light listing, which takes no
+            // fields at all.
+            Request::StartRows,
             Request::CreateThread {
                 project: "p".into(),
             },
@@ -777,6 +826,15 @@ mod tests {
             },
             Response::Threads {
                 threads: vec![thread_info.clone()],
+            },
+            Response::StartRows {
+                rows: vec![StartRow {
+                    id: thread(),
+                    project: "p".into(),
+                    root: Some(PathBuf::from("/srv/p")),
+                    workspace: Some("ws".into()),
+                    front: true,
+                }],
             },
             Response::Thread {
                 thread: thread_info.clone(),

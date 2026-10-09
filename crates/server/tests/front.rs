@@ -20,7 +20,7 @@ use aigentic_runtime::aigentic_core::{
 };
 use aigentic_runtime::aigentic_log::{
     DecisionAnswer, DecisionAnsweredPayload, DecisionKind, DecisionProposedPayload, NewEvent,
-    RunStartedPayload, STARTUP_PREFIX, ThreadLog, ThreadStartedPayload,
+    RunStartedPayload, STARTUP_PREFIX, ThreadLog, ThreadStartedPayload, UserMessagePayload,
 };
 use aigentic_runtime::runner::RunnerHost;
 use aigentic_server::awake::KeepAwake;
@@ -2630,6 +2630,32 @@ async fn front_asked(
     }
 }
 
+/// The same answer, keeping the reply's row: what a client's banner and
+/// its role read (issue #121, review finding 2).
+async fn front_asked_row(
+    client: &mut Client,
+    offered: &str,
+    chosen: &str,
+    reason: &str,
+) -> (aigentic_api::ThreadInfo, FrontOutcome) {
+    match client
+        .request(Request::Front {
+            project: chosen.into(),
+            here: Some(chosen.to_owned()),
+            asked: Some(aigentic_api::StartAsk {
+                offered: offered.into(),
+                chosen: chosen.into(),
+                reason: reason.into(),
+            }),
+        })
+        .await
+        .unwrap()
+    {
+        Response::Front { thread, outcome } => (thread, outcome),
+        other => panic!("a front thread: {other:?}"),
+    }
+}
+
 /// The `decision_proposed`/`decision_answered` pair a start-up ask
 /// leaves in `t`'s log, or nothing where the server logged none.
 fn ask_pair(
@@ -2840,6 +2866,55 @@ async fn t4_ask_d_a_busy_thread_ignores_the_answer() {
     }
 }
 
+/// T4 (issue #121, review finding 2) — the client's note for an answer a
+/// busy front thread ignored. The reply's row is the thread's own
+/// project, so the client's rule (`StartAsk::ignored_note`, what
+/// `main.rs` prints to stderr) yields the line; nothing pinned it
+/// before this fix.
+#[tokio::test]
+async fn t4_ask_h_a_busy_threads_ignored_answer_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = project(dir.path(), "a", "");
+    let b = project(dir.path(), "b", "");
+    // A turn that never answers, so the front thread stays running.
+    let daemon = Daemon::new_with(
+        dir.path(),
+        vec![pc("a", &a), pc("b", &b)],
+        &["steve"],
+        false,
+        ScriptedFactory::new(vec![None]),
+    )
+    .await;
+    let mut steve = daemon.connect("steve").await;
+    let (t, _) = front(&mut steve, "a").await;
+    post(&mut steve, t, "go").await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if matches!(open_state(&mut steve, t).await, ThreadState::Running { .. }) {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "a busy turn");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let (row, outcome) = front_asked_row(&mut steve, "a", "b", "the ask says so").await;
+    assert_eq!(outcome, FrontOutcome::Resumed);
+    assert_eq!(row.id, t);
+    // The row the daemon built after the answer did not land names the
+    // project the thread is in, not the one chosen.
+    assert_eq!(row.project.as_deref(), Some("a"));
+    let ask = aigentic_api::StartAsk {
+        offered: "a".into(),
+        chosen: "b".into(),
+        reason: "the ask says so".into(),
+    };
+    assert_eq!(
+        ask.ignored_note(&row).as_deref(),
+        Some("[the front thread is busy in a; resumed it there — your choice was not applied]"),
+        "the line the client prints when the answer was ignored"
+    );
+}
+
 /// T4 — the move works with the thread not loaded yet, the case a
 /// just-started daemon is in.
 #[tokio::test]
@@ -2932,36 +3007,125 @@ async fn t4_ask_g_first_creates_in_the_chosen_project_and_logs_the_pair() {
     assert_eq!(open_state(&mut steve, t).await, ThreadState::Idle);
 }
 
-/// T1, the cost side (issue #121): `ListThreads` over a fixture of ~500
-/// threads on disk. The time is printed, never asserted: the spec
-/// accepts this read for v1 and makes a lighter one a follow-up if it
-/// exceeds 300 ms.
+/// T1, the cost side (issue #121, review finding 3): a realistic log,
+/// `thread_started` and `events - 1` events behind it, written in one
+/// buffered pass. `ThreadLog::append` fsyncs per event, which is minutes
+/// of I/O at the sizes these tests use.
+fn hand_log_with_events(base: &Path, id: Ulid, root: &Path, front: bool, events: u64) {
+    let mut log = hand_log(base, id);
+    append_started(&mut log, Some("p"), root, "steve", front);
+    let mut written = log.read_all().unwrap();
+    let template = written.remove(0);
+    let path = log.path().to_path_buf();
+    drop(log);
+    let payload = to_value(UserMessagePayload::new(vec![ContentBlock::Text(
+        "a line of the thread".into(),
+    )]))
+    .unwrap();
+    let mut out = std::io::BufWriter::new(
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap(),
+    );
+    for seq in 1..events {
+        let mut event = template.clone();
+        event.seq = seq;
+        event.kind = EventKind::UserMessage;
+        event.payload = payload.clone();
+        serde_json::to_writer(&mut out, &event).unwrap();
+        std::io::Write::write_all(&mut out, b"\n").unwrap();
+    }
+}
+
+/// Cut `<base>/<id>.jsonl` down to its first line, behind the daemon's
+/// back (issue #121, review finding 3).
+fn truncate_to_first_line(base: &Path, id: Ulid) {
+    let path = base.join(format!("{id}.jsonl"));
+    let text = std::fs::read_to_string(&path).unwrap();
+    let first = text
+        .split_inclusive('\n')
+        .next()
+        .unwrap_or_default()
+        .to_owned();
+    std::fs::write(&path, first).unwrap();
+}
+
+/// The rows `StartRows` answers (issue #121).
+async fn start_rows(client: &mut Client) -> Vec<aigentic_api::StartRow> {
+    match client.request(Request::StartRows).await.unwrap() {
+        Response::StartRows { rows } => rows,
+        other => panic!("start rows: {other:?}"),
+    }
+}
+
+/// T1, the cost side (issue #121, review finding 3): `StartRows` reads
+/// the index, not the logs. Every log here is a realistic one (250
+/// events), the rows are read once so the index is built over them, and
+/// then every log is cut down to its first line behind the daemon's
+/// back: the rows still come back right, so nothing on this path reads a
+/// log body.
 #[tokio::test]
-async fn t1_m_listing_500_threads_on_disk_is_timed() {
+async fn t1_m_start_rows_comes_from_the_index_not_the_logs() {
     let dir = tempfile::tempdir().unwrap();
     let base = dir.path().join("threads");
     let root = project(dir.path(), "p", "");
-    for i in 0..500u64 {
-        let id = Ulid::from_parts(1_700_000_000_000 + i, u128::from(i) + 1);
-        let mut log = hand_log(&base, id);
-        append_started(&mut log, Some("p"), &root, "steve", i == 0);
+    let ids: Vec<Ulid> = (0..12u64)
+        .map(|i| Ulid::from_parts(1_700_000_000_000 + i, u128::from(i) + 1))
+        .collect();
+    for (i, id) in ids.iter().enumerate() {
+        hand_log_with_events(&base, *id, &root, i == 0, 250);
     }
 
     let plain = Plain::new(dir.path(), &root, "steve").await;
-    let client = plain.connect().await;
+    let mut client = plain.connect().await;
+    let before = start_rows(&mut client).await;
+    assert_eq!(before.len(), 12, "every thread on disk is listed");
+    assert_eq!(before.iter().filter(|r| r.front).count(), 1);
+
+    // The bodies are gone: each log is its first line alone now.
+    for id in &ids {
+        truncate_to_first_line(&base, *id);
+    }
+    let after = start_rows(&mut client).await;
+    assert_eq!(after, before, "the same rows, from the index");
+    assert!(after.iter().all(|r| r.project == "p"), "{after:?}");
+    assert!(
+        after
+            .iter()
+            .all(|r| r.root.as_deref() == Some(root.as_path())),
+        "{after:?}"
+    );
+}
+
+/// T1, the cost side (issue #121, review finding 3): 2,000 threads of
+/// 250 events each. The `StartRows` time is printed and asserted under
+/// one second — generous for a debug build on CI, and far under what
+/// reading the bodies costs (issue #121's review measured 4.2 s on the
+/// listing that reads them).
+#[tokio::test]
+async fn t1_m_start_rows_over_2000_logs_is_timed() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("threads");
+    let root = project(dir.path(), "p", "");
+    for i in 0..2_000u64 {
+        let id = Ulid::from_parts(1_700_000_000_000 + i, u128::from(i) + 1);
+        hand_log_with_events(&base, id, &root, false, 250);
+    }
+
+    let plain = Plain::new(dir.path(), &root, "steve").await;
+    let mut client = plain.connect().await;
     let started = std::time::Instant::now();
-    let Response::Threads { threads } = client
-        .request(Request::ListThreads { project: None })
-        .await
-        .unwrap()
-    else {
-        panic!("a listing")
-    };
+    let rows = start_rows(&mut client).await;
     let took = started.elapsed();
     eprintln!(
-        "ListThreads over 500 threads on disk: {} ms, {} rows",
+        "StartRows over 2,000 threads of 250 events: {} ms, {} rows",
         took.as_millis(),
-        threads.len()
+        rows.len()
     );
-    assert_eq!(threads.len(), 500, "every thread on disk is listed");
+    assert_eq!(rows.len(), 2_000, "every thread on disk is listed");
+    assert!(
+        took < std::time::Duration::from_secs(1),
+        "StartRows took {took:?}"
+    );
 }

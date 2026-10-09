@@ -116,6 +116,10 @@ pub fn needs(request: &Request) -> Option<Role> {
         // is filtered to the projects the caller holds a role in.
         Request::ListThreads { project: None } => None,
         Request::ListThreads { project: Some(_) } => Some(Role::Read),
+        // The `StartRows` handler judges it (issue #121): the rows are
+        // filtered to this user's own threads, so there is no one
+        // project to check.
+        Request::StartRows => None,
         Request::Open { .. } | Request::Close { .. } | Request::Report { .. } => Some(Role::Read),
         Request::CreateThread { .. }
         | Request::NewFront { .. }
@@ -217,6 +221,9 @@ mod tests {
                 Some(Role::Read),
             ),
             (Request::ListThreads { project: None }, None),
+            // Issue #121: the ask's light listing is this user's own
+            // threads, so no project is checked here.
+            (Request::StartRows, None),
             (
                 Request::NewFront {
                     project: "p".into(),
