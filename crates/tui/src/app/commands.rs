@@ -32,8 +32,11 @@ pub enum Command<'a> {
     Policy,
     /// The memory files as the prefix carries them.
     Memory,
-    /// Follow a build of an issue here: `/build <n>` (issue #68).
+    /// Follow a build of an issue here: `/build <n> [workflow]`.
     Build(Option<&'a str>),
+    /// Answer the followed run's checkpoint: `/answer go`, `/answer amend
+    /// <text>` or `/answer stop`.
+    Answer(&'a str),
     /// A user-invoked skill: its name and the rest of the line.
     Skill(&'a str, &'a str),
     /// The key table.
@@ -97,6 +100,7 @@ pub fn parse_line<'a>(line: &'a str, skills: &[String]) -> Command<'a> {
         ("pin", text) if !text.is_empty() => Command::Pin(text),
         ("build", "") => Command::Build(None),
         ("build", arg) => Command::Build(Some(arg)),
+        ("answer", arg) => Command::Answer(arg),
         ("remember", text) if !text.is_empty() => Command::Remember(text),
         (name, args) if skills.iter().any(|s| s == name) => Command::Skill(name, args),
         _ => Command::Unknown(trimmed),
@@ -147,7 +151,14 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "new",
         "start a new front thread; the old one stays listed; asks first if a turn is running",
     ),
-    ("build", "follow a build of issue n here: /build <n>"),
+    (
+        "build",
+        "follow a build of issue n here: /build <n> [workflow]",
+    ),
+    (
+        "answer",
+        "answer the run's checkpoint: /answer go, /answer amend <text>, /answer stop",
+    ),
     ("diff", "the project's working-tree diff, in the pager"),
     ("copy", "copy a code block of the last reply: /copy [n|all]"),
     ("rename", "set the thread's title: /rename <title>"),
@@ -174,7 +185,8 @@ pub const HELP: &str = "\
 /project use <n> move this thread to project <n>, keeping the conversation
 /threads         your threads in every project: front, builds, then by workspace
 /new             start a new front thread; the old one stays listed; asks first if a turn is running
-/build <n>       follow a build of issue n here, and answer its checkpoints
+/build <n> [w]   follow a build of issue n here (workflow w, else build), and answer its checkpoints
+/answer go       continue the run past its checkpoint; /answer amend <text> continues with changes; /answer stop
 /<skill> [args]  run a user-invoked skill
 /diff            the project's working-tree diff, untracked files included
 /rename <title>  set the thread's title (one is proposed after the first turn)

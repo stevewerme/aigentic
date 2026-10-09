@@ -6,8 +6,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use aigentic_api::{
-    Body, CheckpointAnswer, Frame, FrontOutcome, Notice, PROTOCOL_VERSION, ProjectInfo, Request,
-    Response, StartAsk, SwitchReply, ThreadInfo, ThreadState, Welcome, decode, encode,
+    Body, Frame, FrontOutcome, Notice, PROTOCOL_VERSION, ProjectInfo, Request, Response, StartAsk,
+    SwitchReply, ThreadInfo, ThreadState, Welcome, decode, encode,
 };
 use aigentic_runtime::aigentic_core::{AgentId, Author, UserId};
 use aigentic_runtime::aigentic_policy::Role;
@@ -993,13 +993,9 @@ async fn handle(
             answer,
             amendment,
         } => {
-            // Slice 1 answers `stop` only: acting on `go` or `amend` is
-            // the next slice's work, and nothing is written for them.
-            if !matches!(answer, CheckpointAnswer::Stop) {
-                return Response::Refused {
-                    reason: "answering go or amend comes in slice 2".into(),
-                };
-            }
+            // Which answers a gate takes is the gate's own `options`; the
+            // table checks them against the open ask before anything is
+            // written.
             match threads
                 .answer_checkpoint(lead, gate, answer, amendment, author.clone())
                 .await

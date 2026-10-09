@@ -20,6 +20,19 @@ pub struct IssueView {
     pub body: String,
 }
 
+/// What the forge's CI says about one commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CiState {
+    /// No run names the commit yet: CI may not have picked it up.
+    NoRuns,
+    /// At least one run is queued or in progress, and none has failed.
+    Pending,
+    /// Every run finished, and every one succeeded or was skipped.
+    Passed,
+    /// A run finished with another conclusion, named here.
+    Failed(String),
+}
+
 /// Every way a forge can fail.
 #[derive(Debug, thiserror::Error)]
 pub enum ForgeError {
@@ -50,6 +63,8 @@ pub trait Forge {
     /// Close the issue. An issue that is already closed is success, not a
     /// failure: a rebuilt runner closes what the crash left open.
     fn close(&self, n: u64) -> Result<(), ForgeError>;
+    /// The CI runs for the full commit SHA `sha`.
+    fn ci(&self, sha: &str) -> Result<CiState, ForgeError>;
 }
 
 impl<T: Forge + ?Sized> Forge for Arc<T> {
@@ -67,6 +82,10 @@ impl<T: Forge + ?Sized> Forge for Arc<T> {
 
     fn close(&self, n: u64) -> Result<(), ForgeError> {
         (**self).close(n)
+    }
+
+    fn ci(&self, sha: &str) -> Result<CiState, ForgeError> {
+        (**self).ci(sha)
     }
 }
 
@@ -150,6 +169,57 @@ impl Forge for GhForge {
         }
         Err(failure)
     }
+
+    fn ci(&self, sha: &str) -> Result<CiState, ForgeError> {
+        #[derive(serde::Deserialize)]
+        struct Run {
+            #[serde(default)]
+            status: Option<String>,
+            #[serde(default)]
+            conclusion: Option<String>,
+            #[serde(default)]
+            name: Option<String>,
+        }
+        let text = gh(&[
+            "run",
+            "list",
+            "--commit",
+            sha,
+            "--json",
+            "status,conclusion,name",
+        ])?;
+        let runs: Vec<Run> = serde_json::from_str(&text)?;
+        Ok(fold_ci(runs.into_iter().map(|run| {
+            (
+                run.name.unwrap_or_default(),
+                run.status.unwrap_or_default(),
+                run.conclusion.unwrap_or_default(),
+            )
+        })))
+    }
+}
+
+/// Fold `(name, status, conclusion)` per run into one state. A run that
+/// isn't `completed` is pending; a completed run whose conclusion isn't
+/// `success`, `skipped` or `neutral` fails the commit, named.
+pub fn fold_ci(runs: impl IntoIterator<Item = (String, String, String)>) -> CiState {
+    let mut any = false;
+    let mut pending = false;
+    for (name, status, conclusion) in runs {
+        any = true;
+        if status != "completed" {
+            pending = true;
+            continue;
+        }
+        if !matches!(conclusion.as_str(), "success" | "skipped" | "neutral") {
+            return CiState::Failed(format!("{name}: {conclusion}"));
+        }
+    }
+    match (any, pending) {
+        (false, _) => CiState::NoRuns,
+        (true, true) => CiState::Pending,
+        (true, false) => CiState::Passed,
+    }
 }
 
 impl GhForge {
@@ -194,6 +264,9 @@ pub struct FakeForge {
     closed: AtomicBool,
     /// How many more `close` calls fail before one goes through.
     close_failures: Mutex<usize>,
+    /// What `ci` answers, front first; the last answer repeats. Empty
+    /// answers `Passed`.
+    ci: Mutex<Vec<CiState>>,
 }
 
 impl FakeForge {
@@ -204,7 +277,14 @@ impl FakeForge {
             comments: Mutex::new(Vec::new()),
             closed: AtomicBool::new(false),
             close_failures: Mutex::new(0),
+            ci: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Script what `ci` answers: each call takes the next state, and the
+    /// last one repeats.
+    pub fn script_ci(&self, states: Vec<CiState>) {
+        *self.ci.lock().expect("ci mutex") = states;
     }
 
     /// A forge that starts with `comments` already on the issue.
@@ -278,5 +358,47 @@ impl Forge for FakeForge {
         }
         self.closed.store(true, Ordering::SeqCst);
         Ok(())
+    }
+
+    fn ci(&self, _sha: &str) -> Result<CiState, ForgeError> {
+        let mut states = self.ci.lock().expect("ci mutex");
+        Ok(match states.len() {
+            0 => CiState::Passed,
+            1 => states[0].clone(),
+            _ => states.remove(0),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(status: &str, conclusion: &str) -> (String, String, String) {
+        ("ci".into(), status.into(), conclusion.into())
+    }
+
+    #[test]
+    fn a_commit_with_no_runs_is_not_a_pass() {
+        assert_eq!(fold_ci(Vec::new()), CiState::NoRuns);
+    }
+
+    #[test]
+    fn an_unfinished_run_is_pending_and_a_finished_failure_fails_first() {
+        assert_eq!(
+            fold_ci(vec![run("completed", "success"), run("in_progress", "")]),
+            CiState::Pending
+        );
+        assert_eq!(
+            fold_ci(vec![run("in_progress", ""), run("completed", "failure")]),
+            CiState::Failed("ci: failure".into())
+        );
+        assert_eq!(
+            fold_ci(vec![
+                run("completed", "success"),
+                run("completed", "skipped")
+            ]),
+            CiState::Passed
+        );
     }
 }

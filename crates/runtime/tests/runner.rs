@@ -412,6 +412,23 @@ impl Fixture {
         children: Vec<(Ulid, Vec<Vec<ProviderEvent>>)>,
         comments: Vec<String>,
     ) -> Self {
+        Self::assemble(children, comments, None)
+    }
+
+    /// A fixture over a workflow the test writes: `files` are paths
+    /// relative to the workflow folder and their text.
+    fn with_workflow(
+        children: Vec<(Ulid, Vec<Vec<ProviderEvent>>)>,
+        files: &[(&str, &str)],
+    ) -> Self {
+        Self::assemble(children, Vec::new(), Some(files))
+    }
+
+    fn assemble(
+        children: Vec<(Ulid, Vec<Vec<ProviderEvent>>)>,
+        comments: Vec<String>,
+        files: Option<&[(&str, &str)]>,
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().join("repo");
         let remote = dir.path().join("remote.git");
@@ -420,24 +437,39 @@ impl Fixture {
         // fixture gives them one to read. See `init_git`.
         std::fs::create_dir_all(&repo).unwrap();
         std::fs::create_dir_all(&remote).unwrap();
-        let mut workflow = WorkflowFile::load_dir(
-            &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../workflows/build"),
-            WorkflowOrigin::Bundled,
-        )
-        .expect("the build workflow loads");
-        // The runner's own tests drive the commit checks. E4 (the gate),
-        // E5 and E7 (the report) read a child's tool calls, and the
-        // fixture's children are scripted replies, not real work: those
-        // three have their tests in `tests/checks.rs`. Everything else is
-        // the bundled workflow, so a test can still assert on its real
-        // ids, markers and templates.
-        let implementer = workflow
-            .workflow
-            .steps
-            .iter_mut()
-            .find(|step| step.id == "implement-alone")
-            .expect("the bundled workflow has the implementer step");
-        implementer.checks = vec!["E1".to_owned(), "E2".to_owned(), "E3".to_owned()];
+        let workflow = match files {
+            Some(files) => {
+                let folder = dir.path().join("workflow");
+                for (rel, text) in files {
+                    let path = folder.join(rel);
+                    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    std::fs::write(&path, text).unwrap();
+                }
+                WorkflowFile::load_dir(&folder, WorkflowOrigin::Project)
+                    .expect("the test's workflow loads")
+            }
+            None => {
+                let mut workflow = WorkflowFile::load_dir(
+                    &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../workflows/build"),
+                    WorkflowOrigin::Bundled,
+                )
+                .expect("the build workflow loads");
+                // The runner's own tests drive the commit checks. E4 (the
+                // gate), E5 and E7 (the report) read a child's tool calls,
+                // and the fixture's children are scripted replies, not real
+                // work: those three have their tests in `tests/checks.rs`.
+                // Everything else is the bundled workflow, so a test can
+                // still assert on its real ids, markers and templates.
+                let implementer = workflow
+                    .workflow
+                    .steps
+                    .iter_mut()
+                    .find(|step| step.id == "implement-alone")
+                    .expect("the bundled workflow has the implementer step");
+                implementer.checks = vec!["E1".to_owned(), "E2".to_owned(), "E3".to_owned()];
+                workflow
+            }
+        };
         init_git(&repo, &remote);
         let initial_head = {
             let out = std::process::Command::new("git")
@@ -3574,4 +3606,416 @@ async fn t18_a_budget_warning_between_the_failure_and_the_send_back_keeps_it() {
         "the warning between the two moves changed nothing: {}",
         prompts[1]
     );
+}
+
+// ---------------------------------------------------------------------------
+// A workflow longer than brief → implement: steps that follow `next`, a
+// person's checkpoint, a push that isn't the last step, and CI.
+// ---------------------------------------------------------------------------
+
+const LOOP_TOML: &str = r###"
+name = "loop-test"
+version = 1
+
+[budget]
+trivial = 3.0
+full = 10.0
+max_raise = 2.0
+
+[[slots]]
+name = "issue"
+kind = "string"
+filled_by = "runner"
+
+[[slots]]
+name = "amendment"
+kind = "string"
+required = false
+filled_by = "runner"
+
+[[steps]]
+id = "check"
+role = "checker"
+profile = "flash"
+template = "templates/check.md"
+marker = "## Check"
+next = "decide"
+
+[[steps]]
+id = "decide"
+role = "person"
+profile = "flash"
+template = "templates/decide.md"
+marker = "## Decide"
+checkpoint = true
+next = "implement"
+
+[[steps]]
+id = "implement"
+role = "implementer"
+profile = "flash"
+template = "templates/implement.md"
+marker = "## Implementation"
+writes = true
+push = true
+ci = true
+install = false
+next = "judge"
+
+[[steps]]
+id = "judge"
+role = "judge"
+profile = "flash"
+template = "templates/judge.md"
+marker = "## Review"
+route_by = "verdict"
+routes = { approve = "done", changes = "ask" }
+"###;
+
+fn loop_files() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("workflow.toml", LOOP_TOML),
+        ("templates/check.md", "check issue {{issue}}\n"),
+        (
+            "templates/decide.md",
+            "read the check on #{{issue}}, then decide\n",
+        ),
+        (
+            "templates/implement.md",
+            "implement issue {{issue}}\n{{#amendment}}the person amended: {{amendment}}\n{{/amendment}}",
+        ),
+        ("templates/judge.md", "judge issue {{issue}}\n"),
+    ]
+}
+
+/// A report with a body under `marker` and the given slots.
+fn reported(marker: &str, slots: Value) -> Value {
+    json!({
+        "status": "done",
+        "body": format!("{marker}\n\nwhat this step found"),
+        "slots": slots,
+        "release_impact": "patch",
+    })
+}
+
+struct Looped {
+    fx: Fixture,
+    check: Ulid,
+    implement: Ulid,
+    judge: Ulid,
+}
+
+fn looped(verdict: &str) -> Looped {
+    let check = Ulid::generate();
+    let implement = Ulid::generate();
+    let judge = Ulid::generate();
+    let fx = Fixture::with_workflow(
+        vec![
+            (check, vec![report("c1", reported("## Check", json!({})))]),
+            (
+                implement,
+                vec![report("i1", reported("## Implementation", json!({})))],
+            ),
+            (
+                judge,
+                vec![report(
+                    "j1",
+                    reported("## Review", json!({ "verdict": verdict })),
+                )],
+            ),
+        ],
+        &loop_files(),
+    );
+    Looped {
+        fx,
+        check,
+        implement,
+        judge,
+    }
+}
+
+fn steve() -> Author {
+    Author::User(UserId("steve".into()))
+}
+
+/// The routes a run took, in order.
+fn routes(events: &[Event]) -> Vec<aigentic_log::RouteTakenPayload> {
+    events
+        .iter()
+        .filter(|event| event.kind == EventKind::RouteTaken)
+        .map(|event| serde_json::from_value(event.payload.clone()).unwrap())
+        .collect()
+}
+
+/// A step with no route follows its `next`; a checkpoint step opens a
+/// gate that offers go, amend and stop and shows its rendered template;
+/// `amend` continues, and its text reaches the later step's prompt.
+#[tokio::test]
+async fn a_step_follows_next_and_a_checkpoint_continues_with_the_amendment() {
+    let l = looped("approve");
+    let fx = &l.fx;
+    let mut runner = fx.runner();
+
+    let paused = drive(fx, &mut runner).await;
+    assert_eq!(
+        paused,
+        Advanced::WaitingHuman {
+            gate: "decide".into()
+        },
+        "the check's `next` led to the checkpoint"
+    );
+    let events = fx.lead_events();
+    let taken = routes(&events);
+    assert_eq!(taken.len(), 1, "one route: check → decide");
+    assert_eq!(
+        (taken[0].branch.as_str(), taken[0].taken.as_str()),
+        ("next", "decide")
+    );
+    let asked = checkpoints(&events);
+    let gate = asked.last().unwrap();
+    assert_eq!(gate.options, vec!["go", "amend", "stop"]);
+    assert_eq!(
+        gate.shown,
+        vec![format!("read the check on #{}, then decide\n", fx.issue())],
+        "the gate shows the checkpoint's rendered template"
+    );
+    assert!(
+        step_started(&events).iter().all(|s| s.step != "decide"),
+        "a checkpoint runs no child"
+    );
+
+    runner
+        .answer(
+            "decide",
+            aigentic_log::CheckpointAnswer::Amend,
+            Some("use the small fix".into()),
+            steve(),
+        )
+        .unwrap();
+    let ended = drive(fx, &mut runner).await;
+    assert_eq!(
+        ended,
+        Advanced::Finished {
+            outcome: aigentic_log::RunOutcome::Closed
+        }
+    );
+    let prompts = child_prompts(fx, l.implement);
+    assert!(
+        prompts[0].contains("the person amended: use the small fix"),
+        "the amendment reaches the next step: {}",
+        prompts[0]
+    );
+    let check_prompt = &child_prompts(fx, l.check)[0];
+    assert!(!check_prompt.contains("amended"), "and only later steps");
+
+    let events = fx.lead_events();
+    let pushed = pushed_events(&events);
+    assert_eq!(pushed.len(), 1, "the implementer pushed once");
+    assert_eq!(
+        pushed[0].installed, None,
+        "`install = false` installs nothing"
+    );
+    let taken = routes(&events);
+    let path: Vec<(&str, &str)> = taken
+        .iter()
+        .map(|r| (r.branch.as_str(), r.taken.as_str()))
+        .collect();
+    assert_eq!(
+        path,
+        vec![
+            ("next", "decide"),
+            ("next", "implement"),
+            ("next", "judge"),
+            ("verdict", "done"),
+        ],
+        "every hop is a logged route"
+    );
+    assert!(
+        !child_prompts(fx, l.judge).is_empty(),
+        "the judge ran after the push"
+    );
+    assert!(!fx.forge.is_closed(), "a push before `done` closes nothing");
+}
+
+/// `go` continues a checkpoint with no amendment: the later prompt has
+/// none. `stop` at a checkpoint ends the run.
+#[tokio::test]
+async fn go_continues_and_stop_ends_at_a_checkpoint() {
+    let l = looped("approve");
+    let fx = &l.fx;
+    let mut runner = fx.runner();
+    drive(fx, &mut runner).await;
+    runner
+        .answer("decide", aigentic_log::CheckpointAnswer::Go, None, steve())
+        .unwrap();
+    drive(fx, &mut runner).await;
+    assert!(
+        !child_prompts(fx, l.implement)[0].contains("amended"),
+        "no amendment, no section"
+    );
+
+    let l = looped("approve");
+    let fx = &l.fx;
+    let mut runner = fx.runner();
+    drive(fx, &mut runner).await;
+    runner
+        .answer(
+            "decide",
+            aigentic_log::CheckpointAnswer::Stop,
+            None,
+            steve(),
+        )
+        .unwrap();
+    assert_eq!(
+        drive(fx, &mut runner).await,
+        Advanced::Finished {
+            outcome: aigentic_log::RunOutcome::Stopped
+        }
+    );
+    assert!(!fx.child_exists(l.implement), "nothing ran after stop");
+}
+
+/// A judge that routes to `ask` hands the run to a person.
+#[tokio::test]
+async fn a_judge_that_wants_changes_asks() {
+    let l = looped("changes");
+    let fx = &l.fx;
+    let mut runner = fx.runner();
+    drive(fx, &mut runner).await;
+    runner
+        .answer("decide", aigentic_log::CheckpointAnswer::Go, None, steve())
+        .unwrap();
+    assert_eq!(
+        drive(fx, &mut runner).await,
+        Advanced::WaitingHuman {
+            gate: "route".into()
+        }
+    );
+}
+
+fn quick_ci() -> aigentic_runtime::runner::CiWait {
+    aigentic_runtime::runner::CiWait {
+        interval: std::time::Duration::from_millis(1),
+        grace: std::time::Duration::from_millis(50),
+        timeout: std::time::Duration::from_millis(200),
+    }
+}
+
+/// CI that goes red after pending is a gate, and the judge never runs.
+/// A runner's own gate takes `stop` only.
+#[tokio::test]
+async fn red_ci_after_the_push_is_a_gate() {
+    use aigentic_runtime::runner::CiState;
+    let l = looped("approve");
+    let fx = &l.fx;
+    fx.forge.script_ci(vec![
+        CiState::Pending,
+        CiState::Failed("ci: failure".into()),
+    ]);
+    let mut runner = fx.runner().with_ci_wait(quick_ci());
+    drive(fx, &mut runner).await;
+    runner
+        .answer("decide", aigentic_log::CheckpointAnswer::Go, None, steve())
+        .unwrap();
+    assert_eq!(
+        drive(fx, &mut runner).await,
+        Advanced::WaitingHuman {
+            gate: "ci_failed".into()
+        }
+    );
+    let shown = gate_shown(&fx.lead_events());
+    assert!(shown.iter().any(|line| line == "ci: failure"), "{shown:?}");
+    assert!(!fx.child_exists(l.judge), "the judge never ran");
+    runner
+        .answer(
+            "ci_failed",
+            aigentic_log::CheckpointAnswer::Go,
+            None,
+            steve(),
+        )
+        .unwrap();
+    assert!(
+        matches!(runner.advance().await, Err(RunnerError::SliceTwo { .. })),
+        "go at a runner's own gate is refused"
+    );
+}
+
+/// A commit no CI run names past the grace is a gate, and so is CI that
+/// never finishes.
+#[tokio::test]
+async fn missing_or_slow_ci_is_a_gate() {
+    use aigentic_runtime::runner::CiState;
+    for (states, gate) in [
+        (vec![CiState::NoRuns], "ci_missing"),
+        (vec![CiState::Pending], "ci_timeout"),
+    ] {
+        let l = looped("approve");
+        let fx = &l.fx;
+        fx.forge.script_ci(states);
+        let mut runner = fx.runner().with_ci_wait(quick_ci());
+        drive(fx, &mut runner).await;
+        runner
+            .answer("decide", aigentic_log::CheckpointAnswer::Go, None, steve())
+            .unwrap();
+        assert_eq!(
+            drive(fx, &mut runner).await,
+            Advanced::WaitingHuman { gate: gate.into() }
+        );
+    }
+}
+
+/// Rebuild the runner after every lead event of a looped run (answered
+/// at its checkpoint): each rebuilt runner makes the full run's next move
+/// once, with the same payload.
+#[tokio::test]
+async fn a_looped_run_rebuilds_after_every_event() {
+    let l = looped("approve");
+    let fx = &l.fx;
+    let mut runner = fx.runner();
+    let mut snapshots = vec![snapshot(fx)];
+    let terminal = loop {
+        match runner.advance().await.expect("the run advances") {
+            Advanced::Moved => snapshots.push(snapshot(fx)),
+            Advanced::WaitingHuman { gate } if gate == "decide" => {
+                snapshots.push(snapshot(fx));
+                runner
+                    .answer("decide", aigentic_log::CheckpointAnswer::Go, None, steve())
+                    .unwrap();
+                snapshots.push(snapshot(fx));
+            }
+            other => break other,
+        }
+    };
+    let full = fx.lead_events();
+    assert_eq!(
+        terminal,
+        Advanced::Finished {
+            outcome: aigentic_log::RunOutcome::Closed
+        }
+    );
+    for k in 1..full.len() {
+        // The person's answer is not a runner move: a rebuilt runner
+        // waiting at the checkpoint writes nothing.
+        if full[k].kind == EventKind::CheckpointAnswered {
+            continue;
+        }
+        let snapshot = snapshots
+            .iter()
+            .find(|s| s.lead.len() == k)
+            .expect("a snapshot per lead length");
+        fx.restore(snapshot);
+        fx.rewind_forge(snapshot);
+        let mut rebuilt = fx.runner();
+        rebuilt
+            .advance()
+            .await
+            .expect("the rebuilt runner advances");
+        let after = fx.lead_events();
+        assert_eq!(after.len(), k + 1, "prefix {k}: one event appended");
+        assert_eq!(after[k].kind, full[k].kind, "prefix {k}: the same move");
+        assert_eq!(
+            after[k].payload, full[k].payload,
+            "prefix {k}: with the same payload"
+        );
+    }
 }

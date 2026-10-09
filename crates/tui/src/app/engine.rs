@@ -865,6 +865,7 @@ impl ClientRepl {
                 }
             }
             Command::Build(arg) => self.build(arg, out).await,
+            Command::Answer(arg) => self.answer_checkpoint(arg, out).await,
             // The raw stop reason stays off the transcript (issue #22):
             // `/why` fetches it, engine-local, no daemon round-trip.
             Command::Why => out.line(&why_line(self.last_stop.as_deref())),
@@ -1199,11 +1200,13 @@ impl ClientRepl {
     /// event appended in between is processed after the backlog and
     /// skipped by `printed`.
     async fn build(&mut self, arg: Option<&str>, out: &mut dyn Printer) {
-        let issue = arg
-            .map(str::trim)
+        let mut words = arg.unwrap_or("").split_whitespace();
+        let issue = words
+            .next()
             .and_then(|a| a.parse::<u64>().ok())
             .filter(|n| *n > 0);
-        let Some(issue) = issue else {
+        let workflow = words.next().map(str::to_owned);
+        let Some(issue) = issue.filter(|_| words.next().is_none()) else {
             out.line("[usage: /build <issue number>]");
             return;
         };
@@ -1224,7 +1227,7 @@ impl ClientRepl {
             .request(Request::Build {
                 project,
                 issue,
-                workflow: None,
+                workflow,
             })
             .await;
         match r {
@@ -1291,7 +1294,7 @@ impl ClientRepl {
                 if let Ok(p) =
                     serde_json::from_value::<CheckpointAskedPayload>(event.payload.clone())
                 {
-                    let menu = Menu::checkpoint(&p.gate, &p.shown);
+                    let menu = Menu::checkpoint(&p.gate, &p.shown, &p.options);
                     out.prompt(&menu);
                     self.checkpoint = Some((lead, p.gate, menu));
                 }
@@ -1347,6 +1350,47 @@ impl ClientRepl {
     /// The followed run's checkpoint prompt, while it is up.
     pub fn checkpoint(&self) -> Option<&Menu> {
         self.checkpoint.as_ref().map(|(_, _, menu)| menu)
+    }
+
+    /// `/answer go`, `/answer amend <text>` or `/answer stop`: answer the
+    /// followed run's open checkpoint by name. The daemon refuses an
+    /// answer the gate didn't offer, and the prompt stays up then.
+    async fn answer_checkpoint(&mut self, arg: &str, out: &mut dyn Printer) {
+        let Some((lead, gate)) = self
+            .checkpoint
+            .as_ref()
+            .map(|(lead, gate, _)| (*lead, gate.clone()))
+        else {
+            out.line("[no checkpoint is waiting in this REPL: /build <n> follows a run]");
+            return;
+        };
+        let (word, rest) = arg.split_once(char::is_whitespace).unwrap_or((arg, ""));
+        let (answer, amendment) = match (word, rest.trim()) {
+            ("go", "") => (aigentic_api::CheckpointAnswer::Go, None),
+            ("stop", "") => (aigentic_api::CheckpointAnswer::Stop, None),
+            ("amend", text) if !text.is_empty() => {
+                (aigentic_api::CheckpointAnswer::Amend, Some(text.to_owned()))
+            }
+            _ => {
+                out.line("[usage: /answer go | /answer amend <text> | /answer stop]");
+                return;
+            }
+        };
+        let r = self
+            .request(Request::AnswerCheckpoint {
+                lead,
+                gate: gate.clone(),
+                answer,
+                amendment,
+            })
+            .await;
+        match r {
+            Response::Ok => {
+                self.checkpoint = None;
+                out.line(&format!("[answered {gate}: {word}]"));
+            }
+            other => self.show(other, "", out),
+        }
     }
 
     /// A keyed answer to the checkpoint prompt: stop the run, or leave it
@@ -6094,12 +6138,13 @@ mod tests {
         })
     }
 
-    /// A `checkpoint_asked` payload with one shown line.
+    /// A `checkpoint_asked` payload with one shown line, as the runner
+    /// writes for one of its own gates: `stop` is its only answer.
     fn checkpoint_asked(gate: &str) -> serde_json::Value {
         serde_json::json!({
             "gate": gate,
             "shown": ["plan ready"],
-            "options": ["go", "amend", "stop"],
+            "options": ["stop"],
         })
     }
 
@@ -6150,6 +6195,55 @@ mod tests {
                 .any(|r| matches!(r, Request::Build { .. })),
             "no Build was sent: {:?}",
             lead.daemon.requests()
+        );
+    }
+
+    /// `/build <n> <workflow>` names the workflow to the daemon; a third
+    /// word is a usage error.
+    #[tokio::test]
+    async fn build_names_the_workflow_when_one_is_given() {
+        let mut lead = Lead::start(Ulid::generate(), Vec::new()).await;
+        lead.line("/build 58 loop").await;
+        assert!(
+            lead.daemon.requests().iter().any(|r| matches!(
+                r,
+                Request::Build { issue: 58, workflow: Some(w), .. } if w == "loop"
+            )),
+            "the workflow went with the build: {:?}",
+            lead.daemon.requests()
+        );
+
+        let mut lead = Lead::start(Ulid::generate(), Vec::new()).await;
+        lead.line("/build 58 loop extra").await;
+        assert_eq!(
+            lead.lines(),
+            vec!["[usage: /build <issue number>]".to_owned()]
+        );
+    }
+
+    /// `/answer` parses its word; with no checkpoint up it sends nothing
+    /// and says so.
+    #[tokio::test]
+    async fn answer_parses_and_needs_a_checkpoint() {
+        assert_eq!(parse_line("/answer go", &[]), Command::Answer("go"));
+        assert_eq!(
+            parse_line("/answer amend keep it small", &[]),
+            Command::Answer("amend keep it small")
+        );
+        assert!(HELP.contains("/answer go"), "the help names it: {HELP}");
+        let mut lead = Lead::start(Ulid::generate(), Vec::new()).await;
+        lead.line("/answer go").await;
+        assert_eq!(
+            lead.lines(),
+            vec!["[no checkpoint is waiting in this REPL: /build <n> follows a run]".to_owned()]
+        );
+        assert!(
+            !lead
+                .daemon
+                .requests()
+                .iter()
+                .any(|r| matches!(r, Request::AnswerCheckpoint { .. })),
+            "nothing was sent"
         );
     }
 
@@ -6229,8 +6323,12 @@ mod tests {
         let expected_gate = crate::run_view::render(&backlog[1]).unwrap();
         // The prompt prints through `Menu::plain()`, so its lines come
         // from the menu the engine built, not from here.
-        let prompt =
-            crate::app::menu::Menu::checkpoint("route", &["plan ready".to_owned()]).plain();
+        let prompt = crate::app::menu::Menu::checkpoint(
+            "route",
+            &["plan ready".to_owned()],
+            &["stop".to_owned()],
+        )
+        .plain();
         assert_eq!(
             prompt[prompt.len() - 2..],
             [
@@ -7935,7 +8033,11 @@ mod tests {
         );
         // A gate up: the id of the call it waits on, and the menu drawn.
         repl.prompted = Some("c1".to_owned());
-        repl.menu = Some(Menu::checkpoint("c1", &["ls".to_owned()]));
+        repl.menu = Some(Menu::checkpoint(
+            "c1",
+            &["ls".to_owned()],
+            &["stop".to_owned()],
+        ));
 
         let mut out = Recording::default();
         repl.handle_line("/new", &mut out).await;
