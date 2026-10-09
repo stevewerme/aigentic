@@ -6,19 +6,16 @@ so the rule can be judged, not just obeyed. The `brief`, `plan-check` and
 
 ## How work is split
 
-- **Plan → implement → review** for anything larger than a one-line fix:
-  a planner (profile `kimi`) posts `## Plan` on the issue, an implementer
-  (profile `flash`) follows it, a reviewer (`kimi`) posts `## Review` and
-  closes the issue. Issue comments are the handoff; every step starts in a
-  fresh thread. Trivial fixes: implementer alone.
+- **The loop as run now is in `build-loop.md`.** Spec (supervisor) →
+  spec check → spec v2 merge → implementer → judge → fix, every step a
+  fresh thread on `flash`, handing off through issue comments. The bullets
+  below are the history that shaped it: the planner/verifier split and the
+  Kimi roles were retired once a Flash judge that proves by running beat a
+  Kimi judge that read (#57).
 - **Cost lives in the loop, not the planner.** The model that runs the loop
   pays for ~95% of calls, mostly re-reading its cached context. Put the
   cheap model on the many calls, the strong one on the few. On #38/#39 the
   implement step cost $0.20–0.41 on Flash; the same tokens on GLM cost 3×.
-- **Review is split: verify on Flash, judge on Kimi.** The #43 review ran
-  tests and pty checks on Kimi for $6.86, 39% of the cycle. A verifier
-  (flash) posts `## Verification` with outputs and dumps; a judge (kimi)
-  reads evidence and diff and gives the verdict in a handful of calls.
 - **Every planned test is accounted for.** Flash dropped planned tests
   silently on #37 and #43. The implementer's `## Implementation` carries a
   ledger (T1, T2, … landed or not, with a reason); a planned test missing
@@ -220,10 +217,11 @@ so the rule can be judged, not just obeyed. The `brief`, `plan-check` and
   mutation copies each built the whole workspace into their own
   `/tmp/<name>-target`, a few GB each, and nothing deleted them: on
   2026-10-07, 76 GB of them left 2.9 GB free while an implementer was
-  compiling. Use **one** shared `CARGO_TARGET_DIR=/tmp/aigentic-probes-target`
-  for every probe and mutation copy, and before posting the report delete
-  what the run created in `/tmp` (its probe crates, mutation copies and
-  `/tmp/aigentic-probes-target`). A gate in the repository uses its own
+  compiling. Give **each tree its own** `CARGO_TARGET_DIR` under `/tmp` (a probe
+  crate, a base checkout, each mutation copy): on #124 one target dir
+  shared across different trees ran stale binaries (23 bogus `E0061`
+  errors, a copy that listed no tests). Before posting the report, delete
+  everything the run created in `/tmp`, target dirs included. A gate in the repository uses its own
   `target/` and adds nothing to `/tmp`.
 - If the full-workspace `cargo test` stalls in `crates/server/tests/runs.rs`
   inside the REPL (#103), don't rerun it: run `cargo test --no-fail-fast -p
