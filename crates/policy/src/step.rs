@@ -26,15 +26,18 @@ use crate::Outcome;
 use crate::shell::{SegRead, segment_reads};
 
 /// The command entries, as word prefixes of a bash segment's effective
-/// words: `(label, words, pushes)`.
-const COMMANDS: &[(&str, &[&str], bool)] = &[
-    ("git push", &["git", "push"], true),
-    ("git rebase", &["git", "rebase"], false),
-    ("git reset", &["git", "reset"], false),
-    ("git checkout --", &["git", "checkout", "--"], false),
-    ("git stash", &["git", "stash"], false),
-    ("git clean", &["git", "clean"], false),
-    ("git add -A", &["git", "add", "-A"], false),
+/// words: `(label, words, reason)`. `git commit` and `git add` are for a
+/// step that only reads and reports; a writing step commits.
+const COMMANDS: &[(&str, &[&str], &str)] = &[
+    ("git push", &["git", "push"], PUSH_REASON),
+    ("git rebase", &["git", "rebase"], TREE_REASON),
+    ("git reset", &["git", "reset"], TREE_REASON),
+    ("git checkout --", &["git", "checkout", "--"], TREE_REASON),
+    ("git stash", &["git", "stash"], TREE_REASON),
+    ("git clean", &["git", "clean"], TREE_REASON),
+    ("git add -A", &["git", "add", "-A"], TREE_REASON),
+    ("git commit", &["git", "commit"], READ_ONLY_REASON),
+    ("git add", &["git", "add"], READ_ONLY_REASON),
 ];
 
 /// The one symbolic entry: the `.env` file, read or written.
@@ -48,6 +51,9 @@ const PUSH_REASON: &str =
 
 const TREE_REASON: &str =
     "the tree is the runner's evidence; commit your work and call finish_step";
+
+const READ_ONLY_REASON: &str =
+    "this step reads and reports; it changes nothing in git, so call finish_step with your report";
 
 const ENV_REASON: &str =
     "a step thread never reads or writes .env (#41); the key must not reach the log (AGENTS.md)";
@@ -85,7 +91,7 @@ impl std::error::Error for DenyParseError {}
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StepOverlay {
     /// The command entries the list names, in the list's order.
-    commands: Vec<(&'static str, &'static [&'static str], bool)>,
+    commands: Vec<(&'static str, &'static [&'static str], &'static str)>,
     /// Whether the list carries the `.env` entry.
     copy_env: bool,
 }
@@ -98,10 +104,10 @@ impl StepOverlay {
             // Written either way — `git  push`, ` git add -A ` — the
             // entry means the same command.
             let text = entry.split_whitespace().collect::<Vec<_>>().join(" ");
-            if let Some(&(label, words, pushes)) =
+            if let Some(&(label, words, reason)) =
                 COMMANDS.iter().find(|(label, _, _)| *label == text)
             {
-                overlay.commands.push((label, words, pushes));
+                overlay.commands.push((label, words, reason));
             } else if text == COPY_ENV {
                 overlay.copy_env = true;
             } else {
@@ -127,8 +133,8 @@ impl StepOverlay {
             if reads.iter().any(|read| read.unreadable) {
                 return Some(deny(UNREADABLE, UNREADABLE_REASON));
             }
-            if let Some((label, pushes)) = self.command(&reads) {
-                return Some(deny(label, if pushes { PUSH_REASON } else { TREE_REASON }));
+            if let Some((label, reason)) = self.command(&reads) {
+                return Some(deny(label, reason));
             }
             if self.copy_env && env_in_bash(&reads) {
                 return Some(deny(COPY_ENV, ENV_REASON));
@@ -145,19 +151,19 @@ impl StepOverlay {
     /// the earlier entry. A segment matches when its effective words
     /// start with the entry's words, so `git push` covers
     /// `git push --force` and never `git pushy`.
-    fn command(&self, reads: &[SegRead]) -> Option<(&'static str, bool)> {
-        let mut best: Option<(&'static str, usize, bool)> = None;
-        for (label, words, pushes) in &self.commands {
+    fn command(&self, reads: &[SegRead]) -> Option<(&'static str, &'static str)> {
+        let mut best: Option<(&'static str, usize, &'static str)> = None;
+        for (label, words, reason) in &self.commands {
             let matched = reads.iter().any(|read| starts_with(&read.words, words));
             let better = match best {
                 None => true,
                 Some((_, len, _)) => words.len() > len,
             };
             if matched && better {
-                best = Some((label, words.len(), *pushes));
+                best = Some((label, words.len(), *reason));
             }
         }
-        best.map(|(label, _, pushes)| (label, pushes))
+        best.map(|(label, _, reason)| (label, reason))
     }
 }
 
@@ -411,6 +417,33 @@ mod tests {
             "the example file is not denied without the overlay"
         );
         assert_eq!(overlay.decide(&call), None);
+    }
+
+    /// A step that only reports may not commit or stage anything, and its
+    /// refusal says so rather than asking it to commit. The longer entry
+    /// still wins where both are listed.
+    #[test]
+    fn a_reporting_step_may_not_commit_or_stage() {
+        let overlay = policy_with(&["git commit", "git add", "git add -A"]);
+        for (command, rule) in [
+            ("git commit -m x", "step deny git commit"),
+            ("git add src/lib.rs", "step deny git add"),
+            ("git add -A", "step deny git add -A"),
+        ] {
+            match overlay.decide(&bash(command)) {
+                Some(Outcome::Deny { rule: got, reason }) => {
+                    assert_eq!(got, rule, "{command}");
+                    assert_eq!(
+                        reason.contains("reads and reports"),
+                        rule != "step deny git add -A",
+                        "{command}: {reason}"
+                    );
+                }
+                other => panic!("{command}: {other:?}"),
+            }
+        }
+        assert_eq!(overlay.decide(&bash("git commit-tree x")), None);
+        assert_eq!(overlay.decide(&bash("git log")), None);
     }
 
     /// Anything outside the grammar is named where the overlay is built.

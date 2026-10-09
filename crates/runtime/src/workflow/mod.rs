@@ -416,6 +416,9 @@ impl WorkflowFile {
                     ));
                 }
             }
+            if let Err(err) = aigentic_policy::StepOverlay::parse(&step.deny) {
+                return Err(bad(&err.to_string()));
+            }
             if step.ci && !step.push {
                 return Err(bad("`ci` waits on a push, so it needs `push`"));
             }
@@ -1044,7 +1047,9 @@ pub(crate) mod tests {
 
     /// A checkpoint runs no child: it may not write, check, push or
     /// route, it needs a `next`, and its id may not be a runner's gate.
-    /// `ci` waits on a push, so it needs one. A routing step never
+    /// `ci` waits on a push, so it needs one. A deny list the step
+    /// overlay can't parse is refused at load, not when the step starts.
+    /// A routing step never
     /// reaches the handover, so it may not check or push.
     #[test]
     fn contradictory_step_fields_are_refused() {
@@ -1064,6 +1069,10 @@ pub(crate) mod tests {
             ("decide", "checkpoint = true\n"),
             ("route", "checkpoint = true\nnext = \"done\"\n"),
             ("implement", "ci = true\nnext = \"done\"\n"),
+            (
+                "implement",
+                "deny = [\"git obliterate\"]\nnext = \"done\"\n",
+            ),
             ("implement", "route_by = \"size\"\npush = true\n"),
             ("implement", "route_by = \"size\"\nchecks = [\"E1\"]\n"),
         ];
