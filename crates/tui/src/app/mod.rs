@@ -1946,7 +1946,7 @@ mod tests {
             );
         }
 
-        let menu = Menu::checkpoint("route", &["plan ready".to_owned()]);
+        let menu = Menu::checkpoint("route", &["plan ready".to_owned()], &["stop".to_owned()]);
         let drawn = text(&block_lines(&menu, 40));
         // The first row carries the selection marker; the labels are the
         // picks, and the title and body are the gate's.

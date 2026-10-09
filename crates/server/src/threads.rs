@@ -1396,6 +1396,41 @@ impl ThreadTable {
                 )));
             }
         }
+        // A gate takes only the answers its ask offered: a checkpoint step
+        // offers go, amend and stop; a gate the runner raised offers stop.
+        let word = match answer {
+            CheckpointAnswer::Go => "go",
+            CheckpointAnswer::Amend => "amend",
+            CheckpointAnswer::Stop => "stop",
+        };
+        let offered: Vec<String> = log
+            .events()
+            .iter()
+            .rev()
+            .find(|event| event.kind == aigentic_runtime::aigentic_core::EventKind::CheckpointAsked)
+            .and_then(|event| {
+                serde_json::from_value::<aigentic_runtime::aigentic_log::CheckpointAskedPayload>(
+                    event.payload.clone(),
+                )
+                .ok()
+            })
+            .map(|asked| asked.options)
+            .unwrap_or_default();
+        if !offered.iter().any(|option| option == word) {
+            return Err(ThreadError::Refused(format!(
+                "`{gate}` takes {}, not `{word}`",
+                offered.join(" or ")
+            )));
+        }
+        if answer == CheckpointAnswer::Amend
+            && amendment
+                .as_deref()
+                .is_none_or(|text| text.trim().is_empty())
+        {
+            return Err(ThreadError::Refused(
+                "`amend` needs the amendment's text".into(),
+            ));
+        }
         drop(log);
         let world = self.run_world_for(&project, lead)?;
         let tx = self.claim_or_attach(lead, &world)?;

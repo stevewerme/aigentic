@@ -244,12 +244,18 @@ impl Menu {
     /// lead is waiting at, and the two things a client can do about it
     /// today. `Stop the run` is the one answer the server takes; #59
     /// adds `go` and `amend`.
-    pub fn checkpoint(gate: &str, shown: &[String]) -> Self {
+    pub fn checkpoint(gate: &str, shown: &[String], options: &[String]) -> Self {
+        // A gate that takes `go` is a workflow's own checkpoint: it is
+        // continued by a typed `/answer`, since `amend` needs text.
+        let note = options
+            .iter()
+            .any(|option| option == "go")
+            .then(|| "continue: /answer go · with changes: /answer amend <text>".to_owned());
         Self {
             kind: Kind::Checkpoint,
             title: format!("checkpoint {gate}"),
             body: shown.join("\n"),
-            note: None,
+            note,
             rows: vec![
                 Row {
                     label: "Stop the run".into(),

@@ -169,7 +169,14 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
             .join(format!("aigentic-gate-{}.log", run.issue))
             .display()
             .to_string();
-        Ok(BTreeMap::from([
+        let mut slots = BTreeMap::new();
+        // A person's `amend` at a checkpoint reaches every later step; the
+        // latest one wins, and with none the slot is absent, so a template
+        // shows it only inside its own section.
+        if let Some(text) = self.latest_amendment() {
+            slots.insert("amendment".to_owned(), Value::String(text));
+        }
+        slots.extend(BTreeMap::from([
             ("issue".to_owned(), Value::String(run.issue.to_string())),
             (
                 "title".to_owned(),
@@ -189,7 +196,26 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
                 "max_raise".to_owned(),
                 Value::String(budget.max_raise.to_string()),
             ),
-        ]))
+        ]));
+        Ok(slots)
+    }
+
+    /// The text of the latest `amend` answer in the lead log, if any.
+    fn latest_amendment(&self) -> Option<String> {
+        self.log()
+            .events()
+            .iter()
+            .rev()
+            .filter(|event| event.kind == aigentic_core::EventKind::CheckpointAnswered)
+            .filter_map(|event| {
+                serde_json::from_value::<aigentic_log::CheckpointAnsweredPayload>(
+                    event.payload.clone(),
+                )
+                .ok()
+            })
+            .find(|answer| answer.answer == aigentic_log::CheckpointAnswer::Amend)
+            .and_then(|answer| answer.amendment)
+            .filter(|text| !text.trim().is_empty())
     }
 
     /// What the steps before `step` reported, in the workflow's order, read

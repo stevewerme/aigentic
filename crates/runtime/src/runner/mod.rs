@@ -13,7 +13,7 @@ pub mod host;
 pub mod install;
 pub mod slots;
 
-pub use forge::{FakeForge, Forge, ForgeError, GhForge, IssueView};
+pub use forge::{CiState, FakeForge, Forge, ForgeError, GhForge, IssueView, fold_ci};
 pub use git::{GitRepo, Repo, RepoError};
 pub use host::RunnerHost;
 pub use install::{CargoInstaller, FakeInstaller, Installer};
@@ -224,6 +224,27 @@ impl FailedCheck {
     }
 }
 
+/// How long the runner waits on CI after a `ci` step's push. Its fields
+/// are: how often
+/// it asks, how long a commit may show no run before that is a gate,
+/// and how long it waits in all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CiWait {
+    pub interval: std::time::Duration,
+    pub grace: std::time::Duration,
+    pub timeout: std::time::Duration,
+}
+
+impl Default for CiWait {
+    fn default() -> Self {
+        Self {
+            interval: std::time::Duration::from_secs(20),
+            grace: std::time::Duration::from_secs(180),
+            timeout: std::time::Duration::from_secs(1800),
+        }
+    }
+}
+
 /// One run's lead thread: the log it appends to, and the seams it drives
 /// children and the forge through.
 pub struct Runner<F: Forge, H: RunnerHost, R: Repo> {
@@ -235,6 +256,7 @@ pub struct Runner<F: Forge, H: RunnerHost, R: Repo> {
     workflow: LoadedWorkflow,
     repo: R,
     lock: Option<WriteGuard>,
+    ci_wait: CiWait,
 }
 
 impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
@@ -263,7 +285,14 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
             workflow,
             repo,
             lock: None,
+            ci_wait: CiWait::default(),
         })
+    }
+
+    /// Replace how long a `ci` step's push waits on CI.
+    pub fn with_ci_wait(mut self, wait: CiWait) -> Self {
+        self.ci_wait = wait;
+        self
     }
 
     /// The lead log, for a caller that wants to read it back.
@@ -329,7 +358,7 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
                 attempt,
                 outcome,
             } => self.checks_done(&step, attempt, outcome).await,
-            NextMove::Pushed { step, .. } => self.after_pushed(&step),
+            NextMove::Pushed { step, .. } => self.after_pushed(&step).await,
             NextMove::Answered { gate, answer, .. } => self.answered(&gate, answer),
         }
     }
@@ -415,6 +444,9 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
         child: Option<Ulid>,
     ) -> Result<Advanced, RunnerError> {
         let step = self.step(step_id)?.clone();
+        if step.checkpoint {
+            return self.open_checkpoint(&step);
+        }
         // The prompt is decided before any child exists, so a slot the
         // brief never reported stops the run here, not mid-step.
         let message = match self.attempt_message(&step, attempt) {
@@ -634,10 +666,7 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
             if step.push || !step.checks.is_empty() {
                 return self.handover(step, attempt);
             }
-            if step.next.as_deref() == Some("done") {
-                return self.finish(RunOutcome::Closed);
-            }
-            return Ok(Advanced::Moved);
+            return self.follow_next(step, attempt);
         };
         let slot = |name: &str| {
             report
@@ -666,16 +695,9 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
                 ],
             );
         };
-        let Some(budget) = slot("budget").as_ref().and_then(budget_usd) else {
-            return self.escalate(
-                "route_escalate",
-                vec![
-                    step.id.clone(),
-                    attempt.to_string(),
-                    "the report has no numeric `budget` slot".into(),
-                ],
-            );
-        };
+        // A route carries the budget the routing step reported, when it
+        // reported one; a step that sizes nothing has none to carry.
+        let budget = slot("budget").as_ref().and_then(budget_usd);
         self.append(
             EventKind::RouteTaken,
             &RouteTakenPayload {
@@ -684,10 +706,62 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
                 taken,
                 preconditions: Vec::new(),
                 fallback_reason: None,
-                budget_usd: Some(budget),
+                budget_usd: budget,
             },
         )?;
         Ok(Advanced::Moved)
+    }
+
+    /// A step with no route continues to its `next`: `done` ends the run,
+    /// a step id is written as a `route_taken` so replay follows it, and
+    /// a missing `next` is a gate, never a silent stop.
+    fn follow_next(&mut self, step: &Step, attempt: u32) -> Result<Advanced, RunnerError> {
+        match step.next.as_deref() {
+            Some("done") => self.finish(RunOutcome::Closed),
+            Some(next) => {
+                self.append(
+                    EventKind::RouteTaken,
+                    &RouteTakenPayload {
+                        branch: "next".into(),
+                        proposed: next.to_owned(),
+                        taken: next.to_owned(),
+                        preconditions: Vec::new(),
+                        fallback_reason: None,
+                        budget_usd: None,
+                    },
+                )?;
+                Ok(Advanced::Moved)
+            }
+            None => self.escalate(
+                "no_next_step",
+                vec![
+                    step.id.clone(),
+                    attempt.to_string(),
+                    format!("`{}` names no `next` and no route", step.id),
+                ],
+            ),
+        }
+    }
+
+    /// Open a checkpoint step: show its rendered template and wait for
+    /// `go`, `amend` or `stop`. Writing the ask is the whole move, so a
+    /// crash before it repeats it and a crash after it waits.
+    fn open_checkpoint(&mut self, step: &Step) -> Result<Advanced, RunnerError> {
+        let shown = match self.attempt_message(step, 1) {
+            Ok(text) => text,
+            Err(err @ RunnerError::Workflow(_)) => {
+                return self.escalate(
+                    "render_failed",
+                    vec![step.id.clone(), "1".into(), err.to_string()],
+                );
+            }
+            Err(other) => return Err(other),
+        };
+        self.escalate_with(
+            &step.id.clone(),
+            vec![shown],
+            vec!["go".into(), "amend".into(), "stop".into()],
+        )
     }
 
     // -- the writing step's handover: checks, push, install, close ---------
@@ -842,14 +916,19 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
             }
             self.repo.push(&branch)?;
         }
-        let installed = self.installer.install(&self.repo)?;
-        let short = &head[..head.len().min(12)];
-        if !installed.contains(short) {
-            return self.escalate(
-                "install_mismatch",
-                vec![step.id.clone(), installed, head.clone()],
-            );
-        }
+        let installed = if step.install {
+            let installed = self.installer.install(&self.repo)?;
+            let short = &head[..head.len().min(12)];
+            if !installed.contains(short) {
+                return self.escalate(
+                    "install_mismatch",
+                    vec![step.id.clone(), installed, head.clone()],
+                );
+            }
+            Some(installed)
+        } else {
+            None
+        };
         let commits = match read_commits_between(self.repo.root(), &start.head, "HEAD") {
             Ok(commits) => commits
                 .into_iter()
@@ -871,16 +950,18 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
                 commits,
                 ref_before: start.remote.clone(),
                 ref_after: head,
-                installed: Some(installed),
+                installed,
             },
         )?;
         Ok(Advanced::Moved)
     }
 
-    /// After the push is written: close the issue when this step is the
-    /// last, and end the run. Both are safe to repeat — a rebuild re-reads
+    /// After the push is written: wait for CI when the step asks, then
+    /// continue to `next`, or close the issue and end the run when `next`
+    /// is `done`. Every part is safe to repeat: CI is read again, a
+    /// `route_taken` is the next move's own record, and a rebuild re-reads
     /// the issue's comments and never posts the closing comment twice.
-    fn after_pushed(&mut self, step_id: &str) -> Result<Advanced, RunnerError> {
+    async fn after_pushed(&mut self, step_id: &str) -> Result<Advanced, RunnerError> {
         let step = self.step(step_id)?.clone();
         // A rebuilt runner takes the write lock again: the closing comment
         // and the close are this run's, and nothing here repeats them
@@ -891,14 +972,23 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
         {
             return Ok(waiting);
         }
-        if step.next.as_deref() != Some("done") {
-            return self.escalate(
-                "no_next_step",
-                vec![
-                    step.id.clone(),
-                    format!("`{}` is the last step and names no `next`", step.id),
-                ],
-            );
+        if step.ci
+            && let Some(gate) = self.wait_for_ci(&step).await?
+        {
+            return Ok(gate);
+        }
+        match step.next.as_deref() {
+            Some("done") => {}
+            Some(_) => return self.follow_next(&step, 1),
+            None => {
+                return self.escalate(
+                    "no_next_step",
+                    vec![
+                        step.id.clone(),
+                        format!("`{}` is the last step and names no `next`", step.id),
+                    ],
+                );
+            }
         }
         let issue = self.issue()?;
         let (report, _) = self.latest_report(&step.id)?;
@@ -922,6 +1012,73 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
         }
         self.forge.close(issue)?;
         self.finish_with(RunOutcome::Closed, impact)
+    }
+
+    /// Wait on CI for the commit the last push left at the remote. `None`
+    /// means it passed; `Some` is the gate a red, missing or too-slow CI
+    /// opened. The wait writes nothing, so a restart simply asks again.
+    async fn wait_for_ci(&mut self, step: &Step) -> Result<Option<Advanced>, RunnerError> {
+        let Some(sha) = self.last_pushed_head() else {
+            return self
+                .escalate(
+                    "ci_missing",
+                    vec![step.id.clone(), "no push names a commit to wait on".into()],
+                )
+                .map(Some);
+        };
+        let wait = self.ci_wait;
+        let began = std::time::Instant::now();
+        loop {
+            let waited = began.elapsed();
+            match self.forge.ci(&sha)? {
+                CiState::Passed => return Ok(None),
+                CiState::Failed(why) => {
+                    return self
+                        .escalate("ci_failed", vec![step.id.clone(), sha, why])
+                        .map(Some);
+                }
+                CiState::NoRuns if waited >= wait.grace => {
+                    return self
+                        .escalate(
+                            "ci_missing",
+                            vec![
+                                step.id.clone(),
+                                sha,
+                                format!("no CI run named the commit in {}s", wait.grace.as_secs()),
+                            ],
+                        )
+                        .map(Some);
+                }
+                CiState::NoRuns | CiState::Pending => {}
+            }
+            if waited >= wait.timeout {
+                return self
+                    .escalate(
+                        "ci_timeout",
+                        vec![
+                            step.id.clone(),
+                            sha,
+                            format!("CI had not finished after {}s", wait.timeout.as_secs()),
+                        ],
+                    )
+                    .map(Some);
+            }
+            tokio::time::sleep(wait.interval).await;
+        }
+    }
+
+    /// The commit the last `pushed` left at the remote.
+    fn last_pushed_head(&self) -> Option<String> {
+        self.lead
+            .events()
+            .iter()
+            .rev()
+            .filter(|event| event.kind == EventKind::Pushed)
+            .find_map(|event| {
+                serde_json::from_value::<PushedPayload>(event.payload.clone())
+                    .ok()
+                    .map(|pushed| pushed.ref_after)
+            })
     }
 
     /// Where a step's first attempt started: the head its commits are read
@@ -1083,12 +1240,24 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
         Ok(Advanced::Finished { outcome })
     }
 
-    /// A human answered a gate: `stop` ends the run, and acting on `go` or
-    /// `amend` belongs to a later slice, so it is an error, not a guess.
+    /// A human answered a gate: `stop` ends the run. At a checkpoint step,
+    /// `go` and `amend` continue to its `next` (the amendment is already in
+    /// the answer, where the `amendment` slot reads it). At any gate the
+    /// runner raised itself, only `stop` is an answer.
     fn answered(&mut self, gate: &str, answer: CheckpointAnswer) -> Result<Advanced, RunnerError> {
-        match answer {
-            CheckpointAnswer::Stop => self.finish(RunOutcome::Stopped),
-            CheckpointAnswer::Go | CheckpointAnswer::Amend => Err(RunnerError::SliceTwo {
+        if answer == CheckpointAnswer::Stop {
+            return self.finish(RunOutcome::Stopped);
+        }
+        let checkpoint = self
+            .workflow
+            .workflow
+            .steps
+            .iter()
+            .find(|step| step.checkpoint && step.id == gate)
+            .cloned();
+        match checkpoint {
+            Some(step) => self.follow_next(&step, 1),
+            None => Err(RunnerError::SliceTwo {
                 gate: gate.to_owned(),
             }),
         }
@@ -1097,12 +1266,22 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
     /// Write `checkpoint_asked` and hand the run to the human. This is the
     /// one act safe to repeat after a crash.
     fn escalate(&mut self, gate: &str, shown: Vec<String>) -> Result<Advanced, RunnerError> {
+        self.escalate_with(gate, shown, vec!["stop".into()])
+    }
+
+    /// `escalate`, offering `options` instead of `stop` alone.
+    fn escalate_with(
+        &mut self,
+        gate: &str,
+        shown: Vec<String>,
+        options: Vec<String>,
+    ) -> Result<Advanced, RunnerError> {
         self.append(
             EventKind::CheckpointAsked,
             &CheckpointAskedPayload {
                 gate: gate.into(),
                 shown,
-                options: vec!["stop".into()],
+                options,
             },
         )?;
         self.lock = None;

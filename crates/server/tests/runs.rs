@@ -1735,11 +1735,11 @@ async fn t8_stop_is_answered_go_is_refused() {
         .unwrap()
     {
         Response::Refused { reason } => reason,
-        other => panic!("go comes in slice 2, so it is refused: {other:?}"),
+        other => panic!("the runner's own gate offers stop only, so go is refused: {other:?}"),
     };
     assert!(
-        refused.contains("slice 2"),
-        "the refusal names the slice: {refused}"
+        refused.contains("takes stop") && refused.contains("`go`"),
+        "the refusal names what the gate takes: {refused}"
     );
     assert_eq!(
         daemon.events(lead).len(),
@@ -2469,5 +2469,90 @@ async fn t15b_a_corrupt_lead_log_refuses_a_new_run() {
     assert!(
         !daemon.server.threads.runs().held(lead),
         "nothing claims it"
+    );
+}
+
+/// A workflow's own checkpoint over the wire: the daemon starts the
+/// named workflow, the run waits at the checkpoint with go, amend and
+/// stop offered, an `amend` with no text is refused and writes nothing,
+/// and an `amend` with text continues to `next = "done"`.
+#[tokio::test]
+async fn a_checkpoint_step_is_answered_amend_over_the_server() {
+    let daemon = Daemon::new(Scripts::default(), false).await;
+    let dir = daemon.fixture.bundled.join("workflows").join("gated");
+    std::fs::create_dir_all(dir.join("templates")).unwrap();
+    std::fs::write(
+        dir.join("workflow.toml"),
+        "name = \"gated\"\nversion = 1\n\n[budget]\ntrivial = 1.0\nfull = 1.0\nmax_raise = 1.0\n\n\
+         [[slots]]\nname = \"issue\"\nkind = \"string\"\nfilled_by = \"runner\"\n\n\
+         [[steps]]\nid = \"decide\"\nrole = \"person\"\nprofile = \"flash\"\n\
+         template = \"templates/decide.md\"\nmarker = \"## Decide\"\ncheckpoint = true\nnext = \"done\"\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("templates/decide.md"), "decide on #{{issue}}\n").unwrap();
+    let (client, _) = daemon.connect("steve").await;
+    let lead = match client
+        .request(Request::Build {
+            project: "p".into(),
+            issue: 58,
+            workflow: Some("gated".into()),
+        })
+        .await
+        .unwrap()
+    {
+        Response::Run { lead, .. } => lead,
+        other => panic!("a build is answered with a run: {other:?}"),
+    };
+    let mut asked = None;
+    for _ in 0..250 {
+        asked = daemon
+            .lead_events(lead)
+            .into_iter()
+            .find(|event| event.kind == EventKind::CheckpointAsked);
+        if asked.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let asked: aigentic_runtime::aigentic_log::CheckpointAskedPayload =
+        serde_json::from_value(asked.expect("the run waits at its checkpoint").payload).unwrap();
+    assert_eq!(asked.gate, "decide");
+    assert_eq!(asked.options, ["go", "amend", "stop"]);
+    assert_eq!(asked.shown, ["decide on #58\n"]);
+
+    let before = daemon.lead_events(lead).len();
+    let refused = client
+        .request(Request::AnswerCheckpoint {
+            lead,
+            gate: "decide".into(),
+            answer: CheckpointAnswer::Amend,
+            amendment: None,
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(&refused, Response::Refused { reason } if reason.contains("amendment's text")),
+        "an amend without text is refused: {refused:?}"
+    );
+    assert_eq!(
+        daemon.lead_events(lead).len(),
+        before,
+        "nothing was written"
+    );
+
+    let answered = client
+        .request(Request::AnswerCheckpoint {
+            lead,
+            gate: "decide".into(),
+            answer: CheckpointAnswer::Amend,
+            amendment: Some("keep it small".into()),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(answered, Response::Ok), "{answered:?}");
+    assert_eq!(
+        daemon.wait_finished(lead).await,
+        RunOutcome::Closed,
+        "the checkpoint's `next = \"done\"` ends the run"
     );
 }

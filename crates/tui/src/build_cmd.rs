@@ -93,7 +93,10 @@ pub async fn run(
     // on; fix 4 of #58). Read the log first, so a resumed run shows what
     // it did, and answer a gate that is already open instead of waiting
     // for a live event that will never come.
-    let mut printed = backlog(client, lead, err).await?;
+    let (mut printed, parked) = backlog(client, lead, err).await?;
+    if let Some(gate) = parked {
+        return left_for_a_person(outcome, &gate, args.issue, err);
+    }
     loop {
         let Some(notice) = notices.recv().await else {
             // The session ended: the run is still resumable, and the
@@ -122,6 +125,9 @@ pub async fn run(
                 if event.kind == EventKind::CheckpointAsked {
                     let asked: Option<CheckpointAskedPayload> =
                         serde_json::from_value(event.payload.clone()).ok();
+                    if let Some(gate) = asked.as_ref().filter(|a| takes_go(a)).map(|a| &a.gate) {
+                        return left_for_a_person(outcome, gate, args.issue, err);
+                    }
                     let gate = asked.map(|a| a.gate).unwrap_or_default();
                     answer_stop(client, lead, &gate, err).await?;
                 }
@@ -170,7 +176,11 @@ pub async fn run(
 /// The events come from [`fetch_backlog`], which prints nothing and
 /// answers nothing; what `build` does with the last one is `build`'s
 /// own (issue #68: the REPL shows a prompt there instead).
-async fn backlog(client: &Client, lead: Ulid, err: &mut dyn Write) -> anyhow::Result<u64> {
+async fn backlog(
+    client: &Client,
+    lead: Ulid,
+    err: &mut dyn Write,
+) -> anyhow::Result<(u64, Option<String>)> {
     let events = match fetch_backlog(client, lead).await {
         Ok(events) => events,
         Err(e) if e.downcast_ref::<Refused>().is_some() => {
@@ -178,7 +188,7 @@ async fn backlog(client: &Client, lead: Ulid, err: &mut dyn Write) -> anyhow::Re
             // and the live loop still follows the run.
             writeln!(err, "note: no backlog: {e}")?;
             err.flush()?;
-            return Ok(0);
+            return Ok((0, None));
         }
         Err(e) => return Err(e),
     };
@@ -195,10 +205,38 @@ async fn backlog(client: &Client, lead: Ulid, err: &mut dyn Write) -> anyhow::Re
     {
         let asked: Option<CheckpointAskedPayload> =
             serde_json::from_value(last.payload.clone()).ok();
+        if let Some(asked) = asked.as_ref().filter(|a| takes_go(a)) {
+            return Ok((printed, Some(asked.gate.clone())));
+        }
         let gate = asked.map(|a| a.gate).unwrap_or_default();
         answer_stop(client, lead, &gate, err).await?;
     }
-    Ok(printed)
+    Ok((printed, None))
+}
+
+/// A gate that offers `go` is a workflow's own checkpoint, put there for
+/// a person: this command never answers one.
+fn takes_go(asked: &CheckpointAskedPayload) -> bool {
+    asked.options.iter().any(|option| option == "go")
+}
+
+/// Leave the run waiting at a person's checkpoint, say where to answer
+/// it, and exit as "a human is needed".
+fn left_for_a_person(
+    mut outcome: BuildOutcome,
+    gate: &str,
+    issue: u64,
+    err: &mut dyn Write,
+) -> anyhow::Result<BuildOutcome> {
+    writeln!(
+        err,
+        "checkpoint `{gate}` waits for a person: in the REPL, /build {issue} then \
+         /answer go, /answer amend <text> or /answer stop"
+    )?;
+    err.flush()?;
+    outcome.code = EXIT_NEEDS_HUMAN;
+    outcome.reason = Some(format!("waiting at checkpoint `{gate}`"));
+    Ok(outcome)
 }
 
 /// Answer one gate `stop` — this command never answers `go`.
@@ -523,7 +561,7 @@ mod tests {
                 serde_json::json!({
                     "gate": "route",
                     "shown": ["size: full"],
-                    "options": ["go", "amend", "stop"],
+                    "options": ["stop"],
                 }),
             ),
         ];
@@ -665,6 +703,101 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+        daemon.abort();
+    }
+
+    /// A run parked at a workflow's own checkpoint (it offers `go`) is a
+    /// person's to answer: the command answers nothing, says where to
+    /// answer it, and exits 3 with the run still waiting.
+    #[tokio::test]
+    async fn a_persons_checkpoint_is_left_waiting() {
+        use aigentic_api::{Body, Frame, ThreadState, Welcome, encode};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let lead = Ulid::generate();
+        let backlog = vec![event_at(
+            EventKind::CheckpointAsked,
+            0,
+            lead,
+            serde_json::json!({
+                "gate": "decide",
+                "shown": ["read the spec check, then decide"],
+                "options": ["go", "amend", "stop"],
+            }),
+        )];
+        let daemon = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut lines = BufReader::new(read).lines();
+            while let Some(line) = lines.next_line().await.unwrap() {
+                let Ok(frame) = aigentic_api::decode(&line) else {
+                    break;
+                };
+                let id = frame.id.unwrap_or(0);
+                let Body::Request(request) = frame.body else {
+                    break;
+                };
+                let response = match request {
+                    Request::Hello { .. } => Response::Welcome(Welcome {
+                        user: "steve".into(),
+                        projects: Vec::new(),
+                        server: "fake".into(),
+                    }),
+                    Request::Build { .. } => Response::Run {
+                        lead,
+                        resumed: true,
+                    },
+                    Request::Open { .. } => Response::Opened {
+                        state: ThreadState::Idle,
+                        events: backlog.clone(),
+                        run: None,
+                        mode: "manual".into(),
+                        profile: None,
+                        model: "unknown".into(),
+                        effort: None,
+                    },
+                    other => panic!("the command answered a person's checkpoint: {other:?}"),
+                };
+                let line = format!("{}\n", encode(&Frame::response(id, response)));
+                write.write_all(line.as_bytes()).await.unwrap();
+            }
+        });
+
+        let (client, _) = Client::connect(&aigentic_api::client::Addr::Unix(socket), "steve")
+            .await
+            .unwrap();
+        let notices = client.take_notices().expect("the notice stream");
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let outcome = run(
+            &client,
+            notices,
+            "p",
+            "steve",
+            &BuildArgs {
+                issue: 58,
+                workflow: Some("loop".into()),
+                json: false,
+            },
+            &mut out,
+            &mut err,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.code, EXIT_NEEDS_HUMAN);
+        assert_eq!(
+            outcome.reason.as_deref(),
+            Some("waiting at checkpoint `decide`")
+        );
+        let err = String::from_utf8(err).unwrap();
+        assert!(
+            err.contains("/answer go") && err.contains("/build 58"),
+            "it says where to answer: {err}"
+        );
         daemon.abort();
     }
 }

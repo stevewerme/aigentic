@@ -93,6 +93,14 @@ pub enum WorkflowError {
     /// A render was asked for a step this workflow does not have.
     #[error("this workflow has no step `{step}`")]
     UnknownStep { step: String },
+    /// A step's fields contradict each other, e.g. a checkpoint that
+    /// writes, or `ci` without a push.
+    #[error("{dir}: step `{step}`: {reason}")]
+    BadStep {
+        dir: PathBuf,
+        step: String,
+        reason: String,
+    },
     /// The slot map lacks a slot the template inserts.
     #[error("{path}: no value for slot `{slot}`")]
     MissingSlot { path: PathBuf, slot: String },
@@ -203,7 +211,40 @@ pub struct Step {
     pub deny: Vec<String>,
     #[serde(default)]
     pub next: Option<String>,
+    /// A person's gate, not a model's step: no child thread runs. The
+    /// run waits with the rendered template shown, and `go` or `amend`
+    /// continues to `next` (`amend`'s text reaches later steps as the
+    /// `amendment` slot); `stop` ends the run.
+    #[serde(default)]
+    pub checkpoint: bool,
+    /// After the push, wait for the forge's CI on the pushed commit; red,
+    /// missing or too slow is a checkpoint, never a silent pass.
+    #[serde(default)]
+    pub ci: bool,
+    /// After the push, install the binary from the pushed head and check
+    /// it names that head.
+    #[serde(default = "yes")]
+    pub install: bool,
 }
+
+/// The gates the runner raises itself. A checkpoint step's id is its
+/// gate, so it may not take one of these names.
+pub const RUNNER_GATES: &[&str] = &[
+    "checks_error",
+    "checks_failed",
+    "ci_failed",
+    "ci_missing",
+    "ci_timeout",
+    "install_mismatch",
+    "no_next_step",
+    "no_start_record",
+    "remote_moved",
+    "render_failed",
+    "route",
+    "route_escalate",
+    "step_stop",
+    "write_lock",
+];
 
 /// One `[routes.<name>]` entry: the steps a route jumps to, plus the
 /// preconditions the runner weighs before it takes the route.
@@ -352,6 +393,31 @@ impl WorkflowFile {
                     step: step.id.clone(),
                     template: step.template.clone(),
                 });
+            }
+        }
+        for step in &self.steps {
+            let bad = |reason: &str| WorkflowError::BadStep {
+                dir: dir.to_path_buf(),
+                step: step.id.clone(),
+                reason: reason.to_owned(),
+            };
+            if step.checkpoint {
+                if step.writes || step.push || !step.checks.is_empty() || step.route_by.is_some() {
+                    return Err(bad(
+                        "a checkpoint runs no child, so it cannot write, check, push or route",
+                    ));
+                }
+                if step.next.is_none() {
+                    return Err(bad("a checkpoint needs a `next` to continue to"));
+                }
+                if RUNNER_GATES.contains(&step.id.as_str()) {
+                    return Err(bad(
+                        "a checkpoint's id is its gate, and this name is the runner's",
+                    ));
+                }
+            }
+            if step.ci && !step.push {
+                return Err(bad("`ci` waits on a push, so it needs `push`"));
             }
         }
         for step in &self.steps {
@@ -967,5 +1033,75 @@ pub(crate) mod tests {
         // A file no template names is not part of the workflow.
         fs::write(a.join("notes.txt"), "mine\n").unwrap();
         assert_eq!(first.content_hash, hash(&a).content_hash);
+    }
+
+    /// A checkpoint runs no child: it may not write, check, push or
+    /// route, it needs a `next`, and its id may not be a runner's gate.
+    /// `ci` waits on a push, so it needs one.
+    #[test]
+    fn contradictory_step_fields_are_refused() {
+        let cases = [
+            (
+                "decide",
+                "checkpoint = true\nwrites = true\nnext = \"done\"\n",
+            ),
+            (
+                "decide",
+                "checkpoint = true\npush = true\nnext = \"done\"\n",
+            ),
+            (
+                "decide",
+                "checkpoint = true\nroute_by = \"size\"\nnext = \"done\"\n",
+            ),
+            ("decide", "checkpoint = true\n"),
+            ("route", "checkpoint = true\nnext = \"done\"\n"),
+            ("implement", "ci = true\nnext = \"done\"\n"),
+        ];
+        for (id, extra) in cases {
+            let root = temp();
+            let toml = format!("{HEAD}{}{}", one_slot(), step(id, "templates/b.md", extra));
+            write_folder(
+                &root.path().join("test"),
+                &toml,
+                &[("templates/b.md", "x {{issue}}\n")],
+            );
+            assert!(
+                matches!(
+                    load(root.path(), "test"),
+                    Err(WorkflowError::BadStep { .. })
+                ),
+                "refused: {extra:?}"
+            );
+        }
+    }
+
+    /// A checkpoint with a `next`, and a pushing step with `ci`, load;
+    /// `install` defaults to true.
+    #[test]
+    fn a_checkpoint_and_a_ci_step_load() {
+        let root = temp();
+        let toml = format!(
+            "{HEAD}{}{}{}",
+            one_slot(),
+            step(
+                "decide",
+                "templates/b.md",
+                "checkpoint = true\nnext = \"implement\"\n"
+            ),
+            step(
+                "implement",
+                "templates/b.md",
+                "writes = true\npush = true\nci = true\nnext = \"done\"\n"
+            ),
+        );
+        write_folder(
+            &root.path().join("test"),
+            &toml,
+            &[("templates/b.md", "x {{issue}}\n")],
+        );
+        let loaded = load(root.path(), "test").expect("the workflow loads");
+        let implement = loaded.step("implement").unwrap();
+        assert!(implement.ci && implement.install);
+        assert!(loaded.step("decide").unwrap().checkpoint);
     }
 }
