@@ -5,8 +5,10 @@
 
 use std::path::{Path, PathBuf};
 
+use aigentic_log::MemoryHome;
+
 use crate::Project;
-use crate::project::ProjectError;
+use crate::project::{MEMORY_DIR, ProjectError};
 
 /// The heading of the person's memory block in the prefix. The person is
 /// unnamed here: the config names a user, not the person the memory is
@@ -164,7 +166,7 @@ impl WorkspaceLayer {
             }),
         };
         let mut memory = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(Self::dir(shared).join(crate::project::MEMORY_DIR)) {
+        if let Ok(entries) = std::fs::read_dir(Self::dir(shared).join(MEMORY_DIR)) {
             let mut files: Vec<_> = entries
                 .filter_map(Result::ok)
                 .map(|e| e.path())
@@ -305,6 +307,34 @@ impl Layers {
 
     pub fn workspace_instructions(&self) -> Option<String> {
         self.workspace.as_ref()?.instructions_block()
+    }
+
+    /// Where a home's memory folder is in this thread, `None` when the
+    /// thread has not got it: no person folder or no owner, no workspace,
+    /// no project.
+    pub fn memory_home(&self, home: MemoryHome) -> Option<PathBuf> {
+        match home {
+            MemoryHome::Person => self
+                .global
+                .owner
+                .as_ref()
+                .and(self.global.memory_dir.clone()),
+            MemoryHome::Workspace => self
+                .workspace
+                .as_ref()
+                .and_then(|w| w.shared.as_deref())
+                .map(|shared| WorkspaceLayer::dir(shared).join(MEMORY_DIR)),
+            MemoryHome::Project => self.project.as_ref().map(Project::memory_dir),
+        }
+    }
+
+    /// The homes a thread keeps besides the project's, in the order the
+    /// extraction request names them.
+    pub fn extra_memory_homes(&self) -> Vec<MemoryHome> {
+        [MemoryHome::Person, MemoryHome::Workspace]
+            .into_iter()
+            .filter(|h| self.memory_home(*h).is_some())
+            .collect()
     }
 
     /// Re-read every home this thread has: the person's, the workspace's
