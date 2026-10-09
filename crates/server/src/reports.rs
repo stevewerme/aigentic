@@ -495,12 +495,13 @@ fn author_name(author: &Author) -> &str {
     }
 }
 
-/// `/policy`: the rule table in order with each rule's name, decision
-/// and reason, the bash allow patterns, the mode, and the session grants
-/// with who gave them.
+/// `/policy`: the file boundary, what it does not confine, the rule table
+/// in order with each rule's name, decision and reason, the bash allow
+/// patterns, the mode, and the session grants with who gave them.
 pub fn policy_report(runtime: &Runtime) -> String {
     let policy = runtime.policy();
-    let mut out = String::from("policy rules, first match wins\n");
+    let mut out = policy_boundary_lines(runtime);
+    out.push_str("policy rules, first match wins\n");
     let width = policy
         .rules
         .iter()
@@ -547,6 +548,27 @@ pub fn policy_report(runtime: &Runtime) -> String {
         }
     }
     out.trim_end().to_owned()
+}
+
+/// The `/policy` header (issue #124): the folders file tools reach
+/// without asking, and the tools the boundary does not confine.
+pub fn policy_boundary_lines(runtime: &Runtime) -> String {
+    let roots: Vec<String> = runtime
+        .policy()
+        .boundary_roots()
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
+    let reach = if roots.is_empty() {
+        "nothing (no root)".to_owned()
+    } else {
+        roots.join(", ")
+    };
+    format!(
+        "boundary: file tools reach {reach}; outside, they ask (a step is denied)\n\
+         bash and MCP tools with paths are not confined: they reach the whole disk until the \
+         sandbox (PLAN §15 item 6); in a step, and in exec, an outside path is denied\n"
+    )
 }
 
 /// `/memory`: the memory files with line counts, the `through_seq` of

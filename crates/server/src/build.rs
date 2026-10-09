@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use aigentic_runtime::aigentic_core::{AgentId, Provider};
 use aigentic_runtime::aigentic_log::{Repair, ThreadLog};
+use aigentic_runtime::aigentic_skills::SkillSet;
 use aigentic_runtime::aigentic_tools::{ToolRegistry, Workdir};
 use aigentic_runtime::{
     DEFAULT_COMPACTION, GlobalLayer, Layers, Project, ProjectContext, ProjectFile, ProjectRow,
@@ -164,6 +165,7 @@ pub async fn project_context(
     let policy = file
         .policy()
         .with_root(&root.root, &root.root)
+        .with_boundary_roots(boundary_roots(&file, &root.root, &skills))
         .with_rules_file(&rules_file);
     Ok(Context {
         ctx: ProjectContext {
@@ -194,6 +196,23 @@ pub async fn project_context(
         profile: profile_name,
         mcp_skipped,
     })
+}
+
+/// The folders the file tools may reach without asking (issue #124),
+/// beyond the project root `with_root` installs: the temp dir (both
+/// names of it — on macOS `/tmp` is a symlink to `/private/tmp`, and a
+/// model writes through either), the folders of the thread's *loaded*
+/// skills (never all the skill roots, which would widen the boundary to
+/// the whole bundled `skills/` and every `~/.config/aigentic/skills/`
+/// entry), and the project's `[policy] allow_paths`. `policy`
+/// canonicalises every one of them.
+fn boundary_roots(file: &ProjectFile, root: &Path, skills: &SkillSet) -> Vec<PathBuf> {
+    let mut roots = vec![std::env::temp_dir()];
+    #[cfg(unix)]
+    roots.push(PathBuf::from("/tmp"));
+    roots.extend(skills.iter().map(|manifest| manifest.path.clone()));
+    roots.extend(file.allow_paths(root));
+    roots
 }
 
 /// Open or create a thread's log in `root.threads_dir` and build its

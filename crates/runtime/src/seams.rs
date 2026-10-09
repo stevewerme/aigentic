@@ -8,12 +8,17 @@ use aigentic_log::{
     DecisionScope, PermissionDecidedPayload, PermissionRequestedPayload, PolicyRecord,
 };
 use aigentic_policy::Outcome;
+use std::path::{Path, PathBuf};
 use ulid::Ulid;
 
 use crate::approver::Answer;
 use crate::decisions::{Answered, CancelToken, Pending};
 use crate::mode::Mode;
 use crate::{Runtime, RuntimeError, Signal};
+
+/// The rule name a boundary refusal records (issue #124): a file tool
+/// outside the project, refused where no person could answer.
+pub const BOUNDARY_RULE: &str = "boundary";
 
 /// What policy decided for one call, with the record the tool result
 /// carries either way.
@@ -44,13 +49,37 @@ pub struct SessionGrant {
     pub tool: String,
     /// For `bash`, the exact command; `None` for every other tool.
     pub command: Option<String>,
+    /// For a file tool allowed outside the project (issue #124), the one
+    /// canonical directory the answer covers — the parent of the path
+    /// the person saw. `None` on every other grant, and a `None` grant
+    /// never answers a boundary ask: "for this session" on an inside
+    /// path must not wave an outside one through.
+    pub boundary_dir: Option<PathBuf>,
     pub first_event: Ulid,
     pub author: Author,
 }
 
 impl SessionGrant {
-    fn matches(&self, call: &ToolCall) -> bool {
-        self.tool == call.name && self.command == bash_command(call)
+    /// Whether this grant answers `call`. `outside` says the ask is a
+    /// boundary one and `scope` is the canonical path it found, if any:
+    /// a boundary ask is answered only by a grant scoped to that path's
+    /// own directory, and an ordinary ask only by a tool-wide grant.
+    fn matches(&self, call: &ToolCall, outside: bool, scope: Option<&Path>) -> bool {
+        if self.tool != call.name {
+            return false;
+        }
+        if !outside {
+            return self.boundary_dir.is_none() && self.command == bash_command(call);
+        }
+        let (Some(dir), Some(target)) = (&self.boundary_dir, scope) else {
+            return false;
+        };
+        match target.parent() {
+            Some(parent) => parent == dir,
+            // A target with no parent is a filesystem root; the grant
+            // for it is the root itself.
+            None => target == dir,
+        }
     }
 }
 
@@ -78,18 +107,33 @@ impl Runtime {
         cancel: &CancelToken,
         observe: &mut (dyn FnMut(Signal<'_>) + Send),
     ) -> Result<Verdict, RuntimeError> {
-        // The step overlay is asked before the rules, the project and the
-        // mode (issue #55): what it denies, nothing else may allow, and
-        // its rule name is what the log records.
-        let overlay = self
-            .step
-            .as_ref()
-            .and_then(|step| step.overlay.decide(call));
-        let outcome = match overlay {
-            Some(outcome) => outcome,
-            None => self.policy.decide(call, class),
+        // The file boundary is asked first, even before the step overlay
+        // (issue #124): nothing but a person outside a step may let a
+        // file tool reach another project, so no overlay rule, no mode
+        // and no session grant may answer it. The directory is the one
+        // the tools will resolve against, read now, so a `bash` `cd` and
+        // the check agree. Every path in the policy below is compared
+        // from that same directory, which is what closes the
+        // `cd .aigentic` memory escape.
+        let cwd = self.registry.workdir().map(|w| w.current());
+        let outcome = {
+            let decided = self.policy.decide(call, class, cwd.as_deref());
+            match decided {
+                Outcome::AskBoundary { reason, path } => Outcome::AskBoundary { reason, path },
+                inside => match self
+                    .step
+                    .as_ref()
+                    .and_then(|step| step.overlay.decide(call))
+                {
+                    Some(overlay) => overlay,
+                    None => inside,
+                },
+            }
         };
-        let reason = match outcome {
+        // `outside` says this ask is the boundary's, `boundary_scope` the
+        // canonical path a session grant may cover; both are absent for
+        // an ordinary ask.
+        let (reason, outside, boundary_scope) = match outcome {
             Outcome::Allow { rule } => {
                 return Ok(Verdict::Run(PolicyRecord::rule(rule, "allow")));
             }
@@ -101,16 +145,30 @@ impl Runtime {
                     rule, "deny", reason,
                 )));
             }
-            Outcome::Ask { reason } => reason,
+            Outcome::Ask { reason } => (reason, false, None),
+            // A step or job thread has no person to answer, and #77 needs
+            // a job in `auto` to stay inside its project: outside a
+            // boundary the step is refused outright.
+            Outcome::AskBoundary { reason, .. } if self.step.is_some() => {
+                return Ok(Verdict::Refuse(PolicyRecord::rule_with_reason(
+                    BOUNDARY_RULE,
+                    "deny",
+                    format!("{reason} — a step never reaches another project"),
+                )));
+            }
+            Outcome::AskBoundary { reason, path } => (reason, true, path),
         };
 
         // The mode stands in for the human on what the rules would ask
-        // about, never on what they deny. The record names the mode.
-        let mode_allows = match self.mode {
-            Mode::Manual => false,
-            Mode::AcceptEdits => class == RiskClass::Write,
-            Mode::Auto => true,
-        };
+        // about, never on what they deny, and never on a boundary ask: an
+        // outside path is a person's to answer in every mode. The record
+        // names the mode.
+        let mode_allows = !outside
+            && match self.mode {
+                Mode::Manual => false,
+                Mode::AcceptEdits => class == RiskClass::Write,
+                Mode::Auto => true,
+            };
         if mode_allows {
             return Ok(Verdict::Run(PolicyRecord::rule(
                 self.mode.rule_name(),
@@ -134,7 +192,7 @@ impl Runtime {
         if let Some(grant) = self
             .session_grants
             .iter()
-            .find(|g| g.matches(call))
+            .find(|g| g.matches(call, outside, boundary_scope.as_deref()))
             .cloned()
         {
             let decided = self.append_decided(
@@ -223,12 +281,29 @@ impl Runtime {
             }
         }
         if scope == DecisionScope::Session && allow {
-            self.session_grants.push(SessionGrant {
-                tool: call.name.clone(),
-                command: bash_command(call),
-                first_event: decided,
-                author,
-            });
+            // Outside the project the answer covers one directory — the
+            // parent of the canonical path the person was shown — and
+            // never the tool (issue #124).
+            // `Some` only when the answer can be scoped: a boundary ask
+            // whose path could not be resolved is answered once, not for
+            // the session, so no tool-wide grant is ever created for it.
+            let boundary_dir = match (outside, boundary_scope.as_ref()) {
+                (true, Some(p)) => Some(match p.parent() {
+                    Some(parent) => parent.to_path_buf(),
+                    None => p.clone(),
+                }),
+                (true, None) => None,
+                (false, _) => None,
+            };
+            if !outside || boundary_scope.is_some() {
+                self.session_grants.push(SessionGrant {
+                    tool: call.name.clone(),
+                    command: bash_command(call),
+                    boundary_dir,
+                    first_event: decided,
+                    author,
+                });
+            }
         }
         let record = PolicyRecord::Human {
             event: decided,

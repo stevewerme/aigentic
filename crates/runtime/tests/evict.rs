@@ -240,6 +240,10 @@ async fn run_turn_with(
     let kept = dir.keep();
     let mut runtime = Runtime::new(Box::new(provider), registry, log, AgentId("worker".into()))
         .with_approver(Box::new(Yes))
+        // `with_root` (issue #124): the rig's real file tools read and
+        // write inside the tempdir, so the boundary asks nothing and the
+        // event order below is unchanged.
+        .with_policy(aigentic_policy::Policy::defaults().with_root(&kept, &kept))
         .with_compaction(settings)
         .with_budget(aigentic_core::Budget {
             max_iterations: calls + 20,

@@ -454,6 +454,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn grep_does_not_follow_a_symlink_out_of_the_walked_tree() {
+        // Pins `follow_links(false)` (issue #124): the boundary allows the
+        // project root, so it must be the walk that refuses to leave it. A
+        // later `follow_links(true)` would read the outside file through
+        // either link.
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        let needle = "12345-needle-outside";
+        std::fs::write(outside.join("secret.txt"), format!("{needle}\n")).unwrap();
+        std::fs::write(project.join("inside.txt"), "nothing here\n").unwrap();
+        std::os::unix::fs::symlink(&outside, project.join("link")).unwrap();
+        std::os::unix::fs::symlink(outside.join("secret.txt"), project.join("file-link.txt"))
+            .unwrap();
+        let out = GrepTool::new(Workdir::new(&project))
+            .call(json!({"pattern": needle, "path": "."}))
+            .await
+            .unwrap();
+        assert_eq!(out.content, "no matches in 1 files", "{}", out.content);
+    }
+
+    #[tokio::test]
     async fn grep_options_and_errors() {
         let (_d, w) = fixture();
         let g = GrepTool::new(w);

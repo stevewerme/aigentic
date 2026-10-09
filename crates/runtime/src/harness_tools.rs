@@ -899,11 +899,18 @@ impl Runtime {
                         "skill `{}` is user-invoked; ask the user to run /{} instead",
                         args.name, args.name
                     )),
-                    Some(_) => {
+                    Some(m) => {
+                        // The folder is what makes a skill's own cited
+                        // files readable: the boundary has it as a root,
+                        // so the model can hand `read_file` the absolute
+                        // path it is shown here (issue #124).
+                        let folder = aigentic_policy::canonicalise(&m.path);
                         self.append_skill_loaded(&args.name, Invoker::Model, observe)?;
                         ok(format!(
-                            "loaded skill `{}`; its instructions are now in context",
-                            args.name
+                            "loaded skill `{}`; its instructions are now in context\n\
+                             files beside this skill are in {}",
+                            args.name,
+                            folder.display()
                         ))
                     }
                 },

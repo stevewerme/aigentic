@@ -62,10 +62,15 @@ async fn the_turn_end_lists_files_written_without_error_once_each() {
         aigentic_core::AgentId("w".into()),
     )
     .with_layers(Layers::default())
-    .with_policy(Policy::configured(
-        vec![Rule::class(RiskClass::Write, Decision::Allow, "test")],
-        None,
-    ));
+    .with_policy(
+        // `with_root` (issue #124): the rig writes and reads inside `work`,
+        // so the boundary's own check is satisfied and no path asks.
+        Policy::configured(
+            vec![Rule::class(RiskClass::Write, Decision::Allow, "test")],
+            None,
+        )
+        .with_root(&work, &work),
+    );
     let outcome = rt
         .run_turn(
             steve(),

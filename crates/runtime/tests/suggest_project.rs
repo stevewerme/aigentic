@@ -724,7 +724,10 @@ async fn t7_calls_after_the_proposal_do_not_run() {
     ]);
     let registry = ToolRegistry::builtin(Workdir::new(dir.path()), DEFAULT_TIMEOUT);
     let mut runtime = Runtime::new(provider, registry, log, AgentId("worker".into()))
-        .with_layers(Layers::default().with_project(project(HERE, dir.path(), HERE_RULES)));
+        .with_layers(Layers::default().with_project(project(HERE, dir.path(), HERE_RULES)))
+        // `with_root` (issue #124): `read_file` and `list_dir` here are
+        // inside the rig's tempdir, so no boundary ask parks the turn.
+        .with_policy(aigentic_policy::Policy::defaults().with_root(dir.path(), dir.path()));
     let decisions = Arc::new(Decisions::new());
     runtime = runtime.with_decisions(decisions.clone());
     let answer = answerer(decisions.clone(), SwitchAnswer::No, || None);

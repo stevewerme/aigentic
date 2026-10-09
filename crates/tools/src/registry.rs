@@ -22,6 +22,12 @@ pub struct ToolRegistry {
     tools: Vec<Box<dyn Tool>>,
     /// Connected servers, kept alive while their tools are registered.
     servers: Vec<McpServer>,
+    /// The working directory the built-in file tools share, when they
+    /// were built here (`builtin`). The runtime reads it before a policy
+    /// check, so a `bash` `cd` is the directory the boundary resolves
+    /// against (issue #124). `None` for a registry built by hand from
+    /// single tools, which is every test rig that does not need it.
+    workdir: Option<Workdir>,
 }
 
 impl std::fmt::Debug for ToolRegistry {
@@ -43,6 +49,7 @@ impl ToolRegistry {
         Self {
             tools: Vec::new(),
             servers: Vec::new(),
+            workdir: None,
         }
     }
 
@@ -99,6 +106,9 @@ impl ToolRegistry {
     /// `[tools] bash_timeout_secs`, else 120 s.
     pub fn builtin(workdir: Workdir, bash_timeout: Duration) -> Self {
         let mut registry = Self::empty();
+        // The bash tool takes the handle itself; the registry keeps one to
+        // report the directory (issue #124).
+        let workdir_ref = workdir.clone();
         for tool in [
             Box::new(ReadFileTool::new(workdir.clone())) as Box<dyn Tool>,
             Box::new(WriteFileTool::new(workdir.clone())),
@@ -111,7 +121,15 @@ impl ToolRegistry {
                 .register(tool)
                 .expect("built-in tool names are distinct");
         }
+        registry.workdir = Some(workdir_ref);
         registry
+    }
+
+    /// The working directory the built-in file tools share, when this
+    /// registry built them (issue #124). The runtime asks it for the
+    /// directory the boundary and the rules resolve against.
+    pub fn workdir(&self) -> Option<&Workdir> {
+        self.workdir.as_ref()
     }
 
     /// Add a tool; a second tool with the same name is refused.

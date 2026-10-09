@@ -245,7 +245,7 @@ mod tests {
     fn rule(outcome: &Outcome) -> String {
         match outcome {
             Outcome::Allow { rule } => format!("allow {rule}"),
-            Outcome::Ask { .. } => "ask".into(),
+            Outcome::Ask { .. } | Outcome::AskBoundary { .. } => "ask".into(),
             Outcome::Deny { rule, .. } => rule.clone(),
         }
     }
@@ -346,7 +346,7 @@ mod tests {
             "git log --oneline -3",
         ] {
             let call = bash(command);
-            let plain = plain.decide(&call, RiskClass::Exec);
+            let plain = plain.decide(&call, RiskClass::Exec, None);
             assert!(!matches!(plain, Outcome::Deny { .. }), "{command}");
             assert_eq!(overlay.decide(&call), None, "{command}");
         }
@@ -394,14 +394,20 @@ mod tests {
         ] {
             let call = bash(command);
             assert!(
-                !matches!(plain.decide(&call, RiskClass::Exec), Outcome::Deny { .. }),
+                !matches!(
+                    plain.decide(&call, RiskClass::Exec, None),
+                    Outcome::Deny { .. }
+                ),
                 "{command} is not denied without the overlay"
             );
             assert_eq!(overlay.decide(&call), None, "{command}");
         }
         let call = call("read_file", ".env.example");
         assert!(
-            !matches!(plain.decide(&call, RiskClass::Read), Outcome::Deny { .. }),
+            !matches!(
+                plain.decide(&call, RiskClass::Read, None),
+                Outcome::Deny { .. }
+            ),
             "the example file is not denied without the overlay"
         );
         assert_eq!(overlay.decide(&call), None);

@@ -72,7 +72,7 @@ fn the_asked_fixture_classifies_as_recorded() {
     let mut allowed = 0;
     for (i, line) in commands.iter().enumerate() {
         let command = unescape(line);
-        let outcome = policy.decide(&bash(&command), RiskClass::Exec);
+        let outcome = policy.decide(&bash(&command), RiskClass::Exec, None);
         let verdict = verdicts[i].as_str();
         let case = format!("#{}: {line}", i + 1);
         match verdict.strip_prefix("allow") {
@@ -112,7 +112,8 @@ fn the_asked_fixture_classifies_as_recorded() {
 #[test]
 fn a_chain_that_is_not_read_only_asks_once() {
     let policy = Policy::configured(Vec::new(), None);
-    let Outcome::Ask { reason } = policy.decide(&bash("cargo test && git push"), RiskClass::Exec)
+    let Outcome::Ask { reason } =
+        policy.decide(&bash("cargo test && git push"), RiskClass::Exec, None)
     else {
         panic!("a chain with git push asks");
     };

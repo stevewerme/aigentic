@@ -60,7 +60,7 @@ pub const POCOCK_SECTION_KEYS: &[&str] = &[
     "prs_as_requests",
 ];
 pub const SKILLS_SECTION_KEYS: &[&str] = &["enabled"];
-pub const POLICY_SECTION_KEYS: &[&str] = &["rules", "bash_allow"];
+pub const POLICY_SECTION_KEYS: &[&str] = &["rules", "bash_allow", "allow_paths"];
 /// One `[[mcp_servers]]` entry, shared by `aigentic.toml` and
 /// `config.toml`; `crates/tools/src/mcp.rs` parses it in both.
 pub const MCP_SERVER_KEYS: &[&str] = &[
@@ -296,6 +296,13 @@ pub struct PolicySection {
     /// Replaces the default bash allow patterns when set.
     #[serde(default)]
     pub bash_allow: Option<Vec<String>>,
+    /// Folders outside the project the file tools may reach without
+    /// asking (issue #124): `~` is `$HOME`, a relative entry is relative
+    /// to the project root. Every entry is canonicalised at build, so a
+    /// symlink here is another way to widen the boundary on purpose.
+    /// Rules cannot widen it: they only match inside it.
+    #[serde(default)]
+    pub allow_paths: Vec<String>,
 }
 
 /// A per-turn budget, every field optional. Used by `[profiles.<name>.budget]`
@@ -488,6 +495,23 @@ impl ProjectFile {
 
     pub fn policy(&self) -> Policy {
         Policy::configured(self.policy.rules.clone(), self.policy.bash_allow.clone())
+    }
+
+    /// `[policy] allow_paths` resolved against `root` (issue #124): a
+    /// leading `~` is `$HOME`, a relative entry is relative to the
+    /// project root, an absolute one stands. An entry under an unset
+    /// `HOME` is dropped rather than guessed at, which fails closed.
+    pub fn allow_paths(&self, root: &Path) -> Vec<PathBuf> {
+        self.policy
+            .allow_paths
+            .iter()
+            .filter_map(|entry| match entry.strip_prefix("~") {
+                Some("") => std::env::var_os("HOME").map(PathBuf::from),
+                Some(rest) => std::env::var_os("HOME")
+                    .map(|home| PathBuf::from(home).join(rest.trim_start_matches('/'))),
+                None => Some(root.join(entry)),
+            })
+            .collect()
     }
 
     /// Whether any phase 4 section is present, which makes `[project]
