@@ -1207,7 +1207,7 @@ impl ClientRepl {
             .filter(|n| *n > 0);
         let workflow = words.next().map(str::to_owned);
         let Some(issue) = issue.filter(|_| words.next().is_none()) else {
-            out.line("[usage: /build <issue number>]");
+            out.line("[usage: /build <issue number> [workflow]]");
             return;
         };
         if !self.may_approve() {
@@ -6184,7 +6184,7 @@ mod tests {
         lead.line("/build x").await;
         assert_eq!(
             lead.lines(),
-            vec!["[usage: /build <issue number>]".to_owned()],
+            vec!["[usage: /build <issue number> [workflow]]".to_owned()],
             "the usage line, and nothing sent"
         );
         assert!(
@@ -6217,7 +6217,7 @@ mod tests {
         lead.line("/build 58 loop extra").await;
         assert_eq!(
             lead.lines(),
-            vec!["[usage: /build <issue number>]".to_owned()]
+            vec!["[usage: /build <issue number> [workflow]]".to_owned()]
         );
     }
 

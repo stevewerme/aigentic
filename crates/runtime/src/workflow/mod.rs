@@ -419,6 +419,13 @@ impl WorkflowFile {
             if step.ci && !step.push {
                 return Err(bad("`ci` waits on a push, so it needs `push`"));
             }
+            // `route` takes the `route_by` branch before the handover, so
+            // a routing step's checks and push would never run.
+            if step.route_by.is_some() && (step.push || !step.checks.is_empty()) {
+                return Err(bad(
+                    "a step that routes hands nothing over, so it cannot check or push",
+                ));
+            }
         }
         for step in &self.steps {
             let from = format!("step `{}`", step.id);
@@ -1037,7 +1044,8 @@ pub(crate) mod tests {
 
     /// A checkpoint runs no child: it may not write, check, push or
     /// route, it needs a `next`, and its id may not be a runner's gate.
-    /// `ci` waits on a push, so it needs one.
+    /// `ci` waits on a push, so it needs one. A routing step never
+    /// reaches the handover, so it may not check or push.
     #[test]
     fn contradictory_step_fields_are_refused() {
         let cases = [
@@ -1056,6 +1064,8 @@ pub(crate) mod tests {
             ("decide", "checkpoint = true\n"),
             ("route", "checkpoint = true\nnext = \"done\"\n"),
             ("implement", "ci = true\nnext = \"done\"\n"),
+            ("implement", "route_by = \"size\"\npush = true\n"),
+            ("implement", "route_by = \"size\"\nchecks = [\"E1\"]\n"),
         ];
         for (id, extra) in cases {
             let root = temp();
