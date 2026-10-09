@@ -986,6 +986,55 @@ async fn t18_a_live_gate_is_streamed_before_the_run_waits() {
     assert_eq!(daemon.wait_finished(built.lead).await, RunOutcome::Stopped);
 }
 
+/// A step's start reaches a watcher while its child is still working:
+/// a step is most of a run's wall time, and without the line a person
+/// can't tell a working run from a stuck one, or which child to open.
+#[tokio::test]
+async fn a_step_start_is_streamed_while_its_child_works() {
+    // The brief's child gets an empty script, so its turn never ends.
+    let daemon = Daemon::new(Scripts::of([vec![]]), false).await;
+    let (client, _welcome) = daemon.connect("steve").await;
+    let mut notices = client.take_notices().expect("the notice stream");
+
+    let built = daemon.build(&client, "steve", 58).await;
+    let streamed = Daemon::collect(&mut notices, built.lead, |seen| {
+        seen.iter()
+            .any(|event| event.kind == EventKind::StepStarted)
+    })
+    .await;
+    assert!(
+        streamed
+            .iter()
+            .any(|event| event.kind == EventKind::StepStarted),
+        "the step's start arrives while the step works: {:?}",
+        streamed.iter().map(|e| e.kind).collect::<Vec<_>>()
+    );
+    assert!(
+        !daemon
+            .lead_events(built.lead)
+            .iter()
+            .any(|event| event.kind == EventKind::StepFinished),
+        "the step is still working"
+    );
+    let child = daemon
+        .child_of(built.lead, "brief", 1)
+        .expect("the step names its child");
+    // The child still gets its prompt, once.
+    let mut prompts = 0;
+    for _ in 0..500 {
+        prompts = daemon
+            .child_events(child)
+            .iter()
+            .filter(|event| event.kind == EventKind::UserMessage)
+            .count();
+        if prompts > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(prompts, 1, "the child has its prompt, once");
+}
+
 /// T4 — the full trivial path over the server, with the daemon resolving
 /// the **bundled** `build` workflow: `Build` → brief → implement → checks
 /// → push (the bare remote advances) → close → `run_finished { Closed }`,

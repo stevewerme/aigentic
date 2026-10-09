@@ -785,8 +785,21 @@ impl Fixture {
     /// Restore the logs, but leave a named child's log as the longest
     /// prefix `keep` accepts: a crash inside the child's turn.
     fn restore_child_prefix(&self, snapshot: &Snapshot, id: Ulid, keep: impl Fn(&[Event]) -> bool) {
+        self.restore_child_prefix_from(snapshot, snapshot, id, keep);
+    }
+
+    /// As `restore_child_prefix`, with the child's prefix cut from a later
+    /// snapshot: the lead at a step's `step_started`, the child part-way
+    /// through the turn that only a later move runs.
+    fn restore_child_prefix_from(
+        &self,
+        snapshot: &Snapshot,
+        source: &Snapshot,
+        id: Ulid,
+        keep: impl Fn(&[Event]) -> bool,
+    ) {
         self.restore(snapshot);
-        let Some(events) = snapshot.children.get(&id) else {
+        let Some(events) = source.children.get(&id) else {
             return;
         };
         let mut cut = 0;
@@ -959,6 +972,20 @@ fn snapshot(fx: &Fixture) -> Snapshot {
     }
 }
 
+/// A lead event's payload as a rebuild must reproduce it. A rebuild
+/// from `step_started` runs the child's turn itself, so the report it
+/// points at is a new event: `reported_event` is compared by presence.
+fn same_move(event: &Event) -> Value {
+    let mut payload = event.payload.clone();
+    if event.kind == EventKind::StepFinished
+        && let Some(reported) = payload.get_mut("reported_event")
+        && !reported.is_null()
+    {
+        *reported = Value::from("some");
+    }
+    payload
+}
+
 /// Rebuild from `snapshot` and do one move.
 async fn replay(fx: &Fixture, snapshot: &Snapshot) -> (Advanced, TestRunner) {
     fx.restore(snapshot);
@@ -984,6 +1011,9 @@ async fn drive(fx: &Fixture, runner: &mut TestRunner) -> Advanced {
 /// needs other git work (a wrong subject, an amend) drives itself this
 /// way, so a rebuilt run is caught up the same way the full one was.
 async fn drive_with(_fx: &Fixture, runner: &mut TestRunner, mut between: impl FnMut()) -> Advanced {
+    // The move before this drive (a rebuild's first, say) may have run a
+    // child's whole turn, so its git work is due before the next move.
+    between();
     loop {
         match runner.advance().await.expect("the run advances") {
             Advanced::Moved => between(),
@@ -1576,8 +1606,8 @@ async fn sweep_every_prefix(
                 "prefix {k}: the move the full run made"
             );
             assert_eq!(
-                after[k].payload,
-                run.lead()[k].payload,
+                same_move(&after[k]),
+                same_move(&run.lead()[k]),
                 "prefix {k}: with the same payload"
             );
             assert_ne!(
@@ -1957,8 +1987,9 @@ async fn t16_a_written_report_is_the_attempts_outcome() {
     let fx = &h.fx;
     let run = trace(fx).await;
     // The crash landed inside the brief's turn, after its report.
-    fx.restore_child_prefix(
+    fx.restore_child_prefix_from(
         run.after_where(EventKind::StepStarted, 1),
+        run.after_where(EventKind::StepFinished, 1),
         h.brief_child,
         |events| {
             !events
@@ -3592,12 +3623,18 @@ async fn t18_a_budget_warning_between_the_failure_and_the_send_back_keeps_it() {
     })
     .unwrap();
 
-    // The rebuilt runner still sends the step back with the failure in it.
+    // The rebuilt runner still sends the step back with the failure in it:
+    // one move starts attempt 2, the next posts its prompt.
     let mut runner = fx.runner();
     assert_eq!(
         runner.advance().await.expect("the run advances"),
         Advanced::Moved,
         "the send-back starts attempt 2"
+    );
+    assert_eq!(
+        runner.advance().await.expect("the run advances"),
+        Advanced::Moved,
+        "attempt 2 gets its prompt"
     );
     let prompts = child_prompts(fx, h.implementer_child);
     assert_eq!(prompts.len(), 2, "one prompt per attempt");
@@ -4059,7 +4096,8 @@ async fn a_looped_run_rebuilds_after_every_event() {
         assert_eq!(after.len(), k + 1, "prefix {k}: one event appended");
         assert_eq!(after[k].kind, full[k].kind, "prefix {k}: the same move");
         assert_eq!(
-            after[k].payload, full[k].payload,
+            same_move(&after[k]),
+            same_move(&full[k]),
             "prefix {k}: with the same payload"
         );
     }

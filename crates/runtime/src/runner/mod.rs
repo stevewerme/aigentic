@@ -449,8 +449,8 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
         }
         // The prompt is decided before any child exists, so a slot the
         // brief never reported stops the run here, not mid-step.
-        let message = match self.attempt_message(&step, attempt) {
-            Ok(message) => message,
+        match self.attempt_message(&step, attempt) {
+            Ok(_) => {}
             Err(err @ RunnerError::Workflow(_)) => {
                 return self.escalate(
                     "render_failed",
@@ -458,7 +458,7 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
                 );
             }
             Err(other) => return Err(other),
-        };
+        }
         if step.writes
             && self.lock.is_none()
             && let Some(waiting) = self.take_write_lock()?
@@ -493,7 +493,8 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
         if fresh {
             self.host.create_child(child, &step.id)?;
         }
-        self.post_message(&step, child, &message).await?;
+        // The move ends at `step_started`, so a watcher sees the step
+        // begin; the next move finds the prompt missing and posts it.
         Ok(Advanced::Moved)
     }
 
@@ -514,10 +515,10 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
         }
         let posted = prompt_count(self.host.child_log(child)?.events());
         if posted < attempt {
-            // The prompt never reached the child's log: repair by posting
-            // it once. The crash may also have happened before the child
-            // was created, in which case it is created now — with the id
-            // the `step_started` already names, never a fresh one.
+            // The prompt is not in the child's log yet, whether the step
+            // just started or a crash came first: post it once. A crash
+            // before the child was created leaves it to create here, with
+            // the id `step_started` names, never a fresh one.
             if !self.child_started(child)? {
                 self.host.create_child(child, &step.id)?;
             }
@@ -1167,18 +1168,21 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
 
     /// Whether this step's latest state event is a `checks_run` holding a
     /// `fail`: that is what a send-back answers. Any other event in
-    /// between — a budget warning, say — does not change it.
+    /// between — a budget warning, say — does not change it, and neither
+    /// does the open attempt's own `step_started`, so the prompt reads the
+    /// same whether it is posted before or after that event.
     fn send_back_due(&self, step_id: &str) -> bool {
-        self.lead
-            .events()
-            .iter()
-            .rev()
-            .find(|event| {
-                matches!(
-                    event.kind,
-                    EventKind::StepStarted | EventKind::StepFinished | EventKind::ChecksRun
-                )
-            })
+        let mut state = self.lead.events().iter().rev().filter(|event| {
+            matches!(
+                event.kind,
+                EventKind::StepStarted | EventKind::StepFinished | EventKind::ChecksRun
+            )
+        });
+        let mut latest = state.next();
+        if latest.is_some_and(|event| event.kind == EventKind::StepStarted) {
+            latest = state.next();
+        }
+        latest
             .filter(|event| event.kind == EventKind::ChecksRun)
             .and_then(|event| {
                 serde_json::from_value::<ChecksRunPayload>(event.payload.clone()).ok()
@@ -1349,25 +1353,6 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
                 &mut observe,
             )
             .await?;
-        Ok(())
-    }
-
-    /// Post a step's prompt into its child, and prove it arrived.
-    async fn post_message(
-        &mut self,
-        step: &Step,
-        child: Ulid,
-        text: &str,
-    ) -> Result<(), RunnerError> {
-        let before = prompt_count(self.host.child_log(child)?.events());
-        let mut runtime = self
-            .host
-            .build_child(child, &step.profile, &step.id, &step.deny)
-            .await?;
-        self.run_turn(&mut runtime, text).await?;
-        if prompt_count(self.host.child_log(child)?.events()) != before + 1 {
-            return Err(RunnerError::MessageNotPosted);
-        }
         Ok(())
     }
 
