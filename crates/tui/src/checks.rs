@@ -1138,16 +1138,7 @@ mod tests {
         let config = Config::parse(GOOD).unwrap();
         let global = dir.path().join("instructions.md");
         assert_eq!(
-            check_skills(
-                None,
-                &config,
-                dir.path(),
-                None,
-                &global,
-                &paths,
-                dir.path()
-            )
-            .status,
+            check_skills(None, &config, dir.path(), None, &global, &paths, dir.path()).status,
             Status::Skip
         );
 

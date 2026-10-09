@@ -18,7 +18,7 @@ use aigentic_runtime::aigentic_core::{Author, ContentBlock, Event, EventKind, To
 use aigentic_runtime::aigentic_log::{
     AssistantMessagePayload, CheckpointAnsweredPayload, CheckpointAskedPayload, CompactedPayload,
     CompactionStrategy, DecisionAnswer, DecisionAnsweredPayload, DecisionKind,
-    DecisionProposedPayload, DecisionScope, InterruptedPayload, MemoryExtractedPayload,
+    DecisionProposedPayload, DecisionScope, InterruptedPayload, MemoryExtractedPayload, MemoryHome,
     MemoryRememberedPayload, PermissionDecidedPayload, PolicyRecord, RunFinishedPayload,
     SkillLoadedPayload, ToolResultPayload, TurnEndedPayload, Usage, UserMessagePayload,
 };
@@ -2534,6 +2534,16 @@ pub(crate) fn sweep_line(what: &str, through_seq: u64, ratio: Option<f64>) -> St
 /// The developer view's line for what the harness did on its own (issue
 /// #115), or `None` for a kind that draws none. Pure over the event, so
 /// each kind's wording is tested without a daemon.
+/// What the report calls a line's home. The project's is unmarked: it is
+/// where every line went before the other two homes existed.
+fn memory_home_name(home: MemoryHome) -> &'static str {
+    match home {
+        MemoryHome::Project => "",
+        MemoryHome::Workspace => "the workspace's ",
+        MemoryHome::Person => "the person's ",
+    }
+}
+
 fn system_line(event: &Event) -> Option<String> {
     match event.kind {
         EventKind::ProviderRetried => payload(
@@ -2580,10 +2590,11 @@ fn system_line(event: &Event) -> Option<String> {
             }
         }),
         EventKind::MemoryRemembered => payload(event, |p: MemoryRememberedPayload| {
+            let home = memory_home_name(p.home);
             if p.written {
-                format!("remembered in {}", p.file)
+                format!("remembered in {home}{}", p.file)
             } else {
-                format!("already known: {}", p.file)
+                format!("already known: {home}{}", p.file)
             }
         }),
         EventKind::DecisionProposed => payload(event, |p: DecisionProposedPayload| {
@@ -9533,6 +9544,41 @@ mod tests {
             for (i, (kind, payload, want)) in cases.into_iter().enumerate() {
                 let e = event(kind, i as u64 + 1, payload);
                 assert_eq!(system_line(&e).as_deref(), want, "kind {kind:?} line");
+            }
+        }
+
+        /// A remembered line names the home it went to, so a person's or a
+        /// workspace's line is not read as the project's.
+        #[test]
+        fn the_tui_report_names_the_home() {
+            for (home, remembered, already_known) in [
+                (
+                    MemoryHome::Project,
+                    "remembered in decisions.md",
+                    "already known: decisions.md",
+                ),
+                (
+                    MemoryHome::Workspace,
+                    "remembered in the workspace's decisions.md",
+                    "already known: the workspace's decisions.md",
+                ),
+                (
+                    MemoryHome::Person,
+                    "remembered in the person's decisions.md",
+                    "already known: the person's decisions.md",
+                ),
+            ] {
+                for (written, want) in [(true, remembered), (false, already_known)] {
+                    let payload = serde_json::to_value(MemoryRememberedPayload {
+                        file: "decisions.md".into(),
+                        home,
+                        text: "x".into(),
+                        written,
+                    })
+                    .unwrap();
+                    let e = event(EventKind::MemoryRemembered, 1, payload);
+                    assert_eq!(system_line(&e).as_deref(), Some(want), "home {home:?}");
+                }
             }
         }
     }
