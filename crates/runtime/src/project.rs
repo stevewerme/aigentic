@@ -497,21 +497,46 @@ impl ProjectFile {
         Policy::configured(self.policy.rules.clone(), self.policy.bash_allow.clone())
     }
 
-    /// `[policy] allow_paths` resolved against `root` (issue #124): a
-    /// leading `~` is `$HOME`, a relative entry is relative to the
-    /// project root, an absolute one stands. An entry under an unset
-    /// `HOME` is dropped rather than guessed at, which fails closed.
-    pub fn allow_paths(&self, root: &Path) -> Vec<PathBuf> {
-        self.policy
-            .allow_paths
-            .iter()
-            .filter_map(|entry| match entry.strip_prefix("~") {
-                Some("") => std::env::var_os("HOME").map(PathBuf::from),
-                Some(rest) => std::env::var_os("HOME")
-                    .map(|home| PathBuf::from(home).join(rest.trim_start_matches('/'))),
-                None => Some(root.join(entry)),
-            })
-            .collect()
+    /// `[policy] allow_paths` resolved against `root`: a leading `~` is
+    /// `$HOME`, a relative entry is relative to the project root, an
+    /// absolute one stands. An entry under an unset `HOME`, and an entry
+    /// that names a *user* rather than the home directory — `~nobody/x` —
+    /// are both refused, so the boundary is never widened past `$HOME`.
+    /// The returned warnings name each refused entry.
+    pub fn allow_paths(&self, root: &Path) -> (Vec<PathBuf>, Vec<String>) {
+        let mut found = Vec::new();
+        let mut warnings = Vec::new();
+        for entry in &self.policy.allow_paths {
+            let Some(rest) = entry.strip_prefix('~') else {
+                // A relative entry is relative to the project root.
+                found.push(root.join(entry));
+                continue;
+            };
+            // `~` and `~/…` are `$HOME` and `$HOME/…`; another `~name`
+            // names that user's home, which aigentic will not guess at,
+            // so the entry is refused rather than read as `$HOME/name`.
+            let under_home = if rest.is_empty() || rest.starts_with('/') {
+                Some(rest.trim_start_matches('/'))
+            } else {
+                None
+            };
+            let Some(under_home) = under_home else {
+                warnings.push(format!(
+                    "policy.allow_paths: {entry} names a user home; ignored"
+                ));
+                continue;
+            };
+            match std::env::var_os("HOME") {
+                Some(home) if !under_home.is_empty() => {
+                    found.push(PathBuf::from(home).join(under_home));
+                }
+                Some(home) => found.push(PathBuf::from(home)),
+                None => warnings.push(format!(
+                    "policy.allow_paths: {entry} needs HOME, which is unset; ignored"
+                )),
+            }
+        }
+        (found, warnings)
     }
 
     /// Whether any phase 4 section is present, which makes `[project]

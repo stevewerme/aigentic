@@ -604,3 +604,81 @@ async fn only_the_file_tools_are_confined() {
         "no boundary ask for a shell"
     );
 }
+
+/// A dangling symlink inside the project is not an inside path: the link
+/// resolves, by hand, to its target outside, so a write through it asks a
+/// person in `accept-edits` and `auto` even though the link's own name is
+/// inside, and a denial leaves the target uncreated.
+#[tokio::test]
+async fn a_dangling_link_inside_does_not_carry_a_write_outside() {
+    for mode in [Mode::AcceptEdits, Mode::Auto] {
+        let f = fixture();
+        let ghost = f.sibling.join("ghost.txt");
+        std::os::unix::fs::symlink(&ghost, f.project.join("link-dangling")).unwrap();
+        let mut r = Rig::new(
+            f,
+            vec![
+                vec![
+                    write_file("c1", "link-dangling", "escaped\n"),
+                    done("tool_use"),
+                ],
+                vec![text("done"), done("stop")],
+            ],
+            vec![Answer::Deny],
+            rooted,
+        );
+        r.runtime.set_mode(mode);
+        r.go().await;
+        let asked = r.asked();
+        assert_eq!(asked.len(), 1, "{mode:?} asked: {asked:?}");
+        assert_eq!(asked[0].call.id, "c1");
+        assert_eq!(
+            asked[0].reason,
+            format!("outside this project: {}", ghost.display())
+        );
+        assert!(r.result("c1").result.is_error, "{mode:?}");
+        assert!(
+            !ghost.exists(),
+            "{mode:?}: the denied write created {} through the link",
+            ghost.display()
+        );
+    }
+}
+
+/// The same link under a step is denied with nobody to ask, and the
+/// target stays absent.
+#[tokio::test]
+async fn a_step_denies_a_write_through_a_dangling_link() {
+    let f = fixture();
+    let ghost = f.sibling.join("ghost.txt");
+    std::os::unix::fs::symlink(&ghost, f.project.join("link-dangling")).unwrap();
+    let mut r = Rig::new(
+        f,
+        vec![
+            vec![
+                write_file("c1", "link-dangling", "escaped\n"),
+                done("tool_use"),
+            ],
+            vec![text("done"), done("stop")],
+        ],
+        vec![],
+        rooted,
+    );
+    r.runtime = r
+        .runtime
+        .with_step("implement", &[])
+        .expect("a known deny list");
+    r.go().await;
+    assert!(r.asked().is_empty(), "a step asks nobody");
+    let denied = r.result("c1");
+    assert!(denied.result.is_error);
+    assert_eq!(
+        denied.result.content,
+        format!(
+            "denied by policy: boundary (outside this project: {} — a step never reaches another project)",
+            ghost.display()
+        ),
+        "the refusal names the resolved target"
+    );
+    assert!(!ghost.exists(), "the denied write created nothing");
+}

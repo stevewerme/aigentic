@@ -9,7 +9,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use aigentic_core::{RiskClass, ToolCall};
-use aigentic_policy::{Decision, Outcome, Policy, Rule};
+use aigentic_policy::{Decision, Outcome, Policy, Rule, canonicalise};
 use serde_json::json;
 
 /// The five checked tools, with the class the runtime gives each.
@@ -339,4 +339,98 @@ fn t1_only_the_file_tools_are_checked() {
             "{tool} is not confined by the boundary"
         );
     }
+}
+
+/// A dangling symlink is judged by where it points, not by its path:
+/// `canonicalize()` fails for it, and the write the link carries lands
+/// at the target, so the link to an outside file is outside the project.
+#[test]
+fn a_dangling_symlink_to_an_outside_file_is_outside() {
+    let f = fixture();
+    let target = f.sibling.join("not-created.txt");
+    std::os::unix::fs::symlink(&target, f.project.join("link-dangling")).unwrap();
+    let p = f.policy();
+    assert_eq!(
+        canonicalise(&f.project.join("link-dangling")),
+        target,
+        "resolution follows the link even though the target is missing"
+    );
+    let call = call("write_file", "link-dangling");
+    assert_eq!(
+        asked(&p.decide(&call, RiskClass::Write, Some(&f.project))),
+        target,
+        "the ask names the file the write would create"
+    );
+}
+
+/// The same link, pointing at a file that does not exist inside the
+/// project: the write stays in, so the boundary has nothing to ask.
+#[test]
+fn a_dangling_symlink_to_an_inside_file_is_inside() {
+    let f = fixture();
+    let target = f.project.join("not-created.txt");
+    std::os::unix::fs::symlink(&target, f.project.join("link-dangling")).unwrap();
+    let p = f.policy();
+    let call = call("write_file", "link-dangling");
+    assert!(
+        matches!(
+            p.decide(&call, RiskClass::Write, Some(&f.project)),
+            Outcome::Allow { .. }
+        ),
+        "the write lands inside the project"
+    );
+}
+
+/// A chain of links longer than the kernel follows cannot be resolved,
+/// so the call asks rather than being judged by the link path.
+#[test]
+fn a_symlink_chain_past_the_hop_bound_is_outside() {
+    let f = fixture();
+    let mut next = f.sibling.join("unreachable.txt");
+    for i in (0..45).rev() {
+        let link = f.project.join(format!("chain{i}"));
+        std::os::unix::fs::symlink(&next, &link).unwrap();
+        next = link;
+    }
+    let p = f.policy();
+    let call = call("read_file", "chain0");
+    assert!(
+        matches!(
+            p.decide(&call, RiskClass::Read, Some(&f.project)),
+            Outcome::AskBoundary { .. }
+        ),
+        "45 hops are past the bound"
+    );
+}
+
+/// The whole path is canonicalised in one call, so a deep inside path
+/// costs a syscall per check and not one per component.
+#[test]
+fn a_deep_inside_path_costs_one_call_per_check() {
+    let f = fixture();
+    let p = f.policy();
+    let mut dir = f.project.clone();
+    for i in 0..60 {
+        dir = dir.join(format!("d{i}"));
+    }
+    fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("a.txt");
+    fs::write(&file, "in\n").unwrap();
+    let call = call("read_file", &file.display().to_string());
+    let start = std::time::Instant::now();
+    for _ in 0..1000 {
+        assert!(
+            matches!(
+                p.decide(&call, RiskClass::Read, Some(&f.project)),
+                Outcome::Allow { .. }
+            ),
+            "inside, in one call"
+        );
+    }
+    let took = start.elapsed();
+    eprintln!("1000 checks on a 60-component inside path: {took:?}");
+    assert!(
+        took < std::time::Duration::from_secs(1),
+        "1000 checks took {took:?}"
+    );
 }

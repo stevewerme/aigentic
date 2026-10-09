@@ -205,13 +205,19 @@ pub async fn project_context(
 /// skills (never all the skill roots, which would widen the boundary to
 /// the whole bundled `skills/` and every `~/.config/aigentic/skills/`
 /// entry), and the project's `[policy] allow_paths`. `policy`
-/// canonicalises every one of them.
+/// canonicalises every one of them. An `allow_paths` entry that is
+/// refused — one naming a user's home — warns on stderr, where the
+/// daemon's log keeps it.
 fn boundary_roots(file: &ProjectFile, root: &Path, skills: &SkillSet) -> Vec<PathBuf> {
     let mut roots = vec![std::env::temp_dir()];
     #[cfg(unix)]
     roots.push(PathBuf::from("/tmp"));
     roots.extend(skills.iter().map(|manifest| manifest.path.clone()));
-    roots.extend(file.allow_paths(root));
+    let (allowed, warnings) = file.allow_paths(root);
+    for warning in warnings {
+        eprintln!("warn  {warning}");
+    }
+    roots.extend(allowed);
     roots
 }
 

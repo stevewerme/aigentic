@@ -9,6 +9,7 @@ mod rules;
 mod shell;
 mod step;
 
+use std::collections::VecDeque;
 use std::path::{Component, Path, PathBuf};
 
 use aigentic_core::{RiskClass, ToolCall};
@@ -357,28 +358,116 @@ fn normalise(path: &Path) -> PathBuf {
     out
 }
 
+/// How many symlink hops a hand resolution follows before giving up,
+/// the kernel's own limit.
+const MAX_SYMLINK_HOPS: usize = 40;
+
+/// A path no boundary root contains. Resolution answers with it when it
+/// cannot say where a path lands — a symlink chain past
+/// [`MAX_SYMLINK_HOPS`], or a loop — so the call asks instead of being
+/// judged inside.
+fn unresolvable() -> PathBuf {
+    PathBuf::from("/")
+}
+
 /// The canonical form of `path`, for the boundary's containment checks:
 /// symlinks resolved, so a link out of the project is judged by where it
 /// lands, and a path that does not exist yet answers with its nearest
-/// real ancestor plus the rest. Component by component, so a `link/..`
-/// is the *link's* own parent directory, as the kernel reads it, and not
-/// the directory the link sits in.
+/// real ancestor plus the rest. `link/..` is the *link's* own parent
+/// directory, as the kernel reads it, because the whole path is
+/// canonicalised in one call when it exists.
+///
+/// Only the part below the deepest prefix that exists is walked. A
+/// component `canonicalize()` cannot follow — a symlink whose target
+/// does not exist — is read by [`std::fs::read_link`] and its target
+/// spliced in, so a dangling link is judged by where it points. Past
+/// [`MAX_SYMLINK_HOPS`] hops, or on a loop, the answer is
+/// [`unresolvable`].
 pub fn canonicalise(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for c in path.components() {
-        match c {
-            Component::Prefix(p) => out.push(p.as_os_str()),
-            Component::RootDir => out.push(Component::RootDir.as_os_str()),
-            Component::CurDir => continue,
-            Component::ParentDir => {
+    // Each component as its own one-step path, so a symlink target read
+    // later can be spliced in front of what is still to come.
+    let mut pending: VecDeque<PathBuf> = path
+        .components()
+        .map(|c| PathBuf::from(c.as_os_str()))
+        .collect();
+    // The deepest prefix that exists, canonicalised in one call; the
+    // components below it are what the walk has left to do.
+    let mut below: Vec<PathBuf> = Vec::new();
+    let mut out = loop {
+        let candidate: PathBuf = pending.iter().collect();
+        if let Ok(real) = candidate.canonicalize() {
+            break real;
+        }
+        match pending.pop_back() {
+            Some(component) => below.push(component),
+            None => break PathBuf::new(),
+        }
+    };
+    let mut pending: VecDeque<PathBuf> = below.into_iter().rev().collect();
+
+    // `true` while the prefix does not exist: nothing under a missing
+    // directory can exist either, so the walk stops asking the disk —
+    // until a `..` climbs back to a directory that does.
+    let mut missing = false;
+    let mut hops = 0usize;
+    while let Some(step) = pending.pop_front() {
+        match step.components().next() {
+            Some(Component::Prefix(prefix)) => {
+                out.push(prefix.as_os_str());
+                missing = false;
+            }
+            Some(Component::RootDir) => {
+                out.push(Component::RootDir.as_os_str());
+                missing = false;
+            }
+            // `.` is the prefix itself.
+            Some(Component::CurDir) => continue,
+            // `..` names the parent of whatever the prefix is *called*,
+            // whether or not it exists, as the kernel reads it.
+            Some(Component::ParentDir) => {
                 out.pop();
+                missing = false;
                 continue;
             }
-            Component::Normal(name) => out.push(name),
+            Some(Component::Normal(name)) => out.push(name),
+            None => continue,
+        }
+        if missing {
+            continue;
         }
         if let Ok(real) = out.canonicalize() {
             out = real;
+            continue;
         }
+        let symlink = out
+            .symlink_metadata()
+            .map(|meta| meta.file_type().is_symlink())
+            .unwrap_or(false);
+        if !symlink {
+            missing = true;
+            continue;
+        }
+        hops += 1;
+        if hops > MAX_SYMLINK_HOPS {
+            return unresolvable();
+        }
+        let Ok(target) = std::fs::read_link(&out) else {
+            return unresolvable();
+        };
+        // The link's own name is gone; a relative target resolves
+        // against the link's parent, an absolute one from the root.
+        out.pop();
+        if target.is_absolute() {
+            out = PathBuf::new();
+        }
+        let target: Vec<PathBuf> = target
+            .components()
+            .map(|c| PathBuf::from(c.as_os_str()))
+            .collect();
+        for step in target.into_iter().rev() {
+            pending.push_front(step);
+        }
+        missing = false;
     }
     out
 }
