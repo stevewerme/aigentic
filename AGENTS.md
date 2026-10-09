@@ -109,6 +109,26 @@ expected variables.
   (`AGENTS.md`, `SKILL.md`, MCP). It never reads a file because another
   agent product does (`CLAUDE.md`, `.cursorrules`, `.claude/`).
 
+## Comments
+
+A comment says what is true of the code now, and why when the why
+isn't obvious. Models read comments as fact, so a stale one misleads
+more than a missing one does. History belongs in git, the issues and
+the log, not in the code.
+
+- Public items keep a doc comment for their contract: what it takes,
+  what it returns, what it guarantees, what it refuses.
+- Explain a non-obvious why in one or two lines (an invariant, a
+  constraint, a hazard), next to the code it constrains.
+- No issue or PR numbers (`#123`, `issue #123`), no test-plan labels
+  (`T1`, `T6`), and no comparisons with an earlier version ("as
+  before", "used to", "now that", "as #n did", "HEAD's").
+- Don't restate the spec or narrate the change. Don't describe what the
+  next line plainly does.
+- A test's name says what it proves; its doc comment, if any, says why
+  that matters, not which ticket asked for it.
+- When you touch a file, bring the comments you touch up to this rule.
+
 ## Agent skills
 
 ### Issue tracker
