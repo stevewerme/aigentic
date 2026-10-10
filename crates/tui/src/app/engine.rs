@@ -2531,11 +2531,8 @@ pub(crate) fn sweep_line(what: &str, through_seq: u64, ratio: Option<f64>) -> St
     line
 }
 
-/// The developer view's line for what the harness did on its own (issue
-/// #115), or `None` for a kind that draws none. Pure over the event, so
-/// each kind's wording is tested without a daemon.
-/// What the report calls a line's home. The project's is unmarked: it is
-/// where every line went before the other two homes existed.
+/// What the report calls a line's home. The project's is unmarked, so a
+/// project line reads `remembered in <file>`.
 fn memory_home_name(home: MemoryHome) -> &'static str {
     match home {
         MemoryHome::Project => "",
@@ -2544,6 +2541,9 @@ fn memory_home_name(home: MemoryHome) -> &'static str {
     }
 }
 
+/// The developer view's line for what the harness did on its own, or
+/// `None` for a kind that draws none. Pure over the event, so each kind's
+/// wording is tested without a daemon.
 fn system_line(event: &Event) -> Option<String> {
     match event.kind {
         EventKind::ProviderRetried => payload(
