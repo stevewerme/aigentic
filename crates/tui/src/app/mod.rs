@@ -21,6 +21,7 @@ pub mod pager;
 pub(crate) mod rig;
 pub mod status;
 pub mod tui;
+pub(crate) mod watch;
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -777,7 +778,13 @@ async fn run_shell(
         }
         status.title = engine.title().map(str::to_owned);
         status.usage = engine.usage();
-        status.run = engine.run_segment().map(str::to_owned);
+        // Inside a watch the line is the watch's: its own segment, and
+        // the run's figures with the run's head off (issue #140).
+        status.inside = engine.inside();
+        status.run = match engine.watch_figures() {
+            Some(figures) => Some(figures.to_owned()),
+            None => engine.run_segment().map(str::to_owned),
+        };
         // The turn line carries the clock while a turn runs.
         status.elapsed = None;
         let activity = engine.turn().map(|t| {
@@ -1058,7 +1065,10 @@ async fn run_shell(
                     out.flush()?;
                     break;
                 }
-                Some(n) => engine.render(n, &mut out),
+                Some(n) => {
+                    engine.render(n, &mut out);
+                    engine.settle(&mut out).await;
+                }
             },
             _ = tick.tick() => {}
         }

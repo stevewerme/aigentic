@@ -37,6 +37,9 @@ pub enum Command<'a> {
     /// Answer the followed run's checkpoint: `/answer go`, `/answer amend
     /// <text>` or `/answer stop`.
     Answer(&'a str),
+    /// Watch a running issue's step here, read-only:
+    /// `/watch <issue> [step]` (issue #140).
+    Watch(Option<&'a str>),
     /// A user-invoked skill: its name and the rest of the line.
     Skill(&'a str, &'a str),
     /// The key table.
@@ -100,6 +103,8 @@ pub fn parse_line<'a>(line: &'a str, skills: &[String]) -> Command<'a> {
         ("pin", text) if !text.is_empty() => Command::Pin(text),
         ("build", "") => Command::Build(None),
         ("build", arg) => Command::Build(Some(arg)),
+        ("watch", "") => Command::Watch(None),
+        ("watch", arg) => Command::Watch(Some(arg)),
         ("answer", arg) => Command::Answer(arg),
         ("remember", text) if !text.is_empty() => Command::Remember(text),
         (name, args) if skills.iter().any(|s| s == name) => Command::Skill(name, args),
@@ -159,6 +164,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "answer",
         "answer the run's checkpoint: /answer go, /answer amend <text>, /answer stop",
     ),
+    (
+        "watch",
+        "watch a running issue's step here, read-only: /watch <issue> [step]",
+    ),
     ("diff", "the project's working-tree diff, in the pager"),
     ("copy", "copy a code block of the last reply: /copy [n|all]"),
     ("rename", "set the thread's title: /rename <title>"),
@@ -186,6 +195,7 @@ pub const HELP: &str = "\
 /threads         your threads in every project: front, builds, then by workspace
 /new             start a new front thread; the old one stays listed; asks first if a turn is running
 /build <n> [w]   follow a build of issue n here (workflow w, else build), and answer its checkpoints
+/watch <n> [s]   watch a running issue's step s (default: the step it is on) read-only; /back leaves
 /answer go       continue the run past its checkpoint; /answer amend <text> continues with changes; /answer stop
 /<skill> [args]  run a user-invoked skill
 /diff            the project's working-tree diff, untracked files included

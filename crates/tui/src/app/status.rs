@@ -32,12 +32,27 @@ pub struct Status {
     /// The followed run's own segment, last on the line while a run is
     /// followed and dropped when the follow ends.
     pub run: Option<String>,
+    /// `inside #140 spec` while a step of a running issue is watched
+    /// (issue #140): the line is the watch's alone then, and the front
+    /// thread's own parts come back when the watch ends.
+    pub inside: Option<String>,
 }
 
 impl Status {
     /// `vendela · Crate count · flash (deepseek-v4.1-flash) · manual ·
     /// working 48k · thread 2.1M · queued 1`
     pub fn line(&self) -> String {
+        // Inside a watch the line is the watch's alone: what the watched
+        // run is doing, and the way back. `inside` already names the
+        // issue and the step, so the run's figures are drawn bare.
+        if let Some(inside) = &self.inside {
+            let mut parts = vec![inside.clone()];
+            if let Some(run) = &self.run {
+                parts.push(run.clone());
+            }
+            parts.push("/back".to_owned());
+            return parts.join(" · ");
+        }
         let mut parts = vec![self.project.clone()];
         if let Some(t) = &self.title {
             let short: String = t.chars().take(TITLE_CHARS).collect();
@@ -109,6 +124,22 @@ impl Status {
 /// daemon's own fold over the lead's and the child's logs, so the line
 /// repeats nothing the client counts.
 pub fn run_segment(status: &aigentic_api::RunStatus) -> String {
+    // The issue names the whole line; the rest is one phrase, so the
+    // step reads as the issue's own while the figures follow it.
+    format!("#{} {}", status.issue, run_parts(status, true).join(" · "))
+}
+
+/// The run segment's figures without the head it is drawn under: what the
+/// status line shows beside `inside #140 spec`, which already names the
+/// issue and the step, so the figures are the segment's parts alone.
+pub fn run_figures(status: &aigentic_api::RunStatus) -> String {
+    run_parts(status, false).join(" · ")
+}
+
+/// The run segment's parts, in order: the step's own first when `named`,
+/// then its figures, then the silence. One builder keeps the watched
+/// figures a prefix of the segment they come from.
+fn run_parts(status: &aigentic_api::RunStatus, named: bool) -> Vec<String> {
     let mut parts = Vec::new();
     match &status.phase {
         aigentic_api::RunPhase::Step {
@@ -119,7 +150,9 @@ pub fn run_segment(status: &aigentic_api::RunStatus) -> String {
             checklist,
             ..
         } => {
-            parts.push(step.clone());
+            if named {
+                parts.push(step.clone());
+            }
             parts.push(progress::short_duration(*elapsed_secs as i64));
             parts.push(format!("{calls} calls"));
             // Two decimals, the provider's own stamp: the segment's money
@@ -142,9 +175,7 @@ pub fn run_segment(status: &aigentic_api::RunStatus) -> String {
     if status.idle_secs >= QUIET_AFTER_SECS {
         parts.push(format!("quiet {}m", status.idle_secs / 60));
     }
-    // The issue names the whole line; the rest is one phrase, so the
-    // step reads as the issue's own while the figures follow it.
-    format!("#{} {}", status.issue, parts.join(" · "))
+    parts
 }
 
 /// Seconds of silence after which the segment says `quiet`.
@@ -208,6 +239,7 @@ mod tests {
             queued: 1,
             waiting: None,
             run: None,
+            inside: None,
         };
         // Working and thread (issue #99), each in the footer's one
         // vocabulary, and no ceiling to read them against.
@@ -257,6 +289,7 @@ mod tests {
     }
 
     const STEP: &str = "spec";
+    const GATE: &str = "decide";
 
     #[test]
     fn the_segment_reads_the_issues_step_its_figures_and_its_checklist() {
@@ -323,6 +356,112 @@ mod tests {
         assert_eq!(run_segment(&mov), "#139 running the checks");
         // A move is a sentence, not a step: it carries no clock.
         assert!(!run_segment(&mov).contains("calls"));
+    }
+
+    #[test]
+    fn inside_is_drawn_and_nothing_else_changes() {
+        const ISSUE: u64 = 140;
+        let step_fixture = a_step(ISSUE, 192, 72, 0.51);
+        let figures = run_figures(&step_fixture);
+        let inside = format!("inside #{ISSUE} {STEP}");
+
+        // Nothing changes while no watch is open: the line is exactly the
+        // one the front thread draws today.
+        let front = Status {
+            project: "vendela".into(),
+            mode: "manual".into(),
+            ..Status::default()
+        };
+        assert_eq!(front.line(), "vendela · manual");
+        assert!(!front.line().contains(&inside));
+
+        // Inside, the watch's segment leads, the run's figures follow
+        // bare, and `/back` is last.
+        let watching = Status {
+            project: "vendela".into(),
+            mode: "manual".into(),
+            run: Some(figures.clone()),
+            inside: Some(inside.clone()),
+            ..Status::default()
+        };
+        assert_eq!(
+            watching.line(),
+            format!("{inside} · {figures} · /back"),
+            "the run's head is not drawn twice"
+        );
+
+        // A watch whose run has pushed no figures yet: the segment and
+        // the way back, and nothing invented between them.
+        let quiet = Status {
+            inside: Some(inside.clone()),
+            ..Status::default()
+        };
+        assert_eq!(quiet.line(), format!("{inside} · /back"));
+
+        // A followed run of another issue is not the watched one: the
+        // shell hands the watch's own figures, and a status for another
+        // issue never becomes one.
+        let other = a_step(ISSUE + 1, 10, 1, 0.0);
+        let watched = crate::app::watch::figures_after(ISSUE, None, &step_fixture);
+        assert_eq!(watched.as_deref(), Some(figures.as_str()));
+        assert_eq!(
+            crate::app::watch::figures_after(ISSUE, watched.as_deref(), &other),
+            watched,
+            "another issue's run is not the watched one"
+        );
+        let without = Status {
+            run: crate::app::watch::figures_after(ISSUE, None, &other),
+            inside: Some(inside.clone()),
+            ..Status::default()
+        };
+        assert_eq!(without.line(), format!("{inside} · /back"));
+    }
+
+    #[test]
+    fn the_figures_are_the_run_segment_without_the_head() {
+        const ISSUE: u64 = 140;
+        let step_fixture = a_step(ISSUE, 192, 72, 0.51);
+        assert_eq!(
+            run_segment(&step_fixture),
+            format!("#{ISSUE} {STEP} · {}", run_figures(&step_fixture))
+        );
+
+        let gate_fixture = aigentic_api::RunStatus {
+            issue: ISSUE,
+            phase: aigentic_api::RunPhase::Gate { gate: GATE.into() },
+            idle_secs: 0,
+        };
+        assert_eq!(
+            run_segment(&gate_fixture),
+            format!("#{ISSUE} waiting at {GATE}")
+        );
+        assert_eq!(run_figures(&gate_fixture), format!("waiting at {GATE}"));
+    }
+
+    #[test]
+    fn inside_is_distinguishable_by_sight() {
+        const ISSUE: u64 = 140;
+        let step_fixture = a_step(ISSUE, 192, 72, 0.51);
+        let figures = run_figures(&step_fixture);
+        let inside = format!("inside #{ISSUE} {STEP}");
+
+        let watching = Status {
+            run: Some(figures.clone()),
+            inside: Some(inside.clone()),
+            ..Status::default()
+        };
+        assert!(watching.line().contains(&figures));
+
+        // The two configurations the shell builds: with a watch, the
+        // watch's line; without one, the front thread's byte for byte.
+        let front = Status {
+            project: "vendela".into(),
+            mode: "manual".into(),
+            run: Some(figures.clone()),
+            ..Status::default()
+        };
+        assert_eq!(front.line(), format!("vendela · manual · {figures}"));
+        assert!(!front.line().contains(&inside));
     }
 
     #[test]

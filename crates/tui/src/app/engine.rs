@@ -34,6 +34,7 @@ use crate::app::commands::{Command, HELP, parse_line, truncate_for_display};
 use crate::app::copy::Used;
 use crate::app::look::View;
 use crate::app::menu::{Keyed, Kind, Menu, Pick};
+use crate::app::watch::{Step, Watch, WatchRefused};
 use crate::front;
 
 /// What a key on the prompt menu came to, from `ClientRepl::menu_key`.
@@ -527,6 +528,15 @@ pub struct ClientRepl {
     /// `menu` the moment it arrives and would overwrite it. Answered
     /// here, never sent to the daemon.
     confirm_new: Option<Menu>,
+    /// The running issue's step this REPL watches, if any: its own
+    /// engine, its figures and its moves. The front thread's state is
+    /// untouched while it is open.
+    watch: Option<Watch>,
+    /// What arrived while a watch was open and was not the watched
+    /// child's, in order, drawn when `/back` returns to the front
+    /// thread. The watched run's notices are held too, so its own lines
+    /// are exactly where they would have been.
+    held: Vec<Notice>,
 }
 
 impl ClientRepl {
@@ -611,6 +621,8 @@ impl ClientRepl {
             following: None,
             run_segment: None,
             checkpoint: None,
+            watch: None,
+            held: Vec::new(),
         }
     }
 
@@ -869,6 +881,7 @@ impl ClientRepl {
                     other => self.show(other, "", out),
                 }
             }
+            Command::Watch(arg) => self.watch(arg, out).await,
             Command::Chat(text) => self.post(text, false, out).await,
             Command::Interrupt(text) => self.post(text, true, out).await,
             Command::Skill(name, args) => {
@@ -1286,6 +1299,50 @@ impl ClientRepl {
         }
     }
 
+    /// `/watch <issue> [step]`: open one of an issue's running steps in
+    /// this shell, read-only. An existing follow is left alone, so the
+    /// front's own view of that run is where it was.
+    async fn watch(&mut self, arg: Option<&str>, out: &mut dyn Printer) {
+        let Some(arg) = arg else {
+            out.line("[watch what? /watch <issue> [step], or /watch pin]");
+            return;
+        };
+        let issue = match crate::app::watch::parse(arg) {
+            Ok(issue) => issue,
+            Err(line) => {
+                out.line(&line);
+                return;
+            }
+        };
+        let target = match crate::app::watch::target(arg) {
+            Ok(target) => target,
+            Err(line) => {
+                out.line(&line);
+                return;
+            }
+        };
+        let project = self
+            .project
+            .clone()
+            .unwrap_or_else(|| self.home_project.clone());
+        let user = self.user.clone();
+        let role = self.role.clone();
+        match crate::app::watch::Watch::enter(
+            &self.client,
+            &user,
+            role,
+            &project,
+            issue,
+            target,
+            out,
+        )
+        .await
+        {
+            Ok(watch) => self.watch = Some(watch),
+            Err(refused) => out.line(&refused.0),
+        }
+    }
+
     /// The lead's log from its first event, drawn in order (issue #68).
     /// Nothing is answered here: a gate the backlog ends at is shown and
     /// left waiting for a person.
@@ -1326,6 +1383,33 @@ impl ClientRepl {
         if let Some(text) = crate::run_view::render(event) {
             out.cell(Cell::Run(text), true);
         }
+        self.gate_event(event, lead, out);
+        if event.kind == EventKind::RunFinished
+            && let Ok(p) = serde_json::from_value::<RunFinishedPayload>(event.payload.clone())
+        {
+            out.cell(
+                Cell::Run(format!(
+                    "run {lead} finished: {}",
+                    crate::run_view::outcome_line(&p.outcome)
+                )),
+                true,
+            );
+            self.following = None;
+            self.checkpoint = None;
+            self.run_segment = None;
+        }
+    }
+
+    /// The gate arms of one event for the run whose lead is `lead`: a
+    /// checkpoint asked for shows its prompt, an answer from anywhere
+    /// withdraws it. Split out so a watch can hand the gate it folds to
+    /// its own engine, which is where `/answer` then reaches it.
+    pub(crate) fn gate_event(
+        &mut self,
+        event: &aigentic_runtime::aigentic_core::Event,
+        lead: Ulid,
+        out: &mut dyn Printer,
+    ) {
         match event.kind {
             EventKind::CheckpointAsked => {
                 if let Ok(p) =
@@ -1346,26 +1430,11 @@ impl ClientRepl {
             // this client sending anything. The answer event names no
             // gate (the payload has no such field), and a lead has one
             // gate up at a time, so any answer withdraws the prompt.
-            EventKind::CheckpointAnswered => {
+            EventKind::CheckpointAnswered
                 if serde_json::from_value::<CheckpointAnsweredPayload>(event.payload.clone())
-                    .is_ok()
-                {
-                    self.checkpoint = None;
-                }
-            }
-            EventKind::RunFinished => {
-                if let Ok(p) = serde_json::from_value::<RunFinishedPayload>(event.payload.clone()) {
-                    out.cell(
-                        Cell::Run(format!(
-                            "run {lead} finished: {}",
-                            crate::run_view::outcome_line(&p.outcome)
-                        )),
-                        true,
-                    );
-                    self.following = None;
-                    self.checkpoint = None;
-                    self.run_segment = None;
-                }
+                    .is_ok() =>
+            {
+                self.checkpoint = None;
             }
             _ => {}
         }
@@ -1404,6 +1473,29 @@ impl ClientRepl {
             .as_ref()
             .filter(|open| open.shown)
             .map(|open| &open.menu)
+    }
+
+    /// Whether a step of a running issue is open here.
+    pub fn watching(&self) -> bool {
+        self.watch.is_some()
+    }
+
+    /// `inside #140 spec`, while a watch is open: the status line shows
+    /// this in place of the front thread's own parts.
+    pub fn inside(&self) -> Option<String> {
+        self.watch.as_ref().map(|watch| watch.inside())
+    }
+
+    /// The watched run's figures, while a watch is open and the daemon
+    /// has pushed a status for its run.
+    pub fn watch_figures(&self) -> Option<&str> {
+        self.watch.as_ref().and_then(|watch| watch.figures())
+    }
+
+    /// The watch's own child engine, which the pane and the answering
+    /// keys follow while a watch is open.
+    fn watched_child(&mut self) -> Option<&mut ClientRepl> {
+        self.watch.as_mut().map(|watch| watch.child())
     }
 
     /// `/answer go`, `/answer amend <text>` or `/answer stop`: answer the
@@ -1563,6 +1655,21 @@ impl ClientRepl {
     /// The project the thread last moved to, if it has.
     pub fn project(&self) -> Option<&str> {
         self.project.as_deref()
+    }
+
+    /// The user this client speaks as.
+    pub(crate) fn user(&self) -> &str {
+        &self.user
+    }
+
+    /// The user's role in this project.
+    pub(crate) fn role(&self) -> Option<&String> {
+        self.role.as_ref()
+    }
+
+    /// The connection, for the requests a watch makes of its own.
+    pub(crate) fn client(&self) -> &Client {
+        &self.client
     }
 
     /// The checklist the shell draws above the turn line.
@@ -1966,6 +2073,11 @@ impl ClientRepl {
     /// One notice to lines. Streamed text is printed as its lines
     /// complete; the rest at the message's end.
     pub fn render(&mut self, notice: Notice, out: &mut dyn Printer) {
+        // Inside a watch the notices split three ways by thread, and the
+        // front thread sees none of them until `/back`.
+        if self.watch.is_some() && self.render_watch(&notice, out) {
+            return;
+        }
         // A followed run's notices go to the run view (issue #68), and
         // everything else for its lead is dropped: a lead's `State` must
         // never reach `self.state`, which drives the footer and what
@@ -1978,21 +2090,108 @@ impl ClientRepl {
         self.render_chat(notice, out)
     }
 
+    /// Draw a notice while a watch is open, and say whether it was one.
+    ///
+    /// The watched child's own notices draw through the watch's engine;
+    /// the lead's fold into the watch, carry its gate and drive its
+    /// moves; every other thread's waits in `held`, with a line for a
+    /// gate it would need answered. A move is opened by `settle`, after
+    /// the notices this batch carried.
+    fn render_watch(&mut self, notice: &Notice, out: &mut dyn Printer) -> bool {
+        let Some(child_thread) = self.watch.as_ref().map(|watch| watch.child_thread()) else {
+            return false;
+        };
+        let lead = self.watch.as_ref().map(|watch| watch.lead());
+        let thread = notice_thread(notice);
+        if thread == child_thread {
+            match notice {
+                Notice::Event { event, .. } => {
+                    if let Some(watch) = self.watch.as_mut() {
+                        watch.render_child(event.clone(), out);
+                    }
+                }
+                other => {
+                    if let Some(watch) = self.watch.as_mut() {
+                        watch.child().render(other.clone(), out);
+                    }
+                }
+            }
+            return true;
+        }
+        if Some(thread) == lead {
+            if let Notice::Event { event, .. } = notice {
+                let step = match self.watch.as_mut() {
+                    Some(watch) => watch.absorb(event.clone(), out),
+                    None => Step::Stay,
+                };
+                self.held.push(notice.clone());
+                if matches!(step, Step::Ended) {
+                    // The run this watch followed is over: say so, and
+                    // leave as `/back` does, so the catch-up is not
+                    // stranded.
+                    let now = self
+                        .watch
+                        .as_ref()
+                        .map(|watch| (watch.issue(), watch.divider()));
+                    if let Some((issue, divider)) = now {
+                        out.line(&format!("[watch: run #{issue} finished]"));
+                        self.watch = None;
+                        self.leave_watch(out, divider);
+                    }
+                }
+                return true;
+            }
+            if let Notice::RunStatus { status, .. } = notice
+                && let Some(watch) = self.watch.as_mut()
+            {
+                watch.status(status);
+            }
+            self.held.push(notice.clone());
+            return true;
+        }
+        if opens_gate(notice) {
+            out.line(&format!(
+                "[prompt for thread {thread} is waiting: /watch it to answer]"
+            ));
+        }
+        self.held.push(notice.clone());
+        true
+    }
+
+    /// Finish what the folded lead events left for the daemon: a move
+    /// opens the new step's child and draws its backlog, so the watch is
+    /// whole again before the next key. The shell calls this after the
+    /// notices it drains, and it does nothing with no watch or no move.
+    pub async fn settle(&mut self, out: &mut dyn Printer) {
+        let Some(child) = self.watch.as_mut().and_then(|watch| watch.take_pending()) else {
+            return;
+        };
+        let Some(watch) = self.watch.as_mut() else {
+            return;
+        };
+        if let Err(WatchRefused(line)) = watch.moved(child, out).await {
+            out.line(&line);
+        }
+    }
+
+    /// Leave the watch: the front thread's held notices are drawn in
+    /// order, and `divider` last.
+    fn leave_watch(&mut self, out: &mut dyn Printer, divider: String) {
+        let held = std::mem::take(&mut self.held);
+        for notice in held {
+            if self.route(&notice, out) {
+                continue;
+            }
+            self.render_chat(notice, out);
+        }
+        out.line(&divider);
+    }
+
     /// Draw a notice as the run view, or answer whether it was one
     /// (issue #68). `false` hands the notice to the chat.
     fn route(&mut self, notice: &Notice, out: &mut dyn Printer) -> bool {
         let some_lead = self.following.as_ref().map(|f| f.lead);
-        let thread = match notice {
-            Notice::Event { thread, .. }
-            | Notice::TextDelta { thread, .. }
-            | Notice::ToolCallStarted { thread, .. }
-            | Notice::State { thread, .. }
-            | Notice::Mode { thread, .. }
-            | Notice::Model { thread, .. }
-            | Notice::Usage { thread, .. }
-            | Notice::Note { thread, .. }
-            | Notice::RunStatus { thread, .. } => *thread,
-        };
+        let thread = notice_thread(notice);
         if thread == self.thread {
             return false;
         }
@@ -3460,6 +3659,37 @@ fn first_line(text: &str) -> String {
         s.push('…');
     }
     s
+}
+
+/// The thread a notice belongs to. A notice carries one thread and no
+/// issue or step, so this is the whole of what a watch can match on.
+fn notice_thread(notice: &Notice) -> Ulid {
+    match notice {
+        Notice::Event { thread, .. }
+        | Notice::TextDelta { thread, .. }
+        | Notice::State { thread, .. }
+        | Notice::Mode { thread, .. }
+        | Notice::Model { thread, .. }
+        | Notice::Usage { thread, .. }
+        | Notice::Note { thread, .. }
+        | Notice::RunStatus { thread, .. }
+        | Notice::ToolCallStarted { thread, .. } => *thread,
+    }
+}
+
+/// Whether a notice for a thread this REPL is not on would open a gate
+/// there: a wait a person answers, or a run's checkpoint.
+fn opens_gate(notice: &Notice) -> bool {
+    match notice {
+        Notice::Event { event, .. } => event.kind == EventKind::CheckpointAsked,
+        Notice::State { state, .. } => matches!(
+            state,
+            ThreadState::AwaitingApproval { .. }
+                | ThreadState::AwaitingHuman { .. }
+                | ThreadState::AwaitingSwitch { .. }
+        ),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -6170,6 +6400,8 @@ mod tests {
                 role,
                 refuse_build,
                 refuse_open: None,
+                rows: Vec::new(),
+                children: Vec::new(),
             };
             let daemon = crate::run_view::fake_daemon::FakeDaemon::start(dir.path(), script).await;
             let (client, welcome) = Client::connect(&daemon.addr(), "tok").await.unwrap();
@@ -6205,6 +6437,69 @@ mod tests {
             self.repl.handle_line(line, &mut self.out).await;
         }
 
+        /// The same, with `ListThreads` rows for the run and one `Open`
+        /// backlog per child: what `/watch` reads before it opens one.
+        async fn watching(
+            lead: Ulid,
+            backlog: Vec<Event>,
+            issue: u64,
+            children: Vec<(Ulid, Vec<Event>)>,
+        ) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let rows = vec![aigentic_api::ThreadInfo {
+                id: lead,
+                project: Some("proj".into()),
+                date: "2026-10-01".into(),
+                events: backlog.len() as u64,
+                first_line: "run".into(),
+                state: aigentic_api::ThreadState::Idle,
+                title: None,
+                workspace: None,
+                kind: aigentic_api::ThreadKind::Run(aigentic_api::RunThread::Lead { issue }),
+            }];
+            let script = crate::run_view::fake_daemon::Script {
+                lead,
+                backlog,
+                resumed: false,
+                role: "admin",
+                refuse_build: None,
+                refuse_open: None,
+                rows,
+                children,
+            };
+            let daemon = crate::run_view::fake_daemon::FakeDaemon::start(dir.path(), script).await;
+            let (client, welcome) = Client::connect(&daemon.addr(), "tok").await.unwrap();
+            let role = welcome.projects[0].role.clone();
+            let (thread, state, mode) = open(&client, "proj", Some(Ulid::generate())).await;
+            let notices = client.take_notices().unwrap();
+            let repl = ClientRepl::new(
+                client,
+                thread,
+                "steve",
+                role,
+                state,
+                mode,
+                Identity::default(),
+                "proj",
+            );
+            Self {
+                _dir: dir,
+                daemon,
+                repl,
+                notices,
+                out: Copies::default(),
+            }
+        }
+
+        /// One lead event pushed as the daemon would push it.
+        async fn push_lead(&mut self, event: Event) {
+            let thread = event.thread_id;
+            let mut out = std::mem::take(&mut self.out);
+            self.repl.render(Notice::Event { thread, event }, &mut out);
+            self.repl.settle(&mut out).await;
+            self.out = out;
+        }
+
         /// Every notice that has arrived, drawn. A pause for the
         /// daemon's writes, then whatever is there.
         async fn pump(&mut self) {
@@ -6212,8 +6507,13 @@ mod tests {
                 tokio::time::timeout(std::time::Duration::from_millis(200), self.notices.recv())
                     .await
             {
-                self.repl.render(notice, &mut self.out);
+                let mut out = std::mem::take(&mut self.out);
+                self.repl.render(notice, &mut out);
+                self.out = out;
             }
+            let mut out = std::mem::take(&mut self.out);
+            self.repl.settle(&mut out).await;
+            self.out = out;
         }
 
         /// Push a notice as a live one.
@@ -6261,6 +6561,416 @@ mod tests {
     /// A `run_finished` payload.
     fn run_finished(outcome: aigentic_runtime::aigentic_log::RunOutcome) -> serde_json::Value {
         serde_json::json!({ "outcome": outcome, "cost_usd": 1.5 })
+    }
+
+    /// A `step_finished` payload for a step that was completed.
+    fn step_finished(step: &str) -> serde_json::Value {
+        serde_json::json!({
+            "step": step,
+            "status": "done",
+            "end_reason": "reported",
+            "cost_usd": 1.0,
+        })
+    }
+
+    /// A `run_started` payload, as the runner writes it.
+    fn run_started(issue: u64) -> serde_json::Value {
+        serde_json::json!({
+            "issue": issue,
+            "workflow": "build",
+            "version": 1,
+            "content_hash": "abc",
+            "budget_usd": 30.0,
+        })
+    }
+
+    /// A step's backlog: the child's own events, as its log holds them.
+    fn child_backlog(child: Ulid) -> Vec<Event> {
+        vec![
+            child_event(child, 0, EventKind::ThreadStarted, serde_json::json!({})),
+            child_event(
+                child,
+                1,
+                EventKind::AssistantMessage,
+                serde_json::to_value(AssistantMessagePayload {
+                    blocks: vec![aigentic_runtime::aigentic_core::ContentBlock::Text(
+                        "step one starts".into(),
+                    )],
+                    usage: None,
+                    finish_reason: Some("stop".into()),
+                })
+                .unwrap(),
+            ),
+        ]
+    }
+
+    /// One event belonging to a child thread, at `seq`.
+    fn child_event(thread: Ulid, seq: u64, kind: EventKind, payload: serde_json::Value) -> Event {
+        run_event(thread, seq, kind, payload)
+    }
+
+    /// T1: `/watch 140 spec` reads the run and the step, in that order,
+    /// and writes nothing.
+    #[tokio::test]
+    async fn watch_opens_a_step_read_only() {
+        const ISSUE: u64 = 140;
+        let lead_id = Ulid::generate();
+        let spec = Ulid::generate();
+        let backlog = vec![
+            run_event(lead_id, 0, EventKind::RunStarted, run_started(ISSUE)),
+            run_event(
+                lead_id,
+                1,
+                EventKind::StepStarted,
+                step_started("spec", 1, spec),
+            ),
+        ];
+        let mut lead = Lead::watching(
+            lead_id,
+            backlog.clone(),
+            ISSUE,
+            vec![(spec, child_backlog(spec))],
+        )
+        .await;
+        let step = backlog
+            .iter()
+            .filter_map(crate::app::watch::step_started)
+            .next()
+            .expect("the fixture starts one step");
+        lead.line(&format!("/watch {ISSUE} {}", step.step)).await;
+        let requests = lead.daemon.requests();
+        let opens: Vec<Request> = requests
+            .iter()
+            .filter_map(|r| match r {
+                Request::Open { thread, from_seq } => Some(Request::Open {
+                    thread: *thread,
+                    from_seq: *from_seq,
+                }),
+                _ => None,
+            })
+            .collect();
+        let expected = vec![
+            Request::Open {
+                thread: lead_id,
+                from_seq: 0,
+            },
+            Request::Open {
+                thread: spec,
+                from_seq: 0,
+            },
+        ];
+        assert_eq!(
+            &opens[opens.len() - expected.len()..],
+            expected.as_slice(),
+            "the run and the step, in order"
+        );
+        assert!(
+            !requests.iter().any(|r| matches!(
+                r,
+                Request::Post { .. } | Request::AnswerCheckpoint { .. } | Request::Decide { .. }
+            )),
+            "a watch writes nothing: {requests:?}"
+        );
+        assert_eq!(
+            lead.repl.watch_figures(),
+            None,
+            "no status pushed yet, so no figures"
+        );
+    }
+
+    /// T2: a step with no live child refuses, and says which line.
+    #[tokio::test]
+    async fn watch_refuses_a_step_with_no_live_child() {
+        const ISSUE: u64 = 140;
+        let lead_id = Ulid::generate();
+        let backlog = vec![
+            run_event(lead_id, 0, EventKind::RunStarted, run_started(ISSUE)),
+            run_event(
+                lead_id,
+                1,
+                EventKind::StepStarted,
+                step_started("design", 1, Ulid::generate()),
+            ),
+        ];
+        let mut lead = Lead::watching(lead_id, backlog.clone(), ISSUE, Vec::new()).await;
+        lead.line(&format!("/watch {ISSUE} implement")).await;
+        assert_eq!(
+            lead.lines(),
+            vec![crate::app::watch::refused_child(ISSUE, "implement").0],
+            "the refusal names the step asked for"
+        );
+    }
+
+    /// T3: `/watch 140 spec` opens a step the run has moved past — the
+    /// pin by name.
+    #[tokio::test]
+    async fn watch_enters_a_non_current_step_by_name() {
+        const ISSUE: u64 = 140;
+        let lead_id = Ulid::generate();
+        let spec = Ulid::generate();
+        let design = Ulid::generate();
+        let backlog = vec![
+            run_event(lead_id, 0, EventKind::RunStarted, run_started(ISSUE)),
+            run_event(
+                lead_id,
+                1,
+                EventKind::StepStarted,
+                step_started("spec", 1, spec),
+            ),
+            run_event(lead_id, 2, EventKind::StepFinished, step_finished("spec")),
+            run_event(
+                lead_id,
+                3,
+                EventKind::StepStarted,
+                step_started("design", 1, design),
+            ),
+        ];
+        let mut lead = Lead::watching(
+            lead_id,
+            backlog,
+            ISSUE,
+            vec![(spec, child_backlog(spec)), (design, child_backlog(design))],
+        )
+        .await;
+        lead.line(&format!("/watch {ISSUE} spec")).await;
+        let opens: Vec<String> = lead
+            .daemon
+            .requests()
+            .iter()
+            .filter_map(|r| match r {
+                Request::Open { thread, .. } => Some(thread.to_string()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            opens.contains(&spec.to_string()),
+            "the named step's child was opened (spec {spec}, design {design}, opens {opens:?}, inside {:?})",
+            lead.repl.inside()
+        );
+        assert_eq!(
+            lead.repl.inside(),
+            Some(format!("inside #{ISSUE} {}", "spec")),
+            "the line says the step that was asked for"
+        );
+    }
+
+    /// T4: an unpinned watch takes the run's next step, and its child.
+    #[tokio::test]
+    async fn an_unpinned_watch_follows_the_step_move() {
+        const ISSUE: u64 = 140;
+        let lead_id = Ulid::generate();
+        let spec = Ulid::generate();
+        let design = Ulid::generate();
+        let backlog = vec![
+            run_event(lead_id, 0, EventKind::RunStarted, run_started(ISSUE)),
+            run_event(
+                lead_id,
+                1,
+                EventKind::StepStarted,
+                step_started("spec", 1, spec),
+            ),
+        ];
+        let mut lead = Lead::watching(
+            lead_id,
+            backlog,
+            ISSUE,
+            vec![(spec, child_backlog(spec)), (design, child_backlog(design))],
+        )
+        .await;
+        lead.line(&format!("/watch {ISSUE} pin")).await;
+        let moved = run_event(
+            lead_id,
+            2,
+            EventKind::StepStarted,
+            step_started("design", 1, design),
+        );
+        lead.push(Notice::Event {
+            thread: lead_id,
+            event: moved,
+        });
+        lead.pump().await;
+        assert_eq!(
+            lead.repl.inside(),
+            Some(format!("inside #{ISSUE} design")),
+            "the watch followed the run to its next step"
+        );
+        let open = lead.daemon.requests().iter().any(|r| {
+            matches!(
+                r,
+                Request::Open { thread, .. } if *thread == design
+            )
+        });
+        assert!(open, "the new step's child was opened from scratch");
+    }
+
+    /// T5: a pinned watch stays on its own step through another step's
+    /// start, and follows a new attempt of its own.
+    #[tokio::test]
+    async fn a_pinned_watch_follows_its_own_step() {
+        const ISSUE: u64 = 140;
+        let lead_id = Ulid::generate();
+        let spec = Ulid::generate();
+        let design = Ulid::generate();
+        let retry = Ulid::generate();
+        let backlog = vec![
+            run_event(lead_id, 0, EventKind::RunStarted, run_started(ISSUE)),
+            run_event(
+                lead_id,
+                1,
+                EventKind::StepStarted,
+                step_started("spec", 1, spec),
+            ),
+        ];
+        let mut lead = Lead::watching(
+            lead_id,
+            backlog,
+            ISSUE,
+            vec![
+                (spec, child_backlog(spec)),
+                (design, child_backlog(design)),
+                (retry, child_backlog(retry)),
+            ],
+        )
+        .await;
+        lead.line(&format!("/watch {ISSUE} spec")).await;
+        let other = run_event(
+            lead_id,
+            2,
+            EventKind::StepStarted,
+            step_started("design", 1, design),
+        );
+        lead.push_lead(other).await;
+        assert_eq!(
+            lead.repl.inside(),
+            Some(format!("inside #{ISSUE} spec")),
+            "another step's start never moves a pin"
+        );
+        let retry_at = run_event(
+            lead_id,
+            3,
+            EventKind::StepStarted,
+            step_started("spec", 2, retry),
+        );
+        lead.push_lead(retry_at).await;
+        assert!(
+            lead.daemon.requests().iter().any(|r| matches!(
+                r,
+                Request::Open { thread, .. } if *thread == retry
+            )),
+            "the pin followed its own step's second attempt: {:?}",
+            lead.daemon.requests()
+        );
+    }
+
+    /// T6: a finished run refuses entry by name, and a watch on a run
+    /// that finishes inside ends.
+    #[tokio::test]
+    async fn a_watch_on_a_finished_run_ends() {
+        const ISSUE: u64 = 140;
+        let lead_id = Ulid::generate();
+        let spec = Ulid::generate();
+        let backlog = vec![
+            run_event(lead_id, 0, EventKind::RunStarted, run_started(ISSUE)),
+            run_event(
+                lead_id,
+                1,
+                EventKind::StepStarted,
+                step_started("spec", 1, spec),
+            ),
+        ];
+        let finished = aigentic_runtime::aigentic_log::RunOutcome::Closed;
+        let mut done_events = backlog.clone();
+        done_events.push(run_event(
+            lead_id,
+            2,
+            EventKind::RunFinished,
+            run_finished(finished),
+        ));
+        let mut lead = Lead::watching(
+            lead_id,
+            done_events,
+            ISSUE,
+            vec![(spec, child_backlog(spec))],
+        )
+        .await;
+        lead.line(&format!("/watch {ISSUE} spec")).await;
+        assert_eq!(
+            lead.lines(),
+            vec![crate::app::watch::refused_child(ISSUE, "spec").0],
+            "a run that has ended has no live step"
+        );
+
+        let mut live =
+            Lead::watching(lead_id, backlog, ISSUE, vec![(spec, child_backlog(spec))]).await;
+        live.line(&format!("/watch {ISSUE} pin")).await;
+        let end = run_event(lead_id, 2, EventKind::RunFinished, run_finished(finished));
+        live.push_lead(end).await;
+        assert!(live.repl.inside().is_none(), "the watch left with the run");
+    }
+
+    /// T20: a child's live event above `printed` draws once.
+    #[tokio::test]
+    async fn a_live_child_event_is_drawn_inside_and_not_twice() {
+        const ISSUE: u64 = 140;
+        let lead_id = Ulid::generate();
+        let spec = Ulid::generate();
+        let backlog = vec![
+            run_event(lead_id, 0, EventKind::RunStarted, run_started(ISSUE)),
+            run_event(
+                lead_id,
+                1,
+                EventKind::StepStarted,
+                step_started("spec", 1, spec),
+            ),
+        ];
+        let mut lead =
+            Lead::watching(lead_id, backlog, ISSUE, vec![(spec, child_backlog(spec))]).await;
+        lead.line(&format!("/watch {ISSUE} spec")).await;
+        assert_eq!(
+            lead.repl.inside(),
+            Some(format!("inside #{ISSUE} spec")),
+            "the watch is open before the live event"
+        );
+        let before = lead.lines().len();
+        let live = child_event(
+            spec,
+            2,
+            EventKind::ToolResult,
+            serde_json::to_value(ToolResultPayload::new(
+                aigentic_runtime::aigentic_core::ToolResult {
+                    id: "call-1".into(),
+                    content: "cargo test: ok".into(),
+                    is_error: false,
+                },
+                PolicyRecord::Rule {
+                    rule: "class read".into(),
+                    decision: "allow".into(),
+                    reason: None,
+                },
+            ))
+            .unwrap(),
+        );
+        lead.repl.render(
+            Notice::Event {
+                thread: spec,
+                event: live.clone(),
+            },
+            &mut lead.out,
+        );
+        assert!(
+            lead.lines().len() > before,
+            "a live child event draws: {:?}",
+            lead.lines()
+        );
+        let drawn = lead.lines().len();
+        lead.repl.render(
+            Notice::Event {
+                thread: spec,
+                event: live,
+            },
+            &mut lead.out,
+        );
+        assert_eq!(lead.lines().len(), drawn, "the same event draws once");
     }
 
     /// T1: the parser and the help text. `/build 73` is the number,
@@ -6385,6 +7095,8 @@ mod tests {
             role: "admin",
             refuse_build: None,
             refuse_open: None,
+            rows: Vec::new(),
+            children: Vec::new(),
         };
         let daemon = crate::run_view::fake_daemon::FakeDaemon::start(dir.path(), script).await;
         let (client, welcome) = Client::connect(&daemon.addr(), "tok").await.unwrap();
@@ -7806,6 +8518,7 @@ mod tests {
             project: "proj".into(),
             mode: "manual".into(),
             run: lead.repl.run_segment().map(str::to_owned),
+            inside: None,
             ..crate::app::status::Status::default()
         };
         assert!(line.line().ends_with(&expected), "{}", line.line());
@@ -7834,6 +8547,8 @@ mod tests {
             role: "admin",
             refuse_build: None,
             refuse_open: None,
+            rows: Vec::new(),
+            children: Vec::new(),
         };
         let daemon = crate::run_view::fake_daemon::FakeDaemon::start(dir.path(), script).await;
         let (client, welcome) = Client::connect(&daemon.addr(), "tok").await.unwrap();

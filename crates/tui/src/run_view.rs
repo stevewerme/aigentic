@@ -220,6 +220,10 @@ pub(crate) fn short(sha: &str) -> String {
 /// client's notice stream as `Notice::Event`.
 #[cfg(test)]
 pub(crate) mod fake_daemon {
+    /// The child threads a test watches, each with the log its `Open`
+    /// answers with.
+    pub(crate) type ChildLogs = Vec<(Ulid, Vec<Event>)>;
+
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
@@ -248,6 +252,11 @@ pub(crate) mod fake_daemon {
         pub(crate) refuse_build: Option<String>,
         /// Refuse `Open` on the lead with this reason.
         pub(crate) refuse_open: Option<String>,
+        /// The threads `ListThreads` answers with (issue #140): the runs
+        /// and children a test watches.
+        pub(crate) rows: Vec<aigentic_api::ThreadInfo>,
+        /// Each child's `Open` backlog, by thread.
+        pub(crate) children: ChildLogs,
     }
 
     /// A running scripted daemon. Drop it (or let the test end) to stop
@@ -267,8 +276,10 @@ pub(crate) mod fake_daemon {
             let lead = script.lead;
             let seen: Arc<Mutex<Vec<Request>>> = Arc::new(Mutex::new(Vec::new()));
             let (notices, mut pushed) = mpsc::unbounded_channel::<Notice>();
+            let children: Arc<Mutex<ChildLogs>> = Arc::new(Mutex::new(script.children.clone()));
             let handle = {
                 let seen = Arc::clone(&seen);
+                let children = Arc::clone(&children);
                 tokio::spawn(async move {
                     let (stream, _) = listener.accept().await.unwrap();
                     let (read, mut write) = stream.into_split();
@@ -315,8 +326,31 @@ pub(crate) mod fake_daemon {
                                     resumed: script.resumed,
                                 },
                             },
+                            Request::ListThreads { .. } => Response::Threads {
+                                threads: script.rows.clone(),
+                            },
                             Request::Open { thread, from_seq } => {
-                                if *thread == lead && from_seq == &0 {
+                                if let Some((_, backlog)) = children
+                                    .lock()
+                                    .unwrap()
+                                    .iter()
+                                    .find(|(child, _)| child == thread)
+                                {
+                                    // A watched step's own thread: open,
+                                    // with its backlog.
+                                    Response::Opened {
+                                        state: ThreadState::Idle,
+                                        events: backlog.clone(),
+                                        run: Some(aigentic_api::RunThread::Child {
+                                            lead,
+                                            step: None,
+                                        }),
+                                        mode: "manual".into(),
+                                        profile: None,
+                                        model: "unknown".into(),
+                                        effort: None,
+                                    }
+                                } else if *thread == lead && from_seq == &0 {
                                     match &script.refuse_open {
                                         Some(reason) => Response::Refused {
                                             reason: reason.clone(),
