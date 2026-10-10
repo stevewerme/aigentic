@@ -15,13 +15,13 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 /// Sent in `Hello`; a mismatch is refused with both numbers. Version 2
-/// adds `Build`/`AnswerCheckpoint` and `Response::Run` (issue #58);
-/// version 3 adds `AnswerSwitch` and `ThreadState::AwaitingSwitch`
-/// (issue #7), so a version-2 client is refused rather than left never
-/// seeing the switch it is asked to answer; version 4 adds
-/// `Front`/`NewFront` and `Response::Front` (issue #84); version 5 lets
-/// `ListThreads` omit its project (issue #86); version 6 adds the
-/// run-status notice (issue #139).
+/// adds `Build`/`AnswerCheckpoint` and `Response::Run`; version 3 adds
+/// `AnswerSwitch` and `ThreadState::AwaitingSwitch`, so a version-2
+/// client is refused rather than left never seeing the switch it is
+/// asked to answer; version 4 adds `Front`/`NewFront` and
+/// `Response::Front`; version 5 lets `ListThreads` omit its project;
+/// version 6 adds `Notice::RunStatus`, which an older client cannot
+/// decode.
 pub const PROTOCOL_VERSION: u32 = 6;
 
 /// One line on the wire.
@@ -1166,7 +1166,7 @@ mod tests {
     /// its log and the client cannot tell.
     #[test]
     fn t7_front_asked_round_trips_and_the_old_frame_still_decodes() {
-        assert_eq!(PROTOCOL_VERSION, 6, "issue #139 moved it");
+        assert_eq!(PROTOCOL_VERSION, 6, "the run-status notice moved it");
         let asked = StartAsk {
             offered: "web".into(),
             chosen: "api".into(),
@@ -1218,7 +1218,7 @@ mod tests {
     /// (which always named one) still decodes.
     #[test]
     fn t1_list_threads_project_is_optional_on_the_wire() {
-        assert_eq!(PROTOCOL_VERSION, 6, "issue #139 moved it");
+        assert_eq!(PROTOCOL_VERSION, 6, "the run-status notice moved it");
         let some = Frame::request(
             1,
             Request::ListThreads {
@@ -1518,6 +1518,6 @@ mod tests {
         assert!(
             decode(r#"{"notice":{"kind":"run_status","thread":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":{"issue":1,"phase":{"phase":"teleported"},"idle_secs":0}}}"#).is_err()
         );
-        assert_eq!(PROTOCOL_VERSION, 6, "issue #139 moved it");
+        assert_eq!(PROTOCOL_VERSION, 6, "the run-status notice moved it");
     }
 }
