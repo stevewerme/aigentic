@@ -434,6 +434,107 @@ async fn a_sibling_in_the_workspace_is_searchable_and_briefable() {
 }
 
 #[tokio::test]
+async fn a_row_named_with_a_separator_is_searchable_by_that_name() {
+    let own = tree("p", OWN);
+    let r = tree("r", SIBLING);
+    // A related row is keyed by `<workspace>/<project>`; the separator in
+    // its name must not be read as a path.
+    let rows = vec![
+        row("p", own.path(), Some("w"), true),
+        row("w/r", r.path(), Some("w"), true),
+    ];
+    let (mut rt, _seen) = scope_rig(
+        own.path(),
+        rows,
+        "current project: p\nworkspace w: p\n",
+        None,
+        calls_turn(vec![
+            (
+                "search_knowledge",
+                json!({"query": "postgres storage", "project": "w/r"}),
+            ),
+            (
+                "search_knowledge",
+                json!({"query": "deploy fridays", "project": "p"}),
+            ),
+        ]),
+    );
+    assert!(has_search(&rt), "a row with knowledge offers the tool");
+    rt.run_turn(steve(), vec![ContentBlock::Text("hi".into())], &mut |_| {})
+        .await
+        .unwrap();
+    let results = results(&rt);
+    assert_eq!(results.len(), 2);
+    assert!(
+        results[0]
+            .result
+            .content
+            .starts_with("[read-only · w/r]\nmemory/decisions.md#Storage\n"),
+        "{}",
+        results[0].result.content
+    );
+    assert!(
+        results[0]
+            .result
+            .content
+            .contains("We chose Postgres for storage."),
+        "{}",
+        results[0].result.content
+    );
+    assert!(
+        results[1]
+            .result
+            .content
+            .starts_with("[read-only · p]\nops.md#Deploys\n"),
+        "the own project is unaffected: {}",
+        results[1].result.content
+    );
+}
+
+#[tokio::test]
+async fn a_separator_name_no_row_carries_is_still_a_path() {
+    let own = tree("p", OWN);
+    let q = tree("q", SIBLING);
+    let rows = vec![
+        row("p", own.path(), Some("w"), true),
+        row("q", q.path(), Some("w"), true),
+    ];
+    let (mut rt, _seen) = scope_rig(
+        own.path(),
+        rows,
+        "current project: p\nworkspace w: q\n",
+        None,
+        calls_turn(vec![
+            ("search_knowledge", json!({"query": "x", "project": "v/s"})),
+            ("search_knowledge", json!({"query": "x", "project": "nope"})),
+        ]),
+    );
+    rt.run_turn(steve(), vec![ContentBlock::Text("hi".into())], &mut |_| {})
+        .await
+        .unwrap();
+    let results = results(&rt);
+    assert_eq!(results.len(), 2);
+    assert!(
+        results[0].result.is_error
+            && results[0]
+                .result
+                .content
+                .contains("is a path, not a project name"),
+        "{}",
+        results[0].result.content
+    );
+    assert!(
+        results[1].result.is_error
+            && results[1]
+                .result
+                .content
+                .contains("is not a project this thread understands"),
+        "{}",
+        results[1].result.content
+    );
+}
+
+#[tokio::test]
 async fn a_project_in_another_workspace_is_refused_by_both_tools() {
     let own = tree("p", OWN);
     let q = tree("q", SIBLING);
@@ -522,7 +623,8 @@ async fn a_thread_in_no_workspace_understands_only_itself() {
         assert!(r.result.is_error, "{}", r.result.content);
     }
     assert_eq!(
-        results[0].result.content, "no project in reach has a brief",
+        results[0].result.content,
+        aigentic_runtime::harness_tools::NO_BRIEF_IN_REACH,
         "the sibling in another workspace is no reason to offer it"
     );
     assert!(

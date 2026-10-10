@@ -518,11 +518,6 @@ impl KnowledgeSources for ScopeSources {
             return Ok((format!("workspace {name}"), sections));
         }
         let name = project.expect("the tool sets one of project and workspace");
-        if name.contains('/') || name.contains('\\') {
-            return Err(format!(
-                "`{name}` is a path, not a project name: `search_knowledge` takes the name the projects block lists"
-            ));
-        }
         if state.own.as_ref().is_some_and(|(own, _, _)| own == name) {
             let Some((_, _, sections)) = state
                 .own
@@ -543,6 +538,13 @@ impl KnowledgeSources for ScopeSources {
             .find(|(n, _)| n == name)
             .map(|(_, root)| root.clone());
         let Some(root) = root else {
+            // The path clause is the last resort, so a name a row carries
+            // wins: a related row is keyed by `<workspace>/<project>`.
+            if name.contains('/') || name.contains('\\') {
+                return Err(format!(
+                    "`{name}` is a path, not a project name: `search_knowledge` takes the name the projects block lists"
+                ));
+            }
             return Err(Self::refusal(
                 &state,
                 name,

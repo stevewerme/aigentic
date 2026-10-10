@@ -950,8 +950,9 @@ impl Runtime {
     }
 
     /// The refusal a `read_brief` call gets: why the name does not work,
-    /// and the names that would. A name with a separator in it is a path,
-    /// and the tool never takes one.
+    /// and the names that would. A name with a separator in it is a path
+    /// — unless an understood row carries it, since a related row is
+    /// named `<workspace>/<project>`.
     fn no_brief_error(&self, project: &str) -> String {
         let names = self.brief_names();
         let listed = if names.is_empty() {
@@ -959,13 +960,18 @@ impl Runtime {
         } else {
             names.join(", ")
         };
-        if project.contains('/') || project.contains('\\') {
+        let understood = self.current_project().as_deref() == Some(project)
+            || self
+                .project_rows
+                .iter()
+                .any(|row| row.understood && row.name == project);
+        if !understood && (project.contains('/') || project.contains('\\')) {
             format!(
                 "`{project}` is a path, not a project name: read_brief takes the name a project is listed under, and opens it itself. The projects with a brief are: {listed}"
             )
         } else {
             format!(
-                "no project in reach with a brief is named `{project}`; the projects with a brief are: {listed}"
+                "no project this thread understands with a brief is named `{project}`; the projects with a brief are: {listed}"
             )
         }
     }
@@ -1505,5 +1511,67 @@ mod tests {
         // An empty name is no path; it is simply not a project.
         let answer = rt.read_brief("").unwrap_err();
         assert!(answer.contains("is named ``"), "{answer}");
+    }
+
+    /// T5 (issue #129): a related row is addressed by the name the block
+    /// lists it under, `<workspace>/<project>`. That name wins over the
+    /// path clause, while a separator name no row carries stays a path.
+    #[test]
+    fn a_name_with_a_separator_is_briefable_when_a_row_carries_it() {
+        let here = project_dir(Some("# Foundation\n\nHere.\n"));
+        let related = project_dir(Some("# Elsewhere\n\nThe related brief.\n"));
+        let here_row = crate::ProjectRow {
+            name: "p".into(),
+            root: here.path().to_path_buf(),
+            workspace: None,
+            one_line: Some("Here.".into()),
+            understood: true,
+        };
+        let related_row = crate::ProjectRow {
+            name: "w/q".into(),
+            root: related.path().to_path_buf(),
+            workspace: Some("w".into()),
+            one_line: Some("Elsewhere.".into()),
+            understood: true,
+        };
+        let rt =
+            rig(here.path()).with_projects(None, vec![here_row.clone(), related_row.clone()]);
+        assert!(rt.read_brief_offered(), "the related row carries a brief");
+        let served = rt.read_brief("w/q").unwrap();
+        assert_eq!(
+            served,
+            crate::harness_tools::brief_result("w/q", "# Elsewhere\n\nThe related brief.\n"),
+            "served as a read-only hit under its listed name"
+        );
+
+        // The row is understood but has no brief: the miss sentence, not
+        // the path one. A second, briefed row keeps the tool offered.
+        let briefless = crate::ProjectRow {
+            name: "w/q".into(),
+            root: "/nowhere/q".into(),
+            workspace: Some("w".into()),
+            one_line: None,
+            understood: true,
+        };
+        let web = crate::ProjectRow {
+            name: "web".into(),
+            root: related.path().to_path_buf(),
+            workspace: Some("w".into()),
+            one_line: Some("Elsewhere.".into()),
+            understood: true,
+        };
+        let rt = rig(here.path()).with_projects(None, vec![here_row, web, briefless]);
+        assert!(rt.read_brief_offered(), "the briefed row offers the tool");
+        let answer = rt.read_brief("w/q").unwrap_err();
+        assert_eq!(
+            answer,
+            "no project this thread understands with a brief is named `w/q`; the projects with a brief are: p, web",
+            "the miss sentence, and the list names the briefed rows"
+        );
+        assert!(!answer.contains("is a path"), "{answer}");
+
+        // No row carries it: still the path clause.
+        let answer = rt.read_brief("v/s").unwrap_err();
+        assert!(answer.contains("is a path, not a project name"), "{answer}");
     }
 }

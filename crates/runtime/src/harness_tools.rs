@@ -59,7 +59,7 @@ pub const READ_BRIEF_DESCRIPTION: &str = "Read a project's brief: what it is, wh
 /// What an unoffered `read_brief` call answers (issue #123): the tool is
 /// always answered, so a caller that emits it anyway is told why there is
 /// nothing to read rather than left with an unknown-tool error.
-pub const NO_BRIEF_IN_REACH: &str = "no project in reach has a brief";
+pub const NO_BRIEF_IN_REACH: &str = "no project this thread understands has a brief";
 
 /// What `suggest_project`'s description says (issue #7): call it first
 /// and alone, the person decides, and a no leaves the thread where it
