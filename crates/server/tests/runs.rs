@@ -27,7 +27,7 @@ use aigentic_runtime::aigentic_core::{
     RiskClass, ToolCall,
 };
 use aigentic_runtime::aigentic_log::{
-    Repair, RunOutcome, StepStartedPayload, ThreadLog, ThreadStartedPayload,
+    NewEvent, Repair, RunOutcome, StepStartedPayload, ThreadLog, ThreadStartedPayload,
 };
 use aigentic_runtime::runner::RunnerHost;
 use aigentic_runtime::runner::forge::{FakeForge, Forge, IssueView};
@@ -37,7 +37,7 @@ use aigentic_runtime::workflow::{WorkflowFile, WorkflowOrigin};
 use aigentic_runtime::{CancelToken, Verdict};
 use aigentic_server::build::Root;
 use aigentic_server::config::{Config, ProjectConfig, ServerConfig, UserConfig};
-use aigentic_server::runs::RunDeps;
+use aigentic_server::runs::{RunDeps, Runs};
 use aigentic_server::{Listener, NoReports, Server};
 use futures_core::Stream;
 use serde_json::{Value, json};
@@ -2603,5 +2603,229 @@ async fn a_checkpoint_step_is_answered_amend_over_the_server() {
         daemon.wait_finished(lead).await,
         RunOutcome::Closed,
         "the checkpoint's `next = \"done\"` ends the run"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A followed run's status line (issue #139)
+// ---------------------------------------------------------------------------
+
+/// A lead mid-step, and the child it waits on, written into the daemon's
+/// threads directory: the two logs `tick_status` reads.
+fn write_run(fx: &Fixture, lead: Ulid, child: Ulid, step: &str) {
+    std::fs::create_dir_all(&fx.threads).unwrap();
+    let (mut log, _cut) =
+        ThreadLog::open_with(fx.threads.clone(), lead, Repair::TruncateTornTail).unwrap();
+    log.append(NewEvent {
+        kind: EventKind::RunStarted,
+        author: Author::System,
+        payload: json!({
+            "issue": 139,
+            "workflow": "build",
+            "version": 1,
+            "content_hash": "abc",
+            "budget_usd": 10.0,
+        }),
+        parent_event: None,
+    })
+    .unwrap();
+    log.append(NewEvent {
+        kind: EventKind::StepStarted,
+        author: Author::System,
+        payload: json!({
+            "step": step,
+            "role": "implementer",
+            "profile": "flash",
+            "child_thread": child,
+            "attempt": 1,
+            "budget_usd": 3.0,
+        }),
+        parent_event: None,
+    })
+    .unwrap();
+}
+
+/// The child's open turn: a turn-opening `user_message`, then a reply
+/// with two `ToolCall` blocks and the given stamp.
+fn write_child(fx: &Fixture, child: Ulid, cost_usd: f64) {
+    std::fs::create_dir_all(&fx.threads).unwrap();
+    let (mut log, _cut) =
+        ThreadLog::open_with(fx.threads.clone(), child, Repair::TruncateTornTail).unwrap();
+    log.append(NewEvent {
+        kind: EventKind::UserMessage,
+        author: Author::System,
+        payload: json!({"blocks": [{"type": "text", "text": "go"}]}),
+        parent_event: None,
+    })
+    .unwrap();
+    log.append(NewEvent {
+        kind: EventKind::AssistantMessage,
+        author: Author::Agent(aigentic_runtime::aigentic_core::AgentId("worker".into())),
+        payload: json!({
+            "blocks": [
+                {"type": "tool_call", "id": "c1", "name": "bash", "args": {}},
+                {"type": "tool_call", "id": "c2", "name": "read_file", "args": {}},
+            ],
+            "usage": {"input_tokens": 10, "output_tokens": 5, "cost_usd": cost_usd},
+        }),
+        parent_event: None,
+    })
+    .unwrap();
+}
+
+/// Start `tick_status` for `lead` on a short interval and let it run for
+/// `window`, then hand back what it pushed.
+async fn push_for(
+    runs: &Arc<Runs>,
+    world: &aigentic_server::runs::RunWorld,
+    lead: Ulid,
+    every: Duration,
+    window: Duration,
+    rx: &mut mpsc::UnboundedReceiver<Notice>,
+) -> Vec<Notice> {
+    let ticker = aigentic_server::runs::tick_status(runs.clone(), world, lead, every);
+    let _ = tokio::time::timeout(window, ticker).await;
+    let mut pushed = Vec::new();
+    while let Ok(notice) = rx.try_recv() {
+        pushed.push(notice);
+    }
+    pushed
+}
+
+/// T10 — the lead's and the child's logs fold into one pushed notice:
+/// the fixture's issue, step, call count and stamp reach the watcher,
+/// and the elapsed figure is at least what the fixture has already run.
+#[tokio::test]
+async fn t10_the_followed_leads_lead_and_child_logs_fold_into_one_pushed_notice() {
+    const COST_USD: f64 = 0.51;
+    let daemon = Daemon::new(Scripts::default(), false).await;
+    let lead = Ulid::generate();
+    let child = Ulid::generate();
+    write_run(&daemon.fixture, lead, child, "spec");
+    write_child(&daemon.fixture, child, COST_USD);
+
+    // The fixture's own minimum: the ticker reads the clock itself, so
+    // its figure can only be at or above this.
+    let started_at = daemon
+        .lead_events(lead)
+        .iter()
+        .find(|event| event.kind == EventKind::StepStarted)
+        .map(|event| event.created_at)
+        .unwrap();
+    let before = time::OffsetDateTime::now_utc();
+    let least = (before - started_at).whole_seconds() as u64;
+
+    let world = world(&daemon);
+    let runs = Arc::new(Runs::new());
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    runs.watch(lead, tx);
+    let pushed = push_for(
+        &runs,
+        &world,
+        lead,
+        Duration::from_millis(10),
+        Duration::from_millis(200),
+        &mut rx,
+    )
+    .await;
+
+    let Some(Notice::RunStatus { thread, status }) = pushed.last().cloned() else {
+        panic!("a notice for the followed lead; got {pushed:?}");
+    };
+    assert_eq!(thread, lead, "the notice names the lead it follows");
+    assert_eq!(status.issue, 139);
+    assert_eq!(status.idle_secs, 0, "the child wrote just now");
+    let aigentic_api::RunPhase::Step {
+        step,
+        attempt,
+        elapsed_secs,
+        calls,
+        cost_usd,
+        ..
+    } = status.phase
+    else {
+        panic!("a live step");
+    };
+    assert_eq!(step, "spec");
+    assert_eq!(attempt, 1);
+    assert_eq!(calls, 2);
+    assert_eq!(cost_usd, COST_USD);
+    assert!(
+        elapsed_secs >= least,
+        "the ticker's clock is at or after the fixture's start"
+    );
+}
+
+/// T11 — the ticker pushes on its interval, not once per event: with a
+/// 10 ms interval the notices cannot outnumber the window, and the
+/// production interval is the two seconds the spec names.
+#[tokio::test]
+async fn t11_the_ticker_pushes_on_its_interval_and_no_faster() {
+    let every = Duration::from_millis(10);
+    let window = Duration::from_millis(150);
+    let daemon = Daemon::new(Scripts::default(), false).await;
+    let lead = Ulid::generate();
+    let child = Ulid::generate();
+    write_run(&daemon.fixture, lead, child, "spec");
+    write_child(&daemon.fixture, child, 0.1);
+
+    let world = world(&daemon);
+    let runs = Arc::new(Runs::new());
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    runs.watch(lead, tx);
+    let pushed = push_for(&runs, &world, lead, every, window, &mut rx).await;
+
+    assert!(!pushed.is_empty(), "the interval's first tick pushes");
+    assert!(
+        pushed
+            .iter()
+            .all(|notice| matches!(notice, Notice::RunStatus { thread, .. } if *thread == lead)),
+        "every notice is the watched lead's"
+    );
+    let allowed = window.as_millis() / every.as_millis() + 2;
+    assert!(
+        pushed.len() as u128 <= allowed,
+        "{} pushes in {window:?} at {every:?}",
+        pushed.len()
+    );
+    assert_eq!(
+        aigentic_server::runs::PUSH_EVERY,
+        Duration::from_secs(2),
+        "the production interval"
+    );
+}
+
+/// T12 — a torn child log is a failed read: nothing is pushed and the
+/// bytes are left exactly as they were, torn tail and all.
+#[tokio::test]
+async fn t12_a_torn_child_log_pushes_nothing_and_is_not_repaired() {
+    let daemon = Daemon::new(Scripts::default(), false).await;
+    let lead = Ulid::generate();
+    let child = Ulid::generate();
+    write_run(&daemon.fixture, lead, child, "spec");
+    write_child(&daemon.fixture, child, 0.1);
+    tear_tail(&daemon.fixture.threads, child);
+    let path = daemon.fixture.threads.join(format!("{child}.jsonl"));
+    let before = std::fs::read(&path).unwrap();
+
+    let world = world(&daemon);
+    let runs = Arc::new(Runs::new());
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    runs.watch(lead, tx);
+    let pushed = push_for(
+        &runs,
+        &world,
+        lead,
+        Duration::from_millis(10),
+        Duration::from_millis(100),
+        &mut rx,
+    )
+    .await;
+
+    assert!(pushed.is_empty(), "a dud read pushes nothing: {pushed:?}");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "the torn tail is left alone"
     );
 }
