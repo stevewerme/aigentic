@@ -427,6 +427,19 @@ pub struct Followed {
     pub printed: u64,
 }
 
+/// A followed run's open checkpoint. Leaving it waiting hides the prompt
+/// but keeps the gate, so a later `/answer` still reaches it.
+pub struct OpenGate {
+    lead: Ulid,
+    gate: String,
+    menu: Menu,
+    /// Whether the prompt is drawn and takes keys.
+    shown: bool,
+    /// `Continue with changes` was picked: the next plain line is the
+    /// amendment.
+    amending: bool,
+}
+
 pub struct ClientRepl {
     client: Client,
     thread: Ulid,
@@ -485,10 +498,10 @@ pub struct ClientRepl {
     home_project: String,
     /// The run this REPL follows (issue #68), if any.
     following: Option<Followed>,
-    /// The followed run's checkpoint prompt, apart from `menu`: a chat
+    /// The followed run's open checkpoint, apart from `menu`: a chat
     /// state change clearing `menu` never withdraws it, and a chat
     /// permission prompt comes first when both are up.
-    checkpoint: Option<(Ulid, String, Menu)>,
+    checkpoint: Option<OpenGate>,
     /// The last `Notice::Usage`: the working and thread figures for the
     /// status line (phase 6 step 3, issue #99).
     usage: Option<crate::app::status::Figures>,
@@ -714,7 +727,24 @@ impl ClientRepl {
         // prompt up, a typed `1` is the chat's answer (#68's review).
         if self.prompted.is_none()
             && !line.trim_start().starts_with('/')
-            && let Some(keyed) = self.checkpoint.as_ref().and_then(|(_, _, m)| m.line(line))
+            && !line.trim().is_empty()
+            && self.checkpoint.as_ref().is_some_and(|open| open.amending)
+        {
+            self.send_answer(
+                aigentic_api::CheckpointAnswer::Amend,
+                Some(line.trim().to_owned()),
+                out,
+            )
+            .await;
+            return;
+        }
+        if self.prompted.is_none()
+            && !line.trim_start().starts_with('/')
+            && let Some(keyed) = self
+                .checkpoint
+                .as_ref()
+                .filter(|open| open.shown)
+                .and_then(|open| open.menu.line(line))
         {
             self.apply_checkpoint(keyed, out).await;
             return;
@@ -754,6 +784,8 @@ impl ClientRepl {
                         // switch's and `apply_confirm`'s.
                         Pick::Answer
                         | Pick::Other
+                        | Pick::ContinueRun
+                        | Pick::AmendRun
                         | Pick::StopRun
                         | Pick::LeaveWaiting
                         | Pick::SwitchYes
@@ -1296,7 +1328,13 @@ impl ClientRepl {
                 {
                     let menu = Menu::checkpoint(&p.gate, &p.shown, &p.options);
                     out.prompt(&menu);
-                    self.checkpoint = Some((lead, p.gate, menu));
+                    self.checkpoint = Some(OpenGate {
+                        lead,
+                        gate: p.gate,
+                        menu,
+                        shown: true,
+                        amending: false,
+                    });
                 }
             }
             // Answered from another connection: the prompt goes without
@@ -1349,21 +1387,20 @@ impl ClientRepl {
 
     /// The followed run's checkpoint prompt, while it is up.
     pub fn checkpoint(&self) -> Option<&Menu> {
-        self.checkpoint.as_ref().map(|(_, _, menu)| menu)
+        self.checkpoint
+            .as_ref()
+            .filter(|open| open.shown)
+            .map(|open| &open.menu)
     }
 
     /// `/answer go`, `/answer amend <text>` or `/answer stop`: answer the
     /// followed run's open checkpoint by name. The daemon refuses an
     /// answer the gate didn't offer, and the prompt stays up then.
     async fn answer_checkpoint(&mut self, arg: &str, out: &mut dyn Printer) {
-        let Some((lead, gate)) = self
-            .checkpoint
-            .as_ref()
-            .map(|(lead, gate, _)| (*lead, gate.clone()))
-        else {
+        if self.checkpoint.is_none() {
             out.line("[no checkpoint is waiting in this REPL: /build <n> follows a run]");
             return;
-        };
+        }
         let (word, rest) = arg.split_once(char::is_whitespace).unwrap_or((arg, ""));
         let (answer, amendment) = match (word, rest.trim()) {
             ("go", "") => (aigentic_api::CheckpointAnswer::Go, None),
@@ -1375,6 +1412,29 @@ impl ClientRepl {
                 out.line("[usage: /answer go | /answer amend <text> | /answer stop]");
                 return;
             }
+        };
+        self.send_answer(answer, amendment, out).await;
+    }
+
+    /// Send an answer to the open checkpoint. On success the gate goes;
+    /// a refusal answers nothing and the gate stays as it was.
+    async fn send_answer(
+        &mut self,
+        answer: aigentic_api::CheckpointAnswer,
+        amendment: Option<String>,
+        out: &mut dyn Printer,
+    ) {
+        let Some((lead, gate)) = self
+            .checkpoint
+            .as_ref()
+            .map(|open| (open.lead, open.gate.clone()))
+        else {
+            return;
+        };
+        let word = match answer {
+            aigentic_api::CheckpointAnswer::Go => "go",
+            aigentic_api::CheckpointAnswer::Amend => "amend",
+            aigentic_api::CheckpointAnswer::Stop => "stop",
         };
         let r = self
             .request(Request::AnswerCheckpoint {
@@ -1393,45 +1453,44 @@ impl ClientRepl {
         }
     }
 
-    /// A keyed answer to the checkpoint prompt: stop the run, or leave it
-    /// waiting and send nothing (issue #68).
+    /// A picked or typed answer to the checkpoint prompt. Leaving it
+    /// waiting hides the prompt and sends nothing; the gate stays open,
+    /// so `/answer` still answers it.
     async fn apply_checkpoint(&mut self, keyed: Keyed, out: &mut dyn Printer) {
-        let Some((lead, gate)) = self
-            .checkpoint
-            .as_ref()
-            .map(|(lead, gate, _)| (*lead, gate.clone()))
-        else {
+        let Some(gate) = self.checkpoint.as_ref().map(|open| open.gate.clone()) else {
             return;
         };
-        let Keyed::Decide { pick, echo, .. } = keyed else {
+        let Keyed::Decide { pick, reason, echo } = keyed else {
             return;
         };
         out.line(&echo);
         match pick {
-            Pick::StopRun => {
-                let r = self
-                    .request(Request::AnswerCheckpoint {
-                        lead,
-                        gate: gate.clone(),
-                        answer: aigentic_api::CheckpointAnswer::Stop,
-                        amendment: None,
-                    })
+            Pick::ContinueRun => {
+                self.send_answer(aigentic_api::CheckpointAnswer::Go, None, out)
                     .await;
-                match r {
-                    Response::Ok => {
-                        self.checkpoint = None;
-                        out.line(&format!("[answered {gate}: stop]"));
-                    }
-                    // A refusal answers nothing: the prompt stays.
-                    other => self.show(other, "", out),
+            }
+            Pick::AmendRun => match reason {
+                Some(text) => {
+                    self.send_answer(aigentic_api::CheckpointAnswer::Amend, Some(text), out)
+                        .await;
                 }
+                None => self.start_amending(out),
+            },
+            Pick::StopRun => {
+                self.send_answer(aigentic_api::CheckpointAnswer::Stop, None, out)
+                    .await;
             }
             Pick::LeaveWaiting => {
-                self.checkpoint = None;
-                out.line(&format!("[left {gate} waiting: /build <n> asks again]"));
+                if let Some(open) = self.checkpoint.as_mut() {
+                    open.shown = false;
+                    open.amending = false;
+                }
+                out.line(&format!(
+                    "[left {gate} waiting: /answer answers it, /build <n> shows it again]"
+                ));
             }
             // Neither a switch's picks nor anything else reaches here:
-            // a checkpoint menu offers only the two above.
+            // a checkpoint menu offers only the four above.
             Pick::Answer
             | Pick::Other
             | Pick::Allow { .. }
@@ -1442,6 +1501,19 @@ impl ClientRepl {
             | Pick::SwitchCorrected { .. }
             | Pick::NewYes
             | Pick::NewNo => {}
+        }
+    }
+
+    /// `Continue with changes` picked without its text: the prompt goes
+    /// and the next plain line is the amendment.
+    fn start_amending(&mut self, out: &mut dyn Printer) {
+        if let Some(open) = self.checkpoint.as_mut() {
+            open.shown = false;
+            open.amending = true;
+            out.line(&format!(
+                "[type the changes for {} and press Enter; /answer stop stops the run]",
+                open.gate
+            ));
         }
     }
 
@@ -1518,7 +1590,8 @@ impl ClientRepl {
         }
         self.checkpoint
             .as_ref()
-            .map(|(lead, gate, _)| format!("gate:{lead}:{gate}"))
+            .filter(|open| open.shown)
+            .map(|open| format!("gate:{}:{}", open.lead, open.gate))
     }
 
     /// A key while the menu is up: the selection, the digits, the hidden
@@ -1557,17 +1630,19 @@ impl ClientRepl {
             // With no chat prompt the keys belong to the followed run's
             // checkpoint menu (issue #68), if one is up.
             let keyed = {
-                let Some((_, _, menu)) = self.checkpoint.as_mut() else {
+                let Some(open) = self.checkpoint.as_mut().filter(|open| open.shown) else {
                     return MenuKey::Passed;
                 };
-                menu.key(key, composer_empty, settled)
+                open.menu.key(key, composer_empty, settled)
             };
             return match keyed {
                 Keyed::Passed => MenuKey::Passed,
                 Keyed::Used => MenuKey::Used,
-                // A checkpoint has no text input: there is nothing for
-                // the composer to take.
-                Keyed::Text => MenuKey::Passed,
+                // `Continue with changes`: the composer takes the text.
+                Keyed::Text => {
+                    self.start_amending(out);
+                    MenuKey::Used
+                }
                 keyed @ (Keyed::Decide { .. } | Keyed::Answer { .. }) => {
                     self.apply_checkpoint(keyed, out).await;
                     MenuKey::Used
@@ -1609,6 +1684,8 @@ impl ClientRepl {
                     }
                     Pick::Answer
                     | Pick::Other
+                    | Pick::ContinueRun
+                    | Pick::AmendRun
                     | Pick::StopRun
                     | Pick::LeaveWaiting
                     | Pick::SwitchElsewhere
@@ -6343,8 +6420,8 @@ mod tests {
         assert_eq!(
             prompt[prompt.len() - 2..],
             [
-                "  1. Stop the run".to_owned(),
-                "  2. Leave it waiting".to_owned()
+                "  1. Leave it waiting".to_owned(),
+                "  2. Stop the run".to_owned()
             ],
             "the prompt's last two lines are its rows: {prompt:?}"
         );
@@ -6466,7 +6543,7 @@ mod tests {
         // Picking `Stop the run` sends the answer; `Ok` withdraws it.
         let before = lead.daemon.requests().len();
         lead.repl
-            .menu_key(&key_for('1'), true, true, &mut lead.out)
+            .menu_key(&key_for('2'), true, true, &mut lead.out)
             .await;
         let sent = lead.daemon.requests()[before..].to_vec();
         match &sent[0] {
@@ -6649,8 +6726,8 @@ mod tests {
         daemon.stop();
     }
 
-    /// T7: `Leave it waiting` and Esc withdraw the prompt and send
-    /// nothing.
+    /// `Leave it waiting` and Esc hide the prompt and send nothing, and
+    /// the gate stays open: a later `/answer` still answers it.
     #[tokio::test]
     async fn leaving_the_gate_waiting_sends_nothing() {
         let lead_id = Ulid::generate();
@@ -6663,15 +6740,27 @@ mod tests {
         let (mut repl, mut out, daemon) = repl_for(lead_id, backlog).await;
         repl.handle_line("/build 58", &mut out).await;
         let before = daemon.requests().len();
-        repl.handle_line("2", &mut out).await;
+        repl.handle_line("1", &mut out).await;
         assert_eq!(
             out.0.0.last().unwrap(),
-            "[left wait-here waiting: /build <n> asks again]",
+            "[left wait-here waiting: /answer answers it, /build <n> shows it again]",
             "{:#?}",
             out.0.0
         );
         assert!(repl.menu().is_none(), "the prompt went without an answer");
         assert_eq!(daemon.requests().len(), before, "nothing was sent");
+        repl.handle_line("/answer stop", &mut out).await;
+        assert!(
+            matches!(
+                daemon.requests()[before..],
+                [Request::AnswerCheckpoint {
+                    answer: aigentic_api::CheckpointAnswer::Stop,
+                    ..
+                }]
+            ),
+            "the gate left waiting is still answered: {:?}",
+            daemon.requests()
+        );
 
         // Esc is the same choice, on the prompt itself.
         let lead_id = Ulid::generate();
@@ -6688,6 +6777,130 @@ mod tests {
         assert_eq!(used, MenuKey::Used, "Esc is the prompt's");
         assert!(repl.menu().is_none(), "the prompt went");
         assert_eq!(daemon.requests().len(), before, "nothing was sent");
+        daemon.stop();
+    }
+
+    /// A workflow's own checkpoint offers what it takes: `Continue`,
+    /// `Continue with changes`, `Leave it waiting` and `Stop the run`. The
+    /// selection starts on the row that sends nothing, so Enter alone
+    /// neither stops nor continues the run.
+    #[tokio::test]
+    async fn a_workflow_checkpoint_offers_go_amend_and_stop() {
+        let gate = |name: &str| {
+            serde_json::json!({
+                "gate": name,
+                "shown": ["read the spec"],
+                "options": ["go", "amend", "stop"],
+            })
+        };
+        let rows = |repl: &ClientRepl| -> Vec<String> {
+            repl.menu()
+                .expect("the prompt is up")
+                .rows
+                .iter()
+                .map(|row| row.label.clone())
+                .collect()
+        };
+
+        // Enter on the fresh prompt leaves the run waiting.
+        let lead_id = Ulid::generate();
+        let backlog = vec![run_event(
+            lead_id,
+            1,
+            EventKind::CheckpointAsked,
+            gate("decide"),
+        )];
+        let (mut repl, mut out, daemon) = repl_for(lead_id, backlog).await;
+        repl.handle_line("/build 58", &mut out).await;
+        assert_eq!(
+            rows(&repl),
+            [
+                "Continue",
+                "Continue with changes",
+                "Leave it waiting",
+                "Stop the run"
+            ]
+        );
+        let before = daemon.requests().len();
+        repl.menu_key(&key_for_enter(), true, true, &mut out).await;
+        assert_eq!(daemon.requests().len(), before, "Enter sent nothing");
+        assert!(repl.menu().is_none(), "and left the gate waiting");
+        daemon.stop();
+
+        // `Continue` sends `go`.
+        let lead_id = Ulid::generate();
+        let backlog = vec![run_event(
+            lead_id,
+            1,
+            EventKind::CheckpointAsked,
+            gate("decide"),
+        )];
+        let (mut repl, mut out, daemon) = repl_for(lead_id, backlog).await;
+        repl.handle_line("/build 58", &mut out).await;
+        let before = daemon.requests().len();
+        repl.menu_key(&key_for('1'), true, true, &mut out).await;
+        assert!(
+            matches!(
+                daemon.requests()[before..],
+                [Request::AnswerCheckpoint {
+                    answer: aigentic_api::CheckpointAnswer::Go,
+                    amendment: None,
+                    ..
+                }]
+            ),
+            "{:?}",
+            daemon.requests()
+        );
+        daemon.stop();
+
+        // `Continue with changes` takes the next line as the amendment.
+        let lead_id = Ulid::generate();
+        let backlog = vec![run_event(
+            lead_id,
+            1,
+            EventKind::CheckpointAsked,
+            gate("decide"),
+        )];
+        let (mut repl, mut out, daemon) = repl_for(lead_id, backlog).await;
+        repl.handle_line("/build 58", &mut out).await;
+        let before = daemon.requests().len();
+        repl.menu_key(&key_for('2'), true, true, &mut out).await;
+        assert_eq!(daemon.requests().len(), before, "the text comes first");
+        repl.handle_line("keep the temp dir", &mut out).await;
+        match &daemon.requests()[before..] {
+            [
+                Request::AnswerCheckpoint {
+                    answer: aigentic_api::CheckpointAnswer::Amend,
+                    amendment: Some(text),
+                    ..
+                },
+            ] => assert_eq!(text, "keep the temp dir"),
+            other => panic!("the line is the amendment: {other:?}"),
+        }
+        daemon.stop();
+
+        // `amend <text>` typed at the prompt is the same answer.
+        let lead_id = Ulid::generate();
+        let backlog = vec![run_event(
+            lead_id,
+            1,
+            EventKind::CheckpointAsked,
+            gate("decide"),
+        )];
+        let (mut repl, mut out, daemon) = repl_for(lead_id, backlog).await;
+        repl.handle_line("/build 58", &mut out).await;
+        let before = daemon.requests().len();
+        repl.handle_line("amend split item 7", &mut out).await;
+        match &daemon.requests()[before..] {
+            [
+                Request::AnswerCheckpoint {
+                    answer: aigentic_api::CheckpointAnswer::Amend,
+                    amendment: Some(text),
+                    ..
+                },
+            ] => assert_eq!(text, "split item 7"),
+            other => panic!("the typed amendment is sent: {other:?}"),
+        }
         daemon.stop();
     }
 
@@ -6730,7 +6943,7 @@ mod tests {
         );
 
         let before = daemon.requests().len();
-        repl.menu_key(&key_for('1'), true, true, &mut out).await;
+        repl.menu_key(&key_for('2'), true, true, &mut out).await;
         let sent = daemon.requests()[before..].to_vec();
         assert!(
             matches!(
@@ -6927,13 +7140,13 @@ mod tests {
         let prompt = repl.menu().expect("still up").plain();
         assert_eq!(prompt[0], "[checkpoint] checkpoint plain", "{prompt:?}");
         assert!(
-            prompt.iter().any(|l| l.starts_with("  1. Stop the run")),
+            prompt.iter().any(|l| l.starts_with("  2. Stop the run")),
             "the picks are numbered for a typed answer: {prompt:?}"
         );
 
-        // And a typed `1` is that pick: it sends the answer and goes.
+        // And a typed `2` is that pick: it sends the answer and goes.
         let before = daemon.requests().len();
-        repl.handle_line("1", &mut out).await;
+        repl.handle_line("2", &mut out).await;
         let sent = daemon.requests()[before..].to_vec();
         match &sent[0] {
             Request::AnswerCheckpoint {
@@ -8675,7 +8888,7 @@ mod tests {
         let before = lead.daemon.requests().len();
         let keyed = lead
             .repl
-            .menu_key(&key_for('1'), true, true, &mut lead.out)
+            .menu_key(&key_for('2'), true, true, &mut lead.out)
             .await;
         assert!(matches!(keyed, MenuKey::Used), "{keyed:?}");
         match &lead.daemon.requests()[before..] {

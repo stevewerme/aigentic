@@ -1951,7 +1951,7 @@ mod tests {
         // The first row carries the selection marker; the labels are the
         // picks, and the title and body are the gate's.
         let labels: Vec<&str> = menu.rows.iter().map(|row| row.label.as_str()).collect();
-        assert_eq!(labels, ["Stop the run", "Leave it waiting"]);
+        assert_eq!(labels, ["Leave it waiting", "Stop the run"]);
         assert!(drawn[0].contains("checkpoint route"), "{drawn:?}");
         assert_eq!(drawn[1], "   plan ready", "{drawn:?}");
         for (i, label) in labels.iter().enumerate() {
