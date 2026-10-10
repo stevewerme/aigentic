@@ -24,6 +24,11 @@ pub enum Pick {
     Answer,
     /// Free text for the current question: the composer takes it.
     Other,
+    /// Continue the followed run past its checkpoint: `go`.
+    ContinueRun,
+    /// Continue with changes: `amend`, its text typed after the pick or
+    /// given with it (`amend <text>`, carried as the decision's reason).
+    AmendRun,
     /// Stop the followed run (issue #68), at its checkpoint prompt.
     StopRun,
     /// Leave the followed run waiting: the prompt goes, nothing is sent.
@@ -58,8 +63,8 @@ pub struct Row {
 pub enum Kind {
     Permission,
     Question,
-    /// A followed build's checkpoint (issue #68): stop the run, or
-    /// leave it waiting.
+    /// A followed build's checkpoint: the answers the gate offers, and
+    /// leaving it waiting.
     Checkpoint,
     /// A switch proposal (issue #82): go to the proposed project, stay,
     /// or say where it belongs.
@@ -240,35 +245,39 @@ impl Menu {
         }
     }
 
-    /// The checkpoint prompt for a followed build (issue #68): what the
-    /// lead is waiting at, and the two things a client can do about it
-    /// today. `Stop the run` is the one answer the server takes; #59
-    /// adds `go` and `amend`.
+    /// The checkpoint prompt for a followed build: what the lead is
+    /// waiting at, a row for each answer the gate offers (`go`, `amend`,
+    /// `stop`, in that order), and `Leave it waiting`. The selection
+    /// starts on `Leave it waiting`, the one row that sends nothing, so a
+    /// stray Enter never stops or continues a run.
     pub fn checkpoint(gate: &str, shown: &[String], options: &[String]) -> Self {
-        // A gate that takes `go` is a workflow's own checkpoint: it is
-        // continued by a typed `/answer`, since `amend` needs text.
-        let note = options
+        let offered = |word: &str| options.iter().any(|option| option == word);
+        let row = |label: &str, pick: Pick| Row {
+            label: label.into(),
+            desc: None,
+            pick,
+        };
+        let mut rows = Vec::new();
+        if offered("go") {
+            rows.push(row("Continue", Pick::ContinueRun));
+        }
+        if offered("amend") {
+            rows.push(row("Continue with changes", Pick::AmendRun));
+        }
+        rows.push(row("Leave it waiting", Pick::LeaveWaiting));
+        rows.push(row("Stop the run", Pick::StopRun));
+        let selected = rows
             .iter()
-            .any(|option| option == "go")
-            .then(|| "continue: /answer go · with changes: /answer amend <text>".to_owned());
+            .position(|row| row.pick == Pick::LeaveWaiting)
+            .unwrap_or(0);
+        let note = offered("amend").then(|| "or type: amend <the changes>".to_owned());
         Self {
             kind: Kind::Checkpoint,
             title: format!("checkpoint {gate}"),
             body: shown.join("\n"),
             note,
-            rows: vec![
-                Row {
-                    label: "Stop the run".into(),
-                    desc: None,
-                    pick: Pick::StopRun,
-                },
-                Row {
-                    label: "Leave it waiting".into(),
-                    desc: None,
-                    pick: Pick::LeaveWaiting,
-                },
-            ],
-            selected: 0,
+            rows,
+            selected,
             multi: false,
             picked: Vec::new(),
             questions: None,
@@ -475,7 +484,7 @@ impl Menu {
             // Esc opens the reason input on the deny row, at once.
             KeyCode::Esc if self.kind == Kind::Permission => Keyed::Text,
             // Esc on a checkpoint leaves the run waiting, at once.
-            KeyCode::Esc if self.kind == Kind::Checkpoint => self.pick(1),
+            KeyCode::Esc if self.kind == Kind::Checkpoint => self.pick_of(&Pick::LeaveWaiting),
             // Esc on a switch proposal is `No, stay here`, at once.
             KeyCode::Esc if self.kind == Kind::Switch => self.pick(1),
             // Esc on the `/new` question keeps this thread, at once: it
@@ -622,16 +631,52 @@ impl Menu {
             // A row never carries a typed destination: only `line`
             // builds one. Nothing to send from here.
             Pick::SwitchCorrected { .. } => Keyed::Passed,
-            Pick::StopRun => Keyed::Decide {
-                pick: Pick::StopRun,
+            Pick::ContinueRun | Pick::StopRun => Keyed::Decide {
+                pick: row.pick.clone(),
                 reason: None,
                 echo: format!("↳ {}", row.label),
             },
+            // The changes are typed next: the composer takes them.
+            Pick::AmendRun => Keyed::Text,
             Pick::LeaveWaiting => Keyed::Decide {
                 pick: Pick::LeaveWaiting,
                 reason: None,
                 echo: format!("↳ {}", row.label),
             },
+        }
+    }
+
+    /// The row whose pick is `pick`, picked; `Passed` when there is none.
+    fn pick_of(&self, pick: &Pick) -> Keyed {
+        match self.rows.iter().position(|row| &row.pick == pick) {
+            Some(i) => self.pick(i),
+            None => Keyed::Passed,
+        }
+    }
+
+    /// A typed line at a checkpoint: a row's number, `go`, `stop`,
+    /// `wait`, or `amend <text>`, each only when the gate offers it.
+    /// Anything else is not the prompt's.
+    fn checkpoint_line(&self, text: &str) -> Option<Keyed> {
+        let (word, rest) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
+        let rest = rest.trim();
+        let offers = |pick: &Pick| self.rows.iter().any(|row| &row.pick == pick);
+        match (word.to_ascii_lowercase().as_str(), rest.is_empty()) {
+            (digits, true) if digits.parse::<usize>().is_ok() => {
+                let n: usize = digits.parse().ok()?;
+                (n >= 1 && n <= self.rows.len()).then(|| self.pick(n - 1))
+            }
+            ("go" | "continue", true) if offers(&Pick::ContinueRun) => {
+                Some(self.pick_of(&Pick::ContinueRun))
+            }
+            ("stop", true) => Some(self.pick_of(&Pick::StopRun)),
+            ("wait" | "leave", true) => Some(self.pick_of(&Pick::LeaveWaiting)),
+            ("amend", false) if offers(&Pick::AmendRun) => Some(Keyed::Decide {
+                pick: Pick::AmendRun,
+                reason: Some(rest.to_owned()),
+                echo: "↳ Continue with changes".to_owned(),
+            }),
+            _ => None,
         }
     }
 
@@ -644,11 +689,7 @@ impl Menu {
             return Some(self.question_line(text.trim()));
         }
         if self.kind == Kind::Checkpoint {
-            return match text.trim().to_ascii_lowercase().as_str() {
-                "1" | "stop" => Some(self.pick(0)),
-                "2" | "wait" | "leave" => Some(self.pick(1)),
-                _ => None,
-            };
+            return self.checkpoint_line(text.trim());
         }
         // The switch arm is before the generic permission match, so
         // `3 <where>` is never read as a deny with a reason.
