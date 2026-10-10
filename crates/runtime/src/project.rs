@@ -34,7 +34,7 @@ stated. Edit these files outside the thread; a tool call that writes them is ref
 /// The keys of each table in `aigentic.toml`, in one place so a struct
 /// that gains a field has one line to add here. The walk in
 /// `config_keys` reads them; the spec tree below is built from them.
-pub const PROJECT_SECTION_KEYS: &[&str] = &["name", "description"];
+pub const PROJECT_SECTION_KEYS: &[&str] = &["name", "description", "related"];
 pub const MODEL_SECTION_KEYS: &[&str] = &["profile"];
 // BUDGET_KEYS and COMPACTION_KEYS live beside the shared structs below:
 // `[budget]` and `[compaction]` appear in `aigentic.toml` and in a
@@ -185,6 +185,12 @@ pub struct ProjectSection {
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
+    /// Projects in other workspaces this thread's project declares it
+    /// understands (issue #129): each `<workspace>/<project>`, checked
+    /// at parse. Empty when absent, so a file without the key is
+    /// unchanged.
+    #[serde(default)]
+    pub related: Vec<String>,
 }
 
 /// Keys in `MODEL_SECTION_KEYS`.
@@ -450,6 +456,31 @@ impl CompactionConfig {
     }
 }
 
+/// A `[project] related` entry must be exactly `<workspace>/<project>`:
+/// one `/`, both halves non-empty and neither `.` nor `..`, and no `\`.
+/// Anything else — a path, a bare name, an absolute or `~` form — is
+/// refused here rather than expanded anywhere, so an entry that parses
+/// always names a workspace and a project.
+fn validate_related(entry: &str) -> Result<(), String> {
+    let ok = !entry.contains('\\')
+        && entry.split_once('/').is_some_and(|(ws, project)| {
+            ws != "."
+                && ws != ".."
+                && !ws.is_empty()
+                && project != "."
+                && project != ".."
+                && !project.is_empty()
+                && !project.contains('/')
+        });
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "[project] related: `{entry}` is not <workspace>/<project>"
+        ))
+    }
+}
+
 impl ProjectFile {
     /// The file and the dotted path of every key it set that
     /// `PROJECT_SPEC` does not list (issue #37: ignored, not refused).
@@ -467,6 +498,11 @@ impl ProjectFile {
             compaction
                 .validate()
                 .map_err(|message| format!("invalid [compaction] table: {message}"))?;
+        }
+        if let Some(project) = &file.project {
+            for entry in &project.related {
+                validate_related(entry)?;
+            }
         }
         let unknown = match toml::from_str::<toml::Value>(text) {
             Ok(value) => project_spec().unknown(&value),
@@ -1054,6 +1090,44 @@ steve = \"admin\"
             ProjectFile::default().tools.bash_timeout(),
             std::time::Duration::from_secs(120)
         );
+    }
+
+    #[test]
+    fn the_related_key_parses_and_is_a_known_key() {
+        // A fixture can only turn the walk's silence into evidence if
+        // the key is in both lists: a fixture that sets it and reports
+        // no unknown key proves both.
+        let (file, unknown) =
+            ProjectFile::parse_with("[project]\nname = \"p\"\nrelated = [\"v/r\", \"w/q\"]\n")
+                .unwrap();
+        assert_eq!(unknown, Vec::<String>::new());
+        assert_eq!(
+            file.project.unwrap().related,
+            vec!["v/r".to_owned(), "w/q".to_owned()]
+        );
+        // Absent, the key is an empty vector.
+        let file = ProjectFile::parse("[project]\nname = \"p\"\n").unwrap();
+        assert!(file.project.unwrap().related.is_empty());
+    }
+
+    #[test]
+    fn a_related_entry_that_is_not_workspace_slash_project_is_refused() {
+        // Every bad shape names the offending entry and the reason; the
+        // value is the fixture's, so the message is built from it.
+        for entry in [
+            "r", "", "v/", "/r", "v/r/x", "v/../r", "v/..", "v/r\\x", "/",
+        ] {
+            let text = format!("[project]\nname = \"p\"\nrelated = ['{entry}']\n");
+            let err = ProjectFile::parse(&text).unwrap_err();
+            assert!(
+                err.contains(&format!("`{entry}` is not <workspace>/<project>")),
+                "{entry}: {err}"
+            );
+        }
+        // A bare string where the list belongs is serde's error, not ours
+        // to word.
+        let text = "[project]\nname = \"p\"\nrelated = \"v/r\"\n";
+        assert!(ProjectFile::parse(text).is_err());
     }
 
     #[test]
