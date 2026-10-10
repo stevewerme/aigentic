@@ -519,7 +519,7 @@ mod tests {
                 1,
                 EventKind::RunFinished,
                 5,
-                json!({"outcome": "success", "cost_usd": 1.0}),
+                json!({"outcome": "closed", "cost_usd": 1.0}),
             ),
         ];
         assert_eq!(run_status(&finished, &[], at(10)), None);
