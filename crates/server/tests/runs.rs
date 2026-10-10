@@ -2829,3 +2829,170 @@ async fn t12_a_torn_child_log_pushes_nothing_and_is_not_repaired() {
         "the torn tail is left alone"
     );
 }
+
+/// Append one assistant line to `thread`'s log, as a live turn would, and
+/// answer with its `seq`: an event above the backlog a client's `Opened`
+/// already drew.
+fn append_reply(fx: &Fixture, thread: Ulid, text: &str) -> u64 {
+    let (mut log, _cut) =
+        ThreadLog::open_with(fx.threads.clone(), thread, Repair::TruncateTornTail).unwrap();
+    let event = log
+        .append(NewEvent {
+            kind: EventKind::AssistantMessage,
+            author: Author::Agent(aigentic_runtime::aigentic_core::AgentId("worker".into())),
+            payload: json!({"blocks": [{"type": "text", "text": text}]}),
+            parent_event: None,
+        })
+        .unwrap();
+    event.seq
+}
+
+/// Everything queued on a notice stream now.
+fn drain(rx: &mut mpsc::UnboundedReceiver<Notice>) -> Vec<Notice> {
+    let mut notices = Vec::new();
+    while let Ok(notice) = rx.try_recv() {
+        notices.push(notice);
+    }
+    notices
+}
+
+/// T18 — a watched child's events arrive within a tick, each once: the
+/// ticker catches the watcher up to the log's present, and its own mark
+/// keeps the next tick from pushing the same `seq` again.
+#[tokio::test]
+async fn t18_a_watched_child_is_pushed_within_a_tick_and_once() {
+    let daemon = Daemon::new(Scripts::default(), false).await;
+    let lead = Ulid::generate();
+    let child = Ulid::generate();
+    write_run(&daemon.fixture, lead, child, "spec");
+    let world = world(&daemon);
+    let mut host = aigentic_server::runs::ServerHost::new(world.clone(), lead);
+    host.create_child(child, "spec").unwrap();
+    write_child(&daemon.fixture, child, 0.1);
+
+    // What the client's `Opened` drew, and whether the lead is open too:
+    // a run's own events must reach its watcher from the live push alone.
+    let opened = daemon.child_events(child).last().unwrap().seq;
+    let runs = Arc::new(Runs::new());
+    let (lead_tx, mut lead_rx) = mpsc::unbounded_channel();
+    runs.watch(lead, lead_tx);
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    runs.watch(child, tx);
+
+    let ticker =
+        aigentic_server::runs::tick_status(runs.clone(), &world, lead, Duration::from_millis(10));
+    tokio::pin!(ticker);
+
+    let _ = tokio::time::timeout(Duration::from_millis(60), &mut ticker).await;
+    let mut pushed = drain(&mut rx);
+    assert!(
+        pushed
+            .iter()
+            .any(|notice| matches!(notice, Notice::Event { thread, event } if *thread == child && event.seq == opened)),
+        "the first tick catches a watcher up to the log's present: {pushed:?}"
+    );
+
+    let live = append_reply(&daemon.fixture, child, "still working");
+    assert!(live > opened, "the appended line is above the backlog");
+    let _ = tokio::time::timeout(Duration::from_millis(60), &mut ticker).await;
+    pushed.extend(drain(&mut rx));
+
+    assert!(
+        pushed
+            .iter()
+            .any(|notice| matches!(notice, Notice::Event { thread, event } if *thread == child && event.seq == live)),
+        "a line written after the watch is pushed within a tick: {pushed:?}"
+    );
+    let mut seen = Vec::new();
+    for notice in &pushed {
+        let Notice::Event { thread, event } = notice else {
+            panic!("the ticker pushes events, not {notice:?}");
+        };
+        assert!(
+            !seen.contains(&(*thread, event.seq)),
+            "pushed once: {thread}"
+        );
+        seen.push((*thread, event.seq));
+    }
+    assert!(
+        drain(&mut lead_rx)
+            .iter()
+            .all(|notice| !matches!(notice, Notice::Event { .. })),
+        "the lead's own events are streamed live, never pushed by the ticker"
+    );
+}
+
+/// T19 — a thread this lead did not start is never pushed by its ticker:
+/// another run's step child and a front thread somebody has open. Two
+/// leads' tickers would otherwise push the same event twice.
+#[tokio::test]
+async fn t19_a_thread_this_lead_does_not_own_is_not_pushed() {
+    let daemon = Daemon::new(Scripts::default(), false).await;
+    let (client, _welcome) = daemon.connect("steve").await;
+    let front = match client
+        .request(Request::Front {
+            project: "p".into(),
+            here: None,
+            asked: None,
+        })
+        .await
+        .unwrap()
+    {
+        Response::Front { thread, .. } => thread.id,
+        other => panic!("a front thread: {other:?}"),
+    };
+
+    let world = world(&daemon);
+    let lead = Ulid::generate();
+    let child = Ulid::generate();
+    write_run(&daemon.fixture, lead, child, "spec");
+    let mut host = aigentic_server::runs::ServerHost::new(world.clone(), lead);
+    host.create_child(child, "spec").unwrap();
+    write_child(&daemon.fixture, child, 0.1);
+
+    let other_lead = Ulid::generate();
+    let other_child = Ulid::generate();
+    write_run(&daemon.fixture, other_lead, other_child, "spec");
+    let mut other_host = aigentic_server::runs::ServerHost::new(world.clone(), other_lead);
+    other_host.create_child(other_child, "spec").unwrap();
+    write_child(&daemon.fixture, other_child, 0.1);
+
+    // The lead is open too: the ticker only runs for a lead somebody
+    // watches, as the client that follows a run does.
+    let runs = Arc::new(Runs::new());
+    let (lead_tx, mut lead_rx) = mpsc::unbounded_channel();
+    runs.watch(lead, lead_tx);
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    runs.watch(child, tx);
+    let (other_tx, mut other_rx) = mpsc::unbounded_channel();
+    runs.watch(other_child, other_tx);
+    let (front_tx, mut front_rx) = mpsc::unbounded_channel();
+    runs.watch(front, front_tx);
+
+    let ticker =
+        aigentic_server::runs::tick_status(runs.clone(), &world, lead, Duration::from_millis(10));
+    tokio::pin!(ticker);
+    let _ = tokio::time::timeout(Duration::from_millis(60), &mut ticker).await;
+
+    let pushed = drain(&mut rx);
+    assert!(
+        pushed
+            .iter()
+            .any(|notice| matches!(notice, Notice::Event { thread, .. } if *thread == child)),
+        "this lead's own child is pushed: {pushed:?}"
+    );
+    assert!(
+        drain(&mut other_rx).is_empty(),
+        "another run's child belongs to that run's ticker"
+    );
+    assert!(
+        drain(&mut front_rx).is_empty(),
+        "a thread no run started is never pushed by a ticker"
+    );
+    assert!(
+        drain(&mut lead_rx)
+            .iter()
+            .all(|notice| !matches!(notice, Notice::Event { .. })),
+        "the lead's own events are pushed by the run, not by its ticker"
+    );
+}

@@ -589,6 +589,18 @@ impl Runs {
             .get(&lead)
             .map_or(0, Vec::len)
     }
+
+    /// Every thread somebody watches now, the lead included: a ticker's
+    /// work list, so a step's child is read only while a client has it
+    /// open.
+    pub fn watched(&self) -> Vec<Ulid> {
+        self.watchers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .copied()
+            .collect()
+    }
 }
 
 /// Drive `lead`'s run until it finishes or stops, then give the lead up.
@@ -632,11 +644,16 @@ pub async fn drive(
 /// live, rarely enough that a long step is not a stream of notices.
 pub const PUSH_EVERY: Duration = Duration::from_secs(2);
 
-/// Push `lead`'s status to its watchers every `every`, until stopped.
-/// Reads the lead's and the step's child's logs; repairs nothing and
+/// Push `lead`'s status to its watchers every `every`, until stopped,
+/// and each watched child's new events to that child's watchers.
+/// Reads the lead's and the watched children's logs; repairs nothing and
 /// pushes nothing it cannot read.
 pub async fn tick_status(runs: Arc<Runs>, world: &RunWorld, lead: Ulid, every: Duration) {
     let mut interval = tokio::time::interval(every);
+    // This ticker's own high-water mark per pushed thread. A thread
+    // first seen starts at 0, so a child opened mid-run is caught up to
+    // its log's present at the next tick.
+    let mut marks: HashMap<Ulid, u64> = HashMap::new();
     loop {
         interval.tick().await;
         // Nobody has this lead open: reading two logs every tick would be
@@ -644,17 +661,70 @@ pub async fn tick_status(runs: Arc<Runs>, world: &RunWorld, lead: Ulid, every: D
         if runs.watchers(lead) == 0 {
             continue;
         }
-        let Some(status) = read_status(world, lead) else {
+        if let Some(status) = read_status(world, lead) {
+            runs.broadcast(
+                lead,
+                Notice::RunStatus {
+                    thread: lead,
+                    status: wire_status(status),
+                },
+            );
+        }
+        push_watched_children(&runs, world, lead, &mut marks);
+    }
+}
+
+/// Push each watched thread's new events to its watchers.
+///
+/// The lead's own events already go out live from `broadcast_new`, and a
+/// thread another lead started belongs to that lead's ticker: pushing
+/// either here would send the same event twice.
+fn push_watched_children(
+    runs: &Runs,
+    world: &RunWorld,
+    lead: Ulid,
+    marks: &mut HashMap<Ulid, u64>,
+) {
+    let threads = &world.root.threads_dir;
+    for thread in runs.watched() {
+        if thread == lead {
+            continue;
+        }
+        // A log that is not readable this tick may still be mid-creation,
+        // and a failed read pushes nothing rather than half a log.
+        let Some(events) = read_events(threads, thread) else {
             continue;
         };
-        runs.broadcast(
-            lead,
-            Notice::RunStatus {
-                thread: lead,
-                status: wire_status(status),
-            },
-        );
+        if parent_of(&events) != Some(lead) {
+            continue;
+        }
+        let mark = marks.entry(thread).or_insert(0);
+        for event in events.iter() {
+            if event.seq <= *mark {
+                continue;
+            }
+            runs.broadcast(
+                thread,
+                Notice::Event {
+                    thread,
+                    event: event.clone(),
+                },
+            );
+            *mark = event.seq;
+        }
     }
+}
+
+/// The lead whose step started the thread: the parent its first
+/// `ThreadStarted` names, or `None` for a thread a person started.
+fn parent_of(events: &[Event]) -> Option<Ulid> {
+    events
+        .iter()
+        .filter(|event| event.kind == EventKind::ThreadStarted)
+        .filter_map(|event| {
+            serde_json::from_value::<ThreadStartedPayload>(event.payload.clone()).ok()
+        })
+        .find_map(|started| started.parent_thread)
 }
 
 /// The run's status as the two logs fold it, or `None` when a log that
