@@ -20,8 +20,9 @@ use ulid::Ulid;
 /// (issue #7), so a version-2 client is refused rather than left never
 /// seeing the switch it is asked to answer; version 4 adds
 /// `Front`/`NewFront` and `Response::Front` (issue #84); version 5 lets
-/// `ListThreads` omit its project (issue #86).
-pub const PROTOCOL_VERSION: u32 = 5;
+/// `ListThreads` omit its project (issue #86); version 6 adds the
+/// run-status notice (issue #139).
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// One line on the wire.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -458,6 +459,50 @@ pub enum Notice {
         thread: Ulid,
         text: String,
     },
+    /// A followed run's line: where it is, pushed at most once every two
+    /// seconds while someone watches its lead (issue #139).
+    RunStatus {
+        thread: Ulid,
+        status: RunStatus,
+    },
+}
+
+/// A run's status line, as the daemon pushes it. Mirrors the runtime's
+/// own fold, which `api` cannot see.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunStatus {
+    pub issue: u64,
+    pub phase: RunPhase,
+    pub idle_secs: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "phase", rename_all = "snake_case")]
+pub enum RunPhase {
+    Step {
+        step: String,
+        attempt: u32,
+        elapsed_secs: u64,
+        calls: u32,
+        cost_usd: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        checklist: Option<RunChecklist>,
+    },
+    Gate {
+        gate: String,
+    },
+    Move {
+        what: String,
+    },
+}
+
+/// The checklist figure, as on the wire.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunChecklist {
+    pub done: usize,
+    pub total: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active: Option<String>,
 }
 
 /// A thread a run owns (issue #58). The daemon serves it read-only:
@@ -1121,7 +1166,7 @@ mod tests {
     /// its log and the client cannot tell.
     #[test]
     fn t7_front_asked_round_trips_and_the_old_frame_still_decodes() {
-        assert_eq!(PROTOCOL_VERSION, 5, "no bump for `asked`");
+        assert_eq!(PROTOCOL_VERSION, 6, "issue #139 moved it");
         let asked = StartAsk {
             offered: "web".into(),
             chosen: "api".into(),
@@ -1173,7 +1218,7 @@ mod tests {
     /// (which always named one) still decodes.
     #[test]
     fn t1_list_threads_project_is_optional_on_the_wire() {
-        assert_eq!(PROTOCOL_VERSION, 5);
+        assert_eq!(PROTOCOL_VERSION, 6, "issue #139 moved it");
         let some = Frame::request(
             1,
             Request::ListThreads {
@@ -1404,5 +1449,75 @@ mod tests {
         assert!(text.contains("teleport"), "{text}");
         assert!(decode("not json").is_err());
         assert!(decode("").is_err());
+    }
+
+    /// T9 (issue #139): the run-status notice round-trips, its three phase
+    /// shapes are tagged `step`/`gate`/`move`, and a client that does not
+    /// know the kind fails to decode the whole frame — which is why the
+    /// version moved.
+    #[test]
+    fn the_run_status_notice_round_trips_and_an_unknown_kind_does_not_decode() {
+        let thread = thread();
+        let step = Frame::notice(Notice::RunStatus {
+            thread,
+            status: RunStatus {
+                issue: 139,
+                phase: RunPhase::Step {
+                    step: "spec".into(),
+                    attempt: 1,
+                    elapsed_secs: 192,
+                    calls: 72,
+                    cost_usd: 0.51,
+                    checklist: Some(RunChecklist {
+                        done: 2,
+                        total: 6,
+                        active: Some("Map the code".into()),
+                    }),
+                },
+                idle_secs: 12,
+            },
+        });
+        let line = encode(&step);
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["notice"]["kind"], "run_status");
+        assert_eq!(v["notice"]["status"]["phase"]["phase"], "step");
+        assert_eq!(decode(&line).unwrap(), step, "{line}");
+
+        let gate = Frame::notice(Notice::RunStatus {
+            thread,
+            status: RunStatus {
+                issue: 139,
+                phase: RunPhase::Gate {
+                    gate: "decide".into(),
+                },
+                idle_secs: 0,
+            },
+        });
+        let line = encode(&gate);
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["notice"]["status"]["phase"]["phase"], "gate");
+        assert_eq!(decode(&line).unwrap(), gate, "{line}");
+
+        let moved = Frame::notice(Notice::RunStatus {
+            thread,
+            status: RunStatus {
+                issue: 139,
+                phase: RunPhase::Move {
+                    what: "following fix".into(),
+                },
+                idle_secs: 0,
+            },
+        });
+        let line = encode(&moved);
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["notice"]["status"]["phase"]["phase"], "move");
+        assert_eq!(decode(&line).unwrap(), moved, "{line}");
+
+        // A frame from a client that knows the kind's name but not its
+        // shape, and one that knows neither: both fail whole.
+        assert!(
+            decode(r#"{"notice":{"kind":"run_status","thread":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":{"issue":1,"phase":{"phase":"teleported"},"idle_secs":0}}}"#).is_err()
+        );
+        assert_eq!(PROTOCOL_VERSION, 6, "issue #139 moved it");
     }
 }

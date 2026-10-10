@@ -11,14 +11,15 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use aigentic_api::{CheckpointAnswer, Notice};
-use aigentic_runtime::aigentic_core::{AgentId, Author, EventKind};
+use aigentic_runtime::aigentic_core::{AgentId, Author, Event, EventKind};
 use aigentic_runtime::aigentic_log::{
-    CheckpointAnswer as LogAnswer, NewEvent, Repair, RunStartedPayload, ThreadLog,
-    ThreadStartedPayload,
+    CheckpointAnswer as LogAnswer, NewEvent, NextMove, Repair, RunStartedPayload, ThreadLog,
+    ThreadStartedPayload, run_state,
 };
 use aigentic_runtime::runner::forge::{Forge, GhForge};
 use aigentic_runtime::runner::git::{GitRepo, Repo};
@@ -26,6 +27,7 @@ use aigentic_runtime::runner::install::{CargoInstaller, Installer};
 use aigentic_runtime::runner::{Advanced, Runner, RunnerError, RunnerHost};
 use aigentic_runtime::workflow::{LoadedWorkflow, WorkflowFile, WorkflowRoots};
 use aigentic_runtime::{Mode, Runtime};
+use time::OffsetDateTime;
 use tokio::sync::{mpsc, oneshot};
 use ulid::Ulid;
 
@@ -607,7 +609,13 @@ pub async fn drive(
     // dropped when the task returns, finished, stopped or panicked, so
     // no path leaves the lead locked by a task that ended.
     let _lock = lock;
-    let outcome = run(runs.clone(), &world, lead, &mut answers).await;
+    let outcome = tokio::select! {
+        outcome = run(runs.clone(), &world, lead, &mut answers) => outcome,
+        // The ticker never resolves, so the run's own future is still the
+        // one that ends this task; dropping the ticker is what stops the
+        // pushes.
+        () = tick_status(runs.clone(), &world, lead, PUSH_EVERY) => unreachable!(),
+    };
     if let Err(e) = &outcome {
         runs.broadcast(
             lead,
@@ -618,6 +626,95 @@ pub async fn drive(
         );
     }
     runs.release(lead);
+}
+
+/// How often a watched lead's status is pushed: often enough to feel
+/// live, rarely enough that a long step is not a stream of notices.
+pub const PUSH_EVERY: Duration = Duration::from_secs(2);
+
+/// Push `lead`'s status to its watchers every `every`, until stopped.
+/// Reads the lead's and the step's child's logs; repairs nothing and
+/// pushes nothing it cannot read.
+pub async fn tick_status(runs: Arc<Runs>, world: &RunWorld, lead: Ulid, every: Duration) {
+    let mut interval = tokio::time::interval(every);
+    loop {
+        interval.tick().await;
+        // Nobody has this lead open: reading two logs every tick would be
+        // work for a line nobody sees.
+        if runs.watchers(lead) == 0 {
+            continue;
+        }
+        let Some(status) = read_status(world, lead) else {
+            continue;
+        };
+        runs.broadcast(
+            lead,
+            Notice::RunStatus {
+                thread: lead,
+                status: wire_status(status),
+            },
+        );
+    }
+}
+
+/// The run's status as the two logs fold it, or `None` when a log that
+/// should be readable is not. A step's child is read only once the lead
+/// names it: a child that has written nothing yet is an empty slice, so
+/// the step is visible before its first line, while a child whose log is
+/// present but unreadable is a failed read — and a failed read pushes
+/// nothing rather than a partial line.
+fn read_status(world: &RunWorld, lead: Ulid) -> Option<aigentic_runtime::RunStatus> {
+    let threads = &world.root.threads_dir;
+    let lead_events = read_events(threads, lead)?;
+    let child = match run_state(&lead_events).ok()?.next_move() {
+        NextMove::ReAwait { child_thread, .. } if exists(threads, child_thread) => {
+            read_events(threads, child_thread)?
+        }
+        _ => Vec::new(),
+    };
+    aigentic_runtime::run_status(&lead_events, &child, OffsetDateTime::now_utc())
+}
+
+/// Whether a thread's log has been written at all.
+fn exists(threads: &Path, thread: Ulid) -> bool {
+    threads.join(format!("{thread}.jsonl")).is_file()
+}
+
+/// A thread's events, or `None` when its log is missing or unreadable.
+/// The `exists` check plus `ThreadLog::open`'s `Repair::Refuse` mean a
+/// read never creates a log and never repairs a torn one.
+fn read_events(threads: &Path, thread: Ulid) -> Option<Vec<Event>> {
+    if !exists(threads, thread) {
+        return None;
+    }
+    ThreadLog::open(threads, thread)
+        .ok()
+        .map(|log| log.events().to_vec())
+}
+
+/// The runtime's fold, in the shape the wire carries.
+fn wire_status(status: aigentic_runtime::RunStatus) -> aigentic_api::RunStatus {
+    let phase = match status.phase {
+        aigentic_runtime::Phase::Step(step) => aigentic_api::RunPhase::Step {
+            step: step.step,
+            attempt: step.attempt,
+            elapsed_secs: step.elapsed_secs,
+            calls: step.calls,
+            cost_usd: step.cost_usd,
+            checklist: step.checklist.map(|checklist| aigentic_api::RunChecklist {
+                done: checklist.done,
+                total: checklist.total,
+                active: checklist.active,
+            }),
+        },
+        aigentic_runtime::Phase::Gate { gate } => aigentic_api::RunPhase::Gate { gate },
+        aigentic_runtime::Phase::Move(what) => aigentic_api::RunPhase::Move { what },
+    };
+    aigentic_api::RunStatus {
+        issue: status.issue,
+        phase,
+        idle_secs: status.idle_secs,
+    }
 }
 
 /// The run's own loop. See [`drive`].
