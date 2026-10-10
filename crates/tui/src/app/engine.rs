@@ -717,6 +717,29 @@ impl ClientRepl {
     }
 
     pub async fn handle_line(&mut self, line: &str, out: &mut dyn Printer) {
+        // Inside a watch the front thread is read-only (issue #140):
+        // `/answer` is the one line the watch needs, and it goes to the
+        // watch's own engine, whose gate carries the run's lead. Every
+        // other line, command or text, draws the refusal and sends
+        // nothing.
+        if self.watch.is_some() {
+            match parse_line(line.trim(), &self.skills) {
+                // The watch's own gate: the child engine holds it, and
+                // its `lead` is the run's, so the answer goes to the run.
+                Command::Answer(arg) => {
+                    if let Some(watch) = self.watch.as_mut() {
+                        watch.child().answer_checkpoint(arg, out).await;
+                    }
+                    return;
+                }
+                _ => {
+                    if let Some(watch) = self.watch.as_ref() {
+                        out.line(&watch.refusal());
+                    }
+                    return;
+                }
+            }
+        }
         // `!text` interrupts, as typing a command while the model streams
         // is the common case.
         if let Some(text) = line.strip_prefix('!') {
@@ -1492,10 +1515,18 @@ impl ClientRepl {
         self.watch.as_ref().and_then(|watch| watch.figures())
     }
 
-    /// The watch's own child engine, which the pane and the answering
-    /// keys follow while a watch is open.
-    fn watched_child(&mut self) -> Option<&mut ClientRepl> {
-        self.watch.as_mut().map(|watch| watch.child())
+    /// The watch, for the tests that assert on its words and its gate.
+    #[cfg(test)]
+    pub(crate) fn watch_mut(&mut self) -> Option<&mut Watch> {
+        self.watch.as_mut()
+    }
+
+    /// The gate the watch is waiting at, for the tests.
+    #[cfg(test)]
+    pub(crate) fn watch_gate(&self) -> Option<&Menu> {
+        self.watch
+            .as_ref()
+            .and_then(|watch| watch.child_ref().checkpoint())
     }
 
     /// `/answer go`, `/answer amend <text>` or `/answer stop`: answer the
@@ -1687,6 +1718,11 @@ impl ClientRepl {
     /// keys go to), then the chat prompt, else the followed run's
     /// checkpoint prompt (issue #68).
     pub fn menu(&self) -> Option<&Menu> {
+        // Inside a watch the pane is the step's own (issue #140): its
+        // chips, its `/skill` picker, and its waiting gate's menu.
+        if let Some(watch) = self.watch.as_ref() {
+            return watch.child_ref().menu();
+        }
         if self.confirm_new.is_some() {
             return self.confirm_new.as_ref();
         }
@@ -1702,6 +1738,9 @@ impl ClientRepl {
     /// prompt that replaces it (#68's review: `1` allowed a command, and
     /// the Enter after it stopped the run).
     pub fn menu_id(&self) -> Option<String> {
+        if let Some(watch) = self.watch.as_ref() {
+            return watch.child_ref().menu_id();
+        }
         if self.confirm_new.is_some() {
             return Some("confirm:new".to_owned());
         }
@@ -1726,6 +1765,13 @@ impl ClientRepl {
         settled: bool,
         out: &mut dyn Printer,
     ) -> MenuKey {
+        // A digit or Enter inside a watch enters the step's own selection
+        // (issue #140), never the front thread's.
+        if let Some(watch) = self.watch.as_mut() {
+            // Boxed: the compiler sees the child's `menu_key` as this
+            // one's own, and a watch's child never has a watch of its own.
+            return Box::pin(watch.child().menu_key(key, composer_empty, settled, out)).await;
+        }
         if self.confirm_new.is_some() {
             // The `/new` question takes its keys first (issue #108):
             // Esc is `No` in `Menu::key`, so it never reaches the
@@ -6491,6 +6537,12 @@ mod tests {
             }
         }
 
+        /// The lines drawn so far, cleared, so the next assertion sees
+        /// only what the assertion's own line drew.
+        fn clear(&mut self) {
+            self.out.0.0.clear();
+        }
+
         /// One lead event pushed as the daemon would push it.
         async fn push_lead(&mut self, event: Event) {
             let thread = event.thread_id;
@@ -6971,6 +7023,161 @@ mod tests {
             &mut lead.out,
         );
         assert_eq!(lead.lines().len(), drawn, "the same event draws once");
+    }
+
+    /// T7: inside a watch, a chat line and a command are refused; the
+    /// one line that works is `/answer`, and it answers the run's gate.
+    #[tokio::test]
+    async fn inside_refuses_a_typed_message_and_a_command() {
+        const ISSUE: u64 = 140;
+        let lead_id = Ulid::generate();
+        let spec = Ulid::generate();
+        let backlog = vec![
+            run_event(lead_id, 0, EventKind::RunStarted, run_started(ISSUE)),
+            run_event(
+                lead_id,
+                1,
+                EventKind::StepStarted,
+                step_started("spec", 1, spec),
+            ),
+        ];
+        let mut lead =
+            Lead::watching(lead_id, backlog, ISSUE, vec![(spec, child_backlog(spec))]).await;
+        lead.line(&format!("/watch {ISSUE} spec")).await;
+        let watch = lead.repl.watch_mut().expect("the fixture's watch is open");
+        let refusal = watch.refusal();
+        for line in ["please carry on", "/quit", "  /quit  "] {
+            lead.clear();
+            lead.line(line).await;
+            assert_eq!(
+                lead.lines(),
+                vec![refusal.clone()],
+                "{line:?} is refused with the watch's own words"
+            );
+        }
+        let asked = run_event(
+            lead_id,
+            2,
+            EventKind::CheckpointAsked,
+            checkpoint_asked("plan_gate"),
+        );
+        lead.push_lead(asked).await;
+        lead.clear();
+        let sends = lead.daemon.requests().len();
+        lead.line("/answer go").await;
+        let sent: Vec<Request> = lead.daemon.requests()[sends..].to_vec();
+        assert!(
+            matches!(
+                sent.as_slice(),
+                [Request::AnswerCheckpoint { lead, gate, .. }]
+                    if *lead == lead_id && gate == "plan_gate"
+            ),
+            "the answer went to the run's own gate: {sent:?}"
+        );
+        assert!(
+            lead.repl.watch_gate().is_none(),
+            "the watch's gate cleared with the answer"
+        );
+    }
+
+    /// T12: the watch's gate comes from the lead's `checkpoint_asked`
+    /// and is answered once — the fold must not advance twice.
+    #[tokio::test]
+    async fn watch_absorbs_a_gate() {
+        const ISSUE: u64 = 140;
+        let lead_id = Ulid::generate();
+        let spec = Ulid::generate();
+        let backlog = vec![
+            run_event(lead_id, 0, EventKind::RunStarted, run_started(ISSUE)),
+            run_event(
+                lead_id,
+                1,
+                EventKind::StepStarted,
+                step_started("spec", 1, spec),
+            ),
+        ];
+        let mut lead =
+            Lead::watching(lead_id, backlog, ISSUE, vec![(spec, child_backlog(spec))]).await;
+        lead.line(&format!("/watch {ISSUE} pin")).await;
+        let asked = run_event(
+            lead_id,
+            2,
+            EventKind::CheckpointAsked,
+            checkpoint_asked("plan_gate"),
+        );
+        lead.push_lead(asked.clone()).await;
+        assert!(
+            lead.repl.watch_gate().is_some(),
+            "the run's gate is up inside the watch"
+        );
+        let sends = lead.daemon.requests().len();
+        lead.line("/answer go").await;
+        let sent: Vec<Request> = lead.daemon.requests()[sends..].to_vec();
+        assert!(
+            matches!(
+                sent.as_slice(),
+                [Request::AnswerCheckpoint { lead, gate, .. }]
+                    if *lead == lead_id && gate == "plan_gate"
+            ),
+            "the answer went to the run's own gate: {sent:?}"
+        );
+        assert!(
+            lead.repl.watch_gate().is_none(),
+            "the answer cleared the watch's gate"
+        );
+        lead.push_lead(asked).await;
+        assert_eq!(
+            lead.repl.inside(),
+            Some(format!("inside #{ISSUE} spec")),
+            "the same gate a second time does not move the watch"
+        );
+    }
+
+    /// T13: another thread's waiting prompt is named, and never moves the
+    /// watch's gate.
+    #[tokio::test]
+    async fn a_prompt_for_another_thread_is_tagged() {
+        const ISSUE: u64 = 140;
+        let lead_id = Ulid::generate();
+        let spec = Ulid::generate();
+        let other = Ulid::generate();
+        let backlog = vec![
+            run_event(lead_id, 0, EventKind::RunStarted, run_started(ISSUE)),
+            run_event(
+                lead_id,
+                1,
+                EventKind::StepStarted,
+                step_started("spec", 1, spec),
+            ),
+        ];
+        let mut lead =
+            Lead::watching(lead_id, backlog, ISSUE, vec![(spec, child_backlog(spec))]).await;
+        lead.line(&format!("/watch {ISSUE} spec")).await;
+        let asked = run_event(
+            other,
+            0,
+            EventKind::CheckpointAsked,
+            checkpoint_asked("plan_gate"),
+        );
+        lead.clear();
+        lead.repl.render(
+            Notice::Event {
+                thread: other,
+                event: asked,
+            },
+            &mut lead.out,
+        );
+        assert_eq!(
+            lead.lines(),
+            vec![format!(
+                "[prompt for thread {other} is waiting: /watch it to answer]"
+            )],
+            "one tagged line names the thread"
+        );
+        assert!(
+            lead.repl.watch_gate().is_none(),
+            "another thread's prompt is not the watch's"
+        );
     }
 
     /// T1: the parser and the help text. `/build 73` is the number,
