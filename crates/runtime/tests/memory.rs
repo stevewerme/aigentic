@@ -504,7 +504,7 @@ async fn the_prefix_carries_the_person_workspace_and_project_memory_in_that_orde
         blocks[person]
     );
     // The workspace's and the project's share one message, the workspace's
-    // first, exactly where they were before the person's home existed.
+    // first, after the person's block.
     let memory = blocks
         .iter()
         .position(|b| b.starts_with(&format!("# Workspace memory ({WORKSPACE})")))
@@ -682,7 +682,7 @@ async fn the_extraction_request_offers_only_the_homes_this_thread_has() {
     assert!(!request.contains("`person`"), "{request}");
     assert!(request.contains("`workspace`"), "{request}");
 
-    // No home beyond the project's: the request is today's.
+    // No home beyond the project's: the request is `MEMORY_REQUEST` alone.
     let (mut project_only, seen) = rig_without(
         &dir,
         turn_and_extraction(HOMES_REPLY),

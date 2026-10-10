@@ -86,7 +86,7 @@ fn home_name(home: MemoryHome) -> &'static str {
 /// The extraction request: `MEMORY_REQUEST`, plus — only when the thread
 /// keeps a home beyond the project's — one sentence naming those homes and
 /// saying their word goes before the kind. A project-only thread sends
-/// today's bytes.
+/// `MEMORY_REQUEST` unchanged.
 fn memory_request(homes: &[MemoryHome]) -> String {
     if homes.is_empty() {
         return MEMORY_REQUEST.to_owned();
