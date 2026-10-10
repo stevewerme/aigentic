@@ -50,6 +50,13 @@ pub const CALL_FINISH_STEP: &str = "call finish_step";
 /// cap: the work is not finished, so it continues.
 pub const CONTINUE_PROMPT: &str = "continue";
 
+/// The end reason of an attempt whose report had no body: there is
+/// nothing to post, so the attempt is partial and asked to report again.
+pub const REPORT_WITHOUT_BODY: &str = "report_without_body";
+
+/// What a step's next attempt is told when its last report had no body.
+pub const REPORT_AGAIN_PROMPT: &str = "Your finish_step call had no `body`. Call finish_step again with the same fields and your whole report in `body`, not inside `slots`.";
+
 /// Every way the runner can fail.
 #[derive(Debug, thiserror::Error)]
 pub enum RunnerError {
@@ -1382,6 +1389,7 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
         Ok(match previous.as_str() {
             // It stopped on its own or was picked up without reporting.
             "done" | "resumed" => CALL_FINISH_STEP.to_owned(),
+            REPORT_WITHOUT_BODY => REPORT_AGAIN_PROMPT.to_owned(),
             _ => CONTINUE_PROMPT.to_owned(),
         })
     }
@@ -1432,16 +1440,10 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
                     RunnerError::Host(format!("child {child}: unreadable step_reported"))
                 })?;
             if report.body.clone().unwrap_or_default().trim().is_empty() {
-                // No `step_finished`: a report with no body is not a step's
-                // outcome the log may record as one.
-                self.escalate(
-                    "step_stop",
-                    vec![
-                        step.id.clone(),
-                        attempt.to_string(),
-                        "the report has no body".into(),
-                    ],
-                )?;
+                // Nothing to post: the attempt is partial, so the step is
+                // asked to report again once and escalates the second time.
+                let finished = finish(StepStatus::Partial, REPORT_WITHOUT_BODY.into(), None);
+                self.append(EventKind::StepFinished, &finished)?;
                 return Ok(());
             }
             let status = match report.status {
