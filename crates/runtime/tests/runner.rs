@@ -21,7 +21,7 @@ use aigentic_runtime::workflow::{LoadedWorkflow, WorkflowFile, WorkflowOrigin};
 use aigentic_runtime::{Answer, Approver, LENGTH_STOP, Prices, Runtime};
 use aigentic_runtime::{
     STEP_REPORTED,
-    runner::{CALL_FINISH_STEP, CONTINUE_PROMPT},
+    runner::{CALL_FINISH_STEP, CONTINUE_PROMPT, REPORT_AGAIN_PROMPT, REPORT_WITHOUT_BODY},
 };
 use aigentic_tools::ToolRegistry;
 use common::{done, scripted, usage};
@@ -1941,40 +1941,84 @@ async fn t13_resumed_is_treated_as_done() {
     );
 }
 
+/// A report with no body has nothing to post: the step is asked to
+/// report again once, in the same child, and the body it then gives is
+/// posted. `finish_step` refuses such a report, so the case is a log an
+/// earlier binary wrote, met on resume: the daemon died after the child
+/// reported and before the runner read it.
 #[tokio::test]
-async fn t14_a_report_without_a_body_escalates_and_posts_nothing() {
+async fn a_report_without_a_body_is_asked_again_once() {
     let brief_child = Ulid::generate();
     let implementer_child = Ulid::generate();
-    let mut headless = implementer_report();
-    headless["body"] = json!(null);
     let fx = Fixture::new(vec![
         (brief_child, vec![report("r1", brief_report())]),
-        (implementer_child, vec![report("r2", headless)]),
+        (
+            implementer_child,
+            vec![
+                report("r2", implementer_report()),
+                report("r3", implementer_report()),
+            ],
+        ),
     ]);
+    let run = trace(&fx).await;
+    fx.restore_child_prefix_from(
+        run.after_where(EventKind::StepStarted, 2),
+        run.after_where(EventKind::StepFinished, 2),
+        implementer_child,
+        |events| {
+            !events
+                .iter()
+                .any(|event| event.kind == EventKind::TurnEnded)
+        },
+    );
+    fx.rewind_forge(run.after_where(EventKind::StepStarted, 2));
+    let mut events = fx.child_events_of(implementer_child);
+    let reported = events
+        .iter_mut()
+        .find(|event| event.kind == EventKind::StepReported)
+        .expect("the implementer reported");
+    reported.payload["body"] = Value::Null;
+    write_events(
+        &fx.dir.path().join(format!("{implementer_child}.jsonl")),
+        &events,
+    );
 
     let mut runner = fx.runner();
     assert_eq!(
         drive(&fx, &mut runner).await,
-        Advanced::WaitingHuman {
-            gate: "step_stop".to_owned()
-        }
+        Advanced::Finished {
+            outcome: aigentic_log::RunOutcome::Closed
+        },
+        "the second report carries the run on"
     );
-
-    let events = fx.lead_events();
+    let reasons: Vec<String> = step_finished(&fx.lead_events())
+        .iter()
+        .map(|finished| finished.end_reason.clone())
+        .collect();
     assert_eq!(
-        step_finished(&events).len(),
-        1,
-        "the headless report is not a step_finished"
+        reasons,
+        [STEP_REPORTED, REPORT_WITHOUT_BODY, STEP_REPORTED],
+        "the headless attempt is partial, the next one reports"
     );
+    let prompts = child_prompts(&fx, implementer_child);
     assert_eq!(
-        fx.forge.posted().len(),
-        1,
-        "nothing is posted for a report with no body"
+        prompts.len(),
+        2,
+        "one prompt per attempt, in the same child"
     );
-    let shown = gate_shown(&events);
+    assert_eq!(prompts[1], REPORT_AGAIN_PROMPT);
+    let posted = fx.forge.posted();
     assert!(
-        shown.iter().any(|line| line.contains("no body")),
-        "the gate says the body is missing: {shown:?}"
+        !posted
+            .iter()
+            .any(|comment| comment.contains("step=implement-alone attempt=1")),
+        "nothing is posted for the report with no body"
+    );
+    assert!(
+        posted
+            .iter()
+            .any(|comment| comment.contains("step=implement-alone attempt=2")),
+        "the second report is posted"
     );
 }
 

@@ -42,6 +42,9 @@ pub const RECALL: &str = "recall";
 /// The step thread's report (issue #55, PLAN-layer2 §2). Offered in a
 /// step thread and nowhere else; a call in an ordinary thread is
 /// refused with a result, and no `StepReported` event is written.
+/// The refusal of a `finish_step` call with no prose in `body`.
+pub const BODY_REQUIRED: &str = "body is required: the report's prose, which the runner posts under the step's heading; put it in `body`, not inside `slots`";
+
 pub const FINISH_STEP: &str = "finish_step";
 /// The project proposal (issue #7): the model proposes moving this
 /// thread to another project, the turn parks, and a person answers.
@@ -646,12 +649,12 @@ pub fn harness_specs_with(
     if offer_finish_step {
         specs.push(ToolSpec {
             name: FINISH_STEP.into(),
-            description: "Report the step's §4 fields and end the turn. Fill every field your role's template names: the runner reads the report, not the thread. `status: partial` needs `handoff`. The runtime writes the report as a `step_reported` event and ends the turn with `step_reported`; a second call in the same turn is refused.".into(),
+            description: "Report the step's §4 fields and end the turn. Fill every field your role's template names: the runner reads the report, not the thread. `status: partial` needs `handoff`. `body` is the report's prose, which the runner posts under the step's heading: put it in `body`, never inside `slots`. The runtime writes the report as a `step_reported` event and ends the turn with `step_reported`; a second call in the same turn is refused.".into(),
             schema: json!({
                 "type": "object",
                 "properties": {
                     "status": {"type": "string", "enum": ["done", "partial"], "description": "`partial` needs `handoff`."},
-                    "body": {"type": "string", "description": "The report's prose."},
+                    "body": {"type": "string", "description": "The report's prose, which the runner posts; required, and never inside `slots`."},
                     "slots": {"type": "object", "description": "Rendered template slots, by name."},
                     "planned_tests": {"type": "array", "items": {
                         "type": "object",
@@ -697,7 +700,7 @@ pub fn harness_specs_with(
                         "dirty": {"type": "array", "items": {"type": "string"}}
                     }, "required": ["done", "next"]}
                 },
-                "required": ["status"]
+                "required": ["status", "body"]
             }),
         });
     }
@@ -959,6 +962,11 @@ impl Runtime {
                     Err(e) => err(format!("invalid arguments: {e}")),
                     Ok(args) if args.status.is_none() => {
                         err("status is required: done | partial (partial needs handoff)".into())
+                    }
+                    // The runner posts the body and nothing else, so a report
+                    // without one is refused here, while the turn can fix it.
+                    Ok(args) if args.body.as_deref().is_none_or(|b| b.trim().is_empty()) => {
+                        err(BODY_REQUIRED.into())
                     }
                     Ok(args) if args.status == Some(ReportStatus::Partial) => {
                         if args.handoff.is_none() {

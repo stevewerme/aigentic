@@ -14,6 +14,7 @@ use aigentic_log::{
     ThreadLog, ToolResultPayload,
 };
 use aigentic_policy::{Decision, Policy, Rule};
+use aigentic_runtime::harness_tools::BODY_REQUIRED;
 use aigentic_runtime::{Answer, Approver, ProjectContext, Runtime, RuntimeError, STEP_REPORTED};
 use aigentic_tools::ToolRegistry;
 use common::{done, scripted};
@@ -388,6 +389,44 @@ async fn t12_a_bad_call_is_an_error_result_with_no_event() {
             ..StepReport::default()
         }
     );
+    assert_eq!(end_reason(&r), STEP_REPORTED);
+}
+
+/// A report whose prose is missing, or tucked inside `slots`, is refused
+/// with the reason, so the turn fixes it rather than the runner finding
+/// nothing to post.
+#[tokio::test]
+async fn a_report_without_a_body_is_refused_while_the_turn_can_fix_it() {
+    let mut r = rig(
+        vec![
+            vec![
+                finish("c1", json!({"status": "done"})),
+                finish(
+                    "c2",
+                    json!({"status": "done", "body": "  ", "slots": {"body": "the review"}}),
+                ),
+                done("tool_use"),
+            ],
+            vec![
+                finish("c3", json!({"status": "done", "body": "the review"})),
+                done("tool_use"),
+            ],
+        ],
+        Some(&["git push"]),
+    );
+    r.runtime
+        .run_turn(steve(), vec![ContentBlock::Text("go".into())], &mut |_| {})
+        .await
+        .unwrap();
+    let results = results(&r);
+    assert_eq!(results.len(), 3);
+    for refused in &results[..2] {
+        assert!(refused.result.is_error);
+        assert_eq!(refused.result.content, BODY_REQUIRED);
+    }
+    assert!(!results[2].result.is_error, "the corrected call lands");
+    assert_eq!(count(&r, EventKind::StepReported), 1);
+    assert_eq!(report(&r, 0).body.as_deref(), Some("the review"));
     assert_eq!(end_reason(&r), STEP_REPORTED);
 }
 
