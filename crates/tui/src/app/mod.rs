@@ -777,6 +777,7 @@ async fn run_shell(
         }
         status.title = engine.title().map(str::to_owned);
         status.usage = engine.usage();
+        status.run = engine.run_segment().map(str::to_owned);
         // The turn line carries the clock while a turn runs.
         status.elapsed = None;
         let activity = engine.turn().map(|t| {

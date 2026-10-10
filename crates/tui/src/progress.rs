@@ -52,7 +52,7 @@ const READ_WITHIN: Duration = Duration::hours(24);
 const IDLE_SHOWN: Duration = Duration::seconds(60);
 
 /// A title is cut to this many characters.
-const TITLE_CHARS: usize = 40;
+pub(crate) const TITLE_CHARS: usize = 40;
 /// A tool call's arguments are cut to this many.
 const ARGS_CHARS: usize = 60;
 
@@ -562,7 +562,7 @@ fn arguments(call: &ToolCall) -> String {
 }
 
 /// The first `n` characters, with `…` when there were more.
-fn clip(text: &str, n: usize) -> String {
+pub(crate) fn clip(text: &str, n: usize) -> String {
     let mut out: String = text.chars().take(n).collect();
     if out.chars().count() < text.chars().count() {
         out.push('…');
@@ -571,7 +571,7 @@ fn clip(text: &str, n: usize) -> String {
 }
 
 /// A short duration: `42s`, `4m12s`, `2h05m`, `3d4h`.
-fn short_duration(secs: i64) -> String {
+pub(crate) fn short_duration(secs: i64) -> String {
     let secs = secs.max(0);
     let (days, hours, mins) = (secs / 86_400, (secs % 86_400) / 3_600, (secs % 3_600) / 60);
     if days > 0 {

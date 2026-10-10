@@ -460,7 +460,7 @@ pub enum Notice {
         text: String,
     },
     /// A followed run's line: where it is, pushed at most once every two
-    /// seconds while someone watches its lead (issue #139).
+    /// seconds while someone watches its lead.
     RunStatus {
         thread: Ulid,
         status: RunStatus,
@@ -1451,10 +1451,10 @@ mod tests {
         assert!(decode("").is_err());
     }
 
-    /// T9 (issue #139): the run-status notice round-trips, its three phase
-    /// shapes are tagged `step`/`gate`/`move`, and a client that does not
-    /// know the kind fails to decode the whole frame — which is why the
-    /// version moved.
+    /// The run-status notice round-trips, its three phase shapes are
+    /// tagged `step`/`gate`/`move`, and a frame with an unknown tag fails
+    /// to decode whole rather than as one skipped frame — which is why the
+    /// version had to move.
     #[test]
     fn the_run_status_notice_round_trips_and_an_unknown_kind_does_not_decode() {
         let thread = thread();

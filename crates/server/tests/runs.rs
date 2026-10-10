@@ -2607,7 +2607,7 @@ async fn a_checkpoint_step_is_answered_amend_over_the_server() {
 }
 
 // ---------------------------------------------------------------------------
-// A followed run's status line (issue #139)
+// A followed run's status line
 // ---------------------------------------------------------------------------
 
 /// A lead mid-step, and the child it waits on, written into the daemon's
@@ -2692,9 +2692,9 @@ async fn push_for(
     pushed
 }
 
-/// T10 — the lead's and the child's logs fold into one pushed notice:
-/// the fixture's issue, step, call count and stamp reach the watcher,
-/// and the elapsed figure is at least what the fixture has already run.
+/// The lead's and the child's logs fold into one pushed notice: the
+/// fixture's issue, step, call count and stamp reach the watcher, and the
+/// elapsed figure is at least what the fixture has already run.
 #[tokio::test]
 async fn t10_the_followed_leads_lead_and_child_logs_fold_into_one_pushed_notice() {
     const COST_USD: f64 = 0.51;
@@ -2756,9 +2756,9 @@ async fn t10_the_followed_leads_lead_and_child_logs_fold_into_one_pushed_notice(
     );
 }
 
-/// T11 — the ticker pushes on its interval, not once per event: with a
-/// 10 ms interval the notices cannot outnumber the window, and the
-/// production interval is the two seconds the spec names.
+/// The ticker pushes on its interval, not once per event: with a 10 ms
+/// interval the notices cannot outnumber the window, and the production
+/// interval is two seconds.
 #[tokio::test]
 async fn t11_the_ticker_pushes_on_its_interval_and_no_faster() {
     let every = Duration::from_millis(10);
@@ -2795,8 +2795,8 @@ async fn t11_the_ticker_pushes_on_its_interval_and_no_faster() {
     );
 }
 
-/// T12 — a torn child log is a failed read: nothing is pushed and the
-/// bytes are left exactly as they were, torn tail and all.
+/// A torn child log is a failed read: nothing is pushed and the bytes are
+/// left exactly as they were, torn tail and all.
 #[tokio::test]
 async fn t12_a_torn_child_log_pushes_nothing_and_is_not_repaired() {
     let daemon = Daemon::new(Scripts::default(), false).await;

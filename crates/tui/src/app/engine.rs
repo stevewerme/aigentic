@@ -498,6 +498,10 @@ pub struct ClientRepl {
     home_project: String,
     /// The run this REPL follows (issue #68), if any.
     following: Option<Followed>,
+    /// The followed run's own status segment, as the daemon last pushed
+    /// it: drawn last on the footer while the run is followed, and
+    /// dropped with the follow.
+    run_segment: Option<String>,
     /// The followed run's open checkpoint, apart from `menu`: a chat
     /// state change clearing `menu` never withdraws it, and a chat
     /// permission prompt comes first when both are up.
@@ -605,6 +609,7 @@ impl ClientRepl {
             quit: false,
             home_project: project.to_owned(),
             following: None,
+            run_segment: None,
             checkpoint: None,
         }
     }
@@ -1359,6 +1364,7 @@ impl ClientRepl {
                     );
                     self.following = None;
                     self.checkpoint = None;
+                    self.run_segment = None;
                 }
             }
             _ => {}
@@ -1373,6 +1379,7 @@ impl ClientRepl {
             return;
         };
         self.checkpoint = None;
+        self.run_segment = None;
         out.line(&format!(
             "[detached from run {}: it keeps running in the daemon; without --server, \
              closing this REPL pauses it until /build {}]",
@@ -1383,6 +1390,12 @@ impl ClientRepl {
     /// Whether a run is followed, for the keys (issue #68).
     pub fn following(&self) -> bool {
         self.following.is_some()
+    }
+
+    /// The followed run's status segment, while the daemon has pushed
+    /// one.
+    pub fn run_segment(&self) -> Option<&str> {
+        self.run_segment.as_deref()
     }
 
     /// The followed run's checkpoint prompt, while it is up.
@@ -1977,7 +1990,8 @@ impl ClientRepl {
             | Notice::Mode { thread, .. }
             | Notice::Model { thread, .. }
             | Notice::Usage { thread, .. }
-            | Notice::Note { thread, .. } => *thread,
+            | Notice::Note { thread, .. }
+            | Notice::RunStatus { thread, .. } => *thread,
         };
         if thread == self.thread {
             return false;
@@ -1985,6 +1999,10 @@ impl ClientRepl {
         match notice {
             Notice::Event { event, .. } if some_lead == Some(thread) => {
                 self.render_run_event(event, out);
+                true
+            }
+            Notice::RunStatus { status, .. } if some_lead == Some(thread) => {
+                self.run_segment = Some(crate::app::status::run_segment(status));
                 true
             }
             Notice::Note { text, .. } if some_lead == Some(thread) => {
@@ -1995,6 +2013,7 @@ impl ClientRepl {
                 if text.starts_with("run stopped") {
                     self.following = None;
                     self.checkpoint = None;
+                    self.run_segment = None;
                 }
                 true
             }
@@ -2153,6 +2172,9 @@ impl ClientRepl {
                 self.flush_partial(out);
                 out.line(&format!("[{text}]"));
             }
+            // The followed run's segment is the run view's; a notice for
+            // any other lead has nothing to draw here either.
+            Notice::RunStatus { .. } => {}
         }
     }
 
@@ -7746,6 +7768,61 @@ mod tests {
         repl.render(without, &mut out);
         assert_eq!(repl.usage().and_then(|f| f.thread), None);
         daemon.stop();
+    }
+
+    /// The followed lead's status notice becomes the line's run segment,
+    /// drawn last on the footer, and the lead's `RunFinished` clears it
+    /// with the follow.
+    #[tokio::test]
+    async fn the_followed_runs_segment_is_drawn_and_cleared() {
+        let lead_id = Ulid::generate();
+        let mut lead = Lead::start(lead_id, Vec::new()).await;
+        lead.line("/build 58").await;
+        lead.pump().await;
+
+        let pushed = aigentic_api::RunStatus {
+            issue: 58,
+            phase: aigentic_api::RunPhase::Step {
+                step: "implement".into(),
+                attempt: 1,
+                elapsed_secs: 192,
+                calls: 72,
+                cost_usd: 0.51,
+                checklist: None,
+            },
+            idle_secs: 0,
+        };
+        let expected = crate::app::status::run_segment(&pushed);
+        lead.push(Notice::RunStatus {
+            thread: lead_id,
+            status: pushed,
+        });
+        lead.pump().await;
+
+        assert_eq!(lead.repl.run_segment(), Some(expected.as_str()));
+        // The footer's last part is the segment: what `app/mod.rs` fills
+        // from `run_segment()`.
+        let line = crate::app::status::Status {
+            project: "proj".into(),
+            mode: "manual".into(),
+            run: lead.repl.run_segment().map(str::to_owned),
+            ..crate::app::status::Status::default()
+        };
+        assert!(line.line().ends_with(&expected), "{}", line.line());
+
+        lead.push(Notice::Event {
+            thread: lead_id,
+            event: run_event(
+                lead_id,
+                1,
+                EventKind::RunFinished,
+                run_finished(aigentic_runtime::aigentic_log::RunOutcome::Closed),
+            ),
+        });
+        lead.pump().await;
+        assert!(!lead.repl.following(), "the follow ended");
+        assert_eq!(lead.repl.run_segment(), None, "the segment went with it");
+        lead.daemon.stop();
     }
 
     async fn repl_for(lead: Ulid, backlog: Vec<Event>) -> (ClientRepl, Copies, GuardedLead) {
