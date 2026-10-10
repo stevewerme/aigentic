@@ -34,6 +34,7 @@ pub mod mode;
 pub mod project;
 pub mod recall_tool;
 mod resume;
+pub mod run_status;
 pub mod runner;
 mod runtime;
 pub mod seams;
@@ -64,6 +65,7 @@ pub use memory::{MEMORY_FILES, MEMORY_PROMPT, MEMORY_REQUEST};
 pub use mode::Mode;
 pub use project::{Project, ProjectError, ProjectFile};
 pub use resume::{DAEMON_RESTARTED, INTERRUPTED_RESULT, Resumed};
+pub use run_status::{Phase, RunStatus, run_status};
 pub use runtime::{
     ASKED_HUMAN, CompactionSettings, DEFAULT_BUDGET, DEFAULT_COMPACTION, INTERRUPTED, LENGTH_STOP,
     MAX_TOKENS_STOP, Prices, ProjectContext, ProjectRow, Runtime, STEP_REPORTED, SUMMARY_LIMIT,
