@@ -407,6 +407,118 @@ struct Run {
     _daemon: Daemon,
 }
 
+/// The `daemon` rig, with `p`'s file additionally naming `related` and
+/// `r`'s file carrying `r_participants` when given.
+async fn daemon_related(
+    script: Vec<Vec<ProviderEvent>>,
+    related: &[&str],
+    r_participants: &str,
+) -> Daemon {
+    let rig = daemon(script).await;
+    let list = related
+        .iter()
+        .map(|entry| format!("{entry:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    std::fs::write(
+        rig.dir.path().join("p/aigentic.toml"),
+        format!("[project]\nname = \"p\"\nrelated = [{list}]\n[memory]\nenabled = false\n"),
+    )
+    .unwrap();
+    if !r_participants.is_empty() {
+        std::fs::write(
+            rig.dir.path().join("r/aigentic.toml"),
+            format!("[project]\nname = \"r\"\n{r_participants}[memory]\nenabled = false\n"),
+        )
+        .unwrap();
+    }
+    rig
+}
+
+/// `run`, on a rig whose `p` names `related`.
+async fn run_related(
+    script: Vec<Vec<ProviderEvent>>,
+    project: &str,
+    related: &[&str],
+    r_participants: &str,
+) -> Run {
+    let rig = daemon_related(script, related, r_participants).await;
+    let (client, _welcome) = Client::connect(&Addr::Unix(rig.socket.clone()), "tok")
+        .await
+        .unwrap();
+    let Response::Thread { thread } = client
+        .request(Request::CreateThread {
+            project: project.into(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("a thread")
+    };
+    let id = thread.id;
+    assert!(matches!(
+        client
+            .request(Request::Open {
+                thread: id,
+                from_seq: 0
+            })
+            .await
+            .unwrap(),
+        Response::Opened { .. }
+    ));
+    let mut notices = client.take_notices().unwrap();
+    assert_eq!(
+        client
+            .request(Request::Post {
+                thread: id,
+                blocks: vec![ContentBlock::Text("go".into())],
+                interrupt: false,
+            })
+            .await
+            .unwrap(),
+        Response::Ok
+    );
+    until_idle(&mut notices).await;
+    let log = ThreadLog::open(rig.threads_base.clone(), id).unwrap();
+    let results = log
+        .read_all()
+        .unwrap()
+        .into_iter()
+        .filter_map(|e| serde_json::from_value::<ToolResultPayload>(e.payload).ok())
+        .collect();
+    let (messages, tools) = rig.seen.lock().unwrap()[0].clone();
+    let descriptions = rig.descriptions.lock().unwrap()[0].clone();
+    let prefix = systems(&messages);
+    Run {
+        prefix,
+        tools,
+        descriptions,
+        results,
+        _daemon: rig,
+    }
+}
+
+/// One `read_brief` call and one `search_knowledge` call for `name`,
+/// then a reply.
+fn brief_and_search_turn(name: &str) -> Vec<Vec<ProviderEvent>> {
+    vec![
+        vec![
+            ProviderEvent::ToolCall(ToolCall {
+                id: "b1".into(),
+                name: "read_brief".into(),
+                args: json!({"project": name}),
+            }),
+            ProviderEvent::ToolCall(ToolCall {
+                id: "s1".into(),
+                name: "search_knowledge".into(),
+                args: json!({"query": "deploys", "project": name}),
+            }),
+            tool_use(),
+        ],
+        vec![text("seen"), done()],
+    ]
+}
+
 /// One thread, one posted turn, then idle.
 async fn run(script: Vec<Vec<ProviderEvent>>, project: &str) -> Run {
     let rig = daemon(script).await;
@@ -579,4 +691,117 @@ async fn t6_an_inline_project_offered_the_tool_names_both_arguments() {
     for argument in ["query", "project", "workspace"] {
         assert!(description.contains(argument), "{description}");
     }
+}
+
+#[tokio::test]
+async fn a_related_project_is_briefable_and_searchable_read_only() {
+    let run = run_related(brief_and_search_turn("v/r"), "p", &["v/r"], "").await;
+    let brief = &run.results[0].result;
+    assert!(!brief.is_error, "{}", brief.content);
+    assert!(
+        brief.content.starts_with("[read-only · v/r]\n"),
+        "{}",
+        brief.content
+    );
+    assert!(
+        brief.content.contains("R is elsewhere."),
+        "{}",
+        brief.content
+    );
+    let search = &run.results[1].result;
+    assert!(!search.is_error, "{}", search.content);
+    assert!(
+        search.content.starts_with("[read-only · v/r]\n"),
+        "{}",
+        search.content
+    );
+    assert!(
+        search.content.contains("R deploys on its own."),
+        "{}",
+        search.content
+    );
+    // The block lists the related project once, under its address and
+    // with its brief's one-liner; the plain `v: r` row is gone.
+    let one = aigentic_runtime::brief::one_line("# Project R\n\nR is elsewhere.\n").unwrap();
+    assert!(
+        run.prefix.contains(&format!("v: v/r — {one}")),
+        "{}",
+        run.prefix
+    );
+    assert!(!run.prefix.contains("v: r"), "{}", run.prefix);
+    // No tool result names the related root: nothing reaches its files.
+    let root = run._daemon.dir.path().join("r").display().to_string();
+    for result in &run.results {
+        assert!(
+            !result.result.content.contains(&root),
+            "{}",
+            result.result.content
+        );
+    }
+}
+
+/// The child test `related_never_grants_a_role` re-runs, so its daemon's
+/// stderr lands in the parent's pipe.
+const ROLE_CHILD: &str = "AIGENTIC_129_ROLE_CHILD";
+
+/// A related root whose own participants name someone else: the entry
+/// resolves to no role, so no row, no reachable brief and no searchable
+/// corpus — and the daemon says why on stderr.
+#[test]
+fn related_never_grants_a_role() {
+    if std::env::var(ROLE_CHILD).is_ok() {
+        return;
+    }
+    let exe = std::env::current_exe().unwrap();
+    let out = std::process::Command::new(&exe)
+        .args([
+            "the_child_related_never_grants_a_role",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(ROLE_CHILD, "1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "the child failed:\n{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        stderr
+    );
+    assert!(stderr.contains("warn"), "{stderr}");
+    assert!(stderr.contains("v/r"), "{stderr}");
+}
+
+#[tokio::test]
+async fn the_child_related_never_grants_a_role() {
+    if std::env::var(ROLE_CHILD).is_err() {
+        return;
+    }
+    let run = run_related(
+        brief_and_search_turn("v/r"),
+        "p",
+        &["v/r"],
+        "[participants]\nmia = \"admin\"\n",
+    )
+    .await;
+    for result in &run.results {
+        assert!(result.result.is_error, "{}", result.result.content);
+        assert!(
+            !result.result.content.contains("R is elsewhere."),
+            "{}",
+            result.result.content
+        );
+        assert!(
+            !result.result.content.contains("R deploys on its own."),
+            "{}",
+            result.result.content
+        );
+    }
+    // `related` grants no role, so no row for the project at all.
+    assert!(!run.prefix.contains("v/r"), "{}", run.prefix);
+    assert!(!run.prefix.contains("v: r"), "{}", run.prefix);
 }

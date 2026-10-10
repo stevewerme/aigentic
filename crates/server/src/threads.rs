@@ -25,6 +25,7 @@ use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
 use ulid::Ulid;
 
 use crate::actor::{Mail, Mailbox, Reports, ThreadActor};
+use crate::auth;
 use crate::awake::KeepAwake;
 use crate::build::{BuildError, ProviderFactory, Root, build_thread, project_context};
 use crate::config::{Config, ServerConfig};
@@ -33,7 +34,7 @@ use crate::migrate::Migrated;
 use crate::runs::{Answer, Claim, IssueLock, ProdDeps, RunDeps, RunWorld, Runs, drive};
 use crate::session::role_in_project;
 use crate::skills::SkillPaths;
-use crate::workspaces::{Workspace, workspace_of};
+use crate::workspaces::{Workspace, project_name, workspace_of};
 
 /// The project name a pre-phase-6 log wrote for a root with no project
 /// file, when the per-project directory was the index. #9 dropped the
@@ -167,6 +168,93 @@ pub enum ThreadError {
     Workflow(#[from] aigentic_runtime::workflow::WorkflowError),
     #[error("{0}")]
     Refused(String),
+}
+
+/// The rows `[project] related` adds, and one warning for every entry
+/// that does not resolve. An entry is `<workspace>/<project>`; it
+/// resolves to the first root the named workspace lists under that
+/// project name, found through `project_name` — the rule the block, the
+/// roster and `read_brief` all use — never through the daemon's merged
+/// list, where one name can shadow another root.
+///
+/// Nothing here fails a build: a miss is a warning. An entry naming a
+/// root the thread already understands (its own, or one of its
+/// workspace) is skipped so a project never carries two names; a root an
+/// earlier entry resolved is a duplicate; and the creator's role is read
+/// from the resolved root, `None` meaning the entry does not resolve —
+/// `related` declares a link, it never grants a role.
+fn related_in_reach(
+    rows: &[Listed],
+    workspaces: &[Workspace],
+    related: &[String],
+    here_root: Option<&Path>,
+    here_workspace: Option<&str>,
+    user: &str,
+    owner: Option<&str>,
+) -> (Vec<Listed>, Vec<String>) {
+    let mut added: Vec<Listed> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+    for entry in related {
+        let Some((ws, project)) = entry.split_once('/') else {
+            warnings.push(format!(
+                "related entry `{entry}` is not `<workspace>/<project>`"
+            ));
+            continue;
+        };
+        let Some(workspace) = workspaces.iter().find(|w| w.name == ws) else {
+            warnings.push(format!("related entry `{entry}`: no workspace `{ws}`"));
+            continue;
+        };
+        let Some(root) = workspace
+            .projects
+            .iter()
+            .find(|root| project_name(root) == project)
+        else {
+            warnings.push(format!(
+                "related entry `{entry}`: workspace `{ws}` lists no project `{project}`"
+            ));
+            continue;
+        };
+        let understood = rows
+            .iter()
+            .any(|r| r.understood && r.root.as_path() == root.as_path());
+        if understood || here_root == Some(root.as_path()) || here_workspace == Some(ws) {
+            warnings.push(format!(
+                "related entry `{entry}` is already understood by this thread; skipped"
+            ));
+            continue;
+        }
+        if added.iter().any(|r| r.root == *root) {
+            warnings.push(format!("related entry `{entry}` duplicates an earlier one"));
+            continue;
+        }
+        let file = root.join(aigentic_runtime::project::FILE_NAME);
+        let participants = if file.is_file() {
+            match ProjectFile::load(&file) {
+                Ok(f) => f.participants,
+                Err(e) => {
+                    warnings.push(format!("related entry `{entry}`: {e}"));
+                    continue;
+                }
+            }
+        } else {
+            Participants::default()
+        };
+        if auth::role_in(user, owner, &participants).is_none() {
+            warnings.push(format!(
+                "related entry `{entry}`: {user} holds no role in `{ws}/{project}`"
+            ));
+            continue;
+        }
+        added.push(Listed {
+            name: format!("{ws}/{project}"),
+            root: root.clone(),
+            workspace: Some(ws.to_owned()),
+            one_line: None,
+            understood: true,
+        });
+    }
+    (added, warnings)
 }
 
 impl ThreadTable {
@@ -434,7 +522,7 @@ impl ThreadTable {
         project: Option<&str>,
     ) -> Option<(Option<String>, Vec<ProjectRow>)> {
         let user = creator?.0.as_str();
-        let all: Vec<Listed> = self
+        let mut all: Vec<Listed> = self
             .server
             .projects
             .iter()
@@ -444,6 +532,7 @@ impl ThreadTable {
                 root: p.root.clone(),
                 workspace: self.workspace_label(&p.name),
                 one_line: self.brief_one_line(&p.root),
+                understood: false,
             })
             .collect();
         let current = project.and_then(|name| {
@@ -456,13 +545,45 @@ impl ThreadTable {
                     root: p.root.clone(),
                     workspace: self.workspace_label(&p.name),
                     one_line: self.brief_one_line(&p.root),
+                    understood: true,
                 })
             })
         });
         // The workspace a thread understands beyond its own project: the
         // workspace of the project it is in. Rows outside it stay in the
-        // block, so the model still sees them, but no tool opens them.
+        // block, so the model still sees them, but no tool opens them
+        // unless `[project] related` names one, which the resolver below
+        // turns into a row. The same expression decides what a row can
+        // be served as (`ProjectRow.understood`).
         let here_workspace = current.as_ref().and_then(|c| c.workspace.as_deref());
+        for l in &mut all {
+            l.understood = current.as_ref().is_some_and(|c| c.name == l.name)
+                || (here_workspace.is_some() && l.workspace.as_deref() == here_workspace);
+        }
+        let related = self.related_entries(project);
+        let here_root = current.as_ref().map(|c| c.root.clone());
+        let (mut added, warnings) = related_in_reach(
+            &all,
+            &self.workspaces,
+            &related,
+            here_root.as_deref(),
+            here_workspace,
+            user,
+            self.server.owner(),
+        );
+        for warning in &warnings {
+            eprintln!("warn  {warning}");
+        }
+        // A related row replaces the plain other-workspace row for its
+        // root, by root: the block lists that project once, under the
+        // name `related` can address it by, and a shadowing project
+        // sharing a name keeps its own row.
+        let replaced: Vec<PathBuf> = added.iter().map(|l| l.root.clone()).collect();
+        all.retain(|l| !replaced.contains(&l.root));
+        for l in &mut added {
+            l.one_line = self.brief_one_line(&l.root);
+        }
+        all.extend(added);
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let block = projects_listing(&all, current.as_ref(), home.as_deref())?;
         Some((
@@ -473,11 +594,24 @@ impl ThreadTable {
                     root: l.root.clone(),
                     workspace: l.workspace.clone(),
                     one_line: l.one_line.clone(),
-                    understood: current.as_ref().is_some_and(|c| c.name == l.name)
-                        || (here_workspace.is_some() && l.workspace.as_deref() == here_workspace),
+                    understood: l.understood,
                 })
                 .collect(),
         ))
+    }
+
+    /// `[project] related` from the current project's file, empty when
+    /// there is no project, no file, or a file that does not parse — the
+    /// daemon builds nothing for a thread whose own file is broken.
+    fn related_entries(&self, project: Option<&str>) -> Vec<String> {
+        project
+            .and_then(|name| self.root_of(name).ok())
+            .and_then(|root| {
+                ProjectFile::load(&root.root.join(aigentic_runtime::project::FILE_NAME)).ok()
+            })
+            .and_then(|file| file.project)
+            .map(|p| p.related)
+            .unwrap_or_default()
     }
 
     /// A project's brief one-liner (issue #123), by root. A `stat` is
@@ -2052,6 +2186,173 @@ fn fnv1a_32(bytes: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A workspace `name` listing `roots`, for the resolver tests.
+    fn workspace(name: &str, roots: &[&Path]) -> Workspace {
+        Workspace {
+            name: name.to_owned(),
+            shared: None,
+            projects: roots.iter().map(|r| r.to_path_buf()).collect(),
+        }
+    }
+
+    /// A project root folder `name` under `dir`, with a `[project] name`
+    /// when `named` and the given `[participants]` lines.
+    fn root(dir: &Path, name: &str, text: Option<&str>) -> PathBuf {
+        let root = dir.join(name);
+        std::fs::create_dir_all(&root).unwrap();
+        if let Some(text) = text {
+            std::fs::write(root.join("aigentic.toml"), text).unwrap();
+        }
+        root
+    }
+
+    /// T9: an entry that does not resolve adds no row and warns once,
+    /// naming the entry and the reason; the rest of the list still
+    /// resolves, in entry order.
+    #[test]
+    fn an_entry_that_does_not_resolve_warns_and_adds_no_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = root(dir.path(), "r", None);
+        let bad = root(dir.path(), "bad", Some("not valid = ["));
+        let spaces = [workspace("v", &[good.as_path(), bad.as_path()])];
+
+        // An unknown workspace, a project the workspace does not list,
+        // and a malformed project file at a listed root: no row each,
+        // one warning each.
+        for entry in ["nope/r", "v/q", "v/bad"] {
+            let (added, warnings) = related_in_reach(
+                &[],
+                &spaces,
+                &[entry.to_owned()],
+                None,
+                None,
+                "u",
+                Some("u"),
+            );
+            assert!(added.is_empty(), "{entry} added {}", added.len());
+            assert_eq!(warnings.len(), 1, "{entry}: {warnings:?}");
+            assert!(warnings[0].contains(entry), "{}", warnings[0]);
+        }
+
+        // A valid entry beside a broken one: only the valid row, and the
+        // rows come in entry order.
+        let broken = root(dir.path(), "broken", Some("not valid = ["));
+        let spaces = [workspace("v", &[good.as_path(), broken.as_path()])];
+        let (added, warnings) = related_in_reach(
+            &[],
+            &spaces,
+            &["v/broken".to_owned(), "v/r".to_owned()],
+            None,
+            None,
+            "u",
+            Some("u"),
+        );
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0].name, "v/r");
+        assert_eq!(added[0].root, good);
+        assert!(added[0].understood);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("v/broken"), "{}", warnings[0]);
+    }
+
+    /// T10: an entry naming a root the thread already understands is
+    /// skipped with a warning, so that project keeps its plain name; the
+    /// same entries with no home workspace resolve the other-workspace
+    /// one, named `<ws>/<project>`.
+    #[test]
+    fn an_entry_already_understood_is_skipped_with_a_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let own = root(dir.path(), "own", None);
+        let other = root(dir.path(), "other", None);
+        let spaces = [workspace("w", &[own.as_path(), other.as_path()])];
+        let entries = ["w/own".to_owned(), "w/other".to_owned()];
+
+        // The thread is in `w`, its own project `own`: both entries name
+        // something #125 already understands.
+        let (added, warnings) = related_in_reach(
+            &[],
+            &spaces,
+            &entries,
+            Some(own.as_path()),
+            Some("w"),
+            "u",
+            Some("u"),
+        );
+        assert!(added.is_empty(), "{added:?}");
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings.iter().all(|w| w.contains("understood")),
+            "{warnings:?}"
+        );
+
+        // The same entries with no home workspace: the own root is still
+        // skipped, the other resolves under its address.
+        let (added, warnings) = related_in_reach(
+            &[],
+            &spaces,
+            &entries,
+            Some(own.as_path()),
+            None,
+            "u",
+            Some("u"),
+        );
+        assert_eq!(added.len(), 1, "{added:?}");
+        assert_eq!(added[0].name, "w/other");
+        assert_eq!(added[0].root, other);
+        assert_eq!(added[0].one_line, None);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("w/own"), "{}", warnings[0]);
+    }
+
+    /// T11: nothing declared and no workspace file — no row, no warning.
+    /// The fail-closed case: an absent key reaches nothing.
+    #[test]
+    fn no_related_and_no_workspaces_add_no_row_and_no_warning() {
+        let (added, warnings) = related_in_reach(&[], &[], &[], None, None, "u", Some("u"));
+        assert!(added.is_empty());
+        assert!(warnings.is_empty());
+    }
+
+    /// T12: the role is read from the root the workspace lists, not from
+    /// a project of the same name elsewhere — the collision a name-based
+    /// read (`merge`, `root_of`) walks into.
+    #[test]
+    fn the_role_is_read_from_the_resolved_root_not_a_shadowing_name() {
+        let dir = tempfile::tempdir().unwrap();
+        // The listed root has no participants: `u` is not the owner, so
+        // no role.
+        let listed = root(dir.path(), "r", None);
+        // A same-named project that does grant `u` a role.
+        let shadow = root(
+            dir.path(),
+            "shadow-r",
+            Some("[project]\nname = \"r\"\n\n[participants]\nu = \"admin\"\n"),
+        );
+        // The guard: this root would have resolved, so a row proves the
+        // listed one was used.
+        let file = aigentic_runtime::ProjectFile::load(&shadow.join("aigentic.toml")).unwrap();
+        assert!(
+            auth::role_in("u", Some("boss"), &file.participants).is_some(),
+            "the shadowing root must grant the role for the test to bite"
+        );
+
+        let spaces = [workspace("v", &[listed.as_path()])];
+        let (added, warnings) = related_in_reach(
+            &[],
+            &spaces,
+            &["v/r".to_owned()],
+            None,
+            None,
+            "u",
+            Some("boss"),
+        );
+        assert!(added.is_empty(), "{added:?}");
+        assert_eq!(warnings.len(), 1);
+        // The role reason, not merely the entry: a read by name would
+        // have found the granted role and added a row.
+        assert!(warnings[0].contains("holds no role"), "{}", warnings[0]);
+    }
 
     fn indexed(switched: Option<&str>, switched_root: Option<&str>, root: Option<&str>) -> Indexed {
         Indexed {

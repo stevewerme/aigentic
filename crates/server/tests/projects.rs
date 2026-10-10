@@ -92,6 +92,24 @@ fn project(dir: &Path, name: &str, participants: &str) -> PathBuf {
     root
 }
 
+/// A project `name` whose `[project] related` names `entries`; the
+/// participants stay empty, so the daemon's owner holds a role.
+fn related_project(dir: &Path, name: &str, entries: &[&str]) -> PathBuf {
+    let root = dir.join(name);
+    std::fs::create_dir_all(root.join(".aigentic")).unwrap();
+    let list = entries
+        .iter()
+        .map(|e| format!("{e:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    std::fs::write(
+        root.join("aigentic.toml"),
+        format!("[project]\nname = {name:?}\nrelated = [{list}]\n[memory]\nenabled = false\n"),
+    )
+    .unwrap();
+    root
+}
+
 struct Daemon {
     server: Arc<Server>,
     steve: Client,
@@ -576,4 +594,84 @@ async fn open_and_post(client: &mut Client, notices: &mut mpsc::Receiver<Notice>
         Response::Opened { .. }
     ));
     post(client, notices, thread, "hi").await;
+}
+
+/// T6 (issue #129): a project `[project] related` declares shows on the
+/// other-workspaces line under its `<workspace>/<project>` address, with
+/// its brief, once — and without the key that line is unchanged.
+#[tokio::test]
+async fn a_related_project_shows_on_the_other_workspaces_line_with_its_brief() {
+    // The declared link: `p1` names `v/r`, and `r` carries a brief.
+    let dir = tempfile::tempdir().unwrap();
+    let p2 = project(dir.path(), "p2", "");
+    let q1 = project(dir.path(), "q1", "");
+    let r = project(dir.path(), "r", "");
+    let brief = "R's own brief.\n\nWhy it matters.\n";
+    std::fs::write(r.join(".aigentic/brief.md"), brief).unwrap();
+    let p1 = related_project(dir.path(), "p1", &["v/r"]);
+    let mut d = daemon(
+        dir.path(),
+        vec![],
+        &[
+            ("v", vec![r.clone()]),
+            ("w1", vec![p1.clone(), p2.clone()]),
+            ("w2", vec![q1.clone()]),
+        ],
+    )
+    .await;
+
+    let mut notices = d.steve.take_notices().unwrap();
+    let id = created(&mut d.steve, "p1").await;
+    let mark = d.seen.lock().unwrap().len();
+    post(&mut d.steve, &mut notices, id, "hi").await;
+    let block = block_since(&d.seen, mark).expect("the block");
+    // The one-liner comes from the fixture's brief, by the same rule the
+    // block uses; the address is the workspace name and project name the
+    // workspace file and the project file carry.
+    let one = aigentic_runtime::brief::one_line(brief).unwrap();
+    let expected = format!(
+        "Projects in reach. This thread is in p1 (w1).\n\
+         w1: p1 (here) {} · p2 {}\n\
+         Other workspaces: v: v/r — {one} · w2: q1",
+        p1.display(),
+        p2.display()
+    );
+    assert_eq!(block, expected);
+    // The project is listed once, under its address: no plain `r` row.
+    assert_eq!(block.matches("v/r").count(), 1, "{block}");
+    assert!(!block.contains("v: r"), "{block}");
+    println!("the listing with a declared link:\n{block}");
+
+    // The same rig without the key: line 3 lists the project's plain
+    // name and no brief, and nothing else differs.
+    let plain = tempfile::tempdir().unwrap();
+    let p2 = project(plain.path(), "p2", "");
+    let q1 = project(plain.path(), "q1", "");
+    let r = project(plain.path(), "r", "");
+    std::fs::write(r.join(".aigentic/brief.md"), brief).unwrap();
+    let p1 = project(plain.path(), "p1", "");
+    let mut d = daemon(
+        plain.path(),
+        vec![],
+        &[
+            ("v", vec![r.clone()]),
+            ("w1", vec![p1.clone(), p2.clone()]),
+            ("w2", vec![q1.clone()]),
+        ],
+    )
+    .await;
+    let mut notices = d.steve.take_notices().unwrap();
+    let id = created(&mut d.steve, "p1").await;
+    let mark = d.seen.lock().unwrap().len();
+    post(&mut d.steve, &mut notices, id, "hi").await;
+    let block = block_since(&d.seen, mark).expect("the block");
+    let expected = format!(
+        "Projects in reach. This thread is in p1 (w1).\n\
+         w1: p1 (here) {} · p2 {}\n\
+         Other workspaces: v: r · w2: q1",
+        p1.display(),
+        p2.display()
+    );
+    assert_eq!(block, expected);
+    println!("the same rig without the key:\n{block}");
 }

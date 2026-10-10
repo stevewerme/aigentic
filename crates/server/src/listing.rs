@@ -23,6 +23,12 @@ pub struct Listed {
     /// `None` is no brief, and no ` — ` on the row, which then reads as
     /// today.
     pub one_line: Option<String>,
+    /// Whether a tool can open this row's root: `read_brief` and
+    /// `search_knowledge` reach it. True for the thread's own project
+    /// and its workspace's, and for a project `[project] related`
+    /// declares. Only the other-workspaces line reads it, to show a
+    /// related row's brief.
+    pub understood: bool,
 }
 
 /// The projects in reach, as one system block, or `None` when there is
@@ -35,8 +41,10 @@ pub struct Listed {
 /// value a root under it is shown as `~` against.
 ///
 /// A row of this workspace carries its brief's one-liner after its root
-/// (issue #123). Other workspaces stay names only, and a project with no
-/// brief reads exactly as it did before the brief existed.
+/// (issue #123), and so does another workspace's row that `[project]
+/// related` makes understood. Any other row of another workspace stays
+/// names only, and a project with no brief reads exactly as it did
+/// before the brief existed.
 pub fn projects_listing(
     all: &[Listed],
     current: Option<&Listed>,
@@ -96,8 +104,10 @@ pub fn projects_listing(
         }
     }
 
-    // Line 3: every other workspace, its project names in name order.
-    let mut workspaces: Vec<(&str, Vec<&str>)> = Vec::new();
+    // Line 3: every other workspace. A related row — understood, and
+    // with a brief — shows its one-liner after its name, the name it is
+    // addressed by; every other row stays names only.
+    let mut workspaces: Vec<(&str, Vec<String>)> = Vec::new();
     for p in &rows {
         let Some(ws) = p.workspace.as_deref() else {
             continue;
@@ -105,9 +115,13 @@ pub fn projects_listing(
         if Some(ws) == here.flatten() {
             continue;
         }
+        let shown = match (p.understood, &p.one_line) {
+            (true, Some(one)) => format!("{} — {one}", p.name),
+            _ => p.name.clone(),
+        };
         match workspaces.iter_mut().find(|(name, _)| *name == ws) {
-            Some((_, names)) => names.push(&p.name),
-            None => workspaces.push((ws, vec![&p.name])),
+            Some((_, names)) => names.push(shown),
+            None => workspaces.push((ws, vec![shown])),
         }
     }
     workspaces.sort_by(|a, b| a.0.cmp(b.0));
@@ -166,6 +180,9 @@ mod tests {
             root,
             workspace: workspace.map(str::to_owned),
             one_line: None,
+            // Workspace `one` is the fixture's home, so its rows are the
+            // ones a thread there understands.
+            understood: workspace == Some("one"),
         }
     }
 
@@ -283,6 +300,7 @@ mod tests {
                 root: home.clone(),
                 workspace: Some("one".into()),
                 one_line: None,
+                understood: true,
             },
         ];
         let current = all.iter().find(|p| p.name == "alpha").cloned();

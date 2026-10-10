@@ -1534,8 +1534,7 @@ mod tests {
             one_line: Some("Elsewhere.".into()),
             understood: true,
         };
-        let rt =
-            rig(here.path()).with_projects(None, vec![here_row.clone(), related_row.clone()]);
+        let rt = rig(here.path()).with_projects(None, vec![here_row.clone(), related_row.clone()]);
         assert!(rt.read_brief_offered(), "the related row carries a brief");
         let served = rt.read_brief("w/q").unwrap();
         assert_eq!(
