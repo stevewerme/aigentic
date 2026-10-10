@@ -717,7 +717,7 @@ impl ClientRepl {
     }
 
     pub async fn handle_line(&mut self, line: &str, out: &mut dyn Printer) {
-        // Inside a watch the front thread is read-only (issue #140):
+        // Inside a watch the front thread is read-only:
         // `/answer` is the one line the watch needs, and it goes to the
         // watch's own engine, whose gate carries the run's lead. Every
         // other line, command or text, draws the refusal and sends
@@ -730,6 +730,11 @@ impl ClientRepl {
                     if let Some(watch) = self.watch.as_mut() {
                         watch.child().answer_checkpoint(arg, out).await;
                     }
+                    return;
+                }
+                // Leaving the watch, and nothing else.
+                Command::Back => {
+                    self.back(out).await;
                     return;
                 }
                 _ => {
@@ -905,6 +910,7 @@ impl ClientRepl {
                 }
             }
             Command::Watch(arg) => self.watch(arg, out).await,
+            Command::Back => self.back(out).await,
             Command::Chat(text) => self.post(text, false, out).await,
             Command::Interrupt(text) => self.post(text, true, out).await,
             Command::Skill(name, args) => {
@@ -1366,6 +1372,17 @@ impl ClientRepl {
         }
     }
 
+    /// `/back`: leave the watch and return to the front thread. The
+    /// front thread's held notices are drawn in order, then the divider
+    /// last. At the front, with no watch open, it prints one line.
+    pub async fn back(&mut self, out: &mut dyn Printer) {
+        let Some(watch) = self.watch.take() else {
+            out.line("[not inside a watched step: /watch <issue> [step] opens one]");
+            return;
+        };
+        self.leave_watch(out, watch.divider());
+    }
+
     /// The lead's log from its first event, drawn in order (issue #68).
     /// Nothing is answered here: a gate the backlog ends at is shown and
     /// left waiting for a person.
@@ -1498,13 +1515,9 @@ impl ClientRepl {
             .map(|open| &open.menu)
     }
 
-    /// Whether a step of a running issue is open here.
-    pub fn watching(&self) -> bool {
-        self.watch.is_some()
-    }
-
-    /// `inside #140 spec`, while a watch is open: the status line shows
-    /// this in place of the front thread's own parts.
+    /// Whether a step of a running issue is open here, as its own head
+    /// (`inside #140 spec`): the status line shows this in place of the
+    /// front thread's own parts while a watch is open.
     pub fn inside(&self) -> Option<String> {
         self.watch.as_ref().map(|watch| watch.inside())
     }
@@ -1718,7 +1731,7 @@ impl ClientRepl {
     /// keys go to), then the chat prompt, else the followed run's
     /// checkpoint prompt (issue #68).
     pub fn menu(&self) -> Option<&Menu> {
-        // Inside a watch the pane is the step's own (issue #140): its
+        // Inside a watch the pane is the step's own: its
         // chips, its `/skill` picker, and its waiting gate's menu.
         if let Some(watch) = self.watch.as_ref() {
             return watch.child_ref().menu();
@@ -1765,8 +1778,8 @@ impl ClientRepl {
         settled: bool,
         out: &mut dyn Printer,
     ) -> MenuKey {
-        // A digit or Enter inside a watch enters the step's own selection
-        // (issue #140), never the front thread's.
+        // A digit or Enter inside a watch enters the step's own
+        // selection, never the front thread's.
         if let Some(watch) = self.watch.as_mut() {
             // Boxed: the compiler sees the child's `menu_key` as this
             // one's own, and a watch's child never has a watch of its own.
@@ -6446,6 +6459,7 @@ mod tests {
                 role,
                 refuse_build,
                 refuse_open: None,
+                missing: Vec::new(),
                 rows: Vec::new(),
                 children: Vec::new(),
             };
@@ -6491,6 +6505,18 @@ mod tests {
             issue: u64,
             children: Vec<(Ulid, Vec<Event>)>,
         ) -> Self {
+            Self::watching_with(lead, backlog, issue, children, Vec::new()).await
+        }
+
+        /// The same, plus threads whose log is gone: `Open` refuses them,
+        /// as the daemon does for a thread with no file.
+        async fn watching_with(
+            lead: Ulid,
+            backlog: Vec<Event>,
+            issue: u64,
+            children: Vec<(Ulid, Vec<Event>)>,
+            missing: Vec<Ulid>,
+        ) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let rows = vec![aigentic_api::ThreadInfo {
                 id: lead,
@@ -6510,6 +6536,7 @@ mod tests {
                 role: "admin",
                 refuse_build: None,
                 refuse_open: None,
+                missing,
                 rows,
                 children,
             };
@@ -6535,6 +6562,11 @@ mod tests {
                 notices,
                 out: Copies::default(),
             }
+        }
+
+        /// The thread this REPL is on: the front thread, not the run.
+        fn front_thread(&self) -> Ulid {
+            self.repl.thread
         }
 
         /// The lines drawn so far, cleared, so the next assertion sees
@@ -6625,6 +6657,20 @@ mod tests {
         })
     }
 
+    /// A tool result whose call the engine never saw: `render_event`
+    /// draws it as a tool cell, so it makes a held notice visible.
+    fn tool_result(id: &str) -> serde_json::Value {
+        serde_json::to_value(ToolResultPayload::new(
+            aigentic_runtime::aigentic_core::ToolResult {
+                id: id.to_owned(),
+                content: "while away".to_owned(),
+                is_error: false,
+            },
+            aigentic_runtime::aigentic_log::PolicyRecord::rule("bash", "allow"),
+        ))
+        .unwrap()
+    }
+
     /// A `run_started` payload, as the runner writes it.
     fn run_started(issue: u64) -> serde_json::Value {
         serde_json::json!({
@@ -6661,7 +6707,7 @@ mod tests {
         run_event(thread, seq, kind, payload)
     }
 
-    /// T1: `/watch 140 spec` reads the run and the step, in that order,
+    /// `/watch 140 spec` reads the run and the step, in that order,
     /// and writes nothing.
     #[tokio::test]
     async fn watch_opens_a_step_read_only() {
@@ -6730,7 +6776,7 @@ mod tests {
         );
     }
 
-    /// T2: a step with no live child refuses, and says which line.
+    /// a step with no live child refuses, and says which line.
     #[tokio::test]
     async fn watch_refuses_a_step_with_no_live_child() {
         const ISSUE: u64 = 140;
@@ -6744,16 +6790,46 @@ mod tests {
                 step_started("design", 1, Ulid::generate()),
             ),
         ];
-        let mut lead = Lead::watching(lead_id, backlog.clone(), ISSUE, Vec::new()).await;
+        let listed_child = backlog
+            .iter()
+            .filter_map(crate::app::watch::step_started)
+            .next()
+            .unwrap()
+            .child_thread;
+        let mut lead = Lead::watching_with(
+            lead_id,
+            backlog.clone(),
+            ISSUE,
+            Vec::new(),
+            vec![listed_child],
+        )
+        .await;
         lead.line(&format!("/watch {ISSUE} implement")).await;
         assert_eq!(
             lead.lines(),
             vec![crate::app::watch::refused_child(ISSUE, "implement").0],
             "the refusal names the step asked for"
         );
+
+        // The same line for a step the log still lists whose child is
+        // gone: the log names a child the daemon cannot open.
+        lead.clear();
+        let gone = "design";
+        let listed = backlog
+            .iter()
+            .filter_map(crate::app::watch::step_started)
+            .next()
+            .expect("the fixture starts one step");
+        assert_eq!(listed.step, gone, "the listed step is the one asked for");
+        lead.line(&format!("/watch {ISSUE} {gone}")).await;
+        assert_eq!(
+            lead.lines(),
+            vec![crate::app::watch::refused_child(ISSUE, gone).0],
+            "a listed step with no child file draws the same refusal"
+        );
     }
 
-    /// T3: `/watch 140 spec` opens a step the run has moved past — the
+    /// `/watch 140 spec` opens a step the run has moved past — the
     /// pin by name.
     #[tokio::test]
     async fn watch_enters_a_non_current_step_by_name() {
@@ -6806,7 +6882,7 @@ mod tests {
         );
     }
 
-    /// T4: an unpinned watch takes the run's next step, and its child.
+    /// an unpinned watch takes the run's next step, and its child.
     #[tokio::test]
     async fn an_unpinned_watch_follows_the_step_move() {
         const ISSUE: u64 = 140;
@@ -6830,12 +6906,9 @@ mod tests {
         )
         .await;
         lead.line(&format!("/watch {ISSUE} pin")).await;
-        let moved = run_event(
-            lead_id,
-            2,
-            EventKind::StepStarted,
-            step_started("design", 1, design),
-        );
+        let moved_step = step_started("design", 1, design);
+        let name = moved_step["step"].as_str().unwrap().to_owned();
+        let moved = run_event(lead_id, 2, EventKind::StepStarted, moved_step);
         lead.push(Notice::Event {
             thread: lead_id,
             event: moved,
@@ -6843,8 +6916,13 @@ mod tests {
         lead.pump().await;
         assert_eq!(
             lead.repl.inside(),
-            Some(format!("inside #{ISSUE} design")),
+            Some(format!("inside #{ISSUE} {name}")),
             "the watch followed the run to its next step"
+        );
+        assert!(
+            lead.lines().iter().any(|line| line.contains(&name)),
+            "the move announced the step it went to: {:?}",
+            lead.lines()
         );
         let open = lead.daemon.requests().iter().any(|r| {
             matches!(
@@ -6855,7 +6933,7 @@ mod tests {
         assert!(open, "the new step's child was opened from scratch");
     }
 
-    /// T5: a pinned watch stays on its own step through another step's
+    /// a pinned watch stays on its own step through another step's
     /// start, and follows a new attempt of its own.
     #[tokio::test]
     async fn a_pinned_watch_follows_its_own_step() {
@@ -6914,7 +6992,7 @@ mod tests {
         );
     }
 
-    /// T6: a finished run refuses entry by name, and a watch on a run
+    /// a finished run refuses entry by name, and a watch on a run
     /// that finishes inside ends.
     #[tokio::test]
     async fn a_watch_on_a_finished_run_ends() {
@@ -6960,7 +7038,7 @@ mod tests {
         assert!(live.repl.inside().is_none(), "the watch left with the run");
     }
 
-    /// T20: a child's live event above `printed` draws once.
+    /// a child's live event above `printed` draws once.
     #[tokio::test]
     async fn a_live_child_event_is_drawn_inside_and_not_twice() {
         const ISSUE: u64 = 140;
@@ -7025,7 +7103,7 @@ mod tests {
         assert_eq!(lead.lines().len(), drawn, "the same event draws once");
     }
 
-    /// T7: inside a watch, a chat line and a command are refused; the
+    /// inside a watch, a chat line and a command are refused; the
     /// one line that works is `/answer`, and it answers the run's gate.
     #[tokio::test]
     async fn inside_refuses_a_typed_message_and_a_command() {
@@ -7080,7 +7158,7 @@ mod tests {
         );
     }
 
-    /// T12: the watch's gate comes from the lead's `checkpoint_asked`
+    /// the watch's gate comes from the lead's `checkpoint_asked`
     /// and is answered once — the fold must not advance twice.
     #[tokio::test]
     async fn watch_absorbs_a_gate() {
@@ -7133,7 +7211,7 @@ mod tests {
         );
     }
 
-    /// T13: another thread's waiting prompt is named, and never moves the
+    /// another thread's waiting prompt is named, and never moves the
     /// watch's gate.
     #[tokio::test]
     async fn a_prompt_for_another_thread_is_tagged() {
@@ -7180,7 +7258,202 @@ mod tests {
         );
     }
 
-    /// T1: the parser and the help text. `/build 73` is the number,
+    /// `/back` leaves the watch, draws the front thread's catch-up
+    /// with the divider last, and gives the keys back.
+    #[tokio::test]
+    async fn back_returns_to_the_front() {
+        const ISSUE: u64 = 140;
+        let lead_id = Ulid::generate();
+        let spec = Ulid::generate();
+        let backlog = vec![
+            run_event(lead_id, 0, EventKind::RunStarted, run_started(ISSUE)),
+            run_event(
+                lead_id,
+                1,
+                EventKind::StepStarted,
+                step_started("spec", 1, spec),
+            ),
+        ];
+        let mut lead =
+            Lead::watching(lead_id, backlog, ISSUE, vec![(spec, child_backlog(spec))]).await;
+        lead.line(&format!("/watch {ISSUE} spec")).await;
+        let divider = lead.repl.watch_mut().expect("the watch is open").divider();
+        lead.clear();
+        // A front-thread line arrives while the watch is open: it waits.
+        lead.repl.render(
+            Notice::Note {
+                thread: lead_id,
+                text: "while away".to_owned(),
+            },
+            &mut lead.out,
+        );
+        assert!(
+            lead.lines().is_empty(),
+            "nothing draws while the watch is open"
+        );
+        lead.line("/back").await;
+        assert_eq!(
+            lead.lines().last(),
+            Some(&divider),
+            "the divider is drawn last: {:?}",
+            lead.lines()
+        );
+        assert!(
+            lead.repl.inside().is_none(),
+            "the status line loses `inside`"
+        );
+        // The keys and the pane are the front's own again.
+        let up = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Up,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let menu = lead.repl.menu_key(&up, true, true, &mut lead.out).await;
+        assert!(
+            matches!(menu, crate::app::engine::MenuKey::Passed),
+            "the front has no menu, so a key passes to the composer"
+        );
+    }
+
+    /// `/back` at the front draws one line and nothing else.
+    #[tokio::test]
+    async fn a_watch_that_was_not_entered_refuses_back() {
+        let lead_id = Ulid::generate();
+        let mut lead = Lead::start(lead_id, Vec::new()).await;
+        lead.clear();
+        lead.line("/back").await;
+        assert_eq!(
+            lead.lines(),
+            vec!["[not inside a watched step: /watch <issue> [step] opens one]".to_owned()]
+        );
+    }
+
+    /// while away, the front's own notices draw nothing and the
+    /// folded lead events, not the held ones, move the watch.
+    #[tokio::test]
+    async fn the_front_takes_the_resumed_threads_catch_up() {
+        const ISSUE: u64 = 140;
+        let lead_id = Ulid::generate();
+        let spec = Ulid::generate();
+        let design = Ulid::generate();
+        let backlog = vec![
+            run_event(lead_id, 0, EventKind::RunStarted, run_started(ISSUE)),
+            run_event(
+                lead_id,
+                1,
+                EventKind::StepStarted,
+                step_started("spec", 1, spec),
+            ),
+        ];
+        let mut lead = Lead::watching(
+            lead_id,
+            backlog,
+            ISSUE,
+            vec![(spec, child_backlog(spec)), (design, child_backlog(design))],
+        )
+        .await;
+        lead.line(&format!("/watch {ISSUE} pin")).await;
+        lead.clear();
+        let front = lead.front_thread();
+        lead.repl.render(
+            Notice::Event {
+                thread: front,
+                event: run_event(front, 0, EventKind::ToolResult, tool_result("t1")),
+            },
+            &mut lead.out,
+        );
+        assert!(
+            lead.lines().is_empty(),
+            "the front's own event draws nothing inside: {:?}",
+            lead.lines()
+        );
+        lead.push_lead(run_event(
+            lead_id,
+            2,
+            EventKind::StepStarted,
+            step_started("design", 1, design),
+        ))
+        .await;
+        assert_eq!(
+            lead.repl.inside(),
+            Some(format!("inside #{ISSUE} design")),
+            "the folded event moved the watch"
+        );
+    }
+
+    /// a watch that ends with the run draws the finished line, then
+    /// the front's held notices, and the status line loses `inside`.
+    #[tokio::test]
+    async fn an_unpinned_watch_that_ends_draws_the_catch_up() {
+        const ISSUE: u64 = 140;
+        let lead_id = Ulid::generate();
+        let spec = Ulid::generate();
+        let backlog = vec![
+            run_event(lead_id, 0, EventKind::RunStarted, run_started(ISSUE)),
+            run_event(
+                lead_id,
+                1,
+                EventKind::StepStarted,
+                step_started("spec", 1, spec),
+            ),
+        ];
+        let mut lead =
+            Lead::watching(lead_id, backlog, ISSUE, vec![(spec, child_backlog(spec))]).await;
+        lead.line(&format!("/watch {ISSUE} pin")).await;
+        lead.clear();
+        let front = lead.front_thread();
+        let caught = run_event(front, 0, EventKind::ToolResult, tool_result("t1"));
+        lead.repl.render(
+            Notice::Event {
+                thread: front,
+                event: caught,
+            },
+            &mut lead.out,
+        );
+        assert!(
+            lead.lines().is_empty(),
+            "the front's own notice waits: {:?}",
+            lead.lines()
+        );
+        let end = run_event(
+            lead_id,
+            2,
+            EventKind::RunFinished,
+            run_finished(aigentic_runtime::aigentic_log::RunOutcome::Closed),
+        );
+        lead.repl.render(
+            Notice::Event {
+                thread: lead_id,
+                event: end,
+            },
+            &mut lead.out,
+        );
+        let lines = lead.lines();
+        assert!(
+            lines[0].starts_with(&format!("[watch: run #{ISSUE} finished]")),
+            "the finished line leads: {lines:?}"
+        );
+        let divider = "── back at the front thread ──";
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some(divider),
+            "the catch-up is drawn, then the divider last: {lines:?}"
+        );
+        assert_eq!(
+            lines.first().map(String::as_str),
+            Some("[watch: run #140 finished]"),
+            "the finished line comes first: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("while away")),
+            "the front's held event was drawn on the way out: {lines:?}"
+        );
+        assert!(
+            lead.repl.inside().is_none(),
+            "the watch is over, and the status line says so"
+        );
+    }
+
+    /// the parser and the help text. `/build 73` is the number,
     /// `/build` alone is no argument, and `/build x` is neither.
     #[test]
     fn build_parses_its_argument_and_is_in_the_help() {
@@ -7204,7 +7477,7 @@ mod tests {
         assert!(HELP.contains("/build <n>"), "the help names it: {HELP}");
     }
 
-    /// T1: `/build x` prints the usage line and sends nothing.
+    /// `/build x` prints the usage line and sends nothing.
     #[tokio::test]
     async fn a_bad_build_argument_prints_the_usage_line_and_sends_nothing() {
         let mut lead = Lead::start(Ulid::generate(), Vec::new()).await;
@@ -7274,7 +7547,7 @@ mod tests {
         );
     }
 
-    /// T3: `/build 58` sends the project and the issue, then opens the
+    /// `/build 58` sends the project and the issue, then opens the
     /// lead at seq 0, and the backlog becomes run cells in order — the
     /// first of them saying `started` or `resumed` as the reply did.
     #[tokio::test]
@@ -7302,6 +7575,7 @@ mod tests {
             role: "admin",
             refuse_build: None,
             refuse_open: None,
+            missing: Vec::new(),
             rows: Vec::new(),
             children: Vec::new(),
         };
@@ -7392,7 +7666,7 @@ mod tests {
         daemon.stop();
     }
 
-    /// T6: a backlog that ends at an unanswered gate shows the prompt
+    /// a backlog that ends at an unanswered gate shows the prompt
     /// and sends no answer until a pick. A backlog that ends at the
     /// outcome commits it and leaves nothing followed.
     #[tokio::test]
@@ -7442,7 +7716,7 @@ mod tests {
         daemon.stop();
     }
 
-    /// T5: a live gate shows the prompt; `Stop the run` sends the
+    /// a live gate shows the prompt; `Stop the run` sends the
     /// answer and `Ok` withdraws it; the outcome line ends the follow,
     /// so a later event draws nothing.
     #[tokio::test]
@@ -7845,7 +8119,7 @@ mod tests {
         daemon.stop();
     }
 
-    /// T8: a chat-thread state change leaves the gate's prompt up, and
+    /// a chat-thread state change leaves the gate's prompt up, and
     /// it can still be answered.
     #[tokio::test]
     async fn the_gate_survives_a_chat_state_change_and_is_still_answerable() {
@@ -7899,7 +8173,7 @@ mod tests {
         daemon.stop();
     }
 
-    /// T9: while a run is followed and the chat is idle with an empty
+    /// while a run is followed and the chat is idle with an empty
     /// composer, the first Ctrl-C detaches; the prompt goes with it, and
     /// later lead notices draw nothing.
     #[tokio::test]
@@ -7919,6 +8193,7 @@ mod tests {
             running: false,
             composer_empty: true,
             following: true,
+            inside: false,
         };
         let action = crate::app::keymap::action_for(&key_for_ctrl_c(), ctx);
         assert_eq!(
@@ -7955,6 +8230,7 @@ mod tests {
             running: false,
             composer_empty: true,
             following: false,
+            inside: false,
         };
         assert_eq!(
             crate::app::keymap::action_for(&key_for_ctrl_c(), ctx),
@@ -7966,7 +8242,7 @@ mod tests {
         );
     }
 
-    /// T10: without the approve role, `/build` says so and sends
+    /// without the approve role, `/build` says so and sends
     /// nothing.
     #[tokio::test]
     async fn build_without_the_approve_role_sends_nothing() {
@@ -7987,7 +8263,7 @@ mod tests {
         );
     }
 
-    /// T11: a refused `Build` prints the reason. A lead's `Note`
+    /// a refused `Build` prints the reason. A lead's `Note`
     /// starting `run stopped` becomes a cell and ends the follow.
     #[tokio::test]
     async fn a_refused_build_and_a_run_stopped_note() {
@@ -8023,7 +8299,7 @@ mod tests {
         assert!(!lead.repl.following(), "the note ended the follow");
     }
 
-    /// T14: an answer from another session withdraws the prompt without
+    /// an answer from another session withdraws the prompt without
     /// this client sending anything.
     #[tokio::test]
     async fn an_answer_from_elsewhere_withdraws_the_prompt() {
@@ -8054,7 +8330,7 @@ mod tests {
         assert_eq!(daemon.requests().len(), before, "this client sent nothing");
     }
 
-    /// T13: with the prompt up in plain mode, `/help` still runs the
+    /// with the prompt up in plain mode, `/help` still runs the
     /// command and an unrelated line goes to the chat.
     #[tokio::test]
     async fn a_slash_line_still_runs_and_another_line_goes_to_the_chat() {
@@ -8113,7 +8389,7 @@ mod tests {
         );
     }
 
-    /// T15: a chat permission prompt and a checkpoint at once: the
+    /// a chat permission prompt and a checkpoint at once: the
     /// chat's comes first, and the checkpoint is shown once it ends.
     #[tokio::test]
     async fn the_chat_prompt_comes_first_and_the_gate_after_it() {
@@ -8206,7 +8482,7 @@ mod tests {
         daemon.stop();
     }
 
-    /// T16: `/build 59` while following 58 detaches from 58 — prompt
+    /// `/build 59` while following 58 detaches from 58 — prompt
     /// withdrawn, its later notices undrawn — then follows 59.
     #[tokio::test]
     async fn a_second_build_detaches_from_the_first_run() {
@@ -8248,7 +8524,7 @@ mod tests {
         );
     }
 
-    /// T12: `AwaitingSwitch` prints the line, and `y`, `n` and `n customer
+    /// `AwaitingSwitch` prints the line, and `y`, `n` and `n customer
     /// X` send `Yes`, `No` and `Corrected`; an unrelated line goes to the
     /// chat as usual.
     #[tokio::test]
@@ -8754,6 +9030,7 @@ mod tests {
             role: "admin",
             refuse_build: None,
             refuse_open: None,
+            missing: Vec::new(),
             rows: Vec::new(),
             children: Vec::new(),
         };
@@ -9234,7 +9511,7 @@ mod tests {
         );
     }
 
-    /// T6: `/new` clears the old thread's per-thread state, and the old
+    /// `/new` clears the old thread's per-thread state, and the old
     /// thread's notices stop drawing.
     #[tokio::test]
     async fn new_clears_the_old_threads_approval_state_and_its_notes() {

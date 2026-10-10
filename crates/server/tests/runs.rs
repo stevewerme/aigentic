@@ -2856,9 +2856,9 @@ fn drain(rx: &mut mpsc::UnboundedReceiver<Notice>) -> Vec<Notice> {
     notices
 }
 
-/// T18 — a watched child's events arrive within a tick, each once: the
-/// ticker catches the watcher up to the log's present, and its own mark
-/// keeps the next tick from pushing the same `seq` again.
+/// A watched child's events arrive within a tick, each once: the ticker
+/// catches the watcher up to the log's present, and its own mark keeps
+/// the next tick from pushing the same `seq` again.
 #[tokio::test]
 async fn t18_a_watched_child_is_pushed_within_a_tick_and_once() {
     let daemon = Daemon::new(Scripts::default(), false).await;
@@ -2922,7 +2922,7 @@ async fn t18_a_watched_child_is_pushed_within_a_tick_and_once() {
     );
 }
 
-/// T19 — a thread this lead did not start is never pushed by its ticker:
+/// A thread this lead did not start is never pushed by its ticker:
 /// another run's step child and a front thread somebody has open. Two
 /// leads' tickers would otherwise push the same event twice.
 #[tokio::test]

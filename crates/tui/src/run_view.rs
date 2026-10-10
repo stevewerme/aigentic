@@ -252,7 +252,10 @@ pub(crate) mod fake_daemon {
         pub(crate) refuse_build: Option<String>,
         /// Refuse `Open` on the lead with this reason.
         pub(crate) refuse_open: Option<String>,
-        /// The threads `ListThreads` answers with (issue #140): the runs
+        /// Threads `Open` refuses as unknown: a step whose log is gone
+        /// while the run's lead still lists it.
+        pub(crate) missing: Vec<Ulid>,
+        /// The threads `ListThreads` answers with: the runs
         /// and children a test watches.
         pub(crate) rows: Vec<aigentic_api::ThreadInfo>,
         /// Each child's `Open` backlog, by thread.
@@ -330,7 +333,13 @@ pub(crate) mod fake_daemon {
                                 threads: script.rows.clone(),
                             },
                             Request::Open { thread, from_seq } => {
-                                if let Some((_, backlog)) = children
+                                if script.missing.contains(thread) {
+                                    // A thread with no log: what the real
+                                    // daemon answers for one.
+                                    Response::Refused {
+                                        reason: format!("no thread {thread}"),
+                                    }
+                                } else if let Some((_, backlog)) = children
                                     .lock()
                                     .unwrap()
                                     .iter()

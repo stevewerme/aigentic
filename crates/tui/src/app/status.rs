@@ -32,9 +32,9 @@ pub struct Status {
     /// The followed run's own segment, last on the line while a run is
     /// followed and dropped when the follow ends.
     pub run: Option<String>,
-    /// `inside #140 spec` while a step of a running issue is watched
-    /// (issue #140): the line is the watch's alone then, and the front
-    /// thread's own parts come back when the watch ends.
+    /// The watched step's own head, as `inside #140 spec`, while a step
+    /// of a running issue is open here: the line is the watch's alone
+    /// then, and the front thread's parts come back when it ends.
     pub inside: Option<String>,
 }
 
@@ -130,7 +130,7 @@ pub fn run_segment(status: &aigentic_api::RunStatus) -> String {
 }
 
 /// The run segment's figures without the head it is drawn under: what the
-/// status line shows beside `inside #140 spec`, which already names the
+/// status line shows beside a watch's own head, which already names the
 /// issue and the step, so the figures are the segment's parts alone.
 pub fn run_figures(status: &aigentic_api::RunStatus) -> String {
     run_parts(status, false).join(" · ")

@@ -1,4 +1,4 @@
-//! A watch (issue #140): one step of a running issue, opened read-only
+//! A watch: one step of a running issue, opened read-only
 //! inside the front thread. The step's own events draw in the dev view
 //! through its own engine, the run's figures and its gate come with it,
 //! and its moves are read from the lead's log.

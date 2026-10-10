@@ -38,8 +38,11 @@ pub enum Command<'a> {
     /// <text>` or `/answer stop`.
     Answer(&'a str),
     /// Watch a running issue's step here, read-only:
-    /// `/watch <issue> [step]` (issue #140).
+    /// `/watch <issue> [step]`: open one of its running steps here.
     Watch(Option<&'a str>),
+    /// Leave the watched step and return to the front thread:
+    /// `/back`: leave a watched step for the front thread.
+    Back,
     /// A user-invoked skill: its name and the rest of the line.
     Skill(&'a str, &'a str),
     /// The key table.
@@ -105,6 +108,7 @@ pub fn parse_line<'a>(line: &'a str, skills: &[String]) -> Command<'a> {
         ("build", arg) => Command::Build(Some(arg)),
         ("watch", "") => Command::Watch(None),
         ("watch", arg) => Command::Watch(Some(arg)),
+        ("back", "") => Command::Back,
         ("answer", arg) => Command::Answer(arg),
         ("remember", text) if !text.is_empty() => Command::Remember(text),
         (name, args) if skills.iter().any(|s| s == name) => Command::Skill(name, args),
@@ -197,6 +201,7 @@ pub const HELP: &str = "\
 /build <n> [w]   follow a build of issue n here (workflow w, else build), and answer its checkpoints
 /watch <n> [s]   watch a running issue's step s (default: the step it is on) read-only; /back leaves
 /answer go       continue the run past its checkpoint; /answer amend <text> continues with changes; /answer stop
+/back            leave a watched step and return to the front thread
 /<skill> [args]  run a user-invoked skill
 /diff            the project's working-tree diff, untracked files included
 /rename <title>  set the thread's title (one is proposed after the first turn)

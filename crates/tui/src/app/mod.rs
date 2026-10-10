@@ -779,11 +779,14 @@ async fn run_shell(
         status.title = engine.title().map(str::to_owned);
         status.usage = engine.usage();
         // Inside a watch the line is the watch's: its own segment, and
-        // the run's figures with the run's head off (issue #140).
+        // the run's figures with the run's head off.
         status.inside = engine.inside();
-        status.run = match engine.watch_figures() {
-            Some(figures) => Some(figures.to_owned()),
-            None => engine.run_segment().map(str::to_owned),
+        // Inside, the run part is the watched run's alone: the front
+        // thread's own followed segment must not leak into the watch.
+        status.run = if status.inside.is_some() {
+            engine.watch_figures().map(str::to_owned)
+        } else {
+            engine.run_segment().map(str::to_owned)
         };
         // The turn line carries the clock while a turn runs.
         status.elapsed = None;
@@ -991,6 +994,7 @@ async fn run_shell(
                             running: !matches!(engine.state(), ThreadState::Idle),
                             composer_empty: composer.is_empty(),
                             following: engine.following(),
+                            inside: engine.inside().is_some(),
                         };
                         let action = action_for(&key, ctx);
                         // An armed key completes on its second press.
@@ -1024,6 +1028,7 @@ async fn run_shell(
                             // followed detaches from it; the second
                             // behaves as it always did (issue #68).
                             Action::DetachRun => engine.detach(&mut out),
+                            Action::Back => engine.back(&mut out).await,
                             Action::QuitArm => {
                                 if was_armed == Some(Action::QuitArm) {
                                     break;
