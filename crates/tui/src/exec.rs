@@ -207,6 +207,9 @@ impl Follow {
             // The model a daemon names at attach (issue #43) is for the
             // shell's footer; plain exec prints what the model says.
             Notice::Model { .. } => {}
+            // The followed run's line belongs to the interactive footer;
+            // plain exec already prints the frame as JSON when asked.
+            Notice::RunStatus { .. } => {}
             Notice::TextDelta { text, .. } => {
                 if !self.json {
                     write!(err, "{text}")?;
