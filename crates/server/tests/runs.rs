@@ -1893,6 +1893,161 @@ async fn t8_stop_is_answered_go_is_refused() {
     );
 }
 
+/// One implementer attempt that fails its checks: a commit the brief never
+/// named, so E2 reports it, then a report. The next attempt needs the
+/// daemon to run it, so a test that wants a second failure stages this
+/// script again.
+fn failing_implementer_script() -> Vec<Act> {
+    vec![
+        Act::Commit {
+            file: "pancake-one.txt".into(),
+            body: "the first".into(),
+            subject: "pancake: not named".into(),
+        },
+        report("r2", implementer_report()),
+    ]
+}
+
+/// The last `checkpoint_asked` a lead holds.
+fn last_asked(events: &[Event]) -> aigentic_runtime::aigentic_log::CheckpointAskedPayload {
+    events
+        .iter()
+        .filter(|event| event.kind == EventKind::CheckpointAsked)
+        .filter_map(|event| {
+            serde_json::from_value::<aigentic_runtime::aigentic_log::CheckpointAskedPayload>(
+                event.payload.clone(),
+            )
+            .ok()
+        })
+        .next_back()
+        .expect("the lead holds a checkpoint_asked")
+}
+
+/// The daemon accepts `retry` only where the gate offered it. A
+/// `checks_failed` gate (two failed attempts) takes the word: one answer,
+/// one more attempt on the same child, which fails again and asks again.
+/// `go` at that gate is refused and writes nothing; `stop` still ends the
+/// run.
+#[tokio::test]
+async fn a_retry_answer_crosses_the_daemon() {
+    let scripts = Scripts::of([
+        vec![report("r1", brief_report())],
+        failing_implementer_script(),
+        failing_implementer_script(),
+        failing_implementer_script(),
+    ]);
+    let daemon = Daemon::new(scripts, false).await;
+    let (client, _) = daemon.connect("steve").await;
+    let lead = daemon.build(&client, "steve", 58).await.lead;
+    assert!(
+        daemon
+            .wait_until(|| gate_of(&daemon.lead_events(lead)).as_deref() == Some("checks_failed"))
+            .await,
+        "the run stops at its checks gate"
+    );
+
+    // The gate offers exactly what it takes.
+    let asked = last_asked(&daemon.lead_events(lead));
+    assert_eq!(asked.gate, "checks_failed");
+    assert_eq!(asked.options, ["retry", "stop"]);
+
+    // `retry` is accepted, and the retried attempt is the next attempt of
+    // the same child — the one that just failed.
+    let failed_child = daemon
+        .child_of(lead, "implement-alone", 2)
+        .expect("the second attempt ran");
+    let answered_before = daemon
+        .lead_events(lead)
+        .iter()
+        .filter(|event| event.kind == EventKind::CheckpointAnswered)
+        .count();
+    let retried = client
+        .request(Request::AnswerCheckpoint {
+            lead,
+            gate: "checks_failed".into(),
+            answer: CheckpointAnswer::Retry,
+            amendment: None,
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(retried, Response::Ok),
+        "the retry is taken: {retried:?}"
+    );
+
+    // The retried attempt commits the same wrong subject, so the run
+    // fails its checks a third time and asks again.
+    assert!(
+        daemon
+            .wait_until(|| daemon
+                .lead_events(lead)
+                .iter()
+                .filter(|event| event.kind == EventKind::CheckpointAsked)
+                .count()
+                >= 2)
+            .await,
+        "the retried attempt reached a second gate"
+    );
+    let events = daemon.lead_events(lead);
+    let answered: Vec<aigentic_runtime::aigentic_log::CheckpointAnsweredPayload> = events
+        .iter()
+        .filter(|event| event.kind == EventKind::CheckpointAnswered)
+        .map(|event| serde_json::from_value(event.payload.clone()).unwrap())
+        .collect();
+    assert_eq!(
+        answered.len(),
+        answered_before + 1,
+        "one answer, and only one"
+    );
+    assert_eq!(
+        answered.last().unwrap().answer,
+        aigentic_runtime::aigentic_log::CheckpointAnswer::Retry,
+        "the event records the word it was given"
+    );
+    assert_eq!(
+        daemon.child_of(lead, "implement-alone", 3),
+        Some(failed_child),
+        "the retried attempt is the next attempt of the child that failed"
+    );
+
+    // `go` was never offered here, so it is refused and nothing is added.
+    let before = daemon.events(lead).len();
+    let refused = client
+        .request(Request::AnswerCheckpoint {
+            lead,
+            gate: "checks_failed".into(),
+            answer: CheckpointAnswer::Go,
+            amendment: None,
+        })
+        .await
+        .unwrap();
+    match refused {
+        Response::Refused { reason } => assert!(
+            reason.contains("takes retry or stop") && reason.contains("`go`"),
+            "the refusal names what the gate takes: {reason}"
+        ),
+        other => panic!("the gate offers retry and stop, so go is refused: {other:?}"),
+    }
+    assert_eq!(
+        daemon.events(lead).len(),
+        before,
+        "nothing was appended for a refused go"
+    );
+
+    // `stop` ends it.
+    let stopped = client
+        .request(Request::AnswerCheckpoint {
+            lead,
+            gate: "checks_failed".into(),
+            answer: CheckpointAnswer::Stop,
+            amendment: None,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(stopped, Response::Ok), "{stopped:?}");
+    assert_eq!(daemon.wait_finished(lead).await, RunOutcome::Stopped);
+}
+
 /// T9 — roles: `read` and `write` are refused `Build` and
 /// `AnswerCheckpoint`; `approve` is allowed. (The row list in
 /// `every_request_has_its_row` is hand-written, so the refusals here are

@@ -4146,3 +4146,358 @@ async fn a_looped_run_rebuilds_after_every_event() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// A `checks_failed` gate can grant one more attempt
+// ---------------------------------------------------------------------------
+
+/// The happy path with a third scripted reply for the implementer, so an
+/// attempt past the send-back has a report of its own.
+fn retryable_twice() -> Happy {
+    let brief_child = Ulid::generate();
+    let implementer_child = Ulid::generate();
+    Happy {
+        fx: Fixture::new(vec![
+            (brief_child, vec![report("r1", brief_report())]),
+            (
+                implementer_child,
+                vec![
+                    report("r2", implementer_report()),
+                    report("r3", implementer_report()),
+                    report("r4", implementer_report()),
+                ],
+            ),
+        ]),
+        brief_child,
+        implementer_child,
+    }
+}
+
+/// Whether the lead log holds a `retry` answer. The driver keys both its
+/// amend and its next answer on the log, not on its own state, so a
+/// rebuild from any prefix behaves like the run.
+fn retry_answered(events: &[Event]) -> bool {
+    events.iter().any(|event| {
+        event.kind == EventKind::CheckpointAnswered
+            && serde_json::from_value::<aigentic_log::CheckpointAnsweredPayload>(
+                event.payload.clone(),
+            )
+            .map(|payload| payload.answer == aigentic_log::CheckpointAnswer::Retry)
+            .unwrap_or(false)
+    })
+}
+
+/// Drive to the `checks_failed` gate, answer `retry`, and keep driving.
+/// The retried attempt's checks fail too, so the second gate is answered
+/// `stop`; `fix` amends the wrong subject once the retry answer is in the
+/// log, so that attempt passes instead and the run closes.
+async fn drive_a_retry(fx: &Fixture, implementer: Ulid, fix: bool) -> Trace {
+    let mut runner = fx.runner();
+    let mut snapshots = vec![snapshot(fx)];
+    let mut subject = WrongSubject::new(implementer);
+    let terminal = loop {
+        match runner.advance().await.expect("the run advances") {
+            Advanced::Moved => {
+                subject.between(fx, false);
+                if fix && retry_answered(&fx.lead_events()) && fx.head_subject() != "runtime: two" {
+                    fx.amend_named("runtime: two");
+                }
+                snapshots.push(snapshot(fx));
+            }
+            Advanced::WaitingHuman { gate } => {
+                assert_eq!(gate, "checks_failed", "the only gate this run raises");
+                snapshots.push(snapshot(fx));
+                let answer = if retry_answered(&fx.lead_events()) {
+                    aigentic_log::CheckpointAnswer::Stop
+                } else {
+                    aigentic_log::CheckpointAnswer::Retry
+                };
+                runner
+                    .answer("checks_failed", answer, None, steve())
+                    .expect("the gate takes the answer it offered");
+                snapshots.push(snapshot(fx));
+            }
+            other => break other,
+        }
+    };
+    snapshots.push(snapshot(fx));
+    Trace {
+        snapshots,
+        terminal,
+    }
+}
+
+/// The gate offers `retry` beside `stop`, and nothing else about its ask
+/// moved.
+#[tokio::test]
+async fn a_checks_failed_gate_offers_retry_and_stop() {
+    let h = retryable();
+    let fx = &h.fx;
+    let run = drive_a_wrong_subject(fx, h.implementer_child, false).await;
+    assert_eq!(
+        run.terminal,
+        Advanced::WaitingHuman {
+            gate: "checks_failed".to_owned()
+        }
+    );
+
+    let events = run.lead();
+    let asked = checkpoints(events).pop().expect("the gate was asked");
+    assert_eq!(asked.gate, "checks_failed");
+    assert_eq!(
+        asked.options,
+        vec!["retry", "stop"],
+        "both answers, in order"
+    );
+
+    let failing = checks_run(events)
+        .into_iter()
+        .rfind(|run| {
+            run.checks
+                .iter()
+                .any(|check| check.result == aigentic_log::CheckResult::Fail)
+        })
+        .expect("a run of the checks failed");
+    assert_eq!(asked.shown[0], failing.step, "the gate names the step");
+    let attempt = step_started(events)
+        .into_iter()
+        .rfind(|started| started.step == failing.step)
+        .expect("the failing step started")
+        .attempt;
+    assert_eq!(
+        asked.shown[1],
+        attempt.to_string(),
+        "and the attempt that failed"
+    );
+    for check in failing
+        .checks
+        .iter()
+        .filter(|check| check.result == aigentic_log::CheckResult::Fail)
+    {
+        assert!(
+            asked.shown.join(" ").contains(&check.id),
+            "the gate names {}: {:?}",
+            check.id,
+            asked.shown
+        );
+    }
+}
+
+/// The retry runs one more attempt in the step's own child, is told
+/// the checks that failed it, and the gate asks again when it fails too.
+#[tokio::test]
+async fn a_retry_runs_one_more_attempt_in_the_same_child_with_the_failures() {
+    let h = retryable_twice();
+    let fx = &h.fx;
+    let run = drive_a_retry(fx, h.implementer_child, false).await;
+    assert_eq!(
+        run.terminal,
+        Advanced::Finished {
+            outcome: aigentic_log::RunOutcome::Stopped
+        },
+        "the second gate's stop ends the run"
+    );
+
+    let events = run.lead();
+    let answers: Vec<aigentic_log::CheckpointAnswer> = events
+        .iter()
+        .filter(|event| event.kind == EventKind::CheckpointAnswered)
+        .map(|event| {
+            serde_json::from_value::<aigentic_log::CheckpointAnsweredPayload>(event.payload.clone())
+                .expect("a checkpoint_answered payload")
+                .answer
+        })
+        .collect();
+    assert_eq!(
+        answers,
+        vec![
+            aigentic_log::CheckpointAnswer::Retry,
+            aigentic_log::CheckpointAnswer::Stop
+        ]
+    );
+
+    let answered_at = events
+        .iter()
+        .position(|event| event.kind == EventKind::CheckpointAnswered)
+        .expect("the gate was answered");
+    let started_after = step_started(&events[answered_at..]);
+    assert_eq!(started_after.len(), 1, "one attempt follows the answer");
+    let retried = started_after.into_iter().next().expect("an attempt");
+    let failing = step_started(&events[..answered_at])
+        .into_iter()
+        .rfind(|started| started.step == retried.step)
+        .expect("the failing step started");
+    assert_eq!(retried.attempt, failing.attempt + 1, "one attempt more");
+    assert_eq!(
+        retried.child_thread, failing.child_thread,
+        "in the step's own child"
+    );
+
+    // The retried attempt is told which checks failed it, with their lines.
+    let failed_run = checks_run(&events[..answered_at])
+        .into_iter()
+        .rfind(|run| {
+            run.checks
+                .iter()
+                .any(|check| check.result == aigentic_log::CheckResult::Fail)
+        })
+        .expect("a run of the checks failed");
+    let prompts = child_prompts(fx, h.implementer_child);
+    assert_eq!(prompts.len(), 3, "one prompt per attempt");
+    let retry_prompt = &prompts[2];
+    for check in failed_run
+        .checks
+        .iter()
+        .filter(|check| check.result == aigentic_log::CheckResult::Fail)
+    {
+        assert!(
+            retry_prompt.contains(&check.id),
+            "the retried attempt is told about {}: {retry_prompt}",
+            check.id
+        );
+        if let Some(detail) = &check.detail {
+            assert!(
+                retry_prompt.contains(detail),
+                "and the line it failed with: {retry_prompt}"
+            );
+        }
+    }
+
+    let asked = checkpoints(events);
+    assert_eq!(asked.len(), 2, "the retried attempt failed too");
+    assert_eq!(asked[1].gate, "checks_failed");
+    assert_eq!(asked[1].options, vec!["retry", "stop"]);
+    assert!(pushed_events(events).is_empty(), "nothing is pushed");
+    assert_eq!(fx.remote_head(), fx.initial_head());
+    assert_eq!(fx.installer.calls(), 0, "and nothing is installed");
+}
+
+/// A rebuild from just after the retry answer makes that attempt's
+/// move once, in the same child, and never twice.
+#[tokio::test]
+async fn a_rebuild_after_the_retry_answer_starts_that_attempt_once() {
+    let h = retryable_twice();
+    let fx = &h.fx;
+    let run = drive_a_retry(fx, h.implementer_child, false).await;
+    let snapshot = run.after_where(EventKind::CheckpointAnswered, 1);
+    let answered_at = run
+        .lead()
+        .iter()
+        .position(|event| event.kind == EventKind::CheckpointAnswered)
+        .expect("the gate was answered");
+    let expected = &run.lead()[answered_at + 1];
+    assert_eq!(expected.kind, EventKind::StepStarted, "the retry's move");
+
+    let (advanced, _) = replay(fx, snapshot).await;
+    assert_eq!(advanced, Advanced::Moved, "the move was due");
+    let after = fx.lead_events();
+    assert_eq!(
+        after.len(),
+        snapshot.lead.len() + 1,
+        "exactly one lead event appended"
+    );
+    assert_eq!(after.last().expect("an event").kind, expected.kind);
+    assert_eq!(
+        same_move(after.last().expect("an event")),
+        same_move(expected),
+        "the same step_started"
+    );
+    assert_eq!(
+        after
+            .iter()
+            .filter(|event| event.kind == EventKind::CheckpointAnswered)
+            .count(),
+        1,
+        "no second answer is written"
+    );
+
+    let started = step_started(&after);
+    let retried = started.last().expect("the retried attempt started");
+    let same_step: Vec<_> = started
+        .iter()
+        .filter(|started| started.step == retried.step)
+        .collect();
+    assert_eq!(
+        retried.attempt,
+        same_step[1].attempt + 1,
+        "one attempt more"
+    );
+    assert_eq!(
+        retried.child_thread, same_step[1].child_thread,
+        "in the step's own child"
+    );
+    let children: std::collections::BTreeSet<Ulid> = same_step
+        .iter()
+        .map(|started| started.child_thread)
+        .collect();
+    assert_eq!(children.len(), 1, "no second child thread for the step");
+
+    let (again, _) = replay(fx, snapshot).await;
+    assert_eq!(again, Advanced::Moved);
+    let after_two = fx.lead_events();
+    assert_eq!(after_two.len(), after.len(), "the same number of events");
+    assert_eq!(
+        same_move(after_two.last().expect("an event")),
+        same_move(after.last().expect("an event")),
+        "the second rebuild appends the identical event"
+    );
+}
+
+/// The retried attempt's checks pass, so it pushes the amended commit
+/// and the run installs and closes.
+#[tokio::test]
+async fn a_retried_attempt_that_passes_pushes_and_closes() {
+    let h = retryable_twice();
+    let fx = &h.fx;
+    let run = drive_a_retry(fx, h.implementer_child, true).await;
+    assert_eq!(
+        run.terminal,
+        Advanced::Finished {
+            outcome: aigentic_log::RunOutcome::Closed
+        },
+        "the retried attempt closes the run"
+    );
+
+    let events = run.lead();
+    let asked = checkpoints(events);
+    assert_eq!(asked.len(), 1, "the retried attempt passes, so one gate");
+    assert_eq!(asked[0].gate, "checks_failed");
+    assert_eq!(asked[0].options, vec!["retry", "stop"]);
+
+    let checks = checks_run(events);
+    assert_eq!(checks.len(), 3, "each attempt runs the checks");
+    assert!(
+        checks[..2].iter().all(|run| run
+            .checks
+            .iter()
+            .any(|check| check.result == aigentic_log::CheckResult::Fail)),
+        "the first attempt and the send-back fail"
+    );
+    assert!(
+        checks[2]
+            .checks
+            .iter()
+            .all(|check| check.result == aigentic_log::CheckResult::Pass),
+        "the amended subject passes every check"
+    );
+
+    let pushed = pushed_events(events);
+    assert_eq!(pushed.len(), 1, "one push, after the checks passed");
+    assert_eq!(pushed[0].ref_after, fx.head());
+    assert_eq!(
+        pushed[0]
+            .commits
+            .iter()
+            .map(|commit| commit.subject.as_str())
+            .collect::<Vec<_>>(),
+        vec!["runtime: two", "runtime: one"],
+        "the amended commit and its parent"
+    );
+    assert_eq!(fx.remote_head(), fx.head());
+    assert_eq!(fx.head_subject(), "runtime: two");
+    assert!(fx.forge.is_closed(), "the issue is closed");
+    assert_eq!(
+        run_finished(events).outcome,
+        aigentic_log::RunOutcome::Closed
+    );
+}

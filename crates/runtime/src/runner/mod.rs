@@ -366,7 +366,7 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
                 outcome,
             } => self.checks_done(&step, attempt, outcome).await,
             NextMove::Pushed { step, .. } => self.after_pushed(&step).await,
-            NextMove::Answered { gate, answer, .. } => self.answered(&gate, answer),
+            NextMove::Answered { gate, answer, .. } => self.answered(&gate, answer).await,
         }
     }
 
@@ -895,7 +895,11 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
                 }
                 let mut shown = vec![step.id.clone(), attempt.to_string()];
                 shown.extend(failing.iter().map(|check| check.named()));
-                self.escalate("checks_failed", shown)
+                self.escalate_with(
+                    "checks_failed",
+                    shown,
+                    vec!["retry".to_owned(), "stop".to_owned()],
+                )
             }
         }
     }
@@ -1254,9 +1258,14 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
 
     /// A human answered a gate: `stop` ends the run. At a checkpoint step,
     /// `go` and `amend` continue to its `next` (the amendment is already in
-    /// the answer, where the `amendment` slot reads it). At any gate the
-    /// runner raised itself, only `stop` is an answer.
-    fn answered(&mut self, gate: &str, answer: CheckpointAnswer) -> Result<Advanced, RunnerError> {
+    /// the answer, where the `amendment` slot reads it). At any other gate
+    /// the runner raised itself, only `stop` is an answer, except `retry`
+    /// at `checks_failed`, which grants the step one more attempt.
+    async fn answered(
+        &mut self,
+        gate: &str,
+        answer: CheckpointAnswer,
+    ) -> Result<Advanced, RunnerError> {
         if answer == CheckpointAnswer::Stop {
             return self.finish(RunOutcome::Stopped);
         }
@@ -1267,12 +1276,52 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
             .iter()
             .find(|step| step.checkpoint && step.id == gate)
             .cloned();
-        match checkpoint {
-            Some(step) => self.follow_next(&step, 1),
-            None => Err(RunnerError::SliceTwo {
-                gate: gate.to_owned(),
-            }),
+        if let Some(step) = checkpoint {
+            return self.follow_next(&step, 1);
         }
+        if answer == CheckpointAnswer::Retry && gate == "checks_failed" {
+            return self.retry_attempt().await;
+        }
+        Err(RunnerError::SliceTwo {
+            gate: gate.to_owned(),
+        })
+    }
+
+    /// Grant one more attempt to the step whose checks last failed: the
+    /// answer's move is a fresh `step_started` for the same child, one
+    /// attempt on. Both the step and the attempt come from the log, so a
+    /// rebuild between the answer and this move repeats it exactly. An ask
+    /// can only stand after a run of the step, so a missing event is a
+    /// broken lead, not a state to guess at.
+    async fn retry_attempt(&mut self) -> Result<Advanced, RunnerError> {
+        let step = self
+            .lead
+            .events()
+            .iter()
+            .rev()
+            .filter(|event| event.kind == EventKind::ChecksRun)
+            .filter_map(|event| {
+                serde_json::from_value::<ChecksRunPayload>(event.payload.clone()).ok()
+            })
+            .next()
+            .ok_or_else(|| RunnerError::Host("checks_failed with no checks_run to retry".into()))?
+            .step;
+        let attempt = self
+            .lead
+            .events()
+            .iter()
+            .rev()
+            .filter(|event| event.kind == EventKind::StepStarted)
+            .filter_map(|event| {
+                serde_json::from_value::<StepStartedPayload>(event.payload.clone()).ok()
+            })
+            .find(|payload| payload.step == step)
+            .ok_or_else(|| {
+                RunnerError::Host(format!("checks_failed with no step_started for {step}"))
+            })?
+            .attempt;
+        let child = self.child_of(&step, attempt)?;
+        self.start_step(&step, attempt + 1, Some(child)).await
     }
 
     /// Write `checkpoint_asked` and hand the run to the human. This is the
