@@ -703,6 +703,7 @@ pub enum RunOutcome {
 pub enum CheckpointAnswer {
     Go,
     Amend,
+    Retry,
     Stop,
 }
 
@@ -2023,6 +2024,29 @@ mod tests {
             serde_json::from_value::<CheckpointAnsweredPayload>(value).unwrap(),
             stopped
         );
+    }
+
+    #[test]
+    fn a_retry_answer_round_trips_and_old_answers_still_decode() {
+        assert_eq!(
+            serde_json::to_value(CheckpointAnswer::Retry).unwrap(),
+            json!(snake_case("Retry"))
+        );
+        let p = CheckpointAnsweredPayload {
+            answer: CheckpointAnswer::Retry,
+            amendment: None,
+            marks: vec![],
+        };
+        let value = serde_json::to_value(&p).unwrap();
+        assert_eq!(value, json!({"answer": "retry", "marks": []}));
+        assert_eq!(
+            serde_json::from_value::<CheckpointAnsweredPayload>(value).unwrap(),
+            p
+        );
+        // An answer written before `retry` existed still decodes.
+        let old: CheckpointAnsweredPayload =
+            serde_json::from_value(json!({"answer": "stop", "marks": []})).unwrap();
+        assert_eq!(old.answer, CheckpointAnswer::Stop);
     }
 
     #[test]

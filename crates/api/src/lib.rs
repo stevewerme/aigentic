@@ -223,9 +223,10 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         workflow: Option<String>,
     },
-    /// Answer the open checkpoint of a run's lead (issue #58). In slice 1
-    /// only `stop` is accepted; `go` and `amend` are refused. The lead is
-    /// the run's own thread, not a project thread.
+    /// Answer the open checkpoint of a run's lead. Which words are
+    /// accepted is the gate's own decision: its ask lists the options it
+    /// offered, and the daemon refuses any other word. The lead is the
+    /// run's own thread, not a project thread.
     AnswerCheckpoint {
         lead: Ulid,
         gate: String,
@@ -243,6 +244,7 @@ pub enum Request {
 pub enum CheckpointAnswer {
     Go,
     Amend,
+    Retry,
     Stop,
 }
 
@@ -1057,6 +1059,26 @@ mod tests {
             assert_eq!(line.matches('\n').count(), 1, "{line}");
             assert_eq!(decode(&line).unwrap(), frame, "{line}");
         }
+    }
+
+    #[test]
+    fn the_retry_answer_crosses_the_wire_as_one_word() {
+        assert_eq!(
+            serde_json::to_value(CheckpointAnswer::Retry).unwrap(),
+            json!("retry")
+        );
+        let request = Request::AnswerCheckpoint {
+            lead: thread(),
+            gate: "checks_failed".into(),
+            answer: CheckpointAnswer::Retry,
+            amendment: None,
+        };
+        let frame = Frame::request(1, request.clone());
+        let line = encode(&frame);
+        assert!(line.ends_with('\n'));
+        assert_eq!(line.matches('\n').count(), 1, "{line}");
+        assert!(line.contains("\"answer\":\"retry\""), "{line}");
+        assert_eq!(decode(&line).unwrap(), frame);
     }
 
     /// T2 (issue #84): the front thread's requests and reply are on the

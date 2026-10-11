@@ -1583,6 +1583,7 @@ impl ClientRepl {
         let word = match answer {
             aigentic_api::CheckpointAnswer::Go => "go",
             aigentic_api::CheckpointAnswer::Amend => "amend",
+            aigentic_api::CheckpointAnswer::Retry => "retry",
             aigentic_api::CheckpointAnswer::Stop => "stop",
         };
         let r = self
@@ -7993,6 +7994,21 @@ mod tests {
         assert!(repl.menu().is_none(), "the prompt went");
         assert_eq!(daemon.requests().len(), before, "nothing was sent");
         daemon.stop();
+    }
+
+    /// The wire mirrors the log's enum by hand, and only the tui names both.
+    /// If the two words drift, a client sends a word the daemon's log cannot
+    /// read, and every frame still looks well-formed.
+    #[test]
+    fn the_retry_word_is_the_same_in_the_log_and_the_wire() {
+        assert_eq!(
+            serde_json::to_value(aigentic_api::CheckpointAnswer::Retry).unwrap(),
+            serde_json::json!("retry")
+        );
+        assert_eq!(
+            serde_json::to_value(aigentic_runtime::aigentic_log::CheckpointAnswer::Retry).unwrap(),
+            serde_json::json!("retry")
+        );
     }
 
     /// A workflow's own checkpoint offers what it takes: `Continue`,

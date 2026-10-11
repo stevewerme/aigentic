@@ -873,6 +873,7 @@ fn log_answer(answer: CheckpointAnswer) -> LogAnswer {
     match answer {
         CheckpointAnswer::Go => LogAnswer::Go,
         CheckpointAnswer::Amend => LogAnswer::Amend,
+        CheckpointAnswer::Retry => LogAnswer::Retry,
         CheckpointAnswer::Stop => LogAnswer::Stop,
     }
 }

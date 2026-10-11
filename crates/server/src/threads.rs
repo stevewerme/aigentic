@@ -1535,10 +1535,12 @@ impl ThreadTable {
             }
         }
         // A gate takes only the answers its ask offered: a checkpoint step
-        // offers go, amend and stop; a gate the runner raised offers stop.
+        // offers go, amend and stop; a gate the runner raised offers stop,
+        // or retry at checks_failed.
         let word = match answer {
             CheckpointAnswer::Go => "go",
             CheckpointAnswer::Amend => "amend",
+            CheckpointAnswer::Retry => "retry",
             CheckpointAnswer::Stop => "stop",
         };
         let offered: Vec<String> = log
