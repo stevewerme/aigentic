@@ -29,6 +29,8 @@ pub enum Pick {
     /// Continue with changes: `amend`, its text typed after the pick or
     /// given with it (`amend <text>`, carried as the decision's reason).
     AmendRun,
+    /// Grant one more attempt at a step whose checks failed: `retry`.
+    RetryRun,
     /// Stop the followed run (issue #68), at its checkpoint prompt.
     StopRun,
     /// Leave the followed run waiting: the prompt goes, nothing is sent.
@@ -247,7 +249,7 @@ impl Menu {
 
     /// The checkpoint prompt for a followed build: what the lead is
     /// waiting at, a row for each answer the gate offers (`go`, `amend`,
-    /// `stop`, in that order), and `Leave it waiting`. The selection
+    /// `retry`, `stop`, in that order), and `Leave it waiting`. The selection
     /// starts on `Leave it waiting`, the one row that sends nothing, so a
     /// stray Enter never stops or continues a run.
     pub fn checkpoint(gate: &str, shown: &[String], options: &[String]) -> Self {
@@ -263,6 +265,11 @@ impl Menu {
         }
         if offered("amend") {
             rows.push(row("Continue with changes", Pick::AmendRun));
+        }
+        // A step's checks failed: one more attempt, the row nearest the
+        // reason a person is here.
+        if offered("retry") {
+            rows.push(row("Retry", Pick::RetryRun));
         }
         rows.push(row("Leave it waiting", Pick::LeaveWaiting));
         rows.push(row("Stop the run", Pick::StopRun));
@@ -631,7 +638,7 @@ impl Menu {
             // A row never carries a typed destination: only `line`
             // builds one. Nothing to send from here.
             Pick::SwitchCorrected { .. } => Keyed::Passed,
-            Pick::ContinueRun | Pick::StopRun => Keyed::Decide {
+            Pick::ContinueRun | Pick::StopRun | Pick::RetryRun => Keyed::Decide {
                 pick: row.pick.clone(),
                 reason: None,
                 echo: format!("↳ {}", row.label),
@@ -670,6 +677,7 @@ impl Menu {
                 Some(self.pick_of(&Pick::ContinueRun))
             }
             ("stop", true) => Some(self.pick_of(&Pick::StopRun)),
+            ("retry", true) if offers(&Pick::RetryRun) => Some(self.pick_of(&Pick::RetryRun)),
             ("wait" | "leave", true) => Some(self.pick_of(&Pick::LeaveWaiting)),
             ("amend", false) if offers(&Pick::AmendRun) => Some(Keyed::Decide {
                 pick: Pick::AmendRun,

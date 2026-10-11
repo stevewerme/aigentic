@@ -831,6 +831,7 @@ impl ClientRepl {
                         | Pick::Other
                         | Pick::ContinueRun
                         | Pick::AmendRun
+                        | Pick::RetryRun
                         | Pick::StopRun
                         | Pick::LeaveWaiting
                         | Pick::SwitchYes
@@ -1553,12 +1554,15 @@ impl ClientRepl {
         let (word, rest) = arg.split_once(char::is_whitespace).unwrap_or((arg, ""));
         let (answer, amendment) = match (word, rest.trim()) {
             ("go", "") => (aigentic_api::CheckpointAnswer::Go, None),
+            ("retry", "") => (aigentic_api::CheckpointAnswer::Retry, None),
             ("stop", "") => (aigentic_api::CheckpointAnswer::Stop, None),
             ("amend", text) if !text.is_empty() => {
                 (aigentic_api::CheckpointAnswer::Amend, Some(text.to_owned()))
             }
             _ => {
-                out.line("[usage: /answer go | /answer amend <text> | /answer stop]");
+                out.line(
+                    "[usage: /answer go | /answer retry | /answer amend <text> | /answer stop]",
+                );
                 return;
             }
         };
@@ -1630,6 +1634,10 @@ impl ClientRepl {
                 self.send_answer(aigentic_api::CheckpointAnswer::Stop, None, out)
                     .await;
             }
+            Pick::RetryRun => {
+                self.send_answer(aigentic_api::CheckpointAnswer::Retry, None, out)
+                    .await;
+            }
             Pick::LeaveWaiting => {
                 if let Some(open) = self.checkpoint.as_mut() {
                     open.shown = false;
@@ -1640,7 +1648,7 @@ impl ClientRepl {
                 ));
             }
             // Neither a switch's picks nor anything else reaches here:
-            // a checkpoint menu offers only the four above.
+            // a checkpoint menu offers only the five above.
             Pick::Answer
             | Pick::Other
             | Pick::Allow { .. }
@@ -1866,6 +1874,7 @@ impl ClientRepl {
                     | Pick::Other
                     | Pick::ContinueRun
                     | Pick::AmendRun
+                    | Pick::RetryRun
                     | Pick::StopRun
                     | Pick::LeaveWaiting
                     | Pick::SwitchElsewhere
@@ -7548,6 +7557,41 @@ mod tests {
         );
     }
 
+    /// `/answer retry` grants one more attempt where the gate offers it, and
+    /// the help names it as `go` is named.
+    #[tokio::test]
+    async fn answer_retry_is_sent_and_listed_in_help() {
+        assert!(HELP.contains("/answer retry"), "the help names it: {HELP}");
+        let lead_id = Ulid::generate();
+        let backlog = vec![run_event(
+            lead_id,
+            1,
+            EventKind::CheckpointAsked,
+            serde_json::json!({
+                "gate": "checks_failed",
+                "shown": ["runtime: two", "1", "E2"],
+                "options": ["retry", "stop"],
+            }),
+        )];
+        let (mut repl, mut out, daemon) = repl_for(lead_id, backlog).await;
+        repl.handle_line("/build 58", &mut out).await;
+        let before = daemon.requests().len();
+        repl.handle_line("/answer retry", &mut out).await;
+        assert!(
+            matches!(
+                daemon.requests()[before..],
+                [Request::AnswerCheckpoint {
+                    answer: aigentic_api::CheckpointAnswer::Retry,
+                    amendment: None,
+                    ..
+                }]
+            ),
+            "{:?}",
+            daemon.requests()
+        );
+        daemon.stop();
+    }
+
     /// `/build 58` sends the project and the issue, then opens the
     /// lead at seq 0, and the backlog becomes run cells in order — the
     /// first of them saying `started` or `resumed` as the reply did.
@@ -7993,6 +8037,120 @@ mod tests {
         assert_eq!(used, MenuKey::Used, "Esc is the prompt's");
         assert!(repl.menu().is_none(), "the prompt went");
         assert_eq!(daemon.requests().len(), before, "nothing was sent");
+        daemon.stop();
+    }
+
+    /// A step's checks failed: the gate offers `retry` beside `stop`. The row
+    /// sits after the amendments and before the row that sends nothing; `retry`
+    /// typed at a gate that did not offer it is not an answer.
+    #[tokio::test]
+    async fn a_checks_failed_gate_offers_a_retry_row() {
+        let gate = |options: &[&str]| {
+            serde_json::json!({
+                "gate": "checks_failed",
+                "shown": ["runtime: two", "1", "E2"],
+                "options": options,
+            })
+        };
+        let rows = |repl: &ClientRepl| -> Vec<String> {
+            repl.menu()
+                .expect("the prompt is up")
+                .rows
+                .iter()
+                .map(|row| row.label.clone())
+                .collect()
+        };
+
+        // The prompt's rows, and Enter on it sends nothing.
+        let lead_id = Ulid::generate();
+        let backlog = vec![run_event(
+            lead_id,
+            1,
+            EventKind::CheckpointAsked,
+            gate(&["retry", "stop"]),
+        )];
+        let (mut repl, mut out, daemon) = repl_for(lead_id, backlog).await;
+        repl.handle_line("/build 58", &mut out).await;
+        assert_eq!(rows(&repl), ["Retry", "Leave it waiting", "Stop the run"]);
+        let before = daemon.requests().len();
+        repl.menu_key(&key_for_enter(), true, true, &mut out).await;
+        assert_eq!(daemon.requests().len(), before, "Enter sent nothing");
+        assert!(repl.menu().is_none(), "and left the gate waiting");
+        daemon.stop();
+
+        // The Retry row sends `retry`.
+        let lead_id = Ulid::generate();
+        let backlog = vec![run_event(
+            lead_id,
+            1,
+            EventKind::CheckpointAsked,
+            gate(&["retry", "stop"]),
+        )];
+        let (mut repl, mut out, daemon) = repl_for(lead_id, backlog).await;
+        repl.handle_line("/build 58", &mut out).await;
+        let before = daemon.requests().len();
+        repl.menu_key(&key_for('1'), true, true, &mut out).await;
+        assert!(
+            matches!(
+                daemon.requests()[before..],
+                [Request::AnswerCheckpoint {
+                    answer: aigentic_api::CheckpointAnswer::Retry,
+                    amendment: None,
+                    ..
+                }]
+            ),
+            "{:?}",
+            daemon.requests()
+        );
+        daemon.stop();
+
+        // `retry` typed at the prompt is the same answer.
+        let lead_id = Ulid::generate();
+        let backlog = vec![run_event(
+            lead_id,
+            1,
+            EventKind::CheckpointAsked,
+            gate(&["retry", "stop"]),
+        )];
+        let (mut repl, mut out, daemon) = repl_for(lead_id, backlog).await;
+        repl.handle_line("/build 58", &mut out).await;
+        let before = daemon.requests().len();
+        repl.handle_line("retry", &mut out).await;
+        assert!(
+            matches!(
+                daemon.requests()[before..],
+                [Request::AnswerCheckpoint {
+                    answer: aigentic_api::CheckpointAnswer::Retry,
+                    amendment: None,
+                    ..
+                }]
+            ),
+            "{:?}",
+            daemon.requests()
+        );
+        daemon.stop();
+
+        // A gate that offered only `stop` takes no retry.
+        let lead_id = Ulid::generate();
+        let backlog = vec![run_event(
+            lead_id,
+            1,
+            EventKind::CheckpointAsked,
+            checkpoint_asked("route"),
+        )];
+        let (mut repl, mut out, daemon) = repl_for(lead_id, backlog).await;
+        repl.handle_line("/build 58", &mut out).await;
+        assert_eq!(rows(&repl), ["Leave it waiting", "Stop the run"]);
+        let before = daemon.requests().len();
+        repl.handle_line("retry", &mut out).await;
+        assert!(
+            !daemon.requests()[before..]
+                .iter()
+                .any(|r| matches!(r, Request::AnswerCheckpoint { .. })),
+            "no answer was sent: {:?}",
+            daemon.requests()
+        );
+        assert!(repl.menu().is_some(), "and the prompt stayed");
         daemon.stop();
     }
 
