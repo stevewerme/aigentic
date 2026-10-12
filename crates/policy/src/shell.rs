@@ -580,7 +580,7 @@ fn classify_segment(seg: &Segment, allow: &[String], grants: &[String], depth: u
             } else if writing_flag(cmd.text.as_str(), &rest) {
                 w.fold(Kind::Write, None, false);
             } else if flag_sensitive(cmd.text.as_str(), &rest)
-                && rest.iter().any(|a| a.var || !a.subs.is_empty())
+                && argument_the_rules_cannot_read(cmd.text.as_str(), &rest)
             {
                 // An argument the rules cannot read may hold one of
                 // the writing flags.
@@ -757,7 +757,10 @@ fn writing_flag(command: &str, rest: &[&Word]) -> bool {
             Some("branch") => git_branch_writes(&rest[2..]),
             Some("grep") => git_grep_runs_program(&rest[2..]),
             Some("reflog") => git_reflog_writes(&rest[2..]),
-            Some("diff") => rest.iter().skip(2).any(|w| w.text.starts_with("--output")),
+            Some("diff" | "log" | "show") => {
+                rest.iter().skip(2).any(|w| w.text.starts_with("--output"))
+                    || git_diff_runs_program(&rest[2..])
+            }
             _ => false,
         },
         "gh" if rest.get(1).map(|w| w.text.as_str()) == Some("api") => gh_api_writes(&rest[2..]),
@@ -815,11 +818,52 @@ fn git_grep_runs_program(args: &[&Word]) -> bool {
         let t = w.text.as_str();
         if let Some(long) = t.strip_prefix("--") {
             let name = long.split('=').next().unwrap_or(long);
-            !name.is_empty()
-                && ("open-files-in-pager".starts_with(name) || "textconv".starts_with(name))
+            !name.is_empty() && "open-files-in-pager".starts_with(name)
         } else {
             t.starts_with('-') && t.len() > 1 && t[1..].contains('O')
         }
+    }) || args.iter().any(|w| names_textconv(&w.text))
+}
+
+/// Whether a word names git's `--textconv`: the option itself or an
+/// unambiguous prefix of it, with any `=<value>` cut off. `--no-textconv`
+/// turns the filter off and is not one. The reading is loose — a name git
+/// would reject as ambiguous still counts — because an over-ask is
+/// cheaper than a miss.
+fn names_textconv(t: &str) -> bool {
+    let Some(long) = t.strip_prefix("--") else {
+        return false;
+    };
+    let name = long.split('=').next().unwrap_or(long);
+    !name.is_empty() && "textconv".starts_with(name)
+}
+
+/// Whether a word makes `git diff`, `git log` or `git show` run the
+/// filter program repository data names (`.gitattributes` `diff=<driver>`
+/// plus `diff.<driver>.textconv` in config): `--textconv` and its
+/// prefixes, and the `-a`/`--text` spelling that asks for the same
+/// filter, which the loose long-name reading catches too.
+///
+/// `--no-textconv` runs nothing and is not one. A short cluster is read
+/// only up to the first letter that takes a value (`S G L O U M C B l n
+/// X`): git consumes the rest of the word as that option's value, so the
+/// `a` in `git log -Sparse` is part of the pattern, not a flag.
+fn git_diff_runs_program(args: &[&Word]) -> bool {
+    args.iter().any(|w| {
+        let t = w.text.as_str();
+        names_textconv(t)
+            || (t.starts_with('-')
+                && !t.starts_with("--")
+                && t.len() > 1
+                && t[1..]
+                    .chars()
+                    .take_while(|c| {
+                        !matches!(
+                            c,
+                            'S' | 'G' | 'L' | 'O' | 'U' | 'M' | 'C' | 'B' | 'l' | 'n' | 'X'
+                        )
+                    })
+                    .any(|c| c == 'a'))
     })
 }
 
@@ -927,11 +971,27 @@ fn flag_sensitive(command: &str, rest: &[&Word]) -> bool {
         "sed" | "find" | "sort" | "awk" => true,
         "git" => matches!(
             rest.get(1).map(|w| w.text.as_str()),
-            Some("branch" | "diff" | "grep" | "reflog")
+            Some("branch" | "diff" | "grep" | "log" | "reflog" | "show")
         ),
         "gh" => rest.get(1).map(|w| w.text.as_str()) == Some("api"),
         _ => false,
     }
+}
+
+/// Whether an allow-listed command has an argument whose text the rules
+/// cannot read, and so may hold one of its writing flags.
+///
+/// For `git log` and `git show` only a parameter counts: a substitution
+/// there is nearly always a revision (`$(git rev-parse HEAD)`), and
+/// asking on it would make that common form ask. So a substitution that
+/// prints `--textconv` or `--output` runs without asking; its own command
+/// is still classified. Every other command asks on either.
+fn argument_the_rules_cannot_read(command: &str, rest: &[&Word]) -> bool {
+    let git_subcommand = rest.get(1).map(|w| w.text.as_str());
+    if command == "git" && matches!(git_subcommand, Some("log" | "show")) {
+        return rest.iter().any(|a| a.var);
+    }
+    rest.iter().any(|a| a.var || !a.subs.is_empty())
 }
 
 fn segments(pieces: Vec<Piece>) -> Vec<Segment> {
@@ -2330,6 +2390,79 @@ mod tests {
         assert!(allows("git diff --stat"));
         assert!(!allows("git diff --output out.patch"));
         assert!(!allows("git diff --output=out.patch"));
+    }
+
+    #[test]
+    fn git_diff_log_and_show_ask_only_through_textconv_and_output() {
+        // The textconv filter runs the program repository data names, and
+        // `-a`/`--text` ask for the same filter.
+        assert!(!allows("git diff --textconv"));
+        assert!(!allows("git diff --textconv HEAD~1"));
+        assert!(!allows("git diff --text"));
+        assert!(!allows("git diff -a"));
+        assert!(!allows("git log -p --textconv"));
+        assert!(!allows("git log --textconv -1"));
+        assert!(!allows("git show --textconv"));
+        assert!(!allows("git show --textconv HEAD"));
+
+        // `--output` writes a file, as it does for `git diff`.
+        assert!(!allows("git log --output=/tmp/x"));
+        assert!(!allows("git show --output=/tmp/x"));
+
+        // The plain forms, and `--no-textconv`, run no program.
+        assert!(allows("git diff"));
+        assert!(allows("git diff --stat"));
+        assert!(allows("git diff HEAD~1"));
+        assert!(allows("git diff --no-textconv"));
+        assert!(allows("git log --oneline -3"));
+        assert!(allows("git log -p --no-textconv"));
+        assert!(allows("git show --stat"));
+        assert!(allows("git show HEAD --no-textconv"));
+
+        // A value-taking letter ends a cluster: the `a` in these is part
+        // of the value git takes.
+        assert!(allows("git log -Sparse"));
+        assert!(allows("git log -Gmain"));
+        assert!(allows("git log -L1,5:main.rs"));
+    }
+
+    #[test]
+    fn git_diff_log_and_show_write_only_through_their_program_flags() {
+        let read = scan("git diff --stat");
+        assert_eq!(read[0].kind, Kind::Harmless);
+        assert!(!read[0].write_from_command);
+
+        for command in [
+            "git diff --textconv",
+            "git log -p --textconv",
+            "git show --textconv",
+            "git diff -a",
+            "git log --output=/tmp/x",
+            "git show --output=/tmp/x",
+        ] {
+            let seg = scan(command);
+            assert_eq!(seg[0].kind, Kind::Write, "{command}");
+            assert!(seg[0].write_from_command, "{command}");
+        }
+
+        for command in [
+            "git diff --no-textconv",
+            "git log -p --no-textconv",
+            "git show --stat",
+            "git log -Sparse",
+            "git log -Gmain",
+            "git log -L1,5:main.rs",
+        ] {
+            let seg = scan(command);
+            assert_eq!(seg[0].kind, Kind::Harmless, "{command}");
+            assert!(!seg[0].write_from_command, "{command}");
+        }
+
+        // A parameter may hold a writing flag, so it asks; a substitution
+        // is taken as a revision, so `git log --oneline $(git rev-parse
+        // HEAD)` stays read-only.
+        assert_eq!(scan("git log --oneline \"$opt\"")[0].kind, Kind::Unknown);
+        assert_eq!(scan("git show \"$opt\"")[0].kind, Kind::Unknown);
     }
 
     #[test]
