@@ -536,7 +536,8 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
             let mut runtime = self
                 .host
                 .build_child(child, &step.profile, &step.id, &step.deny)
-                .await?;
+                .await?
+                .with_restack(base.clone());
             self.run_turn(&mut runtime, &message).await?;
             if prompt_count(self.host.child_log(child)?.events()) != posted + 1 {
                 return Err(RunnerError::MessageNotPosted);
@@ -545,7 +546,8 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
             let mut runtime = self
                 .host
                 .build_child(child, &step.profile, &step.id, &step.deny)
-                .await?;
+                .await?
+                .with_restack(base);
             let mut observe = |_: Signal<'_>| {};
             if let crate::Resumed::Interrupted { .. } = runtime.resume(None, &mut observe)? {
                 runtime.continue_turn(&mut observe).await?;

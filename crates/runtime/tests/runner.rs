@@ -45,6 +45,15 @@ fn text(t: &str) -> ProviderEvent {
     ProviderEvent::TextDelta(t.into())
 }
 
+/// One scripted `bash` call, the shape `tests/finish_step.rs` uses.
+fn bash_call(id: &str, command: &str) -> ProviderEvent {
+    ProviderEvent::ToolCall(aigentic_core::ToolCall {
+        id: id.into(),
+        name: "bash".into(),
+        args: json!({ "command": command }),
+    })
+}
+
 /// One scripted reply that reports a step and ends its turn.
 fn report(reply: &str, args: Value) -> Vec<ProviderEvent> {
     vec![finish(reply, args), usage(10, 5), done("tool_use")]
@@ -221,6 +230,10 @@ struct FakeHost {
     /// The price table a child's runtime is built with, so a test can see
     /// a real `usage.cost_usd` on its lines.
     prices: Option<Prices>,
+    /// Whether a child's registry is the builtin one, rooted in the
+    /// fixture's work repo, so a test can see a real command's policy
+    /// verdict and what the command did.
+    bash: bool,
 }
 
 impl FakeHost {
@@ -230,6 +243,7 @@ impl FakeHost {
         children: &[(Ulid, Vec<Vec<ProviderEvent>>)],
         caps: BTreeMap<Ulid, u32>,
         prices: Option<Prices>,
+        bash: bool,
     ) -> Self {
         Self {
             dir,
@@ -242,6 +256,7 @@ impl FakeHost {
                 ("flash".to_owned(), "tensorx/deepseek-v4.1-flash".to_owned()),
             ]),
             prices,
+            bash,
         }
     }
 }
@@ -323,8 +338,17 @@ impl RunnerHost for FakeHost {
                 .cloned()
                 .unwrap_or_default();
             let (provider, _seen) = scripted(script.into_iter().skip(answered).collect());
-            let registry: ToolRegistry =
-                vec![Box::new(Noop) as Box<dyn aigentic_core::Tool>].into();
+            let registry: ToolRegistry = if self.bash {
+                // The fixture's work repo is the child's workdir, so a
+                // scripted `bash` call reads and writes the tree the run's
+                // checks read.
+                ToolRegistry::builtin(
+                    aigentic_tools::Workdir::new(self.dir.join("repo")),
+                    aigentic_tools::DEFAULT_TIMEOUT,
+                )
+            } else {
+                vec![Box::new(Noop) as Box<dyn aigentic_core::Tool>].into()
+            };
             Ok((
                 provider,
                 registry,
@@ -393,6 +417,9 @@ struct Fixture {
     workflow: LoadedWorkflow,
     caps: BTreeMap<Ulid, u32>,
     prices: Option<Prices>,
+    /// Whether the children's registry is the builtin one, rooted in the
+    /// fixture's work repo.
+    bash: bool,
 }
 
 /// The runner a fixture builds, named once so a helper's signature stays
@@ -501,7 +528,25 @@ impl Fixture {
             workflow,
             caps: BTreeMap::new(),
             prices: None,
+            bash: false,
         }
+    }
+
+    /// Replace one child's script: a test that must spell a value it only
+    /// knows once the fixture exists (a recorded head) scripts it here.
+    fn script(mut self, id: Ulid, replies: Vec<Vec<ProviderEvent>>) -> Self {
+        if let Some((_, script)) = self.children.iter_mut().find(|(child, _)| *child == id) {
+            *script = replies;
+        }
+        self
+    }
+
+    /// Give every child the builtin tools, rooted in the fixture's work
+    /// repo, so a test can see a real command's policy verdict and what it
+    /// did to that repo.
+    fn with_bash(mut self) -> Self {
+        self.bash = true;
+        self
     }
 
     /// The child the run gave the implementer step, from the lead log:
@@ -535,6 +580,7 @@ impl Fixture {
             &self.children,
             self.caps.clone(),
             self.prices,
+            self.bash,
         );
         Runner::new(
             log,
@@ -1164,6 +1210,16 @@ fn child_report(fx: &Fixture, id: Ulid) -> StepReport {
         .find(|event| event.kind == EventKind::StepReported)
         .expect("the child reported");
     serde_json::from_value(event.payload.clone()).unwrap()
+}
+
+/// Every `tool_result` payload of a run, oldest first: the verdict a
+/// command got and whether it ran.
+fn tool_results(events: &[Event]) -> Vec<aigentic_log::ToolResultPayload> {
+    events
+        .iter()
+        .filter(|event| event.kind == EventKind::ToolResult)
+        .map(|event| serde_json::from_value(event.payload.clone()).unwrap())
+        .collect()
 }
 
 /// The prompts a log holds, in order: the runner's own messages.
@@ -2598,6 +2654,7 @@ async fn t10_slots_reach_the_template_verbatim() {
         &[],
         BTreeMap::new(),
         None,
+        false,
     );
     for (name, expected) in [
         ("issue", fx.issue().to_string()),
@@ -3182,8 +3239,8 @@ fn fold_sentence(base: &str) -> String {
     )
 }
 
-/// T19: a send-back names the fold route, spelled with the step's own
-/// start; a first prompt does not.
+/// A send-back names the fold route, spelled with the step's own start;
+/// a first prompt does not.
 #[tokio::test]
 async fn t19_a_send_back_names_the_fold_route_with_the_steps_own_start() {
     let h = retryable();
@@ -3225,7 +3282,7 @@ async fn t19_a_send_back_names_the_fold_route_with_the_steps_own_start() {
     );
 }
 
-/// T20: the route is withheld once the remote has moved past the step's
+/// The route is withheld once the remote has moved past the step's
 /// start, and the run is never pushed over the stranger.
 #[tokio::test]
 async fn t20_the_fold_route_is_withheld_once_the_remote_has_moved() {
@@ -3981,15 +4038,102 @@ fn foldless_files() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
-/// T22: a step that does not write gets no fold route: no slot in its
-/// prompt, no start recorded to arm one from.
+/// The sanctioned fold line reaches a writing step's own runtime, and no
+/// other base is armed there.
+#[tokio::test]
+async fn t21_the_fold_is_armed_end_to_end_and_another_base_is_not() {
+    let brief = Ulid::generate();
+    let implementer = Ulid::generate();
+    let fx = Fixture::assemble(
+        vec![
+            (brief, vec![report("r1", brief_report())]),
+            (implementer, Vec::new()),
+        ],
+        Vec::new(),
+        None,
+    )
+    .with_bash()
+    .capped(implementer, 6);
+    // The seed commit is what the step's first attempt records, so it is
+    // both the base the runner arms and the value the script spells.
+    let base = fx.initial_head();
+    let other = {
+        let mut digits: Vec<char> = base.chars().collect();
+        let last = *digits.last().unwrap();
+        *digits.last_mut().unwrap() = if last == '0' { '1' } else { '0' };
+        digits.into_iter().collect::<String>()
+    };
+    assert_ne!(other, base);
+    let fx = fx.script(
+        implementer,
+        vec![
+            vec![
+                bash_call("call-1", &format!("git reset --soft {base}")),
+                usage(10, 5),
+                done("tool_use"),
+            ],
+            vec![
+                bash_call("call-2", &format!("git reset --soft {other}")),
+                usage(10, 5),
+                done("tool_use"),
+            ],
+            report("r2", implementer_report()),
+        ],
+    );
+    let mut runner = fx.runner();
+    let mut moves = 0;
+    while tool_results(&fx.child_events_of(implementer)).len() < 2 {
+        moves += 1;
+        assert!(moves < 20, "the child's two calls land within a few moves");
+        runner.advance().await.expect("the run advances");
+        assert_eq!(
+            fx.head(),
+            base,
+            "the sanctioned reset folded nothing: the step had committed nothing"
+        );
+    }
+    let started = step_started(&fx.lead_events());
+    let record = started
+        .iter()
+        .find(|started| started.step == "implement-alone")
+        .expect("the implementer step started");
+    assert_eq!(
+        record.head_at_start.as_deref(),
+        Some(base.as_str()),
+        "the arm's source is the step's own start"
+    );
+    let results = tool_results(&fx.child_events_of(implementer));
+    assert!(
+        !results[0].result.is_error,
+        "the step's own start is sanctioned: {}",
+        results[0].result.content
+    );
+    assert!(
+        results[1].result.is_error && results[1].result.content.contains("step deny git reset"),
+        "another base is refused: {}",
+        results[1].result.content
+    );
+}
+
+/// A step that does not write gets no fold route: no slot in its prompt,
+/// no start recorded, and nothing armed in the child's runtime, so the
+/// very line a writing step is sanctioned to use is refused there.
 #[tokio::test]
 async fn t22_a_step_without_a_start_record_gets_no_fold_route() {
     let child = Ulid::generate();
+    let seed = Fixture::assemble(Vec::new(), Vec::new(), None).initial_head();
+    let fold = format!("git reset --soft {seed}");
     let fx = Fixture::with_workflow(
-        vec![(child, vec![report("s1", reported("## Size", json!({})))])],
+        vec![(
+            child,
+            vec![
+                vec![bash_call("call-1", &fold)],
+                report("s1", reported("## Size", json!({}))),
+            ],
+        )],
         &foldless_files(),
-    );
+    )
+    .with_bash();
 
     let mut runner = fx.runner();
     assert_eq!(
@@ -4012,6 +4156,20 @@ async fn t22_a_step_without_a_start_record_gets_no_fold_route() {
             .iter()
             .all(|started| started.head_at_start.is_none()),
         "a step that does not write records no start"
+    );
+    let results = tool_results(&fx.child_events_of(child));
+    assert_eq!(
+        results.len(),
+        2,
+        "the scripted bash call, then the step's own report"
+    );
+    let Some(aigentic_log::PolicyRecord::Rule { rule, .. }) = results[0].policy.as_ref() else {
+        panic!("a rule refused the call: {:?}", results[0].policy);
+    };
+    assert_eq!(
+        rule, "step deny git reset",
+        "nothing is armed without a start: {}",
+        results[0].result.content
     );
 }
 

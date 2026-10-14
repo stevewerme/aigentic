@@ -541,6 +541,20 @@ impl Runtime {
         Ok(self)
     }
 
+    /// Arm the fold: `base` is the head this step's first attempt recorded,
+    /// and the one commit its deny overlay lets `git reset --soft` name. The
+    /// step's own template offers the same commit, so both come from one
+    /// derivation. A thread without a step, and a `None` base, arm nothing.
+    pub fn with_restack(mut self, base: Option<String>) -> Self {
+        if let Some(context) = self.step.take() {
+            self.step = Some(StepContext {
+                name: context.name,
+                overlay: context.overlay.with_restack_base(base),
+            });
+        }
+        self
+    }
+
     /// This thread's step name, `None` for a thread that is not a step.
     pub fn step(&self) -> Option<&str> {
         self.step.as_ref().map(|s| s.name.as_str())
