@@ -146,24 +146,6 @@ impl Anthropic {
 
 type EventStream<'a> = Pin<Box<dyn Stream<Item = ProviderEvent> + Send + 'a>>;
 
-/// Debugging aid: with `AIGENTIC_DUMP_REQUESTS=<dir>` every request body
-/// is written there as `<unix-millis>.json`. Never includes the key.
-/// Diffing two consecutive bodies is how a silent cache invalidator is
-/// found.
-fn dump_request(body: &MessagesRequest) {
-    let Some(dir) = std::env::var_os("AIGENTIC_DUMP_REQUESTS") else {
-        return;
-    };
-    let millis = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let path = std::path::Path::new(&dir).join(format!("{millis}.json"));
-    if let Ok(json) = serde_json::to_string_pretty(body) {
-        let _ = std::fs::write(path, json);
-    }
-}
-
 fn retryable_status(status: u16) -> bool {
     matches!(status, 429 | 503 | 529)
 }
@@ -186,7 +168,7 @@ fn retryable_failure(failure: &ProviderEvent) -> bool {
 impl Provider for Anthropic {
     fn complete(&self, request: &CompletionRequest<'_>) -> EventStream<'_> {
         let body = self.build_request(request);
-        dump_request(&body);
+        crate::dump_request(&body);
         let url = format!("{}/v1/messages", self.config.base_url.trim_end_matches('/'));
         let client = self.client.clone();
         let api_key = self.config.api_key.clone();

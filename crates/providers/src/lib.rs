@@ -163,6 +163,73 @@ pub(crate) fn retry_reason(failure: &aigentic_core::ProviderEvent) -> String {
     }
 }
 
+/// How many names an occupied millisecond is stepped past before the dump
+/// gives up: a collision costs a name or two, and a directory full of
+/// dumps cannot make the write loop.
+const DUMP_NAME_ATTEMPTS: u128 = 128;
+
+/// Debugging aid: with `AIGENTIC_DUMP_REQUESTS=<dir>` every request body
+/// is written there, pretty-printed, as `<unix-millis>.json`, and the
+/// path written comes back; nothing is written and `None` comes back when
+/// the variable is unset or empty. Never includes the key, and the
+/// directory is the only path the aid takes — never configuration.
+///
+/// The variable is read per call, so a session picks up a change without
+/// a restart.
+pub(crate) fn dump_request(body: &impl serde::Serialize) -> Option<std::path::PathBuf> {
+    let dir = std::env::var_os("AIGENTIC_DUMP_REQUESTS")?;
+    // An empty value names no directory: joined with a file name it would
+    // be the process's working directory.
+    if dir.is_empty() {
+        return None;
+    }
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    dump_request_at(std::path::Path::new(&dir), body, millis)
+}
+
+/// Write one pretty-printed request body as `<millis>.json` inside `dir`,
+/// returning the path written, or `None` when nothing was.
+///
+/// `dir` must already exist: this creates no directory, and a failure — an
+/// absent directory, a read-only path, a body that will not serialise —
+/// writes nothing rather than failing the call.
+///
+/// The name is claimed by creating the file with `create_new`, so two
+/// writers in the same millisecond each keep a body: `millis` steps
+/// forward to the next free name, at most [`DUMP_NAME_ATTEMPTS`] times.
+pub(crate) fn dump_request_at(
+    dir: &std::path::Path,
+    body: &impl serde::Serialize,
+    millis: u128,
+) -> Option<std::path::PathBuf> {
+    use std::io::Write;
+    let json = serde_json::to_string_pretty(body).ok()?;
+    for step in 0..DUMP_NAME_ATTEMPTS {
+        let path = dir.join(format!("{}.json", millis.saturating_add(step)));
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return None,
+        };
+        return match file.write_all(json.as_bytes()) {
+            Ok(()) => Some(path),
+            // A body written halfway reads as a dump; remove it instead.
+            Err(_) => {
+                let _ = std::fs::remove_file(&path);
+                None
+            }
+        };
+    }
+    None
+}
+
 /// Pass a started stream's events to `tx`, watching for a model that has
 /// gone quiet (issue #42). Only model output resets the clock: a text,
 /// tool-call or blob event, usage or a finish. An empty text delta does
@@ -307,6 +374,10 @@ pub(crate) fn http_client() -> reqwest::Client {
 mod tests {
     use super::*;
     use aigentic_core::{CUT_STREAM, ProviderError, ProviderEvent};
+
+    /// A millisecond the dump tests state themselves, so the names they
+    /// expect follow the helper's own rule rather than a clock.
+    const MILLIS: u128 = 1_700_000_000_000;
 
     fn ms(n: u64) -> std::time::Duration {
         std::time::Duration::from_millis(n)
@@ -594,5 +665,42 @@ mod tests {
             rx.try_recv().unwrap(),
             ProviderEvent::Error(ProviderError::Transport(_))
         ));
+    }
+
+    /// The aid's use is diffing two consecutive request bodies, so a
+    /// second dump in the same millisecond must keep the first rather
+    /// than overwrite it — the same name a second run would collide on.
+    #[test]
+    fn two_bodies_dumped_in_one_millisecond_both_survive() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = serde_json::json!({"a": 1});
+        let second = serde_json::json!({"b": 2});
+
+        let first_path = dump_request_at(dir.path(), &first, MILLIS).unwrap();
+        let second_path = dump_request_at(dir.path(), &second, MILLIS).unwrap();
+
+        assert_eq!(first_path, dir.path().join(format!("{MILLIS}.json")));
+        assert_eq!(second_path, dir.path().join(format!("{}.json", MILLIS + 1)));
+        let read = |path: &std::path::Path| -> serde_json::Value {
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+        };
+        assert_eq!(read(&first_path), first);
+        assert_eq!(read(&second_path), second);
+    }
+
+    /// A dump writes inside the directory a person named and nowhere
+    /// else: an absent one is not created, and the wrong value is a
+    /// missing aid rather than a failed call.
+    #[test]
+    fn a_dump_directory_that_is_not_there_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let absent = dir.path().join("absent");
+
+        assert_eq!(
+            dump_request_at(&absent, &serde_json::json!({"a": 1}), MILLIS),
+            None
+        );
+        assert!(!absent.exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 }
