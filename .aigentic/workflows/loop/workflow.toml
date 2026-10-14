@@ -48,6 +48,14 @@ kind = "string"
 required = false
 filled_by = "runner"
 
+# Filled by the runner only when a send-back may fold the step's own
+# commits: the head its first attempt recorded.
+[[slots]]
+name = "head_at_start"
+kind = "string"
+required = false
+filled_by = "runner"
+
 # The commit subjects spec v2 names, one per line; the implementer's E2
 # check holds its commits to them.
 [[slots]]

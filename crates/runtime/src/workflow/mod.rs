@@ -772,6 +772,7 @@ pub(crate) mod tests {
             ("reference_check", serde_json::Value::from("<check>")),
             ("ui", serde_json::Value::Bool(true)),
             ("check_failures", serde_json::Value::from("<failed>")),
+            ("head_at_start", serde_json::Value::from("<base>")),
         ] {
             slots.insert(name.to_string(), value);
         }

@@ -3175,6 +3175,104 @@ async fn t4_a_remote_that_moved_is_never_pushed_over() {
     assert_eq!(fx.installer.calls(), 0, "nothing is installed");
 }
 
+/// The fold route a send-back names, as the templates spell it.
+fn fold_sentence(base: &str) -> String {
+    format!(
+        "To fold work into an earlier commit, `git reset --soft {base}` and recommit it with the same subject and trailer; the tree must not change."
+    )
+}
+
+/// T19: a send-back names the fold route, spelled with the step's own
+/// start; a first prompt does not.
+#[tokio::test]
+async fn t19_a_send_back_names_the_fold_route_with_the_steps_own_start() {
+    let h = retryable();
+    let fx = &h.fx;
+    let run = drive_a_wrong_subject(fx, h.implementer_child, true).await;
+    assert_eq!(
+        run.terminal,
+        Advanced::Finished {
+            outcome: aigentic_log::RunOutcome::Closed
+        },
+        "the send-back's attempt passes and the run closes"
+    );
+
+    let started: Vec<_> = step_started(run.lead())
+        .into_iter()
+        .filter(|started| started.step == "implement-alone")
+        .collect();
+    assert_eq!(started.len(), 2, "one start per attempt");
+    let base = started[0]
+        .head_at_start
+        .clone()
+        .expect("the first attempt records where the step started");
+    assert_eq!(
+        started[1].head_at_start, None,
+        "a later attempt records no start of its own"
+    );
+
+    let prompts = child_prompts(fx, h.implementer_child);
+    assert_eq!(prompts.len(), 2, "one prompt per attempt");
+    assert!(
+        !prompts[0].contains("git reset --soft "),
+        "a first prompt does not name a fold: {}",
+        prompts[0]
+    );
+    assert!(
+        prompts[1].contains(&fold_sentence(&base)),
+        "the send-back names the fold route and the step's own start: {}",
+        prompts[1]
+    );
+}
+
+/// T20: the route is withheld once the remote has moved past the step's
+/// start, and the run is never pushed over the stranger.
+#[tokio::test]
+async fn t20_the_fold_route_is_withheld_once_the_remote_has_moved() {
+    let h = retryable();
+    let fx = &h.fx;
+    let mut runner = fx.runner();
+    let mut subject = WrongSubject::new(h.implementer_child);
+    let mut stranger = None;
+    let advanced = loop {
+        let advanced = runner.advance().await.expect("the run advances");
+        subject.between(fx, true);
+        if fx.head() != fx.initial_head() && stranger.is_none() {
+            // Someone else pushes while the step is still running.
+            stranger = Some(fx.push_a_stranger());
+        }
+        if !matches!(advanced, Advanced::Moved) {
+            break advanced;
+        }
+    };
+
+    assert_eq!(
+        advanced,
+        Advanced::WaitingHuman {
+            gate: "remote_moved".to_owned()
+        },
+        "the moved remote stops the run"
+    );
+    assert_eq!(
+        fx.remote_head(),
+        stranger.unwrap(),
+        "the remote holds the stranger's commit, not the step's"
+    );
+
+    let prompts = child_prompts(fx, h.implementer_child);
+    assert_eq!(prompts.len(), 2, "one prompt per attempt");
+    assert!(
+        prompts[1].contains("Sent back by the runner"),
+        "the second prompt is the send-back: {}",
+        prompts[1]
+    );
+    assert!(
+        !prompts[1].contains("git reset --soft ") && !prompts[1].contains("{{"),
+        "a moved remote withholds the fold route: {}",
+        prompts[1]
+    );
+}
+
 /// T5: the push landed but the process died before `pushed`; a rebuild
 /// pushes nothing again and records the push once.
 #[tokio::test]
@@ -3839,6 +3937,83 @@ marker = "## Size"
 route_by = "size"
 routes = { trivial = "ask", full = "ask" }
 "###;
+
+/// A non-writing step whose template carries the fold block and whose deny
+/// list holds `git reset`: a slot the runner must not fill shows up in its
+/// prompt, and a wrong arm shows up in its overlay.
+const FOLDLESS_TOML: &str = r###"
+name = "foldless-test"
+version = 1
+
+[budget]
+trivial = 3.0
+full = 10.0
+max_raise = 2.0
+
+[[slots]]
+name = "issue"
+kind = "string"
+filled_by = "runner"
+
+[[slots]]
+name = "head_at_start"
+kind = "string"
+required = false
+filled_by = "runner"
+
+[[steps]]
+id = "foldless"
+role = "sizer"
+profile = "flash"
+template = "templates/foldless.md"
+marker = "## Size"
+deny = ["git reset"]
+next = "done"
+"###;
+
+fn foldless_files() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("workflow.toml", FOLDLESS_TOML),
+        (
+            "templates/foldless.md",
+            "size issue {{issue}}\n{{#head_at_start}}\nTo fold work into an earlier commit, `git reset --soft {{head_at_start}}` and recommit it with the same subject and trailer; the tree must not change.\n{{/head_at_start}}\n",
+        ),
+    ]
+}
+
+/// T22: a step that does not write gets no fold route: no slot in its
+/// prompt, no start recorded to arm one from.
+#[tokio::test]
+async fn t22_a_step_without_a_start_record_gets_no_fold_route() {
+    let child = Ulid::generate();
+    let fx = Fixture::with_workflow(
+        vec![(child, vec![report("s1", reported("## Size", json!({})))])],
+        &foldless_files(),
+    );
+
+    let mut runner = fx.runner();
+    assert_eq!(
+        drive(&fx, &mut runner).await,
+        Advanced::Finished {
+            outcome: aigentic_log::RunOutcome::Closed
+        },
+        "the one-step run closes"
+    );
+
+    let prompts = child_prompts(&fx, child);
+    assert_eq!(prompts.len(), 1, "one prompt");
+    assert!(
+        !prompts[0].contains("git reset --soft ") && !prompts[0].contains("{{"),
+        "the fold route is withheld: {}",
+        prompts[0]
+    );
+    assert!(
+        step_started(&fx.lead_events())
+            .iter()
+            .all(|started| started.head_at_start.is_none()),
+        "a step that does not write records no start"
+    );
+}
 
 fn size_files() -> Vec<(&'static str, &'static str)> {
     vec![

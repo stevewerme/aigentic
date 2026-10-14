@@ -17,6 +17,9 @@ Your earlier report failed these checks. Fix each one, run the gate again, and c
 
 {{check_failures}}
 {{/check_failures}}
+{{#head_at_start}}
+To fold work into an earlier commit, `git reset --soft {{head_at_start}}` and recommit it with the same subject and trailer; the tree must not change.
+{{/head_at_start}}
 
 ## Commits
 
@@ -42,7 +45,7 @@ A single named test must report at least `1 passed`. A test or probe that runs p
 
 ## Safety
 
-Never `git reset`, `git checkout -- <file>`, `git stash`, `git clean`, `git add -A` or `git rebase`. Commit nothing under `.scratch/`, and leave `.aigentic/rules.toml` alone.
+Never `git reset` (the fold route the send-back names, and nothing else, is the one exception), `git checkout -- <file>`, `git stash`, `git clean`, `git add -A` or `git rebase`. Commit nothing under `.scratch/`, and leave `.aigentic/rules.toml` alone.
 
 Search the repository with `rg`, never a bare `grep -r` from the root: it walks `target/`, tens of gigabytes, until the timeout kills it.
 

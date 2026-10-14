@@ -29,6 +29,9 @@ Your earlier report failed these checks. Fix each one, then run the gate again a
 
 {{check_failures}}
 {{/check_failures}}
+{{#head_at_start}}
+To fold work into an earlier commit, `git reset --soft {{head_at_start}}` and recommit it with the same subject and trailer; the tree must not change.
+{{/head_at_start}}
 
 ## Commits
 
@@ -68,7 +71,7 @@ A single named test (`cargo test -p <crate> <name>`) must report at least `1 pas
 
 ## Safety
 
-Never `git reset`, `git checkout -- <file>`, `git stash`, `git clean` or `git add -A`: the tree may hold someone else's unfinished work. Never rebase. Commit nothing under `.scratch/`, and leave `.aigentic/rules.toml` alone.
+Never `git reset` (the fold route the send-back names, and nothing else, is the one exception), `git checkout -- <file>`, `git stash`, `git clean` or `git add -A`: the tree may hold someone else's unfinished work. Never rebase. Commit nothing under `.scratch/`, and leave `.aigentic/rules.toml` alone.
 
 ## Report
 

@@ -456,7 +456,7 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
         }
         // The prompt is decided before any child exists, so a slot the
         // brief never reported stops the run here, not mid-step.
-        match self.attempt_message(&step, attempt) {
+        match self.attempt_message(&step, attempt, None) {
             Ok(_) => {}
             Err(err @ RunnerError::Workflow(_)) => {
                 return self.escalate(
@@ -520,6 +520,9 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
         {
             return Ok(waiting);
         }
+        // One value for the whole attempt: the prompt's fold route and the
+        // child's sanction must never disagree.
+        let base = self.restack_base(&step)?;
         let posted = prompt_count(self.host.child_log(child)?.events());
         if posted < attempt {
             // The prompt is not in the child's log yet, whether the step
@@ -529,7 +532,7 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
             if !self.child_started(child)? {
                 self.host.create_child(child, &step.id)?;
             }
-            let message = self.attempt_message(&step, attempt)?;
+            let message = self.attempt_message(&step, attempt, base.as_deref())?;
             let mut runtime = self
                 .host
                 .build_child(child, &step.profile, &step.id, &step.deny)
@@ -761,7 +764,7 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
     /// `go`, `amend` or `stop`. Writing the ask is the whole move, so a
     /// crash before it repeats it and a crash after it waits.
     fn open_checkpoint(&mut self, step: &Step) -> Result<Advanced, RunnerError> {
-        let shown = match self.attempt_message(step, 1) {
+        let shown = match self.attempt_message(step, 1, None) {
             Ok(text) => text,
             Err(err @ RunnerError::Workflow(_)) => {
                 return self.escalate(
@@ -1121,6 +1124,30 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
         }
     }
 
+    /// The base a writing step may fold its own commits back to: the head
+    /// its first attempt recorded, and only while the branch's remote ref
+    /// still sits where that attempt found it. Nothing of the step's work
+    /// has been pushed then — the same rule its push follows — so a soft
+    /// reset onto that head rewrites the step's own commits and nothing
+    /// else.
+    ///
+    /// `None`, without reading git at all, for a step that does not write,
+    /// for a step with no start record (a run begun before the record
+    /// existed), and for a remote that has moved. A git read that fails is
+    /// the runner's own error, as the reads in `start_step` already are.
+    fn restack_base(&self, step: &Step) -> Result<Option<String>, RunnerError> {
+        if !step.writes {
+            return Ok(None);
+        }
+        let StartRecord::Ready { head, remote } = self.start_record(&step.id)? else {
+            return Ok(None);
+        };
+        if self.repo.remote_head(&self.repo.branch()?)? == Some(remote) {
+            return Ok(Some(head));
+        }
+        Ok(None)
+    }
+
     /// The subjects the brief named, in its own order: the `commits` slot
     /// of the last step before this one that reported. Absent, or not a
     /// list of strings, is an empty list — never a guess.
@@ -1423,7 +1450,16 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
     /// first, a short instruction afterwards, and the template again with
     /// the failing checks when a send-back brings the step back. The render
     /// can fail, and a failed render is a `render_failed` escalation.
-    fn attempt_message(&self, step: &Step, attempt: u32) -> Result<String, RunnerError> {
+    ///
+    /// `head_at_start` is the base the send-back may fold onto, handed in
+    /// by the caller so the prompt and the armed overlay carry one value:
+    /// the send-back offers the route only when it is `Some`.
+    fn attempt_message(
+        &self,
+        step: &Step,
+        attempt: u32,
+        head_at_start: Option<&str>,
+    ) -> Result<String, RunnerError> {
         // A send-back reads as a first attempt with the failures handed to
         // it: the same template, plus the failing checks, so the step is
         // told exactly which lines to fix (#57's `check_failures` slot).
@@ -1435,6 +1471,9 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
                 .map(FailedCheck::line)
                 .collect();
             slots.insert("check_failures".to_string(), Value::from(lines.join("\n")));
+            if let Some(base) = head_at_start {
+                slots.insert("head_at_start".to_string(), Value::from(base));
+            }
             return Ok(self.workflow.render(&step.id, &slots)?);
         }
         if attempt <= 1 {

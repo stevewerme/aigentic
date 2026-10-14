@@ -99,6 +99,14 @@ kind = "string"
 required = false
 filled_by = "runner"
 
+# Filled by the runner only when a send-back may fold the step's own
+# commits: the head its first attempt recorded.
+[[slots]]
+name = "head_at_start"
+kind = "string"
+required = false
+filled_by = "runner"
+
 # Step 1: size the work and prepare the implementer's inputs. It routes
 # on the size it reports: a trivial issue goes straight to the
 # implementer, a full one stops to ask the human. A `full = "plan"` route
