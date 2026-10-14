@@ -95,7 +95,7 @@ const UNREADABLE: &str = "unreadable";
 
 /// The `git reset` spelling the fold is: the soft reset to the armed
 /// base. Anything else — `--hard`, `--mixed`, another commit, a fifth
-/// word — is the entry it always was.
+/// word — is denied by the `git reset` entry.
 const FOLD_OPTION: &str = "--soft";
 
 /// The shortest word that may name the base: git resolves an abbreviated
@@ -154,7 +154,7 @@ pub struct StepOverlay {
     /// The commit the step may fold back to, when the runner armed one:
     /// `Some` only for a writing step whose own commits are the head of
     /// an unmoved remote. [`StepOverlay::parse`] never sets it, so a
-    /// list parsed on its own reads as the entry it always was.
+    /// list parsed on its own denies every `git reset`.
     restack_base: Option<String>,
 }
 
@@ -1103,7 +1103,7 @@ mod tests {
     }
 
     /// The carve-out is one segment, and only while it is the line's only
-    /// reset: a second segment is read as it always was, a second reset
+    /// reset: a second segment is read by its own entries, a second reset
     /// on the line makes both the entry, and the same spelling carrying a
     /// redirection is not the sanctioned line, because the effective
     /// words cannot see a target. Each refusal names the entry that
