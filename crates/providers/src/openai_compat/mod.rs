@@ -794,6 +794,55 @@ mod tests {
         assert!(!events.iter().any(|e| matches!(e, ProviderEvent::Error(_))));
     }
 
+    /// A reply whose first content is the model's tool-call syntax written
+    /// as text is retried like a stream that ended before any content, and
+    /// the next attempt's reply is delivered.
+    #[tokio::test]
+    async fn a_reply_that_leaks_call_markup_is_retried() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let chunk = serde_json::json!({"choices": [{"delta": {
+                "content": "<\u{ff5c}DSML\u{ff5c} calls>\n<\u{ff5c}DSML\u{ff5c} invoke name=\"bash\">"
+            }}]});
+            let body = format!(
+                "data: {chunk}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n"
+            );
+            let leaked = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            for reply in [leaked, hi_reply()] {
+                let (mut conn, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 65536];
+                let _ = conn.read(&mut buf);
+                conn.write_all(reply.as_bytes()).unwrap();
+            }
+        });
+        let config =
+            OpenAiCompatConfig::new(format!("http://{addr}/v1"), "m").with_retry(quick_policy());
+        let provider = OpenAiCompat::new(config);
+        let request = CompletionRequest {
+            messages: &[],
+            tools: &[],
+            max_output_tokens: None,
+        };
+        let events: Vec<ProviderEvent> = provider.complete(&request).collect().await;
+        assert!(
+            matches!(
+                events.first(),
+                Some(ProviderEvent::Retried { attempt: 1, .. })
+            ),
+            "{events:?}"
+        );
+        assert!(
+            matches!(events.get(1), Some(ProviderEvent::TextDelta(t)) if t == "hi"),
+            "{events:?}"
+        );
+        assert!(!events.iter().any(|e| matches!(e, ProviderEvent::Error(_))));
+    }
+
     /// A server that answers one request with a 200 and then only SSE
     /// keep-alive comments (a byte-alive stream with no model output) for
     /// `hold`, then closes; `then` is written to the next connection, if

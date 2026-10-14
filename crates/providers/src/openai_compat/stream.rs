@@ -118,7 +118,19 @@ pub struct Translator {
     /// Set when the stream closed with a completion marker or a reason,
     /// so an EOF after it is a clean end rather than a cut (issue #96).
     saw_end: bool,
+    /// The current line of streamed text while it could still be the
+    /// start of leaked tool-call markup; cleared at each newline.
+    line: String,
+    /// The current line can no longer start with the markup, so the rest
+    /// of it is not collected.
+    line_settled: bool,
 }
+
+/// How DeepSeek's own tool-call syntax begins, in its full-width and ASCII
+/// spellings. A reply that writes it at the start of a line was meant as a
+/// tool call and came out as text: nothing in it can be trusted, and the
+/// call it was writing never arrives.
+const LEAKED_CALL_MARKERS: [&str; 2] = ["<\u{ff5c}DSML\u{ff5c}", "<|DSML|"];
 
 impl Translator {
     pub fn new() -> Self {
@@ -156,6 +168,10 @@ impl Translator {
             if let Some(text) = choice.delta.content
                 && !text.is_empty()
             {
+                if self.starts_leaked_markup(&text) {
+                    out.extend(self.cut());
+                    return out;
+                }
                 out.push(ProviderEvent::TextDelta(text));
             }
             if let Some(r) = choice.delta.reasoning_content {
@@ -226,6 +242,48 @@ impl Translator {
             }),
         });
         out
+    }
+
+    /// Whether `text` completes a line that begins, after its leading
+    /// whitespace, with leaked tool-call markup. The markup may be split
+    /// across chunks; a mention inside a sentence or after a backtick is
+    /// prose and passes.
+    fn starts_leaked_markup(&mut self, text: &str) -> bool {
+        for ch in text.chars() {
+            if ch == '\n' {
+                self.line.clear();
+                self.line_settled = false;
+                continue;
+            }
+            if self.line_settled {
+                continue;
+            }
+            self.line.push(ch);
+            let line = self.line.trim_start();
+            if line.is_empty() {
+                continue;
+            }
+            if LEAKED_CALL_MARKERS.iter().any(|m| line.starts_with(m)) {
+                return true;
+            }
+            if !LEAKED_CALL_MARKERS.iter().any(|m| m.starts_with(line)) {
+                self.line.clear();
+                self.line_settled = true;
+            }
+        }
+        false
+    }
+
+    /// End the reply as cut off: leaked markup means the model's call was
+    /// never sent, so the reply ends the way a dropped stream does. Being
+    /// `done`, the translator ignores whatever the stream sends next and
+    /// never flushes a pending call. The adapter retries a cut before any
+    /// content and the runtime retries one after it.
+    fn cut(&mut self) -> Vec<ProviderEvent> {
+        self.done = true;
+        vec![ProviderEvent::Done {
+            finish_reason: CUT_STREAM.to_owned(),
+        }]
     }
 
     fn flush_calls(&mut self) -> Vec<ProviderEvent> {
@@ -578,6 +636,115 @@ mod tests {
         assert_eq!(events[0], ProviderEvent::TextDelta("He".into()));
         assert!(
             matches!(&events[1], ProviderEvent::Error(ProviderError::Transport(m)) if m.contains("connection reset"))
+        );
+    }
+
+    /// One streamed chunk per text piece, then a finish reason and the
+    /// end marker, the shape a provider sends for a plain reply.
+    fn reply_in_pieces(pieces: &[&str]) -> Vec<ProviderEvent> {
+        let mut translator = Translator::new();
+        let mut out = Vec::new();
+        for piece in pieces {
+            let chunk = json!({"choices": [{"delta": {"content": piece}}]});
+            out.extend(translator.on_data(&chunk.to_string()));
+        }
+        let end = json!({"choices": [{"delta": {}, "finish_reason": "stop"}]});
+        out.extend(translator.on_data(&end.to_string()));
+        out.extend(translator.on_data("[DONE]"));
+        out.extend(translator.finish());
+        out
+    }
+
+    fn text_of(events: &[ProviderEvent]) -> String {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                ProviderEvent::TextDelta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The model's own tool-call syntax at the start of a line ends the
+    /// reply as a cut, in either spelling and split anywhere across chunks,
+    /// so the call it meant is retried rather than read as a finished turn.
+    #[test]
+    fn leaked_call_markup_at_a_line_start_cuts_the_reply() {
+        for marker in LEAKED_CALL_MARKERS {
+            let leak = format!("{marker} calls>\n{marker} invoke name=\"update_tasks\">");
+            let whole = format!("Checked.\n\n  {leak}");
+            for split in 1..whole.chars().count() {
+                let at = whole.char_indices().nth(split).unwrap().0;
+                let events = reply_in_pieces(&[&whole[..at], &whole[at..]]);
+                assert_eq!(
+                    events.last(),
+                    Some(&ProviderEvent::Done {
+                        finish_reason: CUT_STREAM.to_owned()
+                    }),
+                    "{marker} split at {split}: {events:?}"
+                );
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|e| matches!(e, ProviderEvent::Done { .. }))
+                        .count(),
+                    1,
+                    "{events:?}"
+                );
+                assert!(
+                    !text_of(&events).contains(marker),
+                    "the markup is never passed on as text: {events:?}"
+                );
+            }
+        }
+    }
+
+    /// A reply that talks about the markup, mid-sentence or quoted, is
+    /// prose: it streams whole and ends with the provider's own reason.
+    #[test]
+    fn the_markup_mentioned_in_prose_passes() {
+        for marker in LEAKED_CALL_MARKERS {
+            let prose = format!(
+                "The DSML syntax looks like `{marker} calls>`.\nIt starts with {marker} and a name.\n"
+            );
+            let events = reply_in_pieces(&[&prose[..10], &prose[10..]]);
+            assert_eq!(text_of(&events), prose, "{marker}");
+            assert_eq!(
+                events.last(),
+                Some(&ProviderEvent::Done {
+                    finish_reason: "stop".to_owned()
+                }),
+                "{events:?}"
+            );
+        }
+    }
+
+    /// A tool call already streamed is not flushed once the reply leaks
+    /// markup: the reply is cut, and nothing of it is trusted.
+    #[test]
+    fn a_cut_for_leaked_markup_drops_pending_calls() {
+        let mut translator = Translator::new();
+        let call = json!({"choices": [{"delta": {"tool_calls": [
+            {"index": 0, "id": "c1", "function": {"name": "read_file", "arguments": "{}"}}
+        ]}}]});
+        let mut events = translator.on_data(&call.to_string());
+        let leak = json!({"choices": [{"delta": {"content": format!("{} calls>", LEAKED_CALL_MARKERS[0])}}]});
+        events.extend(translator.on_data(&leak.to_string()));
+        events.extend(translator.on_data(
+            &json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}).to_string(),
+        ));
+        events.extend(translator.finish());
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ProviderEvent::ToolCall(_))),
+            "{events:?}"
+        );
+        assert_eq!(
+            events,
+            vec![ProviderEvent::Done {
+                finish_reason: CUT_STREAM.to_owned()
+            }]
         );
     }
 }
