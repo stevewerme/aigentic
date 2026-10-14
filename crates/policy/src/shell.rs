@@ -1019,10 +1019,21 @@ pub(crate) struct SegRead {
     /// The effective words: leading assignments and introducers, the
     /// forwarders ([`FORWARDERS`]) with their own words and options, and
     /// `git`'s global options are gone, and `git add --all` reads as
-    /// `git add -A`. A redirection's target is kept, on the end, because
-    /// the overlay's `.env` rule reads the same list and the command
-    /// entries only look at the front.
+    /// `git add -A`. A redirection's target is not here, whatever its
+    /// kind: it goes to `literal`, which the overlay's `.env` rule reads,
+    /// and the command entries only look at the front, so nothing that
+    /// writes can be judged from this list alone.
     pub words: Vec<String>,
+    /// Every raw word of the segment, in order, before anything is
+    /// stripped. The effective words are the wrong list to judge a
+    /// spelling by: the reader steps over `git`'s global options, so
+    /// `git -C /elsewhere reset` and `git reset` read alike without the
+    /// raw words to compare.
+    pub as_written: Vec<String>,
+    /// Whether the segment carries a redirection of any kind. `words`
+    /// cannot see a target, so a guard that must not be talked past by
+    /// `git reset --soft <sha> > file` asks this.
+    pub redirects: bool,
     /// The literal words only, paths among them: the `.env` rule is a
     /// literal-only guard, so a word holding an unresolved `$var` or a
     /// substitution is not a path it can read.
@@ -1054,6 +1065,8 @@ fn reads_within(src: &str, out: &mut Vec<SegRead>, depth: usize) {
         // either, so it says so instead of guessing.
         out.push(SegRead {
             words: Vec::new(),
+            as_written: Vec::new(),
+            redirects: false,
             literal: Vec::new(),
             unreadable: true,
             sets_index: false,
@@ -1228,6 +1241,8 @@ fn read_segment(seg: &Segment) -> (SegRead, Vec<String>) {
     (
         SegRead {
             words: effective,
+            as_written: seg.words.iter().map(|w| w.text.clone()).collect(),
+            redirects: !seg.redirects.is_empty(),
             literal,
             unreadable,
             sets_index,

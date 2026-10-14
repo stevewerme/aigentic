@@ -38,7 +38,12 @@ use std::fmt;
 use aigentic_core::ToolCall;
 
 use crate::Outcome;
-use crate::shell::{SegRead, segment_reads};
+use crate::shell::{GIT_VALUES, SegRead, segment_reads};
+
+/// The one entry a step may be armed past: a writing step that has
+/// committed something it must reword folds that work back with
+/// [`StepOverlay::with_restack_base`]. Nothing else moves the tree.
+const FOLD_ROW: &[&str] = &["git", "reset"];
 
 /// The command entries, as word prefixes of a bash segment's effective
 /// words: `(label, words, reason)`. `git commit` and `git add` are for a
@@ -46,7 +51,7 @@ use crate::shell::{SegRead, segment_reads};
 const COMMANDS: &[(&str, &[&str], &str)] = &[
     ("git push", &["git", "push"], PUSH_REASON),
     ("git rebase", &["git", "rebase"], TREE_REASON),
-    ("git reset", &["git", "reset"], TREE_REASON),
+    ("git reset", FOLD_ROW, TREE_REASON),
     ("git checkout --", &["git", "checkout", "--"], TREE_REASON),
     ("git stash", &["git", "stash"], TREE_REASON),
     ("git clean", &["git", "clean"], TREE_REASON),
@@ -87,6 +92,16 @@ const COPY_ENV: &str = "copy .env";
 
 /// The rule a command word that cannot be read denies with.
 const UNREADABLE: &str = "unreadable";
+
+/// The `git reset` spelling the fold is: the soft reset to the armed
+/// base. Anything else — `--hard`, `--mixed`, another commit, a fifth
+/// word — is the entry it always was.
+const FOLD_OPTION: &str = "--soft";
+
+/// The shortest word that may name the base: git resolves an abbreviated
+/// object id of seven hex digits and up, so a shorter word names
+/// nothing and the fold is refused.
+const BASE_ABBREV: usize = 7;
 
 const PUSH_REASON: &str =
     "the runner pushes once after its checks (PLAN-layer2 §6.4); commit and call finish_step";
@@ -136,6 +151,11 @@ pub struct StepOverlay {
     commands: Vec<(&'static str, &'static [&'static str], &'static str)>,
     /// Whether the list carries the `.env` entry.
     copy_env: bool,
+    /// The commit the step may fold back to, when the runner armed one:
+    /// `Some` only for a writing step whose own commits are the head of
+    /// an unmoved remote. [`StepOverlay::parse`] never sets it, so a
+    /// list parsed on its own reads as the entry it always was.
+    restack_base: Option<String>,
 }
 
 impl StepOverlay {
@@ -159,6 +179,14 @@ impl StepOverlay {
             }
         }
         Ok(overlay)
+    }
+
+    /// Arm the fold: the step may restack the commits it made since
+    /// `base` with one exact `git reset --soft <base>` line, and
+    /// `None` leaves the overlay exactly as it reads without this call.
+    pub fn with_restack_base(mut self, base: Option<String>) -> Self {
+        self.restack_base = base;
+        self
     }
 
     /// What the overlay says about a call, whatever the rules and the
@@ -197,11 +225,17 @@ impl StepOverlay {
     /// The entry with the most words a segment matches; a tie goes to
     /// the earlier entry. A segment matches when its effective words
     /// start with the entry's words, so `git push` covers
-    /// `git push --force` and never `git pushy`.
+    /// `git push --force` and never `git pushy`. The one segment the
+    /// fold covers matches nothing here, so the list keeps its entries
+    /// and loses one spelling of one of them.
     fn command(&self, reads: &[SegRead]) -> Option<(&'static str, &'static str)> {
+        let fold = self.fold_at(reads);
         let mut best: Option<(&'static str, usize, &'static str)> = None;
         for (label, words, reason) in &self.commands {
-            let matched = reads.iter().any(|read| starts_with(&read.words, words));
+            let matched = reads
+                .iter()
+                .enumerate()
+                .any(|(at, read)| Some(at) != fold && starts_with(&read.words, words));
             let better = match best {
                 None => true,
                 Some((_, len, _)) => words.len() > len,
@@ -212,6 +246,49 @@ impl StepOverlay {
         }
         best.map(|(label, _, reason)| (label, reason))
     }
+
+    /// The segment the fold covers, if any: the armed base in the one
+    /// spelling the route names, and only as the line's only `git reset`
+    /// — two resets on one line are not that spelling, so the entry
+    /// catches both. Every other word of the list, every other segment,
+    /// and every guard in `decide` are untouched by the arming.
+    fn fold_at(&self, reads: &[SegRead]) -> Option<usize> {
+        let base = self.restack_base.as_deref()?;
+        let mut resetting = reads
+            .iter()
+            .enumerate()
+            .filter(|(_, read)| starts_with(&read.words, FOLD_ROW));
+        let (at, read) = resetting.next()?;
+        if resetting.next().is_some() {
+            return None;
+        }
+        let [_, _, option, named] = read.words.as_slice() else {
+            return None;
+        };
+        // A redirection, a `git` global option or a word that is not the
+        // base each mean this is some other command that happens to read
+        // as the fold's effective words, so it stays the entry.
+        (option == FOLD_OPTION
+            && !read.redirects
+            && names_base(named, base)
+            && !read
+                .as_written
+                .iter()
+                .any(|word| GIT_VALUES.iter().any(|value| word.starts_with(value))))
+        .then_some(at)
+    }
+}
+
+/// Whether a word names `base`: the commit itself, or a prefix of at
+/// least [`BASE_ABBREV`] hex digits, which git resolves on its own.
+/// `HEAD`, a branch, a substitution and a quoted word are none of them,
+/// so only the base or its abbreviation is ever a name for it. Case is
+/// folded: a sha read back from a caller may be upper case.
+fn names_base(word: &str, base: &str) -> bool {
+    let word = word.to_ascii_lowercase();
+    word.len() >= BASE_ABBREV
+        && word.chars().all(|c| c.is_ascii_hexdigit())
+        && base.to_ascii_lowercase().starts_with(&word)
 }
 
 fn starts_with(words: &[String], entry: &[&str]) -> bool {
@@ -904,6 +981,159 @@ mod tests {
         assert_eq!(
             policy_with(&["git push"]).decide(&bash("git -c pull.rebase=true pull")),
             None
+        );
+    }
+
+    /// A 40-character commit id, as git writes one. The fold is armed
+    /// with it and every other spelling below is derived from it, so no
+    /// expectation is a hand-typed sha.
+    const BASE: &str = "3f1a9c2b7d4e5081a6b3c9d2e5f704182a5b6c7d";
+
+    /// A second commit id, the same length: the base a line must not name
+    /// when the step is armed with [`BASE`].
+    const OTHER: &str = "9c8b7a6f5e4d3c2b1a09f8e7d6c5b4a392817060";
+
+    /// The overlay of `deny` with the fold armed at `base`.
+    fn armed(deny: &[&str], base: &str) -> StepOverlay {
+        policy_with(deny).with_restack_base(Some(base.to_owned()))
+    }
+
+    /// The issue's escape is exactly one spelling, and every form the
+    /// entry must keep catching is refused as the entry: a harder reset,
+    /// another commit, a word that names no commit, an unresolved or a
+    /// quoted word, the value welded to the option, a separator, a second
+    /// option, a fifth word. None of them is a spelling the guard could
+    /// misread as the fold, and none is `unreadable`.
+    #[test]
+    fn t20_the_sanctioned_soft_reset_is_allowed_and_every_other_form_is_refused() {
+        let overlay = armed(&["git reset", "git stash", "git clean"], BASE);
+        assert_eq!(
+            overlay.decide(&bash(&format!("git reset --soft {BASE}"))),
+            None
+        );
+        for line in [
+            "git reset --hard".to_owned(),
+            format!("git reset --soft {OTHER}"),
+            "git reset --soft HEAD".to_owned(),
+            format!("git reset --soft {BASE}~1"),
+            "git reset --soft 0123456".to_owned(),
+            "git reset --soft $(git rev-parse HEAD)".to_owned(),
+            "git reset --soft \"$SHA\"".to_owned(),
+            format!("git reset --soft={BASE}"),
+            format!("git reset --soft -- {BASE}"),
+            format!("git reset -q --soft {BASE}"),
+            format!("git reset --soft {BASE} extra"),
+            format!("git reset --soft \"{BASE} extra\""),
+        ] {
+            assert_eq!(
+                denied(&overlay, &bash(&line)),
+                "step deny git reset",
+                "{line}"
+            );
+        }
+    }
+
+    /// The arm names one commit: the same line is allowed only when the
+    /// armed base is the commit it names, so an unarmed overlay and a
+    /// differently armed one both refuse it. A full sha either way and an
+    /// abbreviation of seven hex digits and up name the commit; six is
+    /// not a name for it.
+    #[test]
+    fn t21_the_sanction_is_armed_for_one_commit_and_only_when_armed() {
+        let line = format!("git reset --soft {BASE}");
+        assert_eq!(armed(&["git reset"], BASE).decide(&bash(&line)), None);
+        assert_eq!(
+            denied(&armed(&["git reset"], OTHER), &bash(&line)),
+            "step deny git reset"
+        );
+        assert_eq!(
+            denied(&policy_with(&["git reset"]), &bash(&line)),
+            "step deny git reset"
+        );
+        // A sha read back from a caller may be upper case.
+        assert_eq!(
+            armed(&["git reset"], &BASE.to_uppercase()).decide(&bash(&line)),
+            None
+        );
+        for len in BASE_ABBREV..=BASE.len() {
+            let word = &BASE[..len];
+            let line = format!("git reset --soft {word}");
+            assert_eq!(
+                armed(&["git reset"], BASE).decide(&bash(&line)),
+                None,
+                "{word}"
+            );
+        }
+        let short = &BASE[..BASE_ABBREV - 1];
+        let line = format!("git reset --soft {short}");
+        assert_eq!(
+            denied(&armed(&["git reset"], BASE), &bash(&line)),
+            "step deny git reset",
+            "{short}"
+        );
+    }
+
+    /// The reader steps over `git`'s global options, so a reset aimed
+    /// elsewhere would otherwise reach the carve-out spelled exactly like
+    /// the sanctioned line: `git -C /elsewhere reset --soft <base>` reads
+    /// as four words. Every spelling the reader accepts for every option
+    /// the table names is refused, and an option that takes no value is
+    /// not — the guard is the value table, not "any option in front".
+    #[test]
+    fn t22_a_git_global_option_on_the_line_refuses_the_sanction() {
+        let overlay = armed(&["git reset"], BASE);
+        let value = "/elsewhere";
+        for opt in GIT_VALUES {
+            let sep = if opt.starts_with("--") { "=" } else { "" };
+            for line in [
+                format!("git {opt} {value} reset --soft {BASE}"),
+                format!("git {opt}{sep}{value} reset --soft {BASE}"),
+            ] {
+                assert_eq!(
+                    denied(&overlay, &bash(&line)),
+                    "step deny git reset",
+                    "{line}"
+                );
+            }
+        }
+        assert_eq!(
+            overlay.decide(&bash(&format!("git --no-pager reset --soft {BASE}"))),
+            None
+        );
+    }
+
+    /// The carve-out is one segment, and only while it is the line's only
+    /// reset: a second segment is read as it always was, a second reset
+    /// on the line makes both the entry, and the same spelling carrying a
+    /// redirection is not the sanctioned line, because the effective
+    /// words cannot see a target. Each refusal names the entry that
+    /// caught it. The scratch-index guard runs before any entry, so it
+    /// names its own rule whatever the step is armed with.
+    #[test]
+    fn t23_another_segment_on_the_line_still_denies() {
+        let overlay = armed(&["git reset", "git stash", "git clean"], BASE);
+        let fold = format!("git reset --soft {BASE}");
+        let cases: Vec<(String, &str)> = vec![
+            (format!("{fold} && git reset --hard"), "git reset"),
+            (format!("{fold} && {fold}"), "git reset"),
+            (format!("{fold}; git stash"), "git stash"),
+            (format!("{fold}; git clean -fd"), "git clean"),
+            (format!("{fold} > /tmp/out"), "git reset"),
+            (format!("{fold} 2>/dev/null"), "git reset"),
+        ];
+        for (line, entry) in cases {
+            assert_eq!(
+                denied(&overlay, &bash(&line)),
+                format!("step deny {entry}"),
+                "{line}"
+            );
+        }
+        assert_eq!(
+            denied(
+                &overlay,
+                &bash(&format!("GIT_INDEX_FILE=/tmp/i git reset --soft {BASE}"))
+            ),
+            "step deny GIT_INDEX_FILE"
         );
     }
 
