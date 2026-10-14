@@ -43,6 +43,8 @@ Then search `{{gate_log}}` in a separate call (`grep -E 'test result:|FAILED|pan
 
 A single named test must report at least `1 passed`. A test or probe that runs past about 2 minutes is a finding: stop it, shrink the input and look for the cost. A red test is "pre-existing" only once proven red at the base, built in its own `CARGO_TARGET_DIR` under `/tmp` (deleted afterwards). `t6_new_front_makes_a_second_front_thread_the_front_now_resumes` in `crates/server/tests/front.rs` is a known flake: if it's the only red test, rerun it alone once and quote both results.
 
+Run each planned test as its own bash call, `cargo test -p <crate> <exact name>`, with no pipe, no redirection and no loop, so the checks can read its output.
+
 ## Safety
 
 Never `git reset` (the fold route the send-back names, and nothing else, is the one exception), `git checkout -- <file>`, `git stash`, `git clean`, `git add -A` or `git rebase`. Commit nothing under `.scratch/`, and leave `.aigentic/rules.toml` alone.

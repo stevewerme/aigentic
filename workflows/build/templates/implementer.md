@@ -69,6 +69,8 @@ Then search `{{gate_log}}` (`grep -E 'test result:|FAILED|panicked' {{gate_log}}
 
 A single named test (`cargo test -p <crate> <name>`) must report at least `1 passed`. `0 passed` means the name matched nothing or the test binary is stale: fix the name, or touch the file and rebuild, before concluding anything.
 
+Run each planned test as its own bash call, `cargo test -p <crate> <exact name>`, with no pipe, no redirection and no loop, so the checks can read its output.
+
 ## Safety
 
 Never `git reset` (the fold route the send-back names, and nothing else, is the one exception), `git checkout -- <file>`, `git stash`, `git clean` or `git add -A`: the tree may hold someone else's unfinished work. Never rebase. Commit nothing under `.scratch/`, and leave `.aigentic/rules.toml` alone.

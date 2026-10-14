@@ -17,7 +17,7 @@ use aigentic_runtime::runner::{
     Advanced, FakeForge, FakeInstaller, Forge, GhForge, GitRepo, IssueView, Runner, RunnerError,
     RunnerHost, WriteGuard,
 };
-use aigentic_runtime::workflow::{LoadedWorkflow, WorkflowFile, WorkflowOrigin};
+use aigentic_runtime::workflow::{LoadedWorkflow, SlotKind, WorkflowFile, WorkflowOrigin};
 use aigentic_runtime::{Answer, Approver, LENGTH_STOP, Prices, Runtime};
 use aigentic_runtime::{
     STEP_REPORTED,
@@ -3959,6 +3959,93 @@ fn the_repositorys_loop_workflow_loads() {
             .get("changes")
             .map(String::as_str),
         Some("fix")
+    );
+}
+
+/// Both loop prompts and the bundled standalone implementer name the one
+/// form the checks can read: a named run as its own bash call, inside the
+/// gate section — and, where the prompt carries the `1 passed` rule, under
+/// it.
+///
+/// The standalone prompt is rendered twice with the whole slot map filled:
+/// once with the `ui` section and once without it, since a sentence that
+/// landed in that section would be missing from the code-only prompt.
+#[test]
+fn the_implementation_prompts_ask_for_one_unpiped_call_per_test() {
+    const CALL: &str = "Run each planned test as its own bash call, `cargo test -p <crate> <exact name>`, with no pipe, no redirection and no loop, so the checks can read its output.";
+
+    /// Every declared slot filled by its kind, so optional sections are
+    /// kept and no tag is left empty.
+    fn filled(loaded: &LoadedWorkflow) -> BTreeMap<String, Value> {
+        loaded
+            .workflow
+            .slots
+            .iter()
+            .map(|slot| {
+                let value = match slot.kind {
+                    SlotKind::Bool => Value::Bool(true),
+                    SlotKind::String => Value::String(format!("x {}", slot.name)),
+                };
+                (slot.name.clone(), value)
+            })
+            .collect()
+    }
+
+    /// The offset of a phrase asserted to occur exactly once: a sentence
+    /// copied twice, or into the safety list, fails the position it is
+    /// read at.
+    fn only(prompt: &str, needle: &str) -> usize {
+        let mut found = prompt.match_indices(needle).map(|(at, _)| at);
+        let at = found
+            .next()
+            .unwrap_or_else(|| panic!("{needle:?} is missing"));
+        assert!(found.next().is_none(), "{needle:?} occurs more than once");
+        at
+    }
+
+    fn checked(prompt: &str, carries_the_rule: bool) {
+        let call = only(prompt, CALL);
+        assert!(
+            only(prompt, "## The gate") < call,
+            "the sentence sits outside the gate section"
+        );
+        assert!(
+            call < only(prompt, "## Safety"),
+            "the sentence sits in the safety list"
+        );
+        if carries_the_rule {
+            assert!(
+                only(prompt, "`1 passed`") < call,
+                "the sentence sits above the rule it qualifies"
+            );
+        }
+    }
+
+    let loop_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.aigentic/workflows/loop");
+    let loop_workflow =
+        WorkflowFile::load_dir(&loop_dir, WorkflowOrigin::Project).expect("the loop loads");
+    let loop_slots = filled(&loop_workflow);
+    for (step, carries_the_rule) in [("implement", true), ("fix", false)] {
+        let prompt = loop_workflow.render(step, &loop_slots).expect("it renders");
+        checked(&prompt, carries_the_rule);
+    }
+
+    let build_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../workflows/build");
+    let build_workflow = WorkflowFile::load_dir(&build_dir, WorkflowOrigin::Bundled)
+        .expect("the bundled build workflow loads");
+    let mut build_slots = filled(&build_workflow);
+    checked(
+        &build_workflow
+            .render("implement-alone", &build_slots)
+            .expect("it renders"),
+        true,
+    );
+    build_slots.insert("ui".to_string(), Value::Bool(false));
+    checked(
+        &build_workflow
+            .render("implement-alone", &build_slots)
+            .expect("it renders"),
+        true,
     );
 }
 

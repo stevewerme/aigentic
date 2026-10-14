@@ -27,6 +27,8 @@ Do not push: the runner does, and waits for CI.
 
 Each in its own bash call, nothing before or after it: `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, `cargo test > {{gate_log}} 2>&1` with `timeout_secs: 900`; then search `{{gate_log}}` in a separate call.
 
+Run each planned test as its own bash call, `cargo test -p <crate> <exact name>`, with no pipe, no redirection and no loop, so the checks can read its output.
+
 ## Safety
 
 Never `git reset` (the fold route the send-back names, and nothing else, is the one exception), `git checkout -- <file>`, `git stash`, `git clean`, `git add -A` or `git rebase`. Commit nothing under `.scratch/`; leave `.aigentic/rules.toml` alone.
