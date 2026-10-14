@@ -135,6 +135,14 @@ async fn a_400_call_dumps_the_body_it_sent_and_unset_writes_nothing() {
     // An empty value names no directory, so the second call writes
     // nothing: without this, the name would join onto "" and land in the
     // process's working directory.
+    let cwd_dumps = || -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(".")
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("json"))
+            .collect()
+    };
+    let cwd_before = cwd_dumps();
     unsafe { std::env::set_var("AIGENTIC_DUMP_REQUESTS", "") };
     let second = provider(&stub_400(), KEY);
     let events: Vec<ProviderEvent> = second.complete(&request).collect().await;
@@ -149,4 +157,9 @@ async fn a_400_call_dumps_the_body_it_sent_and_unset_writes_nothing() {
 
     let dumped = paths();
     assert_eq!(dumped.len(), 1, "an empty value writes nothing: {dumped:?}");
+    assert_eq!(
+        cwd_dumps(),
+        cwd_before,
+        "an empty value writes nothing into the working directory either"
+    );
 }
