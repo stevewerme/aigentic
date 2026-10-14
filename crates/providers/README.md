@@ -33,6 +33,13 @@ let stream = provider.complete(&CompletionRequest {
 });
 ```
 
+With `AIGENTIC_DUMP_REQUESTS=<dir>` set, every request body either adapter
+sends is also written there, pretty-printed, as `<unix-millis>.json`; the
+directory must already exist, and an unset or empty value writes nothing.
+The key is never in a body, so it is never in a dump. Diffing two
+consecutive bodies is how a silent cache invalidator — or the parameter a
+400 follows — is found.
+
 ## What leaks through the abstraction, and where it goes
 
 | Concern | Handling |
@@ -157,10 +164,6 @@ tool-call request twice, keeping the second, so `tool_calls.sse` shows
 3. On the second turn `/cost` must show `cache read > 0`.
 4. Resume a thread recorded on TensorX with `--profile anthropic` and ask
    what happened earlier; then the reverse.
-
-Set `AIGENTIC_DUMP_REQUESTS=<dir>` to write every request body there as
-JSON (never the key); diffing two consecutive bodies is how a silent cache
-invalidator is found.
 
 Status: all four steps passed on 2026-09-21 with `claude-opus-5`. Fixtures
 were recorded; the parser needed no change. A thread produced entirely on

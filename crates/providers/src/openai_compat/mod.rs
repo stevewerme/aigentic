@@ -259,6 +259,7 @@ fn retryable(failure: &ProviderEvent) -> bool {
 impl Provider for OpenAiCompat {
     fn complete(&self, request: &CompletionRequest<'_>) -> EventStream<'_> {
         let body = self.build_request(request);
+        crate::dump_request(&body);
         let url = format!(
             "{}/chat/completions",
             self.config.base_url.trim_end_matches('/')
@@ -414,6 +415,49 @@ mod tests {
         assert_eq!(body["tools"][0]["type"], "function");
         assert_eq!(body["tools"][0]["function"]["name"], "read_file");
         assert_eq!(body["tools"][0]["function"]["parameters"]["type"], "object");
+    }
+
+    /// The dumped file is the body that goes out, so the parameter an
+    /// endpoint rejected is in the one step a person takes to read it.
+    #[test]
+    fn the_dump_holds_the_request_the_adapter_sends() {
+        const BASE: &str = "http://x/v1";
+        const MODEL: &str = "m";
+        const EFFORT: &str = "medium";
+        const MILLIS: u128 = 1_700_000_000_000;
+        let provider =
+            OpenAiCompat::new(OpenAiCompatConfig::new(BASE, MODEL).with_reasoning_effort(
+                REASONING_EFFORT_PARAM,
+                ReasoningEffort::Label(EFFORT.into()),
+            ));
+        let tools = [ToolSpec {
+            name: "read_file".into(),
+            description: "Read".into(),
+            schema: json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+        }];
+        let messages = [Message {
+            role: Role::User,
+            author: Author::User(UserId("steve".into())),
+            blocks: vec![ContentBlock::Text("hi".into())],
+        }];
+        let request = CompletionRequest {
+            messages: &messages,
+            tools: &tools,
+            max_output_tokens: Some(512),
+        };
+        let body = provider.build_request(&request);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = crate::dump_request_at(dir.path(), &body, MILLIS).unwrap();
+
+        assert_eq!(path, dir.path().join(format!("{MILLIS}.json")));
+        let dumped: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(dumped, serde_json::to_value(&body).unwrap());
+        assert_eq!(
+            dumped[REASONING_EFFORT_PARAM],
+            serde_json::to_value(ReasoningEffort::Label(EFFORT.into())).unwrap()
+        );
     }
 
     #[test]
