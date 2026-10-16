@@ -378,4 +378,28 @@ mod tests {
         assert!(may("a", &decide));
         assert!(may("nobody", &Request::ListProjects));
     }
+
+    /// T14 (issue #79): the jobs listing is judged per project. An
+    /// unscoped ask names none, so the pre-check leaves it to the
+    /// handler; a scoped one needs the read role in the project it
+    /// names. `every_request_has_its_row` carries the same two rows.
+    #[test]
+    fn jobs_is_judged_per_project() {
+        let unscoped = Request::Jobs { project: None };
+        let scoped = Request::Jobs {
+            project: Some("p".into()),
+        };
+        assert_eq!(needs(&unscoped), None);
+        assert_eq!(needs(&scoped), Some(Role::Read));
+
+        // Through the participants: a caller the project file does not
+        // name has no role, so it cannot cover the read the scoped ask
+        // needs; the unscoped ask needs nothing, which the handler then
+        // judges per row.
+        let p: Participants = toml::from_str("r = \"read\"\n").unwrap();
+        assert_eq!(needs(&scoped), Some(Role::Read));
+        assert!(p.allows("r", "owner", Role::Read));
+        assert_eq!(p.role("nobody", "owner"), None);
+        assert!(!p.allows("nobody", "owner", Role::Read));
+    }
 }

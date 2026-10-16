@@ -454,7 +454,11 @@ impl Fixture {
         let server_cfg = ServerConfig {
             listen: "unix".into(),
             idle_unload_secs: 3600,
-            users: ["steve", "magnus", "reviewer", "viewer"]
+            // `outsider` is a user of this daemon with no role in `p`:
+            // every listing judges the project's participants, so a
+            // user the project file does not name can prove the
+            // refusal (issue #79, T14).
+            users: ["steve", "magnus", "reviewer", "viewer", "outsider"]
                 .iter()
                 .map(|n| UserConfig {
                     name: (*n).to_owned(),
@@ -857,6 +861,58 @@ async fn t3_only_todays_leads_are_rows() {
     let ids: Vec<Ulid> = rows.iter().map(|row| row.id).collect();
     assert_eq!(ids, vec![newer, older], "today's leads, newest first");
     assert_eq!(rows[0].project, "p");
+}
+
+/// T14 — the roles (issue #79): the listing is judged per project. A
+/// caller with no role in `p` is refused the scoped ask and gets no rows
+/// from the unscoped one, where a reader sees them.
+#[tokio::test]
+async fn jobs_is_judged_per_project() {
+    let daemon = Daemon::new(Scripts::default(), false).await;
+    let lead = Ulid::from_datetime(std::time::SystemTime::now());
+    write_lead(
+        &daemon.fixture,
+        lead,
+        79,
+        "p",
+        Ulid::from_datetime(std::time::SystemTime::now()),
+    );
+
+    // No role in `p`: a scoped ask names the project, so the pre-check
+    // refuses it before the handler runs.
+    let (outsider, _) = daemon.connect("outsider").await;
+    let refused = outsider
+        .request(Request::Jobs {
+            project: Some("p".into()),
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(refused, Response::Refused { .. }),
+        "a scoped ask needs read in the project: {refused:?}"
+    );
+
+    // The unscoped ask names no project, so it is answered — with the
+    // projects this caller may read, which is none.
+    let none = outsider
+        .request(Request::Jobs { project: None })
+        .await
+        .unwrap();
+    assert_eq!(none, Response::Jobs { rows: Vec::new() });
+
+    // A reader sees the row.
+    let (viewer, _) = daemon.connect("viewer").await;
+    let seen = viewer
+        .request(Request::Jobs { project: None })
+        .await
+        .unwrap();
+    match seen {
+        Response::Jobs { rows } => {
+            assert_eq!(rows.len(), 1, "today's one build: {rows:?}");
+            assert_eq!(rows[0].id, lead);
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
 }
 
 /// T4 — a row names the issue its lead started with, from the run's own

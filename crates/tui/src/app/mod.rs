@@ -782,6 +782,7 @@ async fn run_shell(
         }
         status.title = engine.title().map(str::to_owned);
         status.usage = engine.usage();
+        status.working = engine.working();
         // Inside a watch the line is the watch's: its own segment, and
         // the run's figures with the run's head off.
         status.inside = engine.inside();

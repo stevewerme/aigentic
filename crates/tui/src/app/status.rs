@@ -24,6 +24,10 @@ pub struct Status {
     pub mode: String,
     /// The working and thread figures from `Notice::Usage`.
     pub usage: Option<Figures>,
+    /// How many builds the daemon drives right now, from `Notice::Usage`
+    /// (issue #79). Drawn only when it is above zero: a machine with
+    /// nothing running says nothing about builds.
+    pub working: u32,
     /// How long the running turn has run; `None` when idle.
     pub elapsed: Option<Duration>,
     pub queued: u32,
@@ -49,6 +53,9 @@ impl Status {
             let mut parts = vec![inside.clone()];
             if let Some(run) = &self.run {
                 parts.push(run.clone());
+            }
+            if self.working > 0 {
+                parts.push(format!("{} working", self.working));
             }
             parts.push("/back".to_owned());
             return parts.join(" · ");
@@ -85,6 +92,11 @@ impl Status {
             // A daemon that has sent no usage figure yet leaves the part
             // off the line: `?` was never a figure.
             None => {}
+        }
+        // How busy the machine is (issue #79): nothing to say when
+        // nothing runs.
+        if self.working > 0 {
+            parts.push(format!("{} working", self.working));
         }
         if let Some(elapsed) = self.elapsed {
             parts.push(elapsed_short(elapsed));
@@ -227,6 +239,43 @@ pub fn elapsed_short(d: Duration) -> String {
 mod tests {
     use super::*;
 
+    /// T10 (issue #79): the working count is the daemon's, drawn from the
+    /// line's own parts, and only while something is working. A count of
+    /// zero never prints a `0 working` segment, and a line with no count
+    /// reads as it did.
+    #[test]
+    fn the_line_shows_the_count_only_when_something_works() {
+        let base = Status {
+            project: "vendela".into(),
+            mode: "manual".into(),
+            ..Status::default()
+        };
+        assert!(!base.line().contains("working"), "{}", base.line());
+
+        let busy = Status {
+            working: 2,
+            ..base.clone()
+        };
+        let line = busy.line();
+        assert_eq!(line, "vendela · manual · 2 working");
+        assert!(line.starts_with("vendela · manual"));
+        // Inside a watch the line is the watch's own, and the count
+        // draws on it as on any other line.
+        let inside = Status {
+            inside: Some("#64 · spec".into()),
+            ..busy.clone()
+        };
+        let line = inside.line();
+        assert_eq!(line, "#64 · spec · 2 working · /back");
+        // Nothing running: no segment, in both shapes.
+        let idle = Status {
+            inside: Some("#64 · spec".into()),
+            working: 0,
+            ..Status::default()
+        };
+        assert_eq!(idle.line(), "#64 · spec · /back");
+    }
+
     #[test]
     fn the_line_reads_left_to_right() {
         let mut s = Status {
@@ -238,6 +287,7 @@ mod tests {
                 working: 31_000,
                 thread: Some(2_100_000),
             }),
+            working: 0,
             elapsed: Some(Duration::from_secs(12)),
             queued: 1,
             waiting: None,

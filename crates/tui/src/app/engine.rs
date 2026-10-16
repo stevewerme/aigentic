@@ -516,6 +516,9 @@ pub struct ClientRepl {
     /// The last `Notice::Usage`: the working and thread figures for the
     /// status line (phase 6 step 3, issue #99).
     usage: Option<crate::app::status::Figures>,
+    /// How many builds the daemon reported driving, from the last usage
+    /// notice (issue #79). The status line draws it above zero.
+    working: u32,
     /// The turn that ran last (issue #21): tokens written and calls,
     /// shown by `/cost` — the live line carries state and time only.
     last_turn: Option<(u64, u32)>,
@@ -623,6 +626,7 @@ impl ClientRepl {
             task_calls: std::collections::HashSet::new(),
             step_header: None,
             usage: None,
+            working: 0,
             last_turn: None,
             last_stop: None,
             turn_events: TurnEvents::default(),
@@ -2319,6 +2323,12 @@ impl ClientRepl {
         self.usage
     }
 
+    /// How many builds the daemon last reported driving (issue #79):
+    /// the status line's count.
+    pub fn working(&self) -> u32 {
+        self.working
+    }
+
     pub fn quit_requested(&self) -> bool {
         self.quit
     }
@@ -2616,12 +2626,14 @@ impl ClientRepl {
             Notice::Usage {
                 tokens_in_window,
                 thread_tokens,
+                working,
                 ..
             } => {
                 self.usage = Some(crate::app::status::Figures {
                     working: tokens_in_window,
                     thread: thread_tokens,
                 });
+                self.working = working;
             }
             Notice::Note { text, .. } => {
                 self.flush_partial(out);
@@ -7822,6 +7834,51 @@ mod tests {
                 .any(|l| l.contains("refused") || l.contains("no thread")),
             "the refusal is printed: {:?}",
             refused.lines()
+        );
+    }
+
+    /// The count the daemon reports reaches the status line as
+    /// `N working`, and a daemon that never reported one leaves the part
+    /// off the line rather than claiming zero (issue #79).
+    #[tokio::test]
+    async fn the_count_reaches_the_status_line() {
+        let mut lead = Lead::start(Ulid::generate(), Vec::new()).await;
+        let mut out = Copies::default();
+        lead.repl.render(
+            Notice::Usage {
+                thread: lead.front_thread(),
+                tokens_in_window: 48_000,
+                window: 120_000,
+                turn_elapsed_ms: Some(1_200),
+                queued: 0,
+                thread_tokens: Some(2_100_000),
+                working: 3,
+            },
+            &mut out,
+        );
+        assert_eq!(lead.repl.working(), 3, "the count is kept");
+
+        let line = crate::app::status::Status {
+            usage: lead.repl.usage(),
+            working: lead.repl.working(),
+            ..crate::app::status::Status::default()
+        };
+        let drawn = line.line();
+        assert!(
+            drawn.contains("3 working"),
+            "the count has a part of its own: {drawn}"
+        );
+
+        let fresh = Lead::start(Ulid::generate(), Vec::new()).await;
+        let fresh_line = crate::app::status::Status {
+            usage: fresh.repl.usage(),
+            working: fresh.repl.working(),
+            ..crate::app::status::Status::default()
+        };
+        assert!(
+            !fresh_line.line().contains("working"),
+            "nothing reported, nothing claimed: {}",
+            fresh_line.line()
         );
     }
 
