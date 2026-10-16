@@ -457,7 +457,7 @@ impl Fixture {
             // `outsider` is a user of this daemon with no role in `p`:
             // every listing judges the project's participants, so a
             // user the project file does not name can prove the
-            // refusal (issue #79, T14).
+            // refusal.
             users: ["steve", "magnus", "reviewer", "viewer", "outsider"]
                 .iter()
                 .map(|n| UserConfig {
@@ -759,7 +759,7 @@ fn world(daemon: &Daemon) -> aigentic_server::runs::RunWorld {
 }
 
 // ---------------------------------------------------------------------------
-// The day's builds (issue #79)
+// The day's builds
 // ---------------------------------------------------------------------------
 
 /// A lead's log with its header, its `run_started` and one step open: the
@@ -811,19 +811,21 @@ fn write_lead(fx: &Fixture, lead: Ulid, issue: u64, project: &str, child: Ulid) 
     .unwrap();
 }
 
-/// T3 — the rows are today's leads, newest first: yesterday's lead, today's
+/// The rows are today's leads, newest first: yesterday's lead, today's
 /// step child and today's ordinary thread carry no row.
 #[tokio::test]
-async fn t3_only_todays_leads_are_rows() {
+async fn only_todays_leads_are_rows() {
     let daemon = Daemon::new(Scripts::default(), false).await;
     let day = Duration::from_secs(24 * 60 * 60);
+    // Today's ids sit milliseconds apart, so the fixture holds the same
+    // day even when it runs just after midnight.
     let now = std::time::SystemTime::now();
 
     let yesterday = Ulid::from_datetime(now - day);
-    let older = Ulid::from_datetime(now - Duration::from_secs(60));
+    let older = Ulid::from_datetime(now - Duration::from_millis(3));
     let newer = Ulid::from_datetime(now);
-    let child = Ulid::from_datetime(now - Duration::from_secs(30));
-    let plain = Ulid::from_datetime(now - Duration::from_secs(20));
+    let child = Ulid::from_datetime(now - Duration::from_millis(2));
+    let plain = Ulid::from_datetime(now - Duration::from_millis(1));
 
     write_lead(
         &daemon.fixture,
@@ -863,7 +865,7 @@ async fn t3_only_todays_leads_are_rows() {
     assert_eq!(rows[0].project, "p");
 }
 
-/// T14 — the roles (issue #79): the listing is judged per project. A
+/// The roles: the listing is judged per project. A
 /// caller with no role in `p` is refused the scoped ask and gets no rows
 /// from the unscoped one, where a reader sees them.
 #[tokio::test]
@@ -915,10 +917,10 @@ async fn jobs_is_judged_per_project() {
     }
 }
 
-/// T4 — a row names the issue its lead started with, from the run's own
+/// A row names the issue its lead started with, from the run's own
 /// record, and the ask's project filter decides which rows come back.
 #[tokio::test]
-async fn t4_a_rows_what_is_the_build_number() {
+async fn a_rows_what_is_the_build_number() {
     let daemon = Daemon::new(Scripts::default(), false).await;
     let lead = Ulid::from_datetime(std::time::SystemTime::now());
     write_lead(

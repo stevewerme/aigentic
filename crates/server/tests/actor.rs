@@ -27,7 +27,6 @@ use aigentic_server::{Mail, Mailbox, NoReports, ThreadActor};
 use futures_core::Stream;
 use futures_util::StreamExt;
 use serde_json::json;
-use time::OffsetDateTime;
 use tokio::sync::{mpsc, oneshot};
 
 /// Scripted; a `None` entry pends until the turn is interrupted. Every
@@ -859,7 +858,7 @@ async fn usage_is_pushed_after_the_call_and_again_when_the_turn_ends() {
     rig.task.await.unwrap();
 }
 
-/// T7 (issue #79): a client watching a thread is told the count when a build
+/// A client watching a thread is told the count when a build
 /// starts and stops being driven, with no request of its own. The line is the
 /// one the thread already sends, so nothing new has to be asked for.
 #[tokio::test]
@@ -882,7 +881,7 @@ async fn the_count_follows_the_runs() {
     // A build starts: the count moves to one, and the actor sends the line
     // again on its own. A line the turn already queued may arrive first.
     let lead = ulid::Ulid::generate();
-    rig.working.register(lead, OffsetDateTime::now_utc());
+    rig.working.register(lead);
     let pushed = Rig::until_usage(&mut notices, 1).await;
     assert_eq!(working_of(&pushed), Some(1), "{pushed:?}");
 

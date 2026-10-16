@@ -210,7 +210,7 @@ struct Shared {
     /// #7): `after_turn` announces the new identity once, as an idle
     /// switch does.
     switched: Mutex<bool>,
-    /// The daemon's working count (issue #79): the usage line carries
+    /// The daemon's working count: the usage line carries
     /// it, and a change wakes the loop so every open thread re-pushes
     /// that line.
     working: crate::runs::Working,

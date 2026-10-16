@@ -25,7 +25,7 @@ pub struct Status {
     /// The working and thread figures from `Notice::Usage`.
     pub usage: Option<Figures>,
     /// How many builds the daemon drives right now, from `Notice::Usage`
-    /// (issue #79). Drawn only when it is above zero: a machine with
+    ///. Drawn only when it is above zero: a machine with
     /// nothing running says nothing about builds.
     pub working: u32,
     /// How long the running turn has run; `None` when idle.
@@ -93,7 +93,7 @@ impl Status {
             // off the line: `?` was never a figure.
             None => {}
         }
-        // How busy the machine is (issue #79): nothing to say when
+        // How busy the machine is: nothing to say when
         // nothing runs.
         if self.working > 0 {
             parts.push(format!("{} working", self.working));
@@ -239,7 +239,7 @@ pub fn elapsed_short(d: Duration) -> String {
 mod tests {
     use super::*;
 
-    /// T10 (issue #79): the working count is the daemon's, drawn from the
+    /// The working count is the daemon's, drawn from the
     /// line's own parts, and only while something is working. A count of
     /// zero never prints a `0 working` segment, and a line with no count
     /// reads as it did.

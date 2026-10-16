@@ -1,4 +1,4 @@
-//! `/jobs` (issue #79): today's builds as a table, and the one row a
+//! `/jobs`: today's builds as a table, and the one row a
 //! person picks to look at a build read-only.
 //!
 //! The table is drawn from the rows alone, so the same text reaches a
@@ -74,7 +74,7 @@ mod tests {
         }
     }
 
-    /// T11 (issue #79): the table draws the header once and one line per
+    /// The table draws the header once and one line per
     /// row, with the row's number in this listing, what it is, its
     /// project, its state in the variant's own words and its cost in the
     /// cost cell's. A row with no state and no cost falls back to the same

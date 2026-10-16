@@ -104,7 +104,7 @@ impl Printer for Stdout {
 
 /// Which prompts a pipe prints (issues #82, #108).
 ///
-/// The `/jobs` picker is not one of them (issue #79): its table has
+/// The `/jobs` picker is not one of them: its table has
 /// already gone to `out` as plain lines, and a pipe reads no keys.
 fn prints_in_plain(kind: crate::app::menu::Kind) -> bool {
     use crate::app::menu::Kind;

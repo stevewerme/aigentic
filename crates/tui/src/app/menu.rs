@@ -52,7 +52,7 @@ pub enum Pick {
     /// Keep working in this thread: nothing is interrupted (issue #108).
     NewNo,
     /// Look at the build of a row of the `/jobs` listing read-only: the
-    /// lead it belongs to (issue #79). The engine holds the rows it drew,
+    /// lead it belongs to. The engine holds the rows it drew,
     /// so it resolves this to the build's number and enters it there.
     Job { id: Ulid },
     /// Put the listing away. On a row taken, this leaves that build too.
@@ -83,7 +83,7 @@ pub enum Kind {
     /// a new thread, or keep working here. The engine's own menu, never
     /// sent to the daemon.
     NewThread,
-    /// The `/jobs` listing (issue #79): one row per build today, `id` the
+    /// The `/jobs` listing: one row per build today, `id` the
     /// lead the selection is on. The engine's own menu, never sent to the
     /// daemon.
     Job {
@@ -382,7 +382,7 @@ impl Menu {
         }
     }
 
-    /// `/jobs` with no number (issue #79): today's builds, one row each,
+    /// `/jobs` with no number: today's builds, one row each,
     /// newest first. Enter takes the selected row to look at read-only,
     /// Esc puts the listing away. The rows carry the build's number and
     /// lead, so what a row does is decided where it was drawn.
@@ -410,7 +410,7 @@ impl Menu {
         }
     }
 
-    /// The listing with one row taken (issue #79): the same menu, so
+    /// The listing with one row taken: the same menu, so
     /// Down and Up still walk the builds while one is shown read-only,
     /// and Esc leaves it the way it leaves the listing.
     pub fn show_job(&mut self, id: Ulid, issue: u64) {
@@ -661,7 +661,7 @@ impl Menu {
     }
 
     /// Move the selection, wrapping. A kind that carries the selected
-    /// build (issue #79) follows the selection, so a key and a redraw
+    /// build follows the selection, so a key and a redraw
     /// agree about which build is meant.
     fn select(&mut self, i: usize) {
         if !self.rows.is_empty() {
@@ -717,7 +717,7 @@ impl Menu {
             // A row never carries a typed destination: only `line`
             // builds one. Nothing to send from here.
             Pick::SwitchCorrected { .. } => Keyed::Passed,
-            // The `/jobs` listing (issue #79): a row taken and the
+            // The `/jobs` listing: a row taken and the
             // listing closed are both read by the engine, nothing goes
             // to the daemon from here.
             Pick::Job { .. } | Pick::CloseJob => Keyed::Decide {

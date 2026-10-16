@@ -107,12 +107,12 @@ pub struct RunWorld {
     /// and the user did not override.
     pub bundled: PathBuf,
     /// The daemon's working count, shared with every thread actor so a
-    /// usage line carries it (issue #79).
+    /// usage line carries it.
     pub working: Working,
 }
 
 /// How many builds the daemon drives right now, and the figure the wire
-/// carries (issue #79).
+/// carries.
 ///
 /// Only the daemon that drives the runs can count them, so the count lives
 /// here: a client watching any thread still sees how busy the machine is.
@@ -137,15 +137,16 @@ struct WorkingInner {
 /// to.
 #[derive(Debug, Clone)]
 struct WorkingJob {
-    day: time::Date,
+    day: Option<time::Date>,
     state: Option<JobState>,
 }
 
 impl Working {
     /// A build is now driven: `lead` joins the count as `Running`, under
-    /// the day `at` falls on in the machine's zone. Called by the run path
-    /// that takes the lead's slot.
-    pub fn register(&self, lead: Ulid, at: OffsetDateTime) {
+    /// the day its id was minted on, the day its row is listed under. A
+    /// lead resumed after a restart keeps the day it started. Called by the
+    /// run path that takes the lead's slot.
+    pub fn register(&self, lead: Ulid) {
         self.0
             .jobs
             .lock()
@@ -153,7 +154,7 @@ impl Working {
             .insert(
                 lead,
                 WorkingJob {
-                    day: day_of(at),
+                    day: minted_day(lead),
                     state: Some(JobState::Running),
                 },
             );
@@ -207,7 +208,7 @@ impl Working {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .values()
-            .filter(|job| job.day == today && is_working(job.state.as_ref()))
+            .filter(|job| job.day == Some(today) && is_working(job.state.as_ref()))
             .count() as u32
     }
 
@@ -215,7 +216,12 @@ impl Working {
     /// the usage line it already sends. The count itself is read live, so
     /// a nudge that changes nothing costs one line and no wrong figure.
     pub fn recount(&self) {
-        self.0.figure.send_replace(self.count());
+        let count = self.count();
+        self.0.figure.send_if_modified(|figure| {
+            let moved = *figure != count;
+            *figure = count;
+            moved
+        });
     }
 
     /// Wait for the figure to change. Never errors: the sender lives as
@@ -261,11 +267,18 @@ pub(crate) fn day_of(at: OffsetDateTime) -> time::Date {
     }
 }
 
-/// Whether a build's id was minted on today's day. The id is the run's
-/// start, stamped in UTC, so this is the day a listing keeps.
-pub(crate) fn minted_today(id: Ulid) -> bool {
+/// The day a build's id was minted on: the run's start, stamped in UTC and
+/// read in the machine's zone. The rows and the count both date a build
+/// by it, so the two cannot disagree about which day a build belongs to.
+pub(crate) fn minted_day(id: Ulid) -> Option<time::Date> {
     time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(id.timestamp_ms()) * 1_000_000)
-        .is_ok_and(|at| day_of(at) == day_of(time::OffsetDateTime::now_utc()))
+        .ok()
+        .map(day_of)
+}
+
+/// Whether a build's id was minted on today's day.
+pub fn minted_today(id: Ulid) -> bool {
+    minted_day(id) == Some(day_of(time::OffsetDateTime::now_utc()))
 }
 
 /// What one build's row shows, from one read of its lead's log: its state
@@ -280,7 +293,7 @@ pub fn job_facts(threads: &Path, lead: Ulid, held: bool) -> (Option<JobState>, O
         return (None, None);
     };
     if held {
-        let state = read_status_in(threads, lead)
+        let state = status_of(threads, &events)
             .and_then(|status| state_of(&status))
             .or_else(|| end_state(&events));
         return (state, step_cost(&events));
@@ -745,7 +758,7 @@ pub struct Runs {
     /// advisory locks.
     tasks: Mutex<HashMap<Ulid, tokio::task::JoinHandle<()>>>,
     /// How many of these leads are being driven right now, shared with
-    /// every thread actor (issue #79).
+    /// every thread actor.
     working: Working,
 }
 
@@ -781,7 +794,7 @@ impl Runs {
         let (tx, rx) = mpsc::unbounded_channel();
         slots.insert(lead, tx.clone());
         drop(slots);
-        self.working.register(lead, OffsetDateTime::now_utc());
+        self.working.register(lead);
         Claim::Claimed(lock, rx, tx)
     }
 
@@ -1016,14 +1029,19 @@ fn read_status(world: &RunWorld, lead: Ulid) -> Option<aigentic_runtime::RunStat
 /// The same fold over `threads`: a listing knows a lead's directory and
 /// nothing else of its world.
 pub fn read_status_in(threads: &Path, lead: Ulid) -> Option<aigentic_runtime::RunStatus> {
-    let lead_events = read_events(threads, lead)?;
-    let child = match run_state(&lead_events).ok()?.next_move() {
+    status_of(threads, &read_events(threads, lead)?)
+}
+
+/// The fold of a lead whose log is already read, reading only the child
+/// its run is waiting on.
+fn status_of(threads: &Path, lead_events: &[Event]) -> Option<aigentic_runtime::RunStatus> {
+    let child = match run_state(lead_events).ok()?.next_move() {
         NextMove::ReAwait { child_thread, .. } if exists(threads, child_thread) => {
             read_events(threads, child_thread)?
         }
         _ => Vec::new(),
     };
-    aigentic_runtime::run_status(&lead_events, &child, OffsetDateTime::now_utc())
+    aigentic_runtime::run_status(lead_events, &child, OffsetDateTime::now_utc())
 }
 
 /// Whether a thread's log has been written at all.

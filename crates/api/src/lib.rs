@@ -1135,7 +1135,7 @@ mod tests {
         assert_eq!(decode(&line).unwrap(), Frame::notice(without));
     }
 
-    /// T9 (issue #79): the pair this ticket adds is additive both ways. A
+    /// The pair this ticket adds is additive both ways. A
     /// `usage` line from an older daemon has no `working` key and decodes
     /// to `0`; a row whose state and cost this daemon cannot read leaves
     /// both keys off; and a reason with a colon in it survives the round

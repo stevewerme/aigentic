@@ -517,7 +517,7 @@ pub struct ClientRepl {
     /// status line (phase 6 step 3, issue #99).
     usage: Option<crate::app::status::Figures>,
     /// How many builds the daemon reported driving, from the last usage
-    /// notice (issue #79). The status line draws it above zero.
+    /// notice. The status line draws it above zero.
     working: u32,
     /// The turn that ran last (issue #21): tokens written and calls,
     /// shown by `/cost` — the live line carries state and time only.
@@ -537,7 +537,7 @@ pub struct ClientRepl {
     /// `menu` the moment it arrives and would overwrite it. Answered
     /// here, never sent to the daemon.
     confirm_new: Option<Menu>,
-    /// The `/jobs` picker (issue #79), in a slot of its own for the same
+    /// The `/jobs` picker, in a slot of its own for the same
     /// reason: it is read-only and the least urgent, so a daemon prompt
     /// outranks it. The rows it was drawn from are kept beside it, so a
     /// row's build number can be resolved when it is taken.
@@ -858,7 +858,7 @@ impl ClientRepl {
                         | Pick::SwitchCorrected { .. }
                         | Pick::NewYes
                         | Pick::NewNo
-                        // The `/jobs` picker's own picks (issue #79) are
+                        // The `/jobs` picker's own picks are
                         // answered by `apply_jobs`, and never reach a
                         // daemon prompt's menu here.
                         | Pick::Job { .. }
@@ -1399,17 +1399,18 @@ impl ClientRepl {
     }
 
     /// `/jobs`: today's builds, newest first, as a table, and the picker
-    /// that opens one (issue #79). The table is drawn here, so a pipe
+    /// that opens one. The table is drawn here, so a pipe
     /// prints it with no picker and no colour; a shell gets both. Nothing
     /// is asked of the daemon but the listing.
     async fn jobs_list(&mut self, out: &mut dyn Printer) {
         match self.request(Request::Jobs { project: None }).await {
+            Response::Jobs { rows } if rows.is_empty() => {
+                self.jobs_rows = rows;
+                out.line("[no builds today]");
+            }
             Response::Jobs { rows } => {
                 let table = crate::app::jobs::table(&rows);
                 out.cell(Cell::Note(table.join("\n")), true);
-                if rows.is_empty() {
-                    out.line("[no builds today]");
-                }
                 self.jobs_rows = rows.clone();
                 // The picker is a terminal's: a pipe gets the table above
                 // and no keys to answer, so it opens none.
@@ -1422,7 +1423,7 @@ impl ClientRepl {
     }
 
     /// `/jobs <n>`: the n-th row of today's listing, counted from one and
-    /// newest first, drawn read-only from its log (issue #79).
+    /// newest first, drawn read-only from its log.
     ///
     /// The lead's log is opened, drawn through the shared run view and
     /// closed again: this path neither follows the build nor answers it,
@@ -1457,7 +1458,13 @@ impl ClientRepl {
                 out.line(&line);
             }
         }
-        let _ = self.request(Request::Close { thread: row.id }).await;
+        // A lead this session already follows or watches stays open: the
+        // read borrowed its subscription and must not end it.
+        let in_use = self.following.as_ref().is_some_and(|f| f.lead == row.id)
+            || self.watch.as_ref().is_some_and(|w| w.lead() == row.id);
+        if !in_use {
+            let _ = self.request(Request::Close { thread: row.id }).await;
+        }
     }
 
     /// `/back`: leave the watch and return to the front thread. The
@@ -1468,7 +1475,7 @@ impl ClientRepl {
             out.line("[not inside a watched step: /watch <issue> [step] opens one]");
             return;
         };
-        // A build reached from the `/jobs` listing (issue #79) leaves its
+        // A build reached from the `/jobs` listing leaves its
         // listing behind too: `/back` is a deliberate exit, so the picker
         // does not come back unasked.
         self.jobs = None;
@@ -1847,7 +1854,7 @@ impl ClientRepl {
         match self.checkpoint() {
             Some(open) => Some(open),
             // The picker is read-only and the least urgent of the slots
-            // (issue #79): any daemon prompt and any gate outrank it.
+            //: any daemon prompt and any gate outrank it.
             None => self.jobs.as_ref(),
         }
     }
@@ -1886,7 +1893,7 @@ impl ClientRepl {
         settled: bool,
         out: &mut dyn Printer,
     ) -> MenuKey {
-        // Esc is the `/jobs` listing's own key (issue #79): it puts the
+        // Esc is the `/jobs` listing's own key: it puts the
         // picker away and leaves the build the picker entered, so the key
         // means the same before and after Enter. Everything else inside a
         // watch belongs to the child, a gate of the build included.
@@ -1933,7 +1940,7 @@ impl ClientRepl {
             };
         }
         // With no chat prompt the keys belong to the followed run's
-        // checkpoint menu (issue #68), when one is up; with none up they
+        // checkpoint menu, when one is up; with none up they
         // fall through to the `/jobs` picker and the menu below.
         if self.prompted.is_none()
             && let Some(keyed) = self
@@ -1956,7 +1963,7 @@ impl ClientRepl {
                 }
             };
         }
-        // The picker sits below the daemon's prompts (issue #79): a
+        // The picker sits below the daemon's prompts: a
         // permission or a question that arrived while it was open takes
         // the keys, and the picker waits under it (its slot is kept).
         if self.prompted.is_none() && self.jobs.is_some() {
@@ -2021,7 +2028,7 @@ impl ClientRepl {
                     // never by a daemon prompt's kind here (#108).
                     | Pick::NewYes
                     | Pick::NewNo
-                    // The picker's own picks are `apply_jobs`'s (#79).
+                    // The picker's own picks are `apply_jobs`'s.
                     | Pick::Job { .. }
                     | Pick::CloseJob => {}
                 }
@@ -2059,7 +2066,7 @@ impl ClientRepl {
         }
     }
 
-    /// What the `/jobs` picker came to (issue #79). It is the REPL's own
+    /// What the `/jobs` picker came to. It is the REPL's own
     /// menu, so nothing is sent for the choice itself: a row enters that
     /// build the way `/watch <issue>` does, read-only, and `Close` puts
     /// the listing away, leaving any build it had opened.
@@ -2081,7 +2088,7 @@ impl ClientRepl {
             }
             // A row taken: the same entry the `/watch <issue>` line takes,
             // with the listing left up under the build so Down and Up
-            // still walk it and Esc leaves both (issue #79). A row whose
+            // still walk it and Esc leaves both. A row whose
             // build number is unknown opens nothing.
             Pick::Job { id } => {
                 out.line(&echo);
@@ -2190,7 +2197,7 @@ impl ClientRepl {
             // keys are digits and `y`/`n`, and there is nothing for the
             // composer to send.
             Some(Kind::NewThread) => {}
-            // The picker has none either (issue #79).
+            // The picker has none either.
             Some(Kind::Job { .. } | Kind::ShowJob { .. }) => {}
             // A checkpoint has no text input: nothing to send.
             Some(Kind::Checkpoint) => {}
@@ -2323,7 +2330,7 @@ impl ClientRepl {
         self.usage
     }
 
-    /// How many builds the daemon last reported driving (issue #79):
+    /// How many builds the daemon last reported driving:
     /// the status line's count.
     pub fn working(&self) -> u32 {
         self.working
@@ -6698,7 +6705,7 @@ mod tests {
             }
         }
 
-        /// The same, with the `Jobs` rows a listing draws (issue #79):
+        /// The same, with the `Jobs` rows a listing draws:
         /// `lead` and `backlog` belong to the row that can be entered,
         /// `rows` holds its `ListThreads` row, and `jobs` the listing
         /// itself.
@@ -7570,7 +7577,7 @@ mod tests {
         )
     }
 
-    /// T12 (issue #79): the listing's rows are commands, not decisions.
+    /// The listing's rows are commands, not decisions.
     /// `/jobs` draws the table, Down moves the selection, Enter enters the
     /// selected row exactly as `/watch <its issue>` does, and Esc closes
     /// it — no `Decide`, `AnswerHuman`, `Post` or `Interrupt` ever goes
@@ -7698,7 +7705,7 @@ mod tests {
         }
     }
 
-    /// T13 (issue #79): `/jobs <n>` reads one build and closes it again,
+    /// `/jobs <n>` reads one build and closes it again,
     /// and it writes nothing else — no follow, no answer, no post. A
     /// number past the last row says so and opens nothing, and a build
     /// whose log the daemon refuses answers with the refusal rather than
@@ -7839,7 +7846,7 @@ mod tests {
 
     /// The count the daemon reports reaches the status line as
     /// `N working`, and a daemon that never reported one leaves the part
-    /// off the line rather than claiming zero (issue #79).
+    /// off the line rather than claiming zero.
     #[tokio::test]
     async fn the_count_reaches_the_status_line() {
         let mut lead = Lead::start(Ulid::generate(), Vec::new()).await;

@@ -255,8 +255,19 @@ fn local_only(command: &str) -> String {
     format!("{command} reads this machine's logs; drop --server and run it locally")
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    // The listing's "today" is the person's day, and `time` reads the
+    // machine's zone only while the process has one thread: read it before
+    // the runtime starts any.
+    aigentic_server::runs::read_day_zone();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("starting the async runtime")?
+        .block_on(run())
+}
+
+async fn run() -> anyhow::Result<()> {
     // `.env` in the current directory, if present. Never printed.
     let _ = dotenvy::dotenv();
     let cli = Cli::parse();

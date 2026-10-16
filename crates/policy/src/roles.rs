@@ -379,7 +379,7 @@ mod tests {
         assert!(may("nobody", &Request::ListProjects));
     }
 
-    /// T14 (issue #79): the jobs listing is judged per project. An
+    /// The jobs listing is judged per project. An
     /// unscoped ask names none, so the pre-check leaves it to the
     /// handler; a scoped one needs the read role in the project it
     /// names. `every_request_has_its_row` carries the same two rows.

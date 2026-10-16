@@ -756,8 +756,6 @@ async fn handle(
                 },
             }
         }
-        // Today's builds: the index for the rows, off the session's async
-        // worker like the heavy listing.
         // Today's builds: the index for the rows, then one read of each
         // lead's log for its state and cost, off the session's async
         // worker.

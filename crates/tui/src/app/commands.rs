@@ -466,7 +466,7 @@ mod tests {
         );
     }
 
-    /// T1 (issue #79): `/jobs` with no number asks for the listing, and
+    /// `/jobs` with no number asks for the listing, and
     /// `/jobs <n>` carries the number. Anything else that is not a number
     /// from one upwards is not this command, so it reaches the engine as
     /// an unknown command rather than as a listing request.
@@ -483,7 +483,7 @@ mod tests {
         );
     }
 
-    /// T2 (issue #79): `/jobs` is discoverable wherever the others are.
+    /// `/jobs` is discoverable wherever the others are.
     #[test]
     fn help_names_jobs() {
         assert!(
