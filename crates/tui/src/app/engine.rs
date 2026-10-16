@@ -381,6 +381,12 @@ impl Printer for Copies {
         self.0.line(text);
     }
 
+    /// The inner `Lines` decides the view, so a test that asks for the
+    /// developer view gets the cells a terminal gets.
+    fn view(&self) -> View {
+        self.0.view()
+    }
+
     fn copy(&mut self, text: &str) -> Result<Used, String> {
         self.1.push(text.to_owned());
         Ok(Used::Child)
@@ -528,6 +534,12 @@ pub struct ClientRepl {
     /// `menu` the moment it arrives and would overwrite it. Answered
     /// here, never sent to the daemon.
     confirm_new: Option<Menu>,
+    /// The `/jobs` picker (issue #79), in a slot of its own for the same
+    /// reason: it is read-only and the least urgent, so a daemon prompt
+    /// outranks it. The rows it was drawn from are kept beside it, so a
+    /// row's build number can be resolved when it is taken.
+    jobs: Option<Menu>,
+    jobs_rows: Vec<aigentic_api::JobRow>,
     /// The running issue's step this REPL watches, if any: its own
     /// engine, its figures and its moves. The front thread's state is
     /// untouched while it is open.
@@ -616,6 +628,8 @@ impl ClientRepl {
             turn_events: TurnEvents::default(),
             awaiting_turn: false,
             confirm_new: None,
+            jobs: None,
+            jobs_rows: Vec::new(),
             quit: false,
             home_project: project.to_owned(),
             following: None,
@@ -839,7 +853,12 @@ impl ClientRepl {
                         | Pick::SwitchElsewhere
                         | Pick::SwitchCorrected { .. }
                         | Pick::NewYes
-                        | Pick::NewNo => {}
+                        | Pick::NewNo
+                        // The `/jobs` picker's own picks (issue #79) are
+                        // answered by `apply_jobs`, and never reach a
+                        // daemon prompt's menu here.
+                        | Pick::Job { .. }
+                        | Pick::CloseJob => {}
                     }
                     return;
                 }
@@ -911,6 +930,8 @@ impl ClientRepl {
                 }
             }
             Command::Watch(arg) => self.watch(arg, out).await,
+            Command::Jobs(None) => self.jobs_list(out).await,
+            Command::Jobs(Some(n)) => self.jobs_open(n, out).await,
             Command::Back => self.back(out).await,
             Command::Chat(text) => self.post(text, false, out).await,
             Command::Interrupt(text) => self.post(text, true, out).await,
@@ -1373,6 +1394,68 @@ impl ClientRepl {
         }
     }
 
+    /// `/jobs`: today's builds, newest first, as a table, and the picker
+    /// that opens one (issue #79). The table is drawn here, so a pipe
+    /// prints it with no picker and no colour; a shell gets both. Nothing
+    /// is asked of the daemon but the listing.
+    async fn jobs_list(&mut self, out: &mut dyn Printer) {
+        match self.request(Request::Jobs { project: None }).await {
+            Response::Jobs { rows } => {
+                let table = crate::app::jobs::table(&rows);
+                out.cell(Cell::Note(table.join("\n")), true);
+                if rows.is_empty() {
+                    out.line("[no builds today]");
+                }
+                self.jobs_rows = rows.clone();
+                // The picker is a terminal's: a pipe gets the table above
+                // and no keys to answer, so it opens none.
+                if detailed(out) {
+                    self.jobs = Some(Menu::jobs(&rows));
+                }
+            }
+            other => self.show(other, "", out),
+        }
+    }
+
+    /// `/jobs <n>`: the n-th row of today's listing, counted from one and
+    /// newest first, drawn read-only from its log (issue #79).
+    ///
+    /// The lead's log is opened, drawn through the shared run view and
+    /// closed again: this path neither follows the build nor answers it,
+    /// so nothing of the run is touched. A number past the last row says
+    /// so and closes nothing.
+    async fn jobs_open(&mut self, n: u32, out: &mut dyn Printer) {
+        let rows = match self.request(Request::Jobs { project: None }).await {
+            Response::Jobs { rows } => rows,
+            other => return self.show(other, "", out),
+        };
+        let Some(row) = rows.get(n as usize - 1) else {
+            out.line(&format!(
+                "[no row {n}: today's listing holds {}]",
+                rows.len()
+            ));
+            return;
+        };
+        out.line(&crate::app::jobs::one_line(row));
+        let events = match crate::run_view::fetch_backlog(&self.client, row.id).await {
+            Ok(events) => events,
+            Err(e) if e.downcast_ref::<crate::run_view::Refused>().is_some() => {
+                out.line(&format!("[build refused: {e}]"));
+                return;
+            }
+            Err(e) => {
+                out.line(&format!("[error: {e}]"));
+                return;
+            }
+        };
+        for event in &events {
+            if let Some(line) = crate::run_view::render(event) {
+                out.line(&line);
+            }
+        }
+        let _ = self.request(Request::Close { thread: row.id }).await;
+    }
+
     /// `/back`: leave the watch and return to the front thread. The
     /// front thread's held notices are drawn in order, then the divider
     /// last. At the front, with no watch open, it prints one line.
@@ -1381,6 +1464,10 @@ impl ClientRepl {
             out.line("[not inside a watched step: /watch <issue> [step] opens one]");
             return;
         };
+        // A build reached from the `/jobs` listing (issue #79) leaves its
+        // listing behind too: `/back` is a deliberate exit, so the picker
+        // does not come back unasked.
+        self.jobs = None;
         self.leave_watch(out, watch.divider());
     }
 
@@ -1658,7 +1745,9 @@ impl ClientRepl {
             | Pick::SwitchElsewhere
             | Pick::SwitchCorrected { .. }
             | Pick::NewYes
-            | Pick::NewNo => {}
+            | Pick::NewNo
+            | Pick::Job { .. }
+            | Pick::CloseJob => {}
         }
     }
 
@@ -1751,7 +1840,12 @@ impl ClientRepl {
         if self.prompted.is_some() {
             return self.menu.as_ref();
         }
-        self.checkpoint()
+        match self.checkpoint() {
+            Some(open) => Some(open),
+            // The picker is read-only and the least urgent of the slots
+            // (issue #79): any daemon prompt and any gate outrank it.
+            None => self.jobs.as_ref(),
+        }
     }
 
     /// Which prompt `menu()` draws: the chat's call or the run's gate.
@@ -1773,6 +1867,7 @@ impl ClientRepl {
             .as_ref()
             .filter(|open| open.shown)
             .map(|open| format!("gate:{}:{}", open.lead, open.gate))
+            .or_else(|| self.jobs.as_ref().map(|_| "jobs".to_owned()))
     }
 
     /// A key while the menu is up: the selection, the digits, the hidden
@@ -1787,6 +1882,25 @@ impl ClientRepl {
         settled: bool,
         out: &mut dyn Printer,
     ) -> MenuKey {
+        // Esc is the `/jobs` listing's own key (issue #79): it puts the
+        // picker away and leaves the build the picker entered, so the key
+        // means the same before and after Enter. Everything else inside a
+        // watch belongs to the child, a gate of the build included.
+        if self.prompted.is_none()
+            && self.jobs.is_some()
+            && key.code == crossterm::event::KeyCode::Esc
+        {
+            let keyed = {
+                let Some(menu) = self.jobs.as_mut() else {
+                    return MenuKey::Passed;
+                };
+                menu.key(key, composer_empty, settled)
+            };
+            if let keyed @ Keyed::Decide { .. } = keyed {
+                self.apply_jobs(keyed, out).await;
+                return MenuKey::Used;
+            }
+        }
         // A digit or Enter inside a watch enters the step's own
         // selection, never the front thread's.
         if let Some(watch) = self.watch.as_mut() {
@@ -1814,15 +1928,16 @@ impl ClientRepl {
                 }
             };
         }
-        if self.prompted.is_none() {
-            // With no chat prompt the keys belong to the followed run's
-            // checkpoint menu (issue #68), if one is up.
-            let keyed = {
-                let Some(open) = self.checkpoint.as_mut().filter(|open| open.shown) else {
-                    return MenuKey::Passed;
-                };
-                open.menu.key(key, composer_empty, settled)
-            };
+        // With no chat prompt the keys belong to the followed run's
+        // checkpoint menu (issue #68), when one is up; with none up they
+        // fall through to the `/jobs` picker and the menu below.
+        if self.prompted.is_none()
+            && let Some(keyed) = self
+                .checkpoint
+                .as_mut()
+                .filter(|open| open.shown)
+                .map(|open| open.menu.key(key, composer_empty, settled))
+        {
             return match keyed {
                 Keyed::Passed => MenuKey::Passed,
                 Keyed::Used => MenuKey::Used,
@@ -1833,6 +1948,26 @@ impl ClientRepl {
                 }
                 keyed @ (Keyed::Decide { .. } | Keyed::Answer { .. }) => {
                     self.apply_checkpoint(keyed, out).await;
+                    MenuKey::Used
+                }
+            };
+        }
+        // The picker sits below the daemon's prompts (issue #79): a
+        // permission or a question that arrived while it was open takes
+        // the keys, and the picker waits under it (its slot is kept).
+        if self.prompted.is_none() && self.jobs.is_some() {
+            let keyed = {
+                let Some(menu) = self.jobs.as_mut() else {
+                    return MenuKey::Passed;
+                };
+                menu.key(key, composer_empty, settled)
+            };
+            return match keyed {
+                Keyed::Passed => MenuKey::Passed,
+                Keyed::Used => MenuKey::Used,
+                Keyed::Text => MenuKey::Passed,
+                keyed @ (Keyed::Decide { .. } | Keyed::Answer { .. }) => {
+                    self.apply_jobs(keyed, out).await;
                     MenuKey::Used
                 }
             };
@@ -1881,7 +2016,10 @@ impl ClientRepl {
                     // The `/new` question is answered by `apply_confirm`,
                     // never by a daemon prompt's kind here (#108).
                     | Pick::NewYes
-                    | Pick::NewNo => {}
+                    | Pick::NewNo
+                    // The picker's own picks are `apply_jobs`'s (#79).
+                    | Pick::Job { .. }
+                    | Pick::CloseJob => {}
                 }
             }
             Keyed::Answer { text, echo } => {
@@ -1912,6 +2050,50 @@ impl ClientRepl {
                     self.interrupt(out).await;
                 }
                 self.new_front(interrupted, out).await;
+            }
+            _ => {}
+        }
+    }
+
+    /// What the `/jobs` picker came to (issue #79). It is the REPL's own
+    /// menu, so nothing is sent for the choice itself: a row enters that
+    /// build the way `/watch <issue>` does, read-only, and `Close` puts
+    /// the listing away, leaving any build it had opened.
+    async fn apply_jobs(&mut self, keyed: Keyed, out: &mut dyn Printer) {
+        let Keyed::Decide { pick, echo, .. } = keyed else {
+            return;
+        };
+        match pick {
+            // Put the listing away. On a build taken it leaves that build
+            // too, so Esc means the same before and after Enter.
+            Pick::CloseJob => {
+                let inside = self.watch.is_some();
+                self.jobs = None;
+                if inside {
+                    self.back(out).await;
+                } else {
+                    out.line(&echo);
+                }
+            }
+            // A row taken: the same entry the `/watch <issue>` line takes,
+            // with the listing left up under the build so Down and Up
+            // still walk it and Esc leaves both (issue #79). A row whose
+            // build number is unknown opens nothing.
+            Pick::Job { id } => {
+                out.line(&echo);
+                let issue = self
+                    .jobs_rows
+                    .iter()
+                    .find(|row| row.id == id)
+                    .and_then(|row| row.issue);
+                let Some(issue) = issue else {
+                    out.line("[that row carries no build number: nothing to watch]");
+                    return;
+                };
+                if let Some(menu) = self.jobs.as_mut() {
+                    menu.show_job(id, issue);
+                }
+                self.watch(Some(&issue.to_string()), out).await;
             }
             _ => {}
         }
@@ -2004,6 +2186,8 @@ impl ClientRepl {
             // keys are digits and `y`/`n`, and there is nothing for the
             // composer to send.
             Some(Kind::NewThread) => {}
+            // The picker has none either (issue #79).
+            Some(Kind::Job { .. } | Kind::ShowJob { .. }) => {}
             // A checkpoint has no text input: nothing to send.
             Some(Kind::Checkpoint) => {}
             // A switch proposal's text input is where it belongs
@@ -2437,7 +2621,7 @@ impl ClientRepl {
                 self.usage = Some(crate::app::status::Figures {
                     working: tokens_in_window,
                     thread: thread_tokens,
-                })
+                });
             }
             Notice::Note { text, .. } => {
                 self.flush_partial(out);
@@ -6476,6 +6660,7 @@ mod tests {
                 missing: Vec::new(),
                 rows: Vec::new(),
                 children: Vec::new(),
+                jobs: Vec::new(),
             };
             let daemon = crate::run_view::fake_daemon::FakeDaemon::start(dir.path(), script).await;
             let (client, welcome) = Client::connect(&daemon.addr(), "tok").await.unwrap();
@@ -6498,6 +6683,80 @@ mod tests {
                 repl,
                 notices,
                 out: Copies::default(),
+            }
+        }
+
+        /// The same, with the `Jobs` rows a listing draws (issue #79):
+        /// `lead` and `backlog` belong to the row that can be entered,
+        /// `rows` holds its `ListThreads` row, and `jobs` the listing
+        /// itself.
+        async fn with_jobs(
+            lead: Ulid,
+            backlog: Vec<Event>,
+            issue: u64,
+            children: Vec<(Ulid, Vec<Event>)>,
+            jobs: Vec<aigentic_api::JobRow>,
+        ) -> Self {
+            Self::with_jobs_missing(lead, backlog, issue, children, jobs, Vec::new()).await
+        }
+
+        /// The same, with rows whose logs the daemon refuses to open: a
+        /// build it cannot read is what `/jobs <n>` has to answer.
+        async fn with_jobs_missing(
+            lead: Ulid,
+            backlog: Vec<Event>,
+            issue: u64,
+            children: Vec<(Ulid, Vec<Event>)>,
+            jobs: Vec<aigentic_api::JobRow>,
+            missing: Vec<Ulid>,
+        ) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let rows = vec![aigentic_api::ThreadInfo {
+                id: lead,
+                project: Some("proj".into()),
+                date: "2026-10-01".into(),
+                events: backlog.len() as u64,
+                first_line: "run".into(),
+                state: aigentic_api::ThreadState::Idle,
+                title: None,
+                workspace: None,
+                kind: aigentic_api::ThreadKind::Run(aigentic_api::RunThread::Lead { issue }),
+            }];
+            let script = crate::run_view::fake_daemon::Script {
+                lead,
+                backlog,
+                resumed: false,
+                role: "admin",
+                refuse_build: None,
+                refuse_open: None,
+                missing,
+                rows,
+                children,
+                jobs,
+            };
+            let daemon = crate::run_view::fake_daemon::FakeDaemon::start(dir.path(), script).await;
+            let (client, welcome) = Client::connect(&daemon.addr(), "tok").await.unwrap();
+            let role = welcome.projects[0].role.clone();
+            let (thread, state, mode) = open(&client, "proj", Some(Ulid::generate())).await;
+            let notices = client.take_notices().unwrap();
+            let repl = ClientRepl::new(
+                client,
+                thread,
+                "steve",
+                role,
+                state,
+                mode,
+                Identity::default(),
+                "proj",
+            );
+            Self {
+                _dir: dir,
+                daemon,
+                repl,
+                notices,
+                // The terminal's view: the `/jobs` picker is a terminal's,
+                // so a test that answers its keys asks for the cells.
+                out: Copies(Lines::detail_on(), Vec::new()),
             }
         }
 
@@ -6553,6 +6812,7 @@ mod tests {
                 missing,
                 rows,
                 children,
+                jobs: Vec::new(),
             };
             let daemon = crate::run_view::fake_daemon::FakeDaemon::start(dir.path(), script).await;
             let (client, welcome) = Client::connect(&daemon.addr(), "tok").await.unwrap();
@@ -7272,6 +7532,299 @@ mod tests {
         );
     }
 
+    /// A `Jobs` row for the listing's tests: the cost and the state a
+    /// table cell reads.
+    fn job_row(
+        id: Ulid,
+        issue: u64,
+        what: &str,
+        state: aigentic_api::JobState,
+        cost: f64,
+    ) -> aigentic_api::JobRow {
+        aigentic_api::JobRow {
+            id,
+            issue: Some(issue),
+            what: what.to_owned(),
+            project: "proj".into(),
+            state: Some(state),
+            cost_usd: Some(cost),
+        }
+    }
+
+    fn key_for_down() -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Down,
+            crossterm::event::KeyModifiers::NONE,
+        )
+    }
+
+    /// T12 (issue #79): the listing's rows are commands, not decisions.
+    /// `/jobs` draws the table, Down moves the selection, Enter enters the
+    /// selected row exactly as `/watch <its issue>` does, and Esc closes
+    /// it — no `Decide`, `AnswerHuman`, `Post` or `Interrupt` ever goes
+    /// out. The second row is the one that resolves, so the requests
+    /// prove the selection was used rather than the first row.
+    #[tokio::test]
+    async fn enter_watches_the_row_and_a_pipe_prints_lines() {
+        const ISSUE: u64 = 142;
+        let lead_id = Ulid::generate();
+        let spec = Ulid::generate();
+        let backlog = vec![
+            run_event(lead_id, 0, EventKind::RunStarted, run_started(ISSUE)),
+            run_event(
+                lead_id,
+                1,
+                EventKind::StepStarted,
+                step_started("spec", 1, spec),
+            ),
+        ];
+        let jobs = vec![
+            job_row(
+                Ulid::generate(),
+                11,
+                "build #11",
+                aigentic_api::JobState::Running,
+                0.5,
+            ),
+            job_row(
+                lead_id,
+                ISSUE,
+                "build #142",
+                aigentic_api::JobState::WaitingOnYou,
+                1.25,
+            ),
+        ];
+        let mut lead = Lead::with_jobs(
+            lead_id,
+            backlog,
+            ISSUE,
+            vec![(spec, child_backlog(spec))],
+            jobs.clone(),
+        )
+        .await;
+
+        lead.line("/jobs").await;
+        let drawn = lead.lines();
+        for line in crate::app::jobs::table(&jobs) {
+            assert!(
+                drawn.iter().any(|d| d.contains(line.trim())),
+                "the table's {line:?} is missing from {drawn:?}"
+            );
+        }
+
+        // Down takes the second row; Enter enters it the way `/watch`
+        // does, because that is what the row's issue resolves to.
+        assert!(matches!(
+            lead.repl
+                .menu_key(&key_for_down(), true, true, &mut lead.out)
+                .await,
+            MenuKey::Used
+        ));
+        let requests_before = lead.daemon.requests().len();
+        lead.repl
+            .menu_key(&key_for_enter(), true, true, &mut lead.out)
+            .await;
+        let requests = lead.daemon.requests();
+        let opens: Vec<Request> = requests[requests_before..]
+            .iter()
+            .filter(|r| matches!(r, Request::Open { .. }))
+            .cloned()
+            .collect();
+        assert_eq!(
+            opens,
+            vec![
+                Request::Open {
+                    thread: lead_id,
+                    from_seq: 0
+                },
+                Request::Open {
+                    thread: spec,
+                    from_seq: 0
+                },
+            ],
+            "the row's run and then its step, in order"
+        );
+        assert!(
+            lead.repl.watch_figures().is_some() || lead.repl.inside().is_some(),
+            "the build is drawn read-only: {:?}",
+            lead.lines()
+        );
+        assert!(
+            !requests.iter().any(|r| matches!(
+                r,
+                Request::Decide { .. }
+                    | Request::AnswerHuman { .. }
+                    | Request::Post { .. }
+                    | Request::Interrupt { .. }
+            )),
+            "the listing writes nothing: {requests:?}"
+        );
+
+        // Esc leaves the build's view and puts the listing away.
+        let used = lead
+            .repl
+            .menu_key(&key_for_esc(), true, true, &mut lead.out)
+            .await;
+        assert_eq!(used, MenuKey::Used, "Esc is the listing's own key");
+        assert!(lead.repl.inside().is_none(), "the build's view is left");
+        assert!(lead.repl.menu().is_none(), "the listing is put away");
+
+        // A pipe prints the table's lines and answers no keys: the picker
+        // itself is a terminal's, so `prints_in_plain` leaves it out.
+        use crate::app::menu::Kind;
+        let id = Ulid::generate();
+        assert!(!crate::app::prints_in_plain(Kind::Job { id }));
+        assert!(!crate::app::prints_in_plain(Kind::ShowJob {
+            id,
+            issue: ISSUE
+        }));
+        for line in crate::app::jobs::table(&jobs) {
+            assert!(
+                drawn.iter().any(|d| d.contains(line.trim())),
+                "the table's {line:?} reaches a pipe too"
+            );
+        }
+    }
+
+    /// T13 (issue #79): `/jobs <n>` reads one build and closes it again,
+    /// and it writes nothing else — no follow, no answer, no post. A
+    /// number past the last row says so and opens nothing, and a build
+    /// whose log the daemon refuses answers with the refusal rather than
+    /// an empty read.
+    #[tokio::test]
+    async fn a_numbered_jobs_reads_one_and_closes() {
+        let first = Ulid::generate();
+        let second = Ulid::generate();
+        let third = Ulid::generate();
+        let jobs = vec![
+            job_row(first, 11, "build #11", aigentic_api::JobState::Running, 0.5),
+            job_row(second, 12, "build #12", aigentic_api::JobState::Done, 1.25),
+            job_row(
+                third,
+                13,
+                "build #13",
+                aigentic_api::JobState::WaitingOnYou,
+                0.0,
+            ),
+        ];
+        // The second row's own log: one step started, which is what the
+        // read draws.
+        let step = Ulid::generate();
+        let second_backlog = vec![
+            run_event(second, 0, EventKind::RunStarted, run_started(12)),
+            run_event(
+                second,
+                1,
+                EventKind::StepStarted,
+                step_started("spec", 1, step),
+            ),
+        ];
+        let mut lead = Lead::with_jobs_missing(
+            Ulid::generate(),
+            Vec::new(),
+            11,
+            vec![(second, second_backlog.clone())],
+            jobs.clone(),
+            Vec::new(),
+        )
+        .await;
+
+        let before = lead.daemon.requests().len();
+        lead.line("/jobs 2").await;
+        let requests: Vec<Request> = lead.daemon.requests()[before..].to_vec();
+        let opens: Vec<Request> = requests
+            .iter()
+            .filter(|r| matches!(r, Request::Open { .. }))
+            .cloned()
+            .collect();
+        assert_eq!(
+            opens,
+            vec![Request::Open {
+                thread: second,
+                from_seq: 0
+            }],
+            "the second row's log, and only it"
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| matches!(r, Request::Close { .. }))
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![Request::Close { thread: second }],
+            "the read closes what it opened"
+        );
+        assert!(
+            !requests.iter().any(|r| matches!(
+                r,
+                Request::Decide { .. }
+                    | Request::AnswerHuman { .. }
+                    | Request::Post { .. }
+                    | Request::Interrupt { .. }
+            )),
+            "reading a build writes nothing: {requests:?}"
+        );
+        let drawn = lead.lines().join("\n");
+        let expected = second_backlog
+            .iter()
+            .filter_map(crate::run_view::render)
+            .collect::<Vec<String>>()
+            .join("\n");
+        assert!(
+            !expected.is_empty() && drawn.contains(&expected),
+            "the backlog is drawn through the shared run view: {drawn:?}"
+        );
+        assert!(
+            drawn.contains(&crate::app::jobs::one_line(&jobs[1])),
+            "the row read back: {drawn:?}"
+        );
+
+        // A number past the last row: one line, nothing opened.
+        let before = lead.daemon.requests().len();
+        lead.line("/jobs 9").await;
+        let after = lead.daemon.requests();
+        assert_eq!(
+            after[before..]
+                .iter()
+                .filter(|r| matches!(r, Request::Open { .. }))
+                .count(),
+            0,
+            "no row past the last is opened"
+        );
+        assert_eq!(
+            lead.lines().last().map(String::as_str),
+            Some("[no row 9: today's listing holds 3]"),
+            "one line, naming the number asked for and what the listing holds"
+        );
+
+        // A build whose log the daemon refuses: the refusal is the answer.
+        let mut refused = Lead::with_jobs_missing(
+            Ulid::generate(),
+            Vec::new(),
+            11,
+            Vec::new(),
+            jobs.clone(),
+            vec![third],
+        )
+        .await;
+        refused.line("/jobs 3").await;
+        let refused_requests = refused.daemon.requests();
+        assert!(
+            !refused_requests
+                .iter()
+                .any(|r| matches!(r, Request::Close { .. })),
+            "a refused open closes nothing: {refused_requests:?}"
+        );
+        assert!(
+            refused
+                .lines()
+                .iter()
+                .any(|l| l.contains("refused") || l.contains("no thread")),
+            "the refusal is printed: {:?}",
+            refused.lines()
+        );
+    }
+
     /// `/back` leaves the watch, draws the front thread's catch-up
     /// with the divider last, and gives the keys back.
     #[tokio::test]
@@ -7627,6 +8180,7 @@ mod tests {
             missing: Vec::new(),
             rows: Vec::new(),
             children: Vec::new(),
+            jobs: Vec::new(),
         };
         let daemon = crate::run_view::fake_daemon::FakeDaemon::start(dir.path(), script).await;
         let (client, welcome) = Client::connect(&daemon.addr(), "tok").await.unwrap();
@@ -9111,6 +9665,7 @@ mod tests {
             turn_elapsed_ms: None,
             queued: 0,
             thread_tokens,
+            working: 0,
         };
         let with = usage(Some(2_100_000));
         let without = usage(None);
@@ -9211,6 +9766,7 @@ mod tests {
             missing: Vec::new(),
             rows: Vec::new(),
             children: Vec::new(),
+            jobs: Vec::new(),
         };
         let daemon = crate::run_view::fake_daemon::FakeDaemon::start(dir.path(), script).await;
         let (client, welcome) = Client::connect(&daemon.addr(), "tok").await.unwrap();

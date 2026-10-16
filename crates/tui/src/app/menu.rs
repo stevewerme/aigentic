@@ -4,9 +4,11 @@
 //! and feeds it keys, a pipe prints the rows numbered and reads a number
 //! or text. The answering keys wait for the shell's `PROMPT_GRACE`.
 
+use aigentic_api::JobRow;
 use aigentic_runtime::aigentic_core::{RiskClass, ToolCall};
 use aigentic_runtime::aigentic_policy::{prefix_of, riskiest_segment};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ulid::Ulid;
 
 use crate::app::commands::truncate_for_display;
 
@@ -49,6 +51,12 @@ pub enum Pick {
     NewYes,
     /// Keep working in this thread: nothing is interrupted (issue #108).
     NewNo,
+    /// Look at the build of a row of the `/jobs` listing read-only: the
+    /// lead it belongs to (issue #79). The engine holds the rows it drew,
+    /// so it resolves this to the build's number and enters it there.
+    Job { id: Ulid },
+    /// Put the listing away. On a row taken, this leaves that build too.
+    CloseJob,
 }
 
 /// One row of the menu.
@@ -75,6 +83,18 @@ pub enum Kind {
     /// a new thread, or keep working here. The engine's own menu, never
     /// sent to the daemon.
     NewThread,
+    /// The `/jobs` listing (issue #79): one row per build today, `id` the
+    /// lead the selection is on. The engine's own menu, never sent to the
+    /// daemon.
+    Job {
+        id: Ulid,
+    },
+    /// The same listing with a row taken: `id` is the lead being drawn
+    /// read-only and `issue` its build number.
+    ShowJob {
+        id: Ulid,
+        issue: u64,
+    },
 }
 
 /// What a key or a line came to.
@@ -362,6 +382,48 @@ impl Menu {
         }
     }
 
+    /// `/jobs` with no number (issue #79): today's builds, one row each,
+    /// newest first. Enter takes the selected row to look at read-only,
+    /// Esc puts the listing away. The rows carry the build's number and
+    /// lead, so what a row does is decided where it was drawn.
+    pub fn jobs(rows: &[JobRow]) -> Self {
+        let picked: Vec<Row> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, row)| Row {
+                label: format!("#{} · {} · {}", i + 1, row.what, row.project),
+                desc: Some(crate::app::jobs::state_words(row)),
+                pick: Pick::Job { id: row.id },
+            })
+            .collect();
+        let id = rows.first().map(|r| r.id).unwrap_or_default();
+        Self {
+            kind: Kind::Job { id },
+            title: "today's builds".into(),
+            body: String::new(),
+            note: Some("Enter opens one read-only; Esc puts the listing away".into()),
+            rows: picked,
+            selected: 0,
+            multi: false,
+            picked: Vec::new(),
+            questions: None,
+        }
+    }
+
+    /// The listing with one row taken (issue #79): the same menu, so
+    /// Down and Up still walk the builds while one is shown read-only,
+    /// and Esc leaves it the way it leaves the listing.
+    pub fn show_job(&mut self, id: Ulid, issue: u64) {
+        self.kind = Kind::ShowJob { id, issue };
+        if let Some(at) = self
+            .rows
+            .iter()
+            .position(|r| matches!(r.pick, Pick::Job { id: i, .. } if i == id))
+        {
+            self.selected = at;
+        }
+    }
+
     /// A question from `ask_human`: the first of the call's questions
     /// on the widget, the rest one after another as each is answered.
     /// A question without options has no rows: the composer takes the
@@ -498,6 +560,16 @@ impl Menu {
             // must never fall through to the keymap's interrupt, which
             // is exactly what the question asks about (issue #108).
             KeyCode::Esc if self.kind == Kind::NewThread => self.pick(1),
+            // Esc on the `/jobs` listing puts it away, and on a build
+            // drawn from it leaves that build too: the key means the same
+            // in both, and never reaches the keymap's interrupt.
+            KeyCode::Esc if matches!(self.kind, Kind::Job { .. } | Kind::ShowJob { .. }) => {
+                Keyed::Decide {
+                    pick: Pick::CloseJob,
+                    reason: None,
+                    echo: "↳ closed the listing".into(),
+                }
+            }
             _ if !settled => Keyed::Passed,
             KeyCode::Char(' ') if plain && self.multi && typing_safe => {
                 self.toggle(self.selected);
@@ -588,10 +660,17 @@ impl Menu {
         }
     }
 
-    /// Move the selection, wrapping.
+    /// Move the selection, wrapping. A kind that carries the selected
+    /// build (issue #79) follows the selection, so a key and a redraw
+    /// agree about which build is meant.
     fn select(&mut self, i: usize) {
         if !self.rows.is_empty() {
             self.selected = i % self.rows.len();
+        }
+        if matches!(self.kind, Kind::Job { .. })
+            && let Some(Pick::Job { id }) = self.rows.get(self.selected).map(|r| &r.pick)
+        {
+            self.kind = Kind::Job { id: *id };
         }
     }
 
@@ -638,6 +717,14 @@ impl Menu {
             // A row never carries a typed destination: only `line`
             // builds one. Nothing to send from here.
             Pick::SwitchCorrected { .. } => Keyed::Passed,
+            // The `/jobs` listing (issue #79): a row taken and the
+            // listing closed are both read by the engine, nothing goes
+            // to the daemon from here.
+            Pick::Job { .. } | Pick::CloseJob => Keyed::Decide {
+                pick: row.pick.clone(),
+                reason: None,
+                echo: format!("↳ {}", row.label),
+            },
             Pick::ContinueRun | Pick::StopRun | Pick::RetryRun => Keyed::Decide {
                 pick: row.pick.clone(),
                 reason: None,
@@ -820,6 +907,7 @@ impl Menu {
             Kind::Checkpoint => "checkpoint",
             Kind::Switch => "switch",
             Kind::NewThread => "new thread",
+            Kind::Job { .. } | Kind::ShowJob { .. } => "jobs",
         };
         let mut lines = vec![format!("[{tag}] {}", self.title)];
         if !self.body.is_empty() {

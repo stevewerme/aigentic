@@ -12,6 +12,7 @@ pub mod composer;
 pub mod copy;
 pub mod diff;
 pub mod engine;
+pub mod jobs;
 pub mod keymap;
 pub mod look;
 pub mod markdown;
@@ -102,6 +103,9 @@ impl Printer for Stdout {
 }
 
 /// Which prompts a pipe prints (issues #82, #108).
+///
+/// The `/jobs` picker is not one of them (issue #79): its table has
+/// already gone to `out` as plain lines, and a pipe reads no keys.
 fn prints_in_plain(kind: crate::app::menu::Kind) -> bool {
     use crate::app::menu::Kind;
     matches!(kind, Kind::Checkpoint | Kind::Switch | Kind::NewThread)

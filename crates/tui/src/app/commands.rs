@@ -40,6 +40,9 @@ pub enum Command<'a> {
     /// Watch a running issue's step here, read-only:
     /// `/watch <issue> [step]`: open one of its running steps here.
     Watch(Option<&'a str>),
+    /// Today's builds: `/jobs` lists them, `/jobs <n>` looks at one of
+    /// them read-only, where `n` is the number from the listing.
+    Jobs(Option<u32>),
     /// Leave the watched step and return to the front thread:
     /// `/back`: leave a watched step for the front thread.
     Back,
@@ -108,6 +111,11 @@ pub fn parse_line<'a>(line: &'a str, skills: &[String]) -> Command<'a> {
         ("build", arg) => Command::Build(Some(arg)),
         ("watch", "") => Command::Watch(None),
         ("watch", arg) => Command::Watch(Some(arg)),
+        ("jobs", "") => Command::Jobs(None),
+        ("jobs", arg) => match arg.parse::<u32>() {
+            Ok(n) if n >= 1 => Command::Jobs(Some(n)),
+            _ => Command::Unknown(trimmed),
+        },
         ("back", "") => Command::Back,
         ("answer", arg) => Command::Answer(arg),
         ("remember", text) if !text.is_empty() => Command::Remember(text),
@@ -172,6 +180,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "watch",
         "watch a running issue's step here, read-only: /watch <issue> [step]",
     ),
+    (
+        "jobs",
+        "today's builds and what each is doing: /jobs, then /jobs <n> to look at one read-only",
+    ),
     ("diff", "the project's working-tree diff, in the pager"),
     ("copy", "copy a code block of the last reply: /copy [n|all]"),
     ("rename", "set the thread's title: /rename <title>"),
@@ -202,6 +214,7 @@ pub const HELP: &str = "\
 /watch <n> [s]   watch a running issue's step s (default: the step it is on) read-only; /back leaves
 /answer go       continue the run past its checkpoint; /answer retry grants one more attempt where one is offered; /answer amend <text> continues with changes; /answer stop
 /back            leave a watched step and return to the front thread
+/jobs [n]        today's builds and what each is doing; with a number from the listing, look at that build read-only
 /<skill> [args]  run a user-invoked skill
 /diff            the project's working-tree diff, untracked files included
 /rename <title>  set the thread's title (one is proposed after the first turn)
@@ -451,5 +464,32 @@ mod tests {
             "{}",
             crate::app::keymap::KEYS
         );
+    }
+
+    /// T1 (issue #79): `/jobs` with no number asks for the listing, and
+    /// `/jobs <n>` carries the number. Anything else that is not a number
+    /// from one upwards is not this command, so it reaches the engine as
+    /// an unknown command rather than as a listing request.
+    #[test]
+    fn jobs_parses_with_and_without_a_number() {
+        let none: Vec<String> = vec![];
+        assert_eq!(parse_line("/jobs", &none), Command::Jobs(None));
+        assert_eq!(parse_line("/jobs 3", &none), Command::Jobs(Some(3)));
+        assert_eq!(parse_line("/jobs 0", &none), Command::Unknown("/jobs 0"));
+        assert_eq!(parse_line("/jobs x", &none), Command::Unknown("/jobs x"));
+        assert_eq!(
+            parse_line("/jobs 1 extra", &none),
+            Command::Unknown("/jobs 1 extra")
+        );
+    }
+
+    /// T2 (issue #79): `/jobs` is discoverable wherever the others are.
+    #[test]
+    fn help_names_jobs() {
+        assert!(
+            COMMANDS.iter().any(|(name, _)| *name == "jobs"),
+            "{COMMANDS:#?}"
+        );
+        assert!(HELP.contains("/jobs"), "{HELP}");
     }
 }

@@ -546,6 +546,7 @@ mod tests {
                 missing: Vec::new(),
                 rows: Vec::new(),
                 children: Vec::new(),
+                jobs: Vec::new(),
             },
         )
         .await;

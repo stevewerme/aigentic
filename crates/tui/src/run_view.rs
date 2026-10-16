@@ -276,6 +276,8 @@ pub(crate) mod fake_daemon {
         pub(crate) rows: Vec<aigentic_api::ThreadInfo>,
         /// Each child's `Open` backlog, by thread.
         pub(crate) children: ChildLogs,
+        /// The rows `Jobs` answers with.
+        pub(crate) jobs: Vec<aigentic_api::JobRow>,
     }
 
     /// A running scripted daemon. Drop it (or let the test end) to stop
@@ -348,6 +350,12 @@ pub(crate) mod fake_daemon {
                             Request::ListThreads { .. } => Response::Threads {
                                 threads: script.rows.clone(),
                             },
+                            Request::Jobs { .. } => Response::Jobs {
+                                rows: script.jobs.clone(),
+                            },
+                            // What the daemon answers a client that lets
+                            // go of a thread it only read.
+                            Request::Close { .. } => Response::Ok,
                             Request::Open { thread, from_seq } => {
                                 if script.missing.contains(thread) {
                                     // A thread with no log: what the real
