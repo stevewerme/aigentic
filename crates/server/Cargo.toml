@@ -12,7 +12,9 @@ aigentic-runtime.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-time.workspace = true
+# `local-offset` so a build's day is the person's day: the read happens
+# once, before the daemon has threads to make it unsound.
+time = { workspace = true, features = ["local-offset"] }
 tokio = { workspace = true, features = ["sync", "macros", "rt", "time", "net", "io-util"] }
 toml.workspace = true
 ulid.workspace = true

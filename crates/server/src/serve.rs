@@ -197,6 +197,10 @@ impl Server {
         reports: Arc<dyn Reports>,
         profile: Option<String>,
     ) -> Self {
+        // The listing's day is the person's, and `time` will only read the
+        // zone before the process has threads: this runs while a daemon is
+        // single-threaded, and a later read falls back to UTC.
+        crate::runs::read_day_zone();
         // Workspace files name more projects; server.toml wins on a clash.
         // A broken workspace file leaves the daemon on server.toml alone.
         let workspaces = crate::workspaces::load_all(&config_dir).unwrap_or_default();

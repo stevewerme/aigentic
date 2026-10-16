@@ -15,20 +15,21 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use aigentic_api::{CheckpointAnswer, Notice};
+use aigentic_api::{CheckpointAnswer, JobState, Notice};
 use aigentic_runtime::aigentic_core::{AgentId, Author, Event, EventKind};
 use aigentic_runtime::aigentic_log::{
-    CheckpointAnswer as LogAnswer, NewEvent, NextMove, Repair, RunStartedPayload, ThreadLog,
-    ThreadStartedPayload, run_state,
+    CheckpointAnswer as LogAnswer, NewEvent, NextMove, Repair, RunErroredPayload,
+    RunFinishedPayload, RunStartedPayload, StepFinishedPayload, ThreadLog, ThreadStartedPayload,
+    run_state,
 };
 use aigentic_runtime::runner::forge::{Forge, GhForge};
 use aigentic_runtime::runner::git::{GitRepo, Repo};
 use aigentic_runtime::runner::install::{CargoInstaller, Installer};
 use aigentic_runtime::runner::{Advanced, Runner, RunnerError, RunnerHost};
 use aigentic_runtime::workflow::{LoadedWorkflow, WorkflowFile, WorkflowRoots};
-use aigentic_runtime::{Mode, Runtime};
+use aigentic_runtime::{Mode, Phase, Runtime};
 use time::OffsetDateTime;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use ulid::Ulid;
 
 use crate::awake::{Held, KeepAwake};
@@ -105,6 +106,257 @@ pub struct RunWorld {
     /// The bundled root: its `workflows/` holds the workflows a project
     /// and the user did not override.
     pub bundled: PathBuf,
+    /// The daemon's working count, shared with every thread actor so a
+    /// usage line carries it (issue #79).
+    pub working: Working,
+}
+
+/// How many builds the daemon drives right now, and the figure the wire
+/// carries (issue #79).
+///
+/// Only the daemon that drives the runs can count them, so the count lives
+/// here: a client watching any thread still sees how busy the machine is.
+/// A build is in the map while its [`Runs`] slot is held — exactly while
+/// its task is alive — and the figure is what the wire's `working` reads.
+#[derive(Clone, Default)]
+pub struct Working(Arc<WorkingInner>);
+
+#[derive(Default)]
+struct WorkingInner {
+    /// The held builds, by lead: the day each started and the state its
+    /// last fold read, so the count is a lookup rather than a scan of
+    /// every lead's log.
+    jobs: Mutex<HashMap<Ulid, WorkingJob>>,
+    /// The count, and the nudge a change sends: an actor waits on
+    /// [`Working::changed`] and re-pushes its usage line when the figure
+    /// moves.
+    figure: watch::Sender<u32>,
+}
+
+/// One held build: the day it started and what its state was last folded
+/// to.
+#[derive(Debug, Clone)]
+struct WorkingJob {
+    day: time::Date,
+    state: Option<JobState>,
+}
+
+impl Working {
+    /// A build is now driven: `lead` joins the count as `Running`, under
+    /// the day `at` falls on in the machine's zone. Called by the run path
+    /// that takes the lead's slot.
+    pub fn register(&self, lead: Ulid, at: OffsetDateTime) {
+        self.0
+            .jobs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                lead,
+                WorkingJob {
+                    day: day_of(at),
+                    state: Some(JobState::Running),
+                },
+            );
+        self.recount();
+    }
+
+    /// A driven build moved: park it at a gate, or set it working again.
+    /// The count does not move, so this nudges nobody: whoever knows the
+    /// line it just changed calls [`Working::recount`].
+    pub fn note_state(&self, lead: Ulid, state: Option<JobState>) {
+        if let Some(job) = self
+            .0
+            .jobs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&lead)
+        {
+            job.state = state;
+        }
+    }
+
+    /// `lead` is no longer driven, whatever held it left behind.
+    pub fn release(&self, lead: Ulid) {
+        self.0
+            .jobs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&lead);
+        self.recount();
+    }
+
+    /// Forget every driven build: a daemon ending its tasks drives
+    /// nothing.
+    fn clear(&self) {
+        self.0
+            .jobs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.recount();
+    }
+
+    /// How many builds are driven right now, from the same rule the rows
+    /// use: a build whose state is `Running` or `WaitingOnYou`, on today's
+    /// day, so the figure and the listing agree.
+    #[must_use]
+    pub fn count(&self) -> u32 {
+        let today = day_of(OffsetDateTime::now_utc());
+        self.0
+            .jobs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .filter(|job| job.day == today && is_working(job.state.as_ref()))
+            .count() as u32
+    }
+
+    /// Tell every thread the figure may have moved, so each one re-pushes
+    /// the usage line it already sends. The count itself is read live, so
+    /// a nudge that changes nothing costs one line and no wrong figure.
+    pub fn recount(&self) {
+        self.0.figure.send_replace(self.count());
+    }
+
+    /// Wait for the figure to change. Never errors: the sender lives as
+    /// long as the handle, so a thread's own copy keeps the channel open.
+    pub async fn changed(&self) {
+        let mut rx = self.0.figure.subscribe();
+        // Mark the current value seen, so a thread that attaches now waits
+        // for the next change rather than re-pushing at once.
+        rx.borrow_and_update();
+        let _ = rx.changed().await;
+    }
+}
+
+/// Whether a row's state is a build at work: the two states the count is
+/// made of.
+fn is_working(state: Option<&JobState>) -> bool {
+    matches!(state, Some(JobState::Running | JobState::WaitingOnYou))
+}
+
+/// The zone a build's day is read in, once, or `None` when it could not be
+/// read.
+static DAY_ZONE: std::sync::OnceLock<Option<time::UtcOffset>> = std::sync::OnceLock::new();
+
+/// Read the machine's zone while the process is still single-threaded:
+/// `time` refuses the read once a process may have threads, and a daemon
+/// has them. A daemon calls this as it starts so a listing gets the
+/// person's day rather than UTC's.
+pub fn read_day_zone() {
+    let _ = DAY_ZONE.get_or_init(|| time::UtcOffset::current_local_offset().ok());
+}
+
+/// The day `at` falls on, in the machine's zone where it is known.
+///
+/// A build's id is stamped in UTC and "today" is the person's own day, so
+/// a build started at 00:30 in Stockholm is today's and not the previous
+/// UTC day's. A zone that could not be read leaves the UTC day: a listing
+/// still answers and only the boundary moves.
+pub(crate) fn day_of(at: OffsetDateTime) -> time::Date {
+    let zone = *DAY_ZONE.get_or_init(|| time::UtcOffset::current_local_offset().ok());
+    match zone {
+        Some(offset) => at.to_offset(offset).date(),
+        None => at.date(),
+    }
+}
+
+/// Whether a build's id was minted on today's day. The id is the run's
+/// start, stamped in UTC, so this is the day a listing keeps.
+pub(crate) fn minted_today(id: Ulid) -> bool {
+    time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(id.timestamp_ms()) * 1_000_000)
+        .is_ok_and(|at| day_of(at) == day_of(time::OffsetDateTime::now_utc()))
+}
+
+/// What one build's row shows, from one read of its lead's log: its state
+/// and what it has cost so far.
+///
+/// `held` says whether this daemon drives the lead: a driven build's state
+/// is the run registry's own fold, and its cost is what its finished steps
+/// added up to. A lead this daemon does not drive states only what its log
+/// says: an errored end, a finished end, or nothing at all.
+pub fn job_facts(threads: &Path, lead: Ulid, held: bool) -> (Option<JobState>, Option<f64>) {
+    let Some(events) = read_events(threads, lead) else {
+        return (None, None);
+    };
+    if held {
+        let state = read_status_in(threads, lead)
+            .and_then(|status| state_of(&status))
+            .or_else(|| end_state(&events));
+        return (state, step_cost(&events));
+    }
+    (end_state(&events), end_cost(&events))
+}
+
+/// A stopped reason's first line, clipped as a thread row's title is.
+fn clipped(reason: &str) -> String {
+    crate::threads::first_line_of(reason)
+}
+
+/// The state a folded run's phase stands for. A phase that is neither at
+/// work nor at a gate is a build with no state to show: its end is what
+/// would say so, and a held run's fold has already read the log.
+fn state_of(status: &aigentic_runtime::RunStatus) -> Option<JobState> {
+    match &status.phase {
+        Phase::Step(_) | Phase::Move(_) => Some(JobState::Running),
+        Phase::Gate { .. } => Some(JobState::WaitingOnYou),
+        Phase::Stopped { reason } => Some(JobState::Stopped {
+            reason: clipped(reason),
+        }),
+    }
+}
+
+/// What a lead's log says about how its run ended, for a lead this daemon
+/// does not drive.
+fn end_state(events: &[Event]) -> Option<JobState> {
+    for event in events.iter().rev() {
+        match event.kind {
+            EventKind::RunErrored => {
+                let payload: RunErroredPayload = payload_of(event)?;
+                return Some(JobState::Stopped {
+                    reason: clipped(&payload.reason),
+                });
+            }
+            EventKind::RunFinished => return Some(JobState::Done),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// What a lead's finished steps have cost so far, or `None` when none of
+/// them is priced.
+fn step_cost(events: &[Event]) -> Option<f64> {
+    let priced: Vec<StepFinishedPayload> = events
+        .iter()
+        .filter(|event| event.kind == EventKind::StepFinished)
+        .filter_map(payload_of)
+        .collect();
+    (!priced.is_empty()).then(|| priced.iter().map(|p| p.cost_usd).sum())
+}
+
+/// What a run's own end says it cost, or `None` when it was not priced.
+fn end_cost(events: &[Event]) -> Option<f64> {
+    for event in events.iter().rev() {
+        match event.kind {
+            EventKind::RunErrored => {
+                let payload: RunErroredPayload = payload_of(event)?;
+                return Some(payload.cost_usd);
+            }
+            EventKind::RunFinished => {
+                let payload: RunFinishedPayload = payload_of(event)?;
+                return Some(payload.cost_usd);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// A payload by kind, or `None` when the line cannot be read as one: a
+/// listing shows what it can read rather than refuse the whole day.
+fn payload_of<T: serde::de::DeserializeOwned>(event: &Event) -> Option<T> {
+    serde_json::from_value(event.payload.clone()).ok()
 }
 
 impl RunWorld {
@@ -492,12 +744,22 @@ pub struct Runs {
     /// future, so ending the tasks is what a process dying does to its
     /// advisory locks.
     tasks: Mutex<HashMap<Ulid, tokio::task::JoinHandle<()>>>,
+    /// How many of these leads are being driven right now, shared with
+    /// every thread actor (issue #79).
+    working: Working,
 }
 
 impl Runs {
     /// An empty registry.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The working count this registry drives, for the wire and for the
+    /// thread actors a usage line carries it on.
+    #[must_use]
+    pub fn working(&self) -> Working {
+        self.working.clone()
     }
 
     /// Take `lead` for this caller, or find it taken — inserting and
@@ -518,6 +780,8 @@ impl Runs {
         };
         let (tx, rx) = mpsc::unbounded_channel();
         slots.insert(lead, tx.clone());
+        drop(slots);
+        self.working.register(lead, OffsetDateTime::now_utc());
         Claim::Claimed(lock, rx, tx)
     }
 
@@ -545,6 +809,7 @@ impl Runs {
             let _ = task.await;
         }
         self.slots.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.working.clear();
     }
 
     /// Give up `lead`, so a later claim may drive it again: the task
@@ -554,6 +819,7 @@ impl Runs {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&lead);
+        self.working.release(lead);
     }
 
     /// Whether a task holds `lead` now.
@@ -668,6 +934,9 @@ pub async fn tick_status(runs: Arc<Runs>, world: &RunWorld, lead: Ulid, every: D
         if runs.watchers(lead) == 0 {
             continue;
         }
+        // The count is re-pushed with the status: a client watching this
+        // thread sees how busy the daemon is on the same line.
+        world.working.recount();
         if let Some(status) = read_status(world, lead) {
             runs.broadcast(
                 lead,
@@ -741,7 +1010,12 @@ fn parent_of(events: &[Event]) -> Option<Ulid> {
 /// present but unreadable is a failed read — and a failed read pushes
 /// nothing rather than a partial line.
 fn read_status(world: &RunWorld, lead: Ulid) -> Option<aigentic_runtime::RunStatus> {
-    let threads = &world.root.threads_dir;
+    read_status_in(&world.root.threads_dir, lead)
+}
+
+/// The same fold over `threads`: a listing knows a lead's directory and
+/// nothing else of its world.
+pub fn read_status_in(threads: &Path, lead: Ulid) -> Option<aigentic_runtime::RunStatus> {
     let lead_events = read_events(threads, lead)?;
     let child = match run_state(&lead_events).ok()?.next_move() {
         NextMove::ReAwait { child_thread, .. } if exists(threads, child_thread) => {
@@ -837,6 +1111,8 @@ async fn run(
                 // Nothing is working while the run waits for an answer:
                 // the hold goes back until one arrives.
                 drop(held.take());
+                world.working.note_state(lead, Some(JobState::WaitingOnYou));
+                world.working.recount();
                 let Some(answer) = answers.recv().await else {
                     // Nobody can answer any more: the task ends, and the
                     // run stays resumable.
@@ -849,6 +1125,12 @@ async fn run(
                     answer.by.clone(),
                 );
                 let wrote = verdict.is_ok();
+                if wrote {
+                    // The build works again: the count still holds it, and
+                    // the line's words move with it.
+                    world.working.note_state(lead, Some(JobState::Running));
+                    world.working.recount();
+                }
                 let _ = answer
                     .reply
                     .send(verdict.map(|_| ()).map_err(|e| e.to_string()));

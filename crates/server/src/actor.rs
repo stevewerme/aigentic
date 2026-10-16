@@ -210,6 +210,10 @@ struct Shared {
     /// #7): `after_turn` announces the new identity once, as an idle
     /// switch does.
     switched: Mutex<bool>,
+    /// The daemon's working count (issue #79): the usage line carries
+    /// it, and a change wakes the loop so every open thread re-pushes
+    /// that line.
+    working: crate::runs::Working,
     /// The keep-awake guard and whether a hold is outstanding (issue
     /// #47), under one lock. `held` keeps hold and release paired, so a
     /// turn interrupted while it was waiting cannot release twice, and
@@ -301,6 +305,7 @@ impl Shared {
             turn_elapsed_ms: started.map(|t| t.elapsed().as_millis() as u64),
             queued,
             thread_tokens: Some(usage.thread_tokens),
+            working: self.working.count(),
         });
     }
 
@@ -516,6 +521,7 @@ impl ThreadActor {
         torn: Option<u64>,
         reports: Arc<dyn Reports>,
         labels: WorkspaceLabel,
+        working: crate::runs::Working,
     ) -> Result<(Self, Mailbox), aigentic_runtime::RuntimeError> {
         let decisions = Arc::new(Decisions::new());
         runtime = runtime.with_decisions(decisions.clone());
@@ -533,6 +539,7 @@ impl ThreadActor {
             mode: Mutex::new(runtime.mode().name().to_owned()),
             identity: Mutex::new(runtime.identity()),
             labels,
+            working: working.clone(),
             switched: Mutex::new(false),
             guard: Mutex::new(Hold {
                 guard: Arc::new(crate::awake::ProcessGuard::off()),
@@ -615,14 +622,23 @@ impl ThreadActor {
             self.turn(Start::Continue(Author::System)).await;
         }
         loop {
-            let Some(mail) = self.rx.recv().await else {
-                break;
-            };
-            if let Some(start) = self.handle_idle(mail).await {
-                self.turn(start).await;
-            }
-            if let Some(reply) = self.pending_compact.take() {
-                self.compact(reply).await;
+            tokio::select! {
+                mail = self.rx.recv() => {
+                    let Some(mail) = mail else {
+                        break;
+                    };
+                    if let Some(start) = self.handle_idle(mail).await {
+                        self.turn(start).await;
+                    }
+                    if let Some(reply) = self.pending_compact.take() {
+                        self.compact(reply).await;
+                    }
+                }
+                // A build elsewhere in the daemon started, parked or
+                // ended: this thread's line carries the new count. A
+                // thread that has had no model call pushes nothing
+                // (`push_usage`'s own guard).
+                () = self.shared.working.changed() => self.shared.push_usage(),
             }
         }
     }

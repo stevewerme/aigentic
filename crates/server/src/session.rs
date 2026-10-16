@@ -6,8 +6,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use aigentic_api::{
-    Body, Frame, FrontOutcome, Notice, PROTOCOL_VERSION, ProjectInfo, Request, Response, StartAsk,
-    SwitchReply, ThreadInfo, ThreadState, Welcome, decode, encode,
+    Body, Frame, FrontOutcome, JobRow, Notice, PROTOCOL_VERSION, ProjectInfo, Request, Response,
+    StartAsk, SwitchReply, ThreadInfo, ThreadState, Welcome, decode, encode,
 };
 use aigentic_runtime::aigentic_core::{AgentId, Author, UserId};
 use aigentic_runtime::aigentic_policy::Role;
@@ -758,16 +758,35 @@ async fn handle(
         }
         // Today's builds: the index for the rows, off the session's async
         // worker like the heavy listing.
+        // Today's builds: the index for the rows, then one read of each
+        // lead's log for its state and cost, off the session's async
+        // worker.
         Request::Jobs { project } => {
             let table = Arc::clone(threads);
             let config = Arc::clone(config);
             let user = user.to_owned();
-            let listed = tokio::task::spawn_blocking(move || {
-                table.job_rows(project.as_deref(), |q| {
-                    role_in_project(&config, &table, q, &user).is_some()
+            let listed =
+                tokio::task::spawn_blocking(move || -> Result<Vec<JobRow>, ThreadError> {
+                    let rows = table.job_rows(project.as_deref(), |q| {
+                        role_in_project(&config, &table, q, &user).is_some()
+                    })?;
+                    Ok(rows
+                        .into_iter()
+                        .map(|row| {
+                            let Some(dir) = table.dir_of(row.id) else {
+                                return row;
+                            };
+                            let (state, cost_usd) =
+                                crate::runs::job_facts(&dir, row.id, table.runs().held(row.id));
+                            JobRow {
+                                state,
+                                cost_usd,
+                                ..row
+                            }
+                        })
+                        .collect())
                 })
-            })
-            .await;
+                .await;
             match listed {
                 Ok(Ok(rows)) => Response::Jobs { rows },
                 Ok(Err(e)) => thread_error(e),

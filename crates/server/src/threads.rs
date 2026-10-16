@@ -1030,10 +1030,16 @@ impl ThreadTable {
         if let Some(wanted) = project {
             self.root_of(wanted)?;
         }
+        // The day is the row's own, from the id the run was minted with:
+        // no log body is read here, so a listing over a long index stays
+        // cheap.
         let mut rows: Vec<JobRow> = self
             .known_ids()
             .into_iter()
             .filter_map(|id| {
+                if !crate::runs::minted_today(id) {
+                    return None;
+                }
                 let indexed = self.lookup(id)?;
                 let RunThread::Lead { issue } = indexed.run else {
                     return None;
@@ -1186,6 +1192,7 @@ impl ThreadTable {
             built.torn,
             self.reports.clone(),
             self.labels(),
+            self.runs().working(),
         )?;
         let actor = actor.with_keep_awake(self.guard());
         tokio::spawn(actor.run());
@@ -1289,6 +1296,7 @@ impl ThreadTable {
             project: project.to_owned(),
             workspaces: self.workspaces.clone(),
             bundled,
+            working: self.runs.working(),
         })
     }
 
@@ -2137,7 +2145,7 @@ fn summarise(dir: &Path, id: Ulid, project: &str) -> ThreadInfo {
 
 const FIRST_LINE_CHARS: usize = 72;
 
-fn first_line_of(text: &str) -> String {
+pub(crate) fn first_line_of(text: &str) -> String {
     let line = text
         .lines()
         .find(|l| !l.trim().is_empty())

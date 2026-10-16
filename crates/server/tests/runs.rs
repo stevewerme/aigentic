@@ -754,6 +754,149 @@ fn world(daemon: &Daemon) -> aigentic_server::runs::RunWorld {
         .unwrap()
 }
 
+// ---------------------------------------------------------------------------
+// The day's builds (issue #79)
+// ---------------------------------------------------------------------------
+
+/// A lead's log with its header, its `run_started` and one step open: the
+/// shape a run leaves, and the shape the index reads a row from.
+fn write_lead(fx: &Fixture, lead: Ulid, issue: u64, project: &str, child: Ulid) {
+    std::fs::create_dir_all(&fx.threads).unwrap();
+    let (mut log, _cut) =
+        ThreadLog::open_with(fx.threads.clone(), lead, Repair::TruncateTornTail).unwrap();
+    log.append(NewEvent {
+        kind: EventKind::ThreadStarted,
+        author: Author::System,
+        payload: json!({
+            "project": project,
+            "root": fx.repo.display().to_string(),
+            "created_by": {"kind": "system"},
+            "parent_thread": null,
+            "step": null,
+            "front": false,
+        }),
+        parent_event: None,
+    })
+    .unwrap();
+    log.append(NewEvent {
+        kind: EventKind::RunStarted,
+        author: Author::System,
+        payload: json!({
+            "issue": issue,
+            "workflow": "build",
+            "version": 1,
+            "content_hash": "abc",
+            "budget_usd": 10.0,
+        }),
+        parent_event: None,
+    })
+    .unwrap();
+    log.append(NewEvent {
+        kind: EventKind::StepStarted,
+        author: Author::System,
+        payload: json!({
+            "step": "spec",
+            "role": "spec",
+            "profile": "flash",
+            "child_thread": child,
+            "attempt": 1,
+            "budget_usd": 3.0,
+        }),
+        parent_event: None,
+    })
+    .unwrap();
+}
+
+/// T3 — the rows are today's leads, newest first: yesterday's lead, today's
+/// step child and today's ordinary thread carry no row.
+#[tokio::test]
+async fn t3_only_todays_leads_are_rows() {
+    let daemon = Daemon::new(Scripts::default(), false).await;
+    let day = Duration::from_secs(24 * 60 * 60);
+    let now = std::time::SystemTime::now();
+
+    let yesterday = Ulid::from_datetime(now - day);
+    let older = Ulid::from_datetime(now - Duration::from_secs(60));
+    let newer = Ulid::from_datetime(now);
+    let child = Ulid::from_datetime(now - Duration::from_secs(30));
+    let plain = Ulid::from_datetime(now - Duration::from_secs(20));
+
+    write_lead(
+        &daemon.fixture,
+        yesterday,
+        700,
+        "p",
+        Ulid::from_datetime(now - day),
+    );
+    write_lead(&daemon.fixture, older, 701, "p", child);
+    write_lead(&daemon.fixture, newer, 702, "p", child);
+    // An ordinary thread: a header, and nothing that makes it run-owned.
+    let (mut log, _cut) = ThreadLog::open_with(
+        daemon.fixture.threads.clone(),
+        plain,
+        Repair::TruncateTornTail,
+    )
+    .unwrap();
+    log.append(NewEvent {
+        kind: EventKind::ThreadStarted,
+        author: Author::User(aigentic_runtime::aigentic_core::UserId("steve".into())),
+        payload: json!({
+            "project": "p",
+            "root": daemon.fixture.repo.display().to_string(),
+            "created_by": {"kind": "user", "id": "steve"},
+            "parent_thread": null,
+            "step": null,
+            "front": false,
+        }),
+        parent_event: None,
+    })
+    .unwrap();
+
+    let rows = daemon.server.threads.job_rows(None, |_| true).unwrap();
+
+    let ids: Vec<Ulid> = rows.iter().map(|row| row.id).collect();
+    assert_eq!(ids, vec![newer, older], "today's leads, newest first");
+    assert_eq!(rows[0].project, "p");
+}
+
+/// T4 — a row names the issue its lead started with, from the run's own
+/// record, and the ask's project filter decides which rows come back.
+#[tokio::test]
+async fn t4_a_rows_what_is_the_build_number() {
+    let daemon = Daemon::new(Scripts::default(), false).await;
+    let lead = Ulid::from_datetime(std::time::SystemTime::now());
+    write_lead(
+        &daemon.fixture,
+        lead,
+        139,
+        "p",
+        Ulid::from_datetime(std::time::SystemTime::now()),
+    );
+
+    let rows = daemon.server.threads.job_rows(None, |_| true).unwrap();
+
+    assert_eq!(rows.len(), 1, "one lead today");
+    assert_eq!(rows[0].issue, Some(139), "the issue its run_started names");
+    assert_eq!(rows[0].what, "build #139");
+    assert!(
+        daemon
+            .server
+            .threads
+            .job_rows(Some("elsewhere"), |_| true)
+            .is_err(),
+        "a project this daemon does not serve is refused"
+    );
+    assert!(
+        daemon
+            .server
+            .threads
+            .job_rows(None, |project| project == "elsewhere")
+            .unwrap()
+            .is_empty(),
+        "a project the caller may not read carries no row"
+    );
+}
+
 /// T1 — `create_child` is idempotent: one `thread_started` with
 /// `parent_thread` and `step`; a second call adds nothing; an empty file
 /// gets the header.

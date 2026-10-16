@@ -468,6 +468,11 @@ pub enum Notice {
         /// daemon before #99, and an older client ignores it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         thread_tokens: Option<u64>,
+        /// How many builds the daemon drives right now: its own count, the
+        /// same on every thread it sends a line for. A daemon that does not
+        /// send one leaves the key off, which reads as `0`.
+        #[serde(default)]
+        working: u32,
     },
     /// A remark for the person that is not an event (a rules file that
     /// could not be written).
@@ -1081,6 +1086,7 @@ mod tests {
                 turn_elapsed_ms: Some(1_200),
                 queued: 1,
                 thread_tokens: Some(2_100_000),
+                working: 2,
             },
             Notice::Usage {
                 thread: thread(),
@@ -1089,6 +1095,7 @@ mod tests {
                 turn_elapsed_ms: None,
                 queued: 0,
                 thread_tokens: None,
+                working: 0,
             },
         ]
     }
@@ -1106,6 +1113,7 @@ mod tests {
             turn_elapsed_ms: None,
             queued: 0,
             thread_tokens: Some(2_100_000),
+            working: 0,
         };
         let line = encode(&Frame::notice(with.clone()));
         assert!(line.contains("\"thread_tokens\":2100000"), "{line}");
@@ -1118,6 +1126,7 @@ mod tests {
             turn_elapsed_ms: None,
             queued: 0,
             thread_tokens: None,
+            working: 0,
         };
         let line = encode(&Frame::notice(without.clone()));
         assert!(!line.contains("thread_tokens"), "{line}");
@@ -1126,11 +1135,13 @@ mod tests {
         assert_eq!(decode(&line).unwrap(), Frame::notice(without));
     }
 
-    /// The jobs pair is additive on the wire: `Jobs` without a project
-    /// writes no `project` key, and a row whose state and cost this daemon
-    /// cannot read leaves both off.
+    /// T9 (issue #79): the pair this ticket adds is additive both ways. A
+    /// `usage` line from an older daemon has no `working` key and decodes
+    /// to `0`; a row whose state and cost this daemon cannot read leaves
+    /// both keys off; and a reason with a colon in it survives the round
+    /// trip.
     #[test]
-    fn a_jobs_request_and_its_row_round_trip_with_the_fields_left_off() {
+    fn the_wire_tolerates_a_usage_without_the_count_and_round_trips_a_row() {
         let empty = JobRow {
             state: None,
             cost_usd: None,
@@ -1155,6 +1166,32 @@ mod tests {
         };
         let round = serde_json::to_string(&stopped).unwrap();
         assert_eq!(serde_json::from_str::<JobRow>(&round).unwrap(), stopped);
+
+        let counting = Notice::Usage {
+            thread: thread(),
+            tokens_in_window: 48_000,
+            window: 120_000,
+            turn_elapsed_ms: None,
+            queued: 0,
+            thread_tokens: None,
+            working: 3,
+        };
+        let line = encode(&Frame::notice(counting.clone()));
+        assert_eq!(decode(&line).unwrap(), Frame::notice(counting), "{line}");
+
+        // What a daemon that does not count sends: the same line with the
+        // key dropped.
+        let mut older: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(older["notice"]["working"], 3, "{older}");
+        older["notice"]
+            .as_object_mut()
+            .expect("a notice is a JSON object")
+            .remove("working");
+        let older: Notice = serde_json::from_value(older["notice"].clone()).unwrap();
+        let Notice::Usage { working, .. } = older else {
+            panic!("a usage line decodes as usage");
+        };
+        assert_eq!(working, 0);
     }
 
     #[test]
