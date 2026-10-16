@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use aigentic_api::{
-    CheckpointAnswer, Notice, ReportKind, StartRow, ThreadInfo, ThreadKind, ThreadState,
+    CheckpointAnswer, JobRow, Notice, ReportKind, StartRow, ThreadInfo, ThreadKind, ThreadState,
 };
 use aigentic_runtime::ProjectFile;
 use aigentic_runtime::ProjectRow;
@@ -1012,6 +1012,55 @@ impl ThreadTable {
         // project.
         rows.sort_unstable_by_key(|r| std::cmp::Reverse(r.id));
         rows
+    }
+
+    /// A build's row as `/jobs` shows it: every lead this daemon knows,
+    /// newest first, with the project the caller may read. A step's child
+    /// and an ordinary thread are never rows, and a lead whose project the
+    /// caller cannot read is left out — a listing they may not read
+    /// anywhere is empty rather than refused.
+    ///
+    /// Nothing here reads a log body: the index carries the run mark and
+    /// the project. `state` and `cost_usd` stay unset.
+    pub fn job_rows(
+        &self,
+        project: Option<&str>,
+        readable: impl Fn(&str) -> bool,
+    ) -> Result<Vec<JobRow>, ThreadError> {
+        if let Some(wanted) = project {
+            self.root_of(wanted)?;
+        }
+        let mut rows: Vec<JobRow> = self
+            .known_ids()
+            .into_iter()
+            .filter_map(|id| {
+                let indexed = self.lookup(id)?;
+                let RunThread::Lead { issue } = indexed.run else {
+                    return None;
+                };
+                let its = indexed
+                    .switched
+                    .filter(|name| self.server.project(name).is_some())
+                    .or(indexed.home)?;
+                match project {
+                    Some(wanted) if wanted != its => return None,
+                    None if !readable(&its) => return None,
+                    _ => {}
+                }
+                Some(JobRow {
+                    id,
+                    issue: Some(issue),
+                    what: format!("build #{issue}"),
+                    project: its,
+                    state: None,
+                    cost_usd: None,
+                })
+            })
+            .collect();
+        // Newest first, as the id is time-ordered and minted when the run
+        // starts.
+        rows.sort_unstable_by_key(|r| std::cmp::Reverse(r.id));
+        Ok(rows)
     }
 
     /// One row as `/threads` shows it (issue #86): `summarise`'s log

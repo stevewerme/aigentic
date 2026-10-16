@@ -22,8 +22,9 @@ use ulid::Ulid;
 /// `Response::Front`; version 5 lets `ListThreads` omit its project;
 /// version 6 adds `Notice::RunStatus`, which an older client cannot
 /// decode; version 7 adds `RunPhase::Stopped`, which an older client
-/// would render as a move, so a mismatched pair must refuse loudly.
-pub const PROTOCOL_VERSION: u32 = 7;
+/// would render as a move; version 8 adds `Jobs`/`JobRow`, so a client
+/// that cannot show today's builds must refuse rather than misread one.
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// One line on the wire.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -84,6 +85,14 @@ pub enum Request {
     /// rest grouped by workspace. The daemon judges the roles of a
     /// project-less listing per project.
     ListThreads {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project: Option<String>,
+    },
+    /// Today's builds and what each is doing. With no project the daemon
+    /// judges the roles per row's project, like a project-less listing;
+    /// with one it needs `read` there. A build another daemon drives
+    /// lists with no state and no cost.
+    Jobs {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         project: Option<String>,
     },
@@ -286,6 +295,10 @@ pub enum Response {
     /// the whole `ThreadInfo`.
     StartRows {
         rows: Vec<StartRow>,
+    },
+    /// The reply to `Jobs`: today's builds, newest first.
+    Jobs {
+        rows: Vec<JobRow>,
     },
     Thread {
         thread: ThreadInfo,
@@ -675,6 +688,52 @@ pub struct ThreadInfo {
     pub kind: ThreadKind,
 }
 
+/// One `Jobs` row: a build started today. Its state and its cost are
+/// absent when this daemon is not the one running it, since it states
+/// only what it can read.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JobRow {
+    /// The build's lead thread.
+    pub id: Ulid,
+    /// The issue the build works; `None` on a row that is not a build.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue: Option<u64>,
+    /// What the table shows for the row, `build #<issue>`.
+    pub what: String,
+    pub project: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<JobState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+}
+
+/// What a `Jobs` row's build is doing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum JobState {
+    Running,
+    /// Parked at a checkpoint: it waits on a person, not on the model.
+    WaitingOnYou,
+    Done,
+    /// The run's turn ended in an error and the run has not ended.
+    Stopped {
+        reason: String,
+    },
+}
+
+impl JobState {
+    /// The table's words for the state: `running`, `waiting on you`,
+    /// `done`, or `stopped: <reason>`.
+    pub fn words(&self) -> String {
+        match self {
+            Self::Running => "running".to_owned(),
+            Self::WaitingOnYou => "waiting on you".to_owned(),
+            Self::Done => "done".to_owned(),
+            Self::Stopped { reason } => format!("stopped: {reason}"),
+        }
+    }
+}
+
 /// A line that could not be read.
 #[derive(Debug, thiserror::Error)]
 #[error("cannot read frame (this side speaks protocol {PROTOCOL_VERSION}): {message}")]
@@ -750,6 +809,18 @@ mod tests {
         }
     }
 
+    /// A `Jobs` row, for the reply that carries one.
+    fn job_row() -> JobRow {
+        JobRow {
+            id: thread(),
+            issue: Some(29),
+            what: "build #29".into(),
+            project: "p".into(),
+            state: Some(JobState::Running),
+            cost_usd: Some(0.5),
+        }
+    }
+
     fn every_request() -> Vec<Request> {
         vec![
             Request::Hello {
@@ -763,6 +834,12 @@ mod tests {
             // Issue #86: no project means every project the caller may
             // read, so the frame carries none.
             Request::ListThreads { project: None },
+            Request::Jobs {
+                project: Some("p".into()),
+            },
+            // A project-less ask names nothing to judge: the daemon
+            // judges each row's project.
+            Request::Jobs { project: None },
             // Issue #121: the ask's light listing, which takes no
             // fields at all.
             Request::StartRows,
@@ -889,6 +966,10 @@ mod tests {
                     front: true,
                 }],
             },
+            Response::Jobs {
+                rows: vec![job_row()],
+            },
+            Response::Jobs { rows: Vec::new() },
             Response::Thread {
                 thread: thread_info.clone(),
             },
@@ -1045,6 +1126,37 @@ mod tests {
         assert_eq!(decode(&line).unwrap(), Frame::notice(without));
     }
 
+    /// The jobs pair is additive on the wire: `Jobs` without a project
+    /// writes no `project` key, and a row whose state and cost this daemon
+    /// cannot read leaves both off.
+    #[test]
+    fn a_jobs_request_and_its_row_round_trip_with_the_fields_left_off() {
+        let empty = JobRow {
+            state: None,
+            cost_usd: None,
+            ..job_row()
+        };
+        let line = encode(&Frame::request(1, Request::Jobs { project: None }));
+        assert!(!line.contains("project"), "{line}");
+        assert_eq!(
+            decode(&line).unwrap(),
+            Frame::request(1, Request::Jobs { project: None })
+        );
+        let bare = serde_json::to_string(&empty).unwrap();
+        assert!(!bare.contains("state"), "{bare}");
+        assert!(!bare.contains("cost_usd"), "{bare}");
+        assert_eq!(serde_json::from_str::<JobRow>(&bare).unwrap(), empty);
+
+        let stopped = JobRow {
+            state: Some(JobState::Stopped {
+                reason: "no such label".into(),
+            }),
+            ..job_row()
+        };
+        let round = serde_json::to_string(&stopped).unwrap();
+        assert_eq!(serde_json::from_str::<JobRow>(&round).unwrap(), stopped);
+    }
+
     #[test]
     fn every_frame_round_trips_on_one_line() {
         let mut frames: Vec<Frame> = every_request()
@@ -1194,7 +1306,7 @@ mod tests {
     /// its log and the client cannot tell.
     #[test]
     fn t7_front_asked_round_trips_and_the_old_frame_still_decodes() {
-        assert_eq!(PROTOCOL_VERSION, 7, "the stopped phase moved it");
+        assert_eq!(PROTOCOL_VERSION, 8, "the jobs pair moved it");
         let asked = StartAsk {
             offered: "web".into(),
             chosen: "api".into(),
@@ -1246,7 +1358,7 @@ mod tests {
     /// (which always named one) still decodes.
     #[test]
     fn t1_list_threads_project_is_optional_on_the_wire() {
-        assert_eq!(PROTOCOL_VERSION, 7, "the stopped phase moved it");
+        assert_eq!(PROTOCOL_VERSION, 8, "the jobs pair moved it");
         let some = Frame::request(
             1,
             Request::ListThreads {
@@ -1561,6 +1673,6 @@ mod tests {
         assert!(
             decode(r#"{"notice":{"kind":"run_status","thread":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":{"issue":1,"phase":{"phase":"teleported"},"idle_secs":0}}}"#).is_err()
         );
-        assert_eq!(PROTOCOL_VERSION, 7, "the stopped phase moved it");
+        assert_eq!(PROTOCOL_VERSION, 8, "the jobs pair moved it");
     }
 }

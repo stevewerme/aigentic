@@ -239,12 +239,15 @@ fn project_for(threads: &ThreadTable, request: &Request) -> Option<String> {
         Request::ListThreads {
             project: Some(project),
         }
+        | Request::Jobs {
+            project: Some(project),
+        }
         | Request::CreateThread { project }
         | Request::Build { project, .. } => Some(project.clone()),
         // Listed across projects (issue #86): there is no one project
         // to check, so the handler judges each row's project. The arm
         // keeps this match exhaustive.
-        Request::ListThreads { project: None } => None,
+        Request::ListThreads { project: None } | Request::Jobs { project: None } => None,
         // A checkpoint is answered in the project its run works in.
         Request::AnswerCheckpoint { lead, .. } => threads.project_of(*lead),
         Request::Open { thread, .. }
@@ -747,6 +750,26 @@ async fn handle(
             .await;
             match listed {
                 Ok(Ok(list)) => Response::Threads { threads: list },
+                Ok(Err(e)) => thread_error(e),
+                Err(e) => Response::Refused {
+                    reason: format!("the listing failed: {e}"),
+                },
+            }
+        }
+        // Today's builds: the index for the rows, off the session's async
+        // worker like the heavy listing.
+        Request::Jobs { project } => {
+            let table = Arc::clone(threads);
+            let config = Arc::clone(config);
+            let user = user.to_owned();
+            let listed = tokio::task::spawn_blocking(move || {
+                table.job_rows(project.as_deref(), |q| {
+                    role_in_project(&config, &table, q, &user).is_some()
+                })
+            })
+            .await;
+            match listed {
+                Ok(Ok(rows)) => Response::Jobs { rows },
                 Ok(Err(e)) => thread_error(e),
                 Err(e) => Response::Refused {
                     reason: format!("the listing failed: {e}"),

@@ -116,6 +116,12 @@ pub fn needs(request: &Request) -> Option<Role> {
         // is filtered to the projects the caller holds a role in.
         Request::ListThreads { project: None } => None,
         Request::ListThreads { project: Some(_) } => Some(Role::Read),
+        // The `Jobs` handler judges it, per project: nothing is judged at a
+        // listing that names no project, and the rows are filtered to the
+        // projects the caller may read; a listing scoped to one project
+        // needs `read` in it.
+        Request::Jobs { project: None } => None,
+        Request::Jobs { project: Some(_) } => Some(Role::Read),
         // The `StartRows` handler judges it (issue #121): the rows are
         // filtered to this user's own threads, so there is no one
         // project to check.
@@ -221,6 +227,15 @@ mod tests {
                 Some(Role::Read),
             ),
             (Request::ListThreads { project: None }, None),
+            // A jobs listing is judged per project like a thread listing:
+            // the handler filters rows, and a scoped ask needs `read`.
+            (
+                Request::Jobs {
+                    project: Some("p".into()),
+                },
+                Some(Role::Read),
+            ),
+            (Request::Jobs { project: None }, None),
             // Issue #121: the ask's light listing is this user's own
             // threads, so no project is checked here.
             (Request::StartRows, None),
