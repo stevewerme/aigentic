@@ -829,11 +829,16 @@ pub struct RouteTakenPayload {
 
 /// Payload of a `checkpoint_asked` event: the gate, what the human was
 /// shown, and the options offered.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CheckpointAskedPayload {
     pub gate: String,
     pub shown: Vec<String>,
     pub options: Vec<String>,
+    /// The smallest figure that clears the budget gate, when the gate
+    /// offers a raise. Absent from a log written before the field
+    /// existed, and from every gate that needs no figure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raise_usd: Option<f64>,
 }
 
 /// One finding's mark at the reveal stage. `Missed` marks a purpose
@@ -1987,6 +1992,7 @@ mod tests {
             gate: "plan_gate".into(),
             shown: vec!["## Plan".into(), "## Plan amendment".into()],
             options: vec!["go".into(), "amend".into(), "stop".into()],
+            raise_usd: None,
         };
         let value = serde_json::to_value(&p).unwrap();
         assert_eq!(
@@ -2000,6 +2006,51 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<CheckpointAskedPayload>(value).unwrap(),
             p
+        );
+    }
+
+    /// The raise figure is additive: an ask that carries one round-trips
+    /// with it, and an ask that carries none writes the keys it always
+    /// wrote — an older log reads as `None` and an older reader ignores
+    /// the key.
+    #[test]
+    fn an_ask_carries_the_raise_figure_only_when_it_offers_one() {
+        let figure = 3.76;
+        let with = CheckpointAskedPayload {
+            gate: "budget".into(),
+            shown: vec!["spent 3.00 of the run's 3.00 budget".into()],
+            options: vec!["raise".into(), "stop".into()],
+            raise_usd: Some(figure),
+        };
+        let value = serde_json::to_value(&with).unwrap();
+        assert_eq!(
+            value["raise_usd"],
+            json!(figure),
+            "the figure is a key of the ask: {value}"
+        );
+        assert_eq!(
+            serde_json::from_value::<CheckpointAskedPayload>(value).unwrap(),
+            with,
+            "and the ask reads back as it was written"
+        );
+        let without = CheckpointAskedPayload {
+            raise_usd: None,
+            ..with
+        };
+        let value = serde_json::to_value(&without).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "gate": "budget",
+                "shown": ["spent 3.00 of the run's 3.00 budget"],
+                "options": ["raise", "stop"]
+            }),
+            "an ask without a figure writes no key for it"
+        );
+        assert_eq!(
+            serde_json::from_value::<CheckpointAskedPayload>(value).unwrap(),
+            without,
+            "and reads back as the same ask"
         );
     }
 

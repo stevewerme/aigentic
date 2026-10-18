@@ -723,6 +723,7 @@ mod tests {
                 gate: gate.into(),
                 shown: vec!["## Plan".into()],
                 options: vec!["go".into(), "stop".into()],
+                raise_usd: None,
             },
         )
     }

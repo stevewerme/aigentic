@@ -1662,6 +1662,7 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
                 gate: gate.into(),
                 shown,
                 options,
+                raise_usd: None,
             },
         )?;
         self.lock = None;

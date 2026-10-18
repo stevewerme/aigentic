@@ -1615,6 +1615,7 @@ mod tests {
                 gate: "plan_gate".into(),
                 shown: vec!["## Plan".into()],
                 options: vec!["go".into(), "stop".into()],
+                raise_usd: None,
             }),
         );
         let checkpoint_answered = ev(
