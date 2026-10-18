@@ -36,7 +36,7 @@ use crate::app::cells::{Cell, ExploredRow, ToolState, is_read_tool};
 use crate::app::completion::{FileIndex, Popup};
 use crate::app::composer::Composer;
 use crate::app::engine::{ClientRepl, MenuKey, Printer, TurnStats};
-use crate::app::keymap::{Action, KeyContext, action_for};
+use crate::app::keymap::{Action, KeyContext, action_for, while_raising};
 use crate::app::look::View;
 use crate::app::menu::{Menu, Pick};
 use crate::app::pager::Pager;
@@ -818,12 +818,6 @@ async fn run_shell(
             let draft = prompt_draft.take().unwrap();
             composer.set_text(&draft);
         }
-        // A figure the person deleted disarms the raise: a later line
-        // must not be read as the figure it no longer holds.
-        if engine.raising() && composer.is_empty() {
-            engine.cancel_raise(&mut out);
-            raise_stash = None;
-        }
         // The live area is sized by the turn's phase (issue #43), not
         // by the rows that happen to exist this tick: the in-flight row
         // stays reserved while a tool is out, the tail slot holds its
@@ -1000,9 +994,11 @@ async fn run_shell(
                                     // composer, and the draft it displaced
                                     // comes back if the raise is withdrawn.
                                     if let Some(figure) = engine.raise_draft() {
-                                        if !composer.is_empty() {
-                                            raise_stash = Some(composer.text());
-                                        }
+                                        // Each pick holds only its own
+                                        // draft: one left from an earlier
+                                        // gate never comes back.
+                                        raise_stash =
+                                            (!composer.is_empty()).then(|| composer.text());
                                         composer.set_text(&figure);
                                     }
                                     continue;
@@ -1020,7 +1016,14 @@ async fn run_shell(
                             following: engine.following(),
                             inside: engine.inside().is_some(),
                         };
-                        let action = action_for(&key, ctx);
+                        let mut action = action_for(&key, ctx);
+                        // The raise is withdrawn only through the
+                        // `ClearDraft` arm below: Esc, Ctrl-U, or Ctrl-C
+                        // on a non-empty composer. Backspacing the figure
+                        // to retype it leaves the raise armed.
+                        if engine.raising() {
+                            action = while_raising(action, &key);
+                        }
                         // An armed key completes on its second press.
                         let was_armed = armed.take().map(|(a, _)| a);
                         match action {

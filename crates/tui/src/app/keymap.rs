@@ -106,6 +106,21 @@ pub fn action_for(key: &KeyEvent, ctx: KeyContext) -> Action {
     }
 }
 
+/// The action a key takes while a raise is armed at the budget gate.
+///
+/// Esc withdraws the raise whatever the composer holds, so an emptied
+/// composer cannot route Esc anywhere else. Every other key keeps its
+/// meaning: Backspace edits the figure rather than withdrawing it, so a
+/// person can clear the prefill and type their own. A running turn still
+/// takes Esc as an interrupt.
+pub fn while_raising(action: Action, key: &KeyEvent) -> Action {
+    if key.code == KeyCode::Esc && action != Action::Interrupt {
+        Action::ClearDraft
+    } else {
+        action
+    }
+}
+
 /// `/keys`.
 pub const KEYS: &str = "\
 Enter            send; while a turn runs: queue for the next turn (in the log at once); a prompt menu: pick the row
@@ -170,6 +185,31 @@ mod tests {
         // still clears.
         assert_eq!(action_for(&ctrl_c, RUNNING), Action::Interrupt);
         assert_eq!(action_for(&ctrl_c, IDLE_DRAFT), Action::ClearDraft);
+    }
+
+    /// A figure cleared to be retyped stays a raise: only Esc withdraws
+    /// it, at an empty composer as at a full one, and a running turn
+    /// still takes Esc as an interrupt.
+    #[test]
+    fn while_raising_only_esc_withdraws_the_raise() {
+        let esc = key(KeyCode::Esc, KeyModifiers::NONE);
+        for ctx in [IDLE_EMPTY, IDLE_DRAFT, FOLLOWING] {
+            assert_eq!(
+                while_raising(action_for(&esc, ctx), &esc),
+                Action::ClearDraft,
+                "{ctx:?}"
+            );
+        }
+        assert_eq!(
+            while_raising(action_for(&esc, RUNNING), &esc),
+            Action::Interrupt
+        );
+        for code in [KeyCode::Backspace, KeyCode::Delete, KeyCode::Char('5')] {
+            let k = key(code, KeyModifiers::NONE);
+            for ctx in [IDLE_EMPTY, IDLE_DRAFT] {
+                assert_eq!(while_raising(action_for(&k, ctx), &k), action_for(&k, ctx));
+            }
+        }
     }
 
     /// A step watched: Esc at an empty composer goes back,
