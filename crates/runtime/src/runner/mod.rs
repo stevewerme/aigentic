@@ -113,7 +113,7 @@ pub enum RunnerError {
     /// again.
     #[error(
         "a raise of `{offered}` does not clear the budget gate: {spent:.2} spent against \
-         {budget:.2} in force, and a figure above {least:.2} would"
+         {budget:.2} in force, and {least:.2} would"
     )]
     RaiseRefused {
         /// The figure the answer offered, as it was written.
@@ -122,7 +122,7 @@ pub enum RunnerError {
         budget: f64,
         /// What the run had spent then.
         spent: f64,
-        /// The smallest figure that would clear the line.
+        /// The smallest figure that clears the line.
         least: f64,
     },
     /// Installing the binary failed, or the installed binary could not be
@@ -462,10 +462,9 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
             offered: offered.to_owned(),
             budget: state.budget_usd,
             spent: state.cost_usd,
-            // A figure that clears the line is the smallest the guard
-            // would take, so a person reading the error knows where to
-            // aim rather than guessing.
-            least: f64::next_up(state.cost_usd / BUDGET_ASK_AT),
+            // The same figure the ask names, so a person who copies
+            // either one is not refused again.
+            least: least_clearing_raise(&state),
         };
         let usd = budget_usd(&Value::String(offered.to_owned())).ok_or_else(refused)?;
         if usd > state.budget_usd && state.cost_usd < BUDGET_ASK_AT * usd {
@@ -1649,20 +1648,27 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
         self.escalate_with(gate, shown, vec!["stop".into()])
     }
 
-    /// `escalate`, offering `options` instead of `stop` alone.
+    /// `escalate`, offering `options` instead of `stop` alone. The budget
+    /// gate's ask carries the figure a raise takes; no other gate needs
+    /// one.
     fn escalate_with(
         &mut self,
         gate: &str,
         shown: Vec<String>,
         options: Vec<String>,
     ) -> Result<Advanced, RunnerError> {
+        let raise_usd = if gate == BUDGET_GATE {
+            Some(least_clearing_raise(&self.state()?))
+        } else {
+            None
+        };
         self.append(
             EventKind::CheckpointAsked,
             &CheckpointAskedPayload {
                 gate: gate.into(),
                 shown,
                 options,
-                raise_usd: None,
+                raise_usd,
             },
         )?;
         self.lock = None;
@@ -2206,10 +2212,38 @@ fn budget_usd(value: &serde_json::Value) -> Option<f64> {
     text[..end].parse::<f64>().ok().filter(|n| n.is_finite())
 }
 
+/// The smallest whole number of cents that clears the budget gate: above
+/// the budget in force, and leaving the spend under the ask line the guard
+/// reads. The walk tests the guard's own comparison, so a figure it would
+/// read as *at* the line — a float product that rounds to the spend
+/// exactly — is stepped past rather than offered.
+fn least_clearing_raise(state: &RunState) -> f64 {
+    let from_line = ((state.cost_usd / BUDGET_ASK_AT) * 100.0).floor();
+    let from_budget = (state.budget_usd * 100.0).floor();
+    let mut cents = if from_line.is_finite() {
+        from_line
+    } else {
+        from_budget
+    }
+    .max(from_budget)
+    .max(1.0);
+    // The start is at most a couple of cents under the figure, so the cap
+    // is reached only by a start JSON cannot record.
+    for _ in 0..1_000 {
+        let usd = cents / 100.0;
+        if usd > state.budget_usd && state.cost_usd < BUDGET_ASK_AT * usd {
+            return usd;
+        }
+        cents += 1.0;
+    }
+    (cents - 1.0) / 100.0
+}
+
 /// What the budget ask tells the person: what the run has spent, the
-/// figure in force, and — when a brief's proposal opened the gate — that
-/// proposal and the ceiling it crossed. The figures are formatted rather
-/// than ranged so one line states them all.
+/// figure in force, what a raise takes to clear the gate, and — when a
+/// brief's proposal opened the gate — that proposal and the ceiling it
+/// crossed. The figures are formatted rather than ranged so one line
+/// states them all.
 fn spent_shown(state: &RunState, proposal: Option<(f64, f64)>) -> Vec<String> {
     let mut shown = vec![format!(
         "spent {:.2} of the run's {:.2} budget",
@@ -2221,6 +2255,10 @@ fn spent_shown(state: &RunState, proposal: Option<(f64, f64)>) -> Vec<String> {
             offered, ceiling
         ));
     }
+    shown.push(format!(
+        "a raise of at least {:.2} clears the gate: /answer raise <usd>",
+        least_clearing_raise(state)
+    ));
     shown
 }
 

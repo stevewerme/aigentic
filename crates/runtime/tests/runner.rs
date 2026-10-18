@@ -5569,6 +5569,19 @@ fn clearing_raise() -> f64 {
     budget_figure() * 4.0
 }
 
+/// The smallest whole number of cents that clears the budget gate for a run
+/// that has spent `cost` against `budget`: the guard's own comparison, walked
+/// from one cent up rather than taken from the figure the runner names.
+fn least_clearing_figure(cost: f64, budget: f64) -> f64 {
+    for cents in 1..=1_000_000 {
+        let usd = f64::from(cents) / 100.0;
+        if usd > budget && cost < BUDGET_ASK_AT * usd {
+            return usd;
+        }
+    }
+    panic!("no figure under 10,000 clears {cost} spent against {budget}");
+}
+
 /// The price table the fixture's replies are priced by.
 fn budget_prices() -> Prices {
     Prices {
@@ -5790,6 +5803,150 @@ async fn a_run_at_eighty_percent_of_its_budget_parks_before_the_next_step() {
         shown.iter().any(|line| line.contains(&figure)),
         "and the figure in force: {shown:?}"
     );
+}
+
+/// The budget ask says where to raise to and how, beside the spend it
+/// already states: the smallest figure the guard takes and the command that
+/// answers with it.
+#[tokio::test]
+async fn the_budget_ask_names_the_smallest_figure_that_clears_it() {
+    let fx = budget_fixture(budget_figure()).fx;
+    let mut runner = fx.runner();
+    assert_eq!(
+        drive(&fx, &mut runner).await,
+        Advanced::WaitingHuman {
+            gate: BUDGET_GATE.to_owned()
+        },
+        "the run parks at the budget gate"
+    );
+    let events = fx.lead_events();
+    let state = run_state(&events).expect("the log derives a run");
+    let least = least_clearing_figure(state.cost_usd, state.budget_usd);
+    let asks = checkpoints(&events);
+    assert_eq!(asks.len(), 1, "one ask");
+    assert_eq!(
+        asks[0].raise_usd,
+        Some(least),
+        "the ask carries the figure that clears the gate"
+    );
+    assert_eq!(
+        asks[0].shown.len(),
+        2,
+        "the spend's line and the raise's, nothing replaced: {:?}",
+        asks[0].shown
+    );
+    let figure = format!("{least:.2}");
+    assert!(
+        asks[0]
+            .shown
+            .iter()
+            .any(|line| line.contains(&figure) && line.contains("/answer raise")),
+        "one line names the figure and the command: {:?}",
+        asks[0].shown
+    );
+}
+
+/// The figure the ask names is one the gate takes: answering with it clears
+/// the line, records the raise and starts the next step.
+#[tokio::test]
+async fn the_figure_the_ask_names_is_the_one_the_gate_accepts() {
+    let fx = budget_fixture(budget_figure()).fx;
+    let mut runner = fx.runner();
+    assert_eq!(
+        drive(&fx, &mut runner).await,
+        Advanced::WaitingHuman {
+            gate: BUDGET_GATE.to_owned()
+        },
+        "the run parks at the budget gate"
+    );
+    let asks = checkpoints(&fx.lead_events());
+    let figure = format!("{:.2}", asks[0].raise_usd.expect("the ask names a figure"));
+    runner
+        .answer(
+            BUDGET_GATE,
+            CheckpointAnswer::Raise,
+            Some(figure.clone()),
+            steve(),
+        )
+        .expect("the figure the ask names clears the gate");
+    assert_eq!(
+        runner.advance().await.expect("the answer is taken"),
+        Advanced::Moved,
+        "the raise is recorded"
+    );
+    let events = fx.lead_events();
+    let raised: Vec<BudgetRaisedPayload> = events
+        .iter()
+        .filter(|event| event.kind == EventKind::BudgetRaised)
+        .filter_map(|event| serde_json::from_value(event.payload.clone()).ok())
+        .collect();
+    assert_eq!(
+        raised.len(),
+        1,
+        "one raise, carrying the figure: {raised:?}"
+    );
+    assert_eq!(
+        raised[0].usd,
+        figure.parse::<f64>().expect("the figure is a number"),
+        "the figure the answer sent"
+    );
+    assert_eq!(
+        run_state(&events)
+            .expect("the log derives a run")
+            .budget_usd,
+        raised[0].usd,
+        "and the fold takes it"
+    );
+    assert_eq!(
+        runner.advance().await.expect("the run goes on"),
+        Advanced::Moved,
+        "the writing step runs"
+    );
+    assert_eq!(
+        events_at(&fx.lead_events(), EventKind::StepStarted).len(),
+        2,
+        "the brief and the writing step"
+    );
+}
+
+/// The figure is read off the log, so a rebuilt run asks the same thing
+/// again: the same figure, in the same words.
+#[tokio::test]
+async fn a_rebuild_shows_the_same_figure() {
+    let fx = budget_fixture(budget_figure()).fx;
+    let mut runner = fx.runner();
+    let mut snapshots = vec![snapshot(&fx)];
+    let terminal = loop {
+        let advanced = runner.advance().await.expect("the run advances");
+        if advanced != Advanced::Moved {
+            break advanced;
+        }
+        push_snapshots(&fx, &mut snapshots);
+    };
+    assert_eq!(
+        terminal,
+        Advanced::WaitingHuman {
+            gate: BUDGET_GATE.to_owned()
+        },
+        "the run parks at the budget gate"
+    );
+    let asked = checkpoints(&fx.lead_events());
+    assert_eq!(asked.len(), 1, "one ask");
+    // The world before the ask: the rebuilt run writes it again from the
+    // same events, so the figure is the log's, not the first writer's.
+    fx.restore(snapshots.last().expect("the run moved at least once"));
+    let mut rebuilt = fx.runner();
+    assert_eq!(
+        rebuilt.advance().await.expect("the rebuilt run advances"),
+        Advanced::WaitingHuman {
+            gate: BUDGET_GATE.to_owned()
+        },
+        "and parks at the same gate"
+    );
+    let again = checkpoints(&fx.lead_events());
+    assert_eq!(again.len(), 1, "one ask, written again");
+    assert_eq!(again[0].raise_usd, asked[0].raise_usd, "the same figure");
+    assert_eq!(again[0].shown, asked[0].shown, "and the same words");
 }
 
 /// A run whose spend has reached the ask line exactly parks before the next
@@ -6039,6 +6196,39 @@ async fn a_brief_that_proposes_above_the_ceiling_parks_at_the_route() {
     );
 }
 
+/// The ask a brief's own proposal opens carries the figure too: every
+/// budget ask is written by the same path.
+#[tokio::test]
+async fn the_briefs_proposal_ask_carries_the_figure_too() {
+    let proposal = budget_ceiling() + 1.0;
+    let fx = budget_fixture(proposal).fx;
+    let mut runner = fx.runner();
+    assert_eq!(
+        drive(&fx, &mut runner).await,
+        Advanced::WaitingHuman {
+            gate: BUDGET_GATE.to_owned()
+        },
+        "the run parks at the route"
+    );
+    let events = fx.lead_events();
+    let state = run_state(&events).expect("the log derives a run");
+    let asks = checkpoints(&events);
+    assert_eq!(asks.len(), 1, "one ask");
+    assert_eq!(
+        asks[0].raise_usd,
+        Some(least_clearing_figure(state.cost_usd, state.budget_usd)),
+        "the proposal's ask names the figure that clears the gate"
+    );
+    assert!(
+        asks[0]
+            .shown
+            .iter()
+            .any(|line| line.contains(&format!("{proposal:.2}"))),
+        "and still names the proposal: {:?}",
+        asks[0].shown
+    );
+}
+
 /// A proposal at the ceiling exactly is the run's figure, with no ask.
 #[tokio::test]
 async fn a_brief_that_proposes_at_the_ceiling_is_taken_without_asking() {
@@ -6086,6 +6276,7 @@ async fn a_raise_that_does_not_clear_the_gate_is_refused_without_writing() {
     let state = run_state(&parked).expect("the log derives a run");
     let quotient = state.cost_usd / BUDGET_ASK_AT;
     let least = format!("{}", quotient);
+    let figure = least_clearing_figure(state.cost_usd, state.budget_usd);
     let current = format!("{:.2}", state.budget_usd);
     let offers = vec![
         ("an unparseable figure", "a lot".to_owned()),
@@ -6112,9 +6303,8 @@ async fn a_raise_that_does_not_clear_the_gate_is_refused_without_writing() {
                 assert_eq!(budget, state.budget_usd, "{why}: and the figure in force");
                 assert_eq!(spent, state.cost_usd, "{why}: and what was spent");
                 assert_eq!(
-                    told,
-                    f64::next_up(quotient),
-                    "{why}: and the smallest figure above the ask point"
+                    told, figure,
+                    "{why}: and the smallest figure that clears the line"
                 );
             }
             other => panic!("{why}: the refusal is the raise's, not {other:?}"),
@@ -6132,16 +6322,16 @@ async fn a_raise_that_does_not_clear_the_gate_is_refused_without_writing() {
             "{why}: so the run stays parked and may be answered again"
         );
     }
-    // The figure the refusal points at is the one that clears: the guard's
-    // test is strict, so the smallest figure past the quotient is taken.
+    // The figure the refusal points at is the one that clears: the smallest
+    // whole cent the guard's strict test accepts.
     runner
         .answer(
             BUDGET_GATE,
             CheckpointAnswer::Raise,
-            Some(format!("{}", f64::next_up(quotient))),
+            Some(format!("{figure:.2}")),
             steve(),
         )
-        .expect("the smallest figure past the ask point clears the line");
+        .expect("the smallest figure that clears the line clears it");
 }
 
 /// A rebuild from every prefix of a raised run does each move once and
