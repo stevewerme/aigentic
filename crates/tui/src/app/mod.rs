@@ -760,6 +760,8 @@ async fn run_shell(
     // becomes the prompt's text input; the draft it held comes back
     // after.
     let mut prompt_draft: Option<String> = None;
+    // Esc at a raise: the draft the prefill displaced comes back once.
+    let mut raise_stash: Option<String> = None;
     // When the current prompt block first showed: single-key answers wait
     // PROMPT_GRACE so a key meant for the draft does not answer it.
     let mut block_since: Option<(String, Instant)> = None;
@@ -815,6 +817,12 @@ async fn run_shell(
         if prompt_draft.is_some() && engine.menu().is_none() {
             let draft = prompt_draft.take().unwrap();
             composer.set_text(&draft);
+        }
+        // A figure the person deleted disarms the raise: a later line
+        // must not be read as the figure it no longer holds.
+        if engine.raising() && composer.is_empty() {
+            engine.cancel_raise(&mut out);
+            raise_stash = None;
         }
         // The live area is sized by the turn's phase (issue #43), not
         // by the rows that happen to exist this tick: the in-flight row
@@ -987,7 +995,18 @@ async fn run_shell(
                                 .await
                             {
                                 MenuKey::Passed => {}
-                                MenuKey::Used => continue,
+                                MenuKey::Used => {
+                                    // A raise pick puts its figure in the
+                                    // composer, and the draft it displaced
+                                    // comes back if the raise is withdrawn.
+                                    if let Some(figure) = engine.raise_draft() {
+                                        if !composer.is_empty() {
+                                            raise_stash = Some(composer.text());
+                                        }
+                                        composer.set_text(&figure);
+                                    }
+                                    continue;
+                                }
                                 MenuKey::Text => {
                                     prompt_draft = Some(composer.text());
                                     composer.clear();
@@ -1027,7 +1046,15 @@ async fn run_shell(
                             Action::Down => composer.down(),
                             Action::Home => composer.home(),
                             Action::End => composer.end(),
-                            Action::ClearDraft => composer.clear(),
+                            Action::ClearDraft => {
+                                composer.clear();
+                                if engine.raising() {
+                                    engine.cancel_raise(&mut out);
+                                    if let Some(draft) = raise_stash.take() {
+                                        composer.set_text(&draft);
+                                    }
+                                }
+                            }
                             Action::Interrupt => engine.interrupt(&mut out).await,
                             // The first Ctrl-C or Esc while a run is
                             // followed detaches from it; the second
@@ -1967,7 +1994,12 @@ mod tests {
             );
         }
 
-        let menu = Menu::checkpoint("route", &["plan ready".to_owned()], &["stop".to_owned()]);
+        let menu = Menu::checkpoint(
+            "route",
+            &["plan ready".to_owned()],
+            &["stop".to_owned()],
+            None,
+        );
         let drawn = text(&block_lines(&menu, 40));
         // The first row carries the selection marker; the labels are the
         // picks, and the title and body are the gate's.

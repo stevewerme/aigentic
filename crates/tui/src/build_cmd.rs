@@ -543,6 +543,7 @@ mod tests {
                 role: "admin",
                 refuse_build: None,
                 refuse_open: None,
+                refuse_answer: None,
                 missing: Vec::new(),
                 rows: Vec::new(),
                 children: Vec::new(),

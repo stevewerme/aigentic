@@ -445,6 +445,11 @@ pub struct OpenGate {
     /// `Continue with changes` was picked: the next plain line is the
     /// amendment.
     amending: bool,
+    /// `Raise the budget` was picked: the next plain line is the figure.
+    raising: bool,
+    /// What a raise would prefill, rounded up to a whole dollar at the
+    /// gate that offered it. `None` when the ask named no figure.
+    raise_usd: Option<f64>,
 }
 
 pub struct ClientRepl {
@@ -788,17 +793,26 @@ impl ClientRepl {
         // so `/build` and `/help` keep working with the prompt up. Only
         // while it is the prompt on screen, though: with the chat's
         // prompt up, a typed `1` is the chat's answer (#68's review).
+        // A figure or an amendment typed for the gate: whichever the
+        // pick armed, that is what the line answers. It returns before
+        // the menu sees the line, so a figure is never read as a row.
+        let answering = self.checkpoint.as_ref().and_then(|open| {
+            open.raising
+                .then_some(aigentic_api::CheckpointAnswer::Raise)
+                .or(open
+                    .amending
+                    .then_some(aigentic_api::CheckpointAnswer::Amend))
+        });
         if self.prompted.is_none()
             && !line.trim_start().starts_with('/')
             && !line.trim().is_empty()
-            && self.checkpoint.as_ref().is_some_and(|open| open.amending)
+            && let Some(answer) = answering
         {
-            self.send_answer(
-                aigentic_api::CheckpointAnswer::Amend,
-                Some(line.trim().to_owned()),
-                out,
-            )
-            .await;
+            if let Some(open) = self.checkpoint.as_mut() {
+                open.raising = false;
+            }
+            self.send_answer(answer, Some(line.trim().to_owned()), out)
+                .await;
             return;
         }
         if self.prompted.is_none()
@@ -851,6 +865,7 @@ impl ClientRepl {
                         | Pick::AmendRun
                         | Pick::RetryRun
                         | Pick::StopRun
+                        | Pick::RaiseRun
                         | Pick::LeaveWaiting
                         | Pick::SwitchYes
                         | Pick::SwitchNo
@@ -1554,7 +1569,11 @@ impl ClientRepl {
                 if let Ok(p) =
                     serde_json::from_value::<CheckpointAskedPayload>(event.payload.clone())
                 {
-                    let menu = Menu::checkpoint(&p.gate, &p.shown, &p.options);
+                    // Rounding up is the client's presentation: a whole
+                    // dollar the person types, never a figure the guard
+                    // reads as below the line it already passed.
+                    let raise_usd = p.raise_usd.map(f64::ceil);
+                    let menu = Menu::checkpoint(&p.gate, &p.shown, &p.options, raise_usd);
                     out.prompt(&menu);
                     self.checkpoint = Some(OpenGate {
                         lead,
@@ -1562,6 +1581,8 @@ impl ClientRepl {
                         menu,
                         shown: true,
                         amending: false,
+                        raising: false,
+                        raise_usd,
                     });
                 }
             }
@@ -1708,7 +1729,17 @@ impl ClientRepl {
                 self.checkpoint = None;
                 out.line(&format!("[answered {gate}: {word}]"));
             }
-            other => self.show(other, "", out),
+            other => {
+                let refused_a_raise = answer == aigentic_api::CheckpointAnswer::Raise;
+                self.show(other, "", out);
+                // A refused figure leaves the person where they were,
+                // rows and reason together: the gate is still open and
+                // `/answer raise <usd>` still reaches it.
+                if refused_a_raise && let Some(open) = self.checkpoint.as_mut() {
+                    open.shown = true;
+                    out.prompt(&open.menu);
+                }
+            }
         }
     }
 
@@ -1743,17 +1774,19 @@ impl ClientRepl {
                 self.send_answer(aigentic_api::CheckpointAnswer::Retry, None, out)
                     .await;
             }
+            Pick::RaiseRun => self.start_raising(out),
             Pick::LeaveWaiting => {
                 if let Some(open) = self.checkpoint.as_mut() {
                     open.shown = false;
                     open.amending = false;
+                    open.raising = false;
                 }
                 out.line(&format!(
                     "[left {gate} waiting: /answer answers it, /build <n> shows it again]"
                 ));
             }
             // Neither a switch's picks nor anything else reaches here:
-            // a checkpoint menu offers only the five above.
+            // a checkpoint menu offers only the six above.
             Pick::Answer
             | Pick::Other
             | Pick::Allow { .. }
@@ -1775,11 +1808,60 @@ impl ClientRepl {
         if let Some(open) = self.checkpoint.as_mut() {
             open.shown = false;
             open.amending = true;
+            open.raising = false;
             out.line(&format!(
                 "[type the changes for {} and press Enter; /answer stop stops the run]",
                 open.gate
             ));
         }
+    }
+
+    /// `Raise the budget` picked: the prompt goes and the next plain line
+    /// is the figure, which the line names so plain mode loses nothing.
+    fn start_raising(&mut self, out: &mut dyn Printer) {
+        let Some(open) = self.checkpoint.as_mut() else {
+            return;
+        };
+        // Arm only with a figure to prefill: the row is offered only when
+        // the ask named one, and a raise with nothing to type would take
+        // the next chat line as its figure.
+        let Some(usd) = open.raise_usd else {
+            return;
+        };
+        open.shown = false;
+        open.raising = true;
+        open.amending = false;
+        out.line(&format!(
+            "[raise to what? Enter sends {usd:.2}, Esc leaves the gate waiting]"
+        ));
+    }
+
+    /// The figure a raise pick prefills: the gate's rounded-up figure, so
+    /// the shell can put it in the composer.
+    pub fn raise_draft(&self) -> Option<String> {
+        let open = self.checkpoint.as_ref()?;
+        if !open.raising {
+            return None;
+        }
+        Some(format!("{:.2}", open.raise_usd?))
+    }
+
+    /// Whether a raise is waiting for its figure.
+    pub fn raising(&self) -> bool {
+        self.checkpoint.as_ref().is_some_and(|open| open.raising)
+    }
+
+    /// Drop a raise whose figure the composer no longer holds: nothing is
+    /// sent and the gate keeps waiting.
+    pub fn cancel_raise(&mut self, out: &mut dyn Printer) {
+        let Some(open) = self.checkpoint.as_mut() else {
+            return;
+        };
+        if !open.raising {
+            return;
+        }
+        open.raising = false;
+        out.line("[left the budget gate waiting: /answer raise <usd> or /answer stop]");
     }
 
     /// Answer the permission request this client prompted for. `p` sends
@@ -2029,6 +2111,7 @@ impl ClientRepl {
                     | Pick::AmendRun
                     | Pick::RetryRun
                     | Pick::StopRun
+                    | Pick::RaiseRun
                     | Pick::LeaveWaiting
                     | Pick::SwitchElsewhere
                     // The `/new` question is answered by `apply_confirm`,
@@ -6676,6 +6759,24 @@ mod tests {
             refuse_build: Option<String>,
             resumed: bool,
         ) -> Self {
+            Self::answering(lead, backlog, role, refuse_build, resumed, None).await
+        }
+
+        /// The same, with the daemon refusing every answer at a gate: the
+        /// runner's reason comes back as `Refused` instead of `Ok`.
+        async fn refusing(lead: Ulid, backlog: Vec<Event>, reason: &str) -> Self {
+            Self::answering(lead, backlog, "admin", None, false, Some(reason.to_owned())).await
+        }
+
+        /// The daemon behind both, with the reason it refuses an answer.
+        async fn answering(
+            lead: Ulid,
+            backlog: Vec<Event>,
+            role: &'static str,
+            refuse_build: Option<String>,
+            resumed: bool,
+            refuse_answer: Option<String>,
+        ) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let script = crate::run_view::fake_daemon::Script {
                 lead,
@@ -6684,6 +6785,7 @@ mod tests {
                 role,
                 refuse_build,
                 refuse_open: None,
+                refuse_answer,
                 missing: Vec::new(),
                 rows: Vec::new(),
                 children: Vec::new(),
@@ -6756,6 +6858,7 @@ mod tests {
                 role: "admin",
                 refuse_build: None,
                 refuse_open: None,
+                refuse_answer: None,
                 missing,
                 rows,
                 children,
@@ -6836,6 +6939,7 @@ mod tests {
                 role: "admin",
                 refuse_build: None,
                 refuse_open: None,
+                refuse_answer: None,
                 missing,
                 rows,
                 children,
@@ -8249,6 +8353,7 @@ mod tests {
             role: "admin",
             refuse_build: None,
             refuse_open: None,
+            refuse_answer: None,
             missing: Vec::new(),
             rows: Vec::new(),
             children: Vec::new(),
@@ -8305,6 +8410,7 @@ mod tests {
             "route",
             &["plan ready".to_owned()],
             &["stop".to_owned()],
+            None,
         )
         .plain();
         assert_eq!(
@@ -8781,6 +8887,307 @@ mod tests {
             daemon.requests()
         );
         assert!(repl.menu().is_some(), "and the prompt stayed");
+        daemon.stop();
+    }
+
+    // ---- the budget gate's raise --------------------------------
+
+    /// The budget gate's ask as the runner writes it: the spend, the raise
+    /// it takes, and the options it offers. `payload` writes the figure the
+    /// ask named for the picker, or leaves it out as an ask that names none
+    /// does.
+    struct BudgetAsk {
+        /// What the gate takes, cent-exact.
+        least: f64,
+        shown: Vec<String>,
+    }
+
+    impl BudgetAsk {
+        fn new(least: f64) -> Self {
+            Self {
+                least,
+                shown: vec![
+                    "spent 3.00 of the run's 3.00 budget".to_owned(),
+                    format!("a raise of at least {least:.2} clears the gate: /answer raise <usd>"),
+                ],
+            }
+        }
+
+        fn payload(&self, names_figure: bool) -> serde_json::Value {
+            let mut payload = serde_json::json!({
+                "gate": aigentic_runtime::aigentic_log::BUDGET_GATE,
+                "shown": self.shown,
+                "options": ["raise", "stop"],
+            });
+            if names_figure {
+                payload["raise_usd"] = serde_json::json!(self.least);
+            }
+            payload
+        }
+
+        /// What the picker prefills: the figure rounded up to a dollar.
+        fn prefill(&self) -> String {
+            format!("{:.2}", self.least.ceil())
+        }
+    }
+
+    /// A followed run parked at the budget gate, its prompt up, and the
+    /// lead it follows.
+    async fn budget_lead(ask: &BudgetAsk) -> (Lead, Ulid) {
+        let lead_id = Ulid::generate();
+        let backlog = vec![run_event(
+            lead_id,
+            1,
+            EventKind::CheckpointAsked,
+            ask.payload(true),
+        )];
+        let mut lead = Lead::start(lead_id, backlog).await;
+        lead.line("/build 58").await;
+        lead.pump().await;
+        (lead, lead_id)
+    }
+
+    /// The labels of the prompt's rows.
+    fn row_labels(repl: &ClientRepl) -> Vec<String> {
+        repl.menu()
+            .expect("the prompt is up")
+            .rows
+            .iter()
+            .map(|row| row.label.clone())
+            .collect()
+    }
+
+    /// The budget gate's raise is a row of the picker, after the rows that
+    /// already answered it, and picking it puts the figure the ask named in
+    /// the composer rather than sending it: the figure is text.
+    #[tokio::test]
+    async fn the_budget_gate_offers_a_raise_row_last_and_the_figure_prefilled() {
+        let ask = BudgetAsk::new(3.76);
+        let (mut lead, _lead_id) = budget_lead(&ask).await;
+        assert_eq!(
+            row_labels(&lead.repl),
+            ["Leave it waiting", "Stop the run", "Raise the budget"],
+            "the raise is the last row: {:?}",
+            lead.repl.menu().map(|m| m.title.clone())
+        );
+        let menu = lead.repl.menu().expect("the prompt is up");
+        assert_eq!(menu.body, ask.shown.join("\n"), "both shown lines");
+
+        let before = lead.daemon.requests().len();
+        let used = lead
+            .repl
+            .menu_key(&key_for('3'), true, true, &mut lead.out)
+            .await;
+        assert_eq!(used, MenuKey::Used, "the row is the prompt's");
+        assert_eq!(
+            lead.daemon.requests().len(),
+            before,
+            "the figure is typed next: nothing sent yet"
+        );
+        assert!(
+            lead.lines().iter().any(|l| l.contains(&ask.prefill())),
+            "the hint names the figure: {:?}",
+            lead.lines()
+        );
+        assert_eq!(lead.repl.raise_draft(), Some(ask.prefill()));
+        lead.daemon.stop();
+    }
+
+    /// The figure the pick prefilled is what Enter sends; an empty line
+    /// answers nothing and leaves the raise armed.
+    #[tokio::test]
+    async fn enter_after_the_raise_pick_sends_the_figure() {
+        let ask = BudgetAsk::new(3.76);
+        let (mut lead, _lead_id) = budget_lead(&ask).await;
+        let figure = ask.prefill();
+        lead.repl
+            .menu_key(&key_for('3'), true, true, &mut lead.out)
+            .await;
+        let before = lead.daemon.requests().len();
+        lead.line(&figure).await;
+        assert!(
+            matches!(
+                lead.daemon.requests()[before..],
+                [Request::AnswerCheckpoint {
+                    answer: aigentic_api::CheckpointAnswer::Raise,
+                    amendment: Some(ref sent),
+                    ..
+                }] if *sent == figure
+            ),
+            "the figure goes as the raise: {:?}",
+            lead.daemon.requests()
+        );
+        assert!(lead.repl.raise_draft().is_none(), "the raise is answered");
+        lead.daemon.stop();
+
+        // An empty line is not the figure.
+        let (mut lead, _lead_id) = budget_lead(&ask).await;
+        lead.repl
+            .menu_key(&key_for('3'), true, true, &mut lead.out)
+            .await;
+        let before = lead.daemon.requests().len();
+        lead.line("   ").await;
+        assert_eq!(lead.daemon.requests().len(), before, "nothing was sent");
+        assert_eq!(
+            lead.repl.raise_draft(),
+            Some(ask.prefill()),
+            "the raise still waits for its figure"
+        );
+        lead.daemon.stop();
+    }
+
+    /// The raise row is last so the numbers that answered the gate before
+    /// keep answering it: `1` leaves it waiting and `2` stops the run.
+    #[tokio::test]
+    async fn the_digits_that_answered_the_gate_still_do() {
+        let ask = BudgetAsk::new(3.76);
+        let (mut lead, _lead_id) = budget_lead(&ask).await;
+        let before = lead.daemon.requests().len();
+        lead.repl
+            .menu_key(&key_for('1'), true, true, &mut lead.out)
+            .await;
+        assert_eq!(lead.daemon.requests().len(), before, "`1` sent nothing");
+        assert!(lead.repl.menu().is_none(), "`1` left the gate waiting");
+        lead.daemon.stop();
+
+        let (mut lead, _lead_id) = budget_lead(&ask).await;
+        let before = lead.daemon.requests().len();
+        lead.repl
+            .menu_key(&key_for('2'), true, true, &mut lead.out)
+            .await;
+        assert!(
+            matches!(
+                lead.daemon.requests()[before..],
+                [Request::AnswerCheckpoint {
+                    answer: aigentic_api::CheckpointAnswer::Stop,
+                    ..
+                }]
+            ),
+            "`2` stops the run: {:?}",
+            lead.daemon.requests()
+        );
+        lead.daemon.stop();
+    }
+
+    /// Withdrawing an armed raise sends nothing, says how to answer the
+    /// gate, and leaves nothing to send a later line as.
+    #[tokio::test]
+    async fn escaping_after_the_raise_pick_sends_nothing() {
+        let ask = BudgetAsk::new(3.76);
+        let (mut lead, _lead_id) = budget_lead(&ask).await;
+        lead.repl
+            .menu_key(&key_for('3'), true, true, &mut lead.out)
+            .await;
+        let before = lead.daemon.requests().len();
+        let printed = lead.lines().len();
+        lead.repl.cancel_raise(&mut lead.out);
+        assert_eq!(lead.daemon.requests().len(), before, "nothing was sent");
+        let said = lead.lines()[printed..].join("\n");
+        assert!(
+            said.contains("/answer raise") && said.contains("/answer stop"),
+            "the line names both ways to answer the gate: {said:?}"
+        );
+        assert!(lead.repl.raise_draft().is_none(), "the raise is withdrawn");
+        let printed = lead.lines().len();
+        lead.repl.cancel_raise(&mut lead.out);
+        assert_eq!(
+            lead.lines().len(),
+            printed,
+            "a second withdraw says nothing: {:?}",
+            lead.lines()
+        );
+        lead.daemon.stop();
+    }
+
+    /// A refused figure shows the runner's reason and puts the rows back:
+    /// the person sees why, and the gate is still there to answer.
+    #[tokio::test]
+    async fn a_refused_raise_prints_the_reason_and_puts_the_picker_back() {
+        let ask = BudgetAsk::new(3.76);
+        let reason = "a raise of 3.76 does not clear the 3.00 budget";
+        let lead_id = Ulid::generate();
+        let backlog = vec![run_event(
+            lead_id,
+            1,
+            EventKind::CheckpointAsked,
+            ask.payload(true),
+        )];
+        let mut lead = Lead::refusing(lead_id, backlog, reason).await;
+        lead.line("/build 58").await;
+        lead.pump().await;
+        let figure = ask.prefill();
+        lead.repl
+            .menu_key(&key_for('3'), true, true, &mut lead.out)
+            .await;
+        lead.line(&figure).await;
+        let printed = lead.lines().join("\n");
+        assert!(
+            printed.contains(reason),
+            "the runner's reason is shown: {printed:?}"
+        );
+        assert_eq!(
+            row_labels(&lead.repl),
+            ["Leave it waiting", "Stop the run", "Raise the budget"],
+            "the rows are back with the reason: {printed:?}"
+        );
+        assert!(lead.repl.raise_draft().is_none(), "nothing is armed");
+        lead.daemon.stop();
+    }
+
+    /// An answer from elsewhere withdraws the gate: the armed raise goes
+    /// with it, so the next line is the chat's.
+    #[tokio::test]
+    async fn a_withdrawn_ask_disarms_the_raise_draft() {
+        let ask = BudgetAsk::new(3.76);
+        let (mut lead, lead_id) = budget_lead(&ask).await;
+        lead.repl
+            .menu_key(&key_for('3'), true, true, &mut lead.out)
+            .await;
+        lead.push(Notice::Event {
+            thread: lead_id,
+            event: run_event(
+                lead_id,
+                2,
+                EventKind::CheckpointAnswered,
+                serde_json::json!({
+                    "answer": aigentic_api::CheckpointAnswer::Stop,
+                    "by": "steve",
+                }),
+            ),
+        });
+        lead.pump().await;
+        assert!(lead.repl.raise_draft().is_none(), "the raise went with it");
+        assert!(lead.repl.menu().is_none(), "and the prompt went with it");
+        let before = lead.daemon.requests().len();
+        let figure = ask.prefill();
+        lead.line(&figure).await;
+        assert!(
+            !lead.daemon.requests()[before..]
+                .iter()
+                .any(|r| matches!(r, Request::AnswerCheckpoint { .. })),
+            "the line is the chat's, not a raise: {:?}",
+            lead.daemon.requests()
+        );
+        lead.daemon.stop();
+    }
+
+    /// An ask that names no figure offers no raise row: the row is only
+    /// offered with the figure it would prefill, and `/answer raise <usd>`
+    /// still reaches the gate.
+    #[tokio::test]
+    async fn an_ask_without_a_figure_offers_no_raise() {
+        let ask = BudgetAsk::new(3.76);
+        let lead_id = Ulid::generate();
+        let backlog = vec![run_event(
+            lead_id,
+            1,
+            EventKind::CheckpointAsked,
+            ask.payload(false),
+        )];
+        let (mut repl, mut out, daemon) = repl_for(lead_id, backlog).await;
+        repl.handle_line("/build 58", &mut out).await;
+        assert_eq!(row_labels(&repl), ["Leave it waiting", "Stop the run"]);
+        assert!(repl.raise_draft().is_none(), "nothing to prefill");
         daemon.stop();
     }
 
@@ -9903,6 +10310,7 @@ mod tests {
             role: "admin",
             refuse_build: None,
             refuse_open: None,
+            refuse_answer: None,
             missing: Vec::new(),
             rows: Vec::new(),
             children: Vec::new(),
@@ -10411,6 +10819,7 @@ mod tests {
             "c1",
             &["ls".to_owned()],
             &["stop".to_owned()],
+            None,
         ));
 
         let mut out = Recording::default();

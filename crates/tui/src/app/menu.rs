@@ -35,6 +35,8 @@ pub enum Pick {
     RetryRun,
     /// Stop the followed run (issue #68), at its checkpoint prompt.
     StopRun,
+    /// Offer a raise at the budget gate: the composer takes the figure.
+    RaiseRun,
     /// Leave the followed run waiting: the prompt goes, nothing is sent.
     LeaveWaiting,
     /// Switch the thread to the proposal's project (issue #82).
@@ -271,8 +273,15 @@ impl Menu {
     /// waiting at, a row for each answer the gate offers (`go`, `amend`,
     /// `retry`, `stop`, in that order), and `Leave it waiting`. The selection
     /// starts on `Leave it waiting`, the one row that sends nothing, so a
-    /// stray Enter never stops or continues a run.
-    pub fn checkpoint(gate: &str, shown: &[String], options: &[String]) -> Self {
+    /// stray Enter never stops or continues a run. A gate that offers
+    /// `raise` and says what a raise takes gets a raise row last, where it
+    /// moves none of the numbers already answering the gate.
+    pub fn checkpoint(
+        gate: &str,
+        shown: &[String],
+        options: &[String],
+        raise_usd: Option<f64>,
+    ) -> Self {
         let offered = |word: &str| options.iter().any(|option| option == word);
         let row = |label: &str, pick: Pick| Row {
             label: label.into(),
@@ -293,6 +302,12 @@ impl Menu {
         }
         rows.push(row("Leave it waiting", Pick::LeaveWaiting));
         rows.push(row("Stop the run", Pick::StopRun));
+        // Last, so the numbers that already answer this gate keep
+        // answering it. Offered only with the figure it would prefill:
+        // `/answer raise <usd>` still reaches a gate that lacks one.
+        if offered("raise") && raise_usd.is_some() {
+            rows.push(row("Raise the budget", Pick::RaiseRun));
+        }
         let selected = rows
             .iter()
             .position(|row| row.pick == Pick::LeaveWaiting)
@@ -725,7 +740,7 @@ impl Menu {
                 reason: None,
                 echo: format!("↳ {}", row.label),
             },
-            Pick::ContinueRun | Pick::StopRun | Pick::RetryRun => Keyed::Decide {
+            Pick::ContinueRun | Pick::StopRun | Pick::RetryRun | Pick::RaiseRun => Keyed::Decide {
                 pick: row.pick.clone(),
                 reason: None,
                 echo: format!("↳ {}", row.label),

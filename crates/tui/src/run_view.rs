@@ -269,6 +269,9 @@ pub(crate) mod fake_daemon {
         pub(crate) refuse_build: Option<String>,
         /// Refuse `Open` on the lead with this reason.
         pub(crate) refuse_open: Option<String>,
+        /// Refuse `AnswerCheckpoint` with this reason, as a runner that
+        /// will not take the answer does.
+        pub(crate) refuse_answer: Option<String>,
         /// Threads `Open` refuses as unknown: a step whose log is gone
         /// while the run's lead still lists it.
         pub(crate) missing: Vec<Ulid>,
@@ -412,8 +415,14 @@ pub(crate) mod fake_daemon {
                                     }
                                 }
                             }
-                            // Every answer the REPL sends is accepted.
-                            Request::AnswerCheckpoint { .. } => Response::Ok,
+                            // An answer the REPL sends is accepted unless
+                            // the script refuses it.
+                            Request::AnswerCheckpoint { .. } => match &script.refuse_answer {
+                                Some(reason) => Response::Refused {
+                                    reason: reason.clone(),
+                                },
+                                None => Response::Ok,
+                            },
                             Request::AnswerSwitch { .. } => Response::Ok,
                             other => panic!("the tests sent an unscripted request: {other:?}"),
                         };
