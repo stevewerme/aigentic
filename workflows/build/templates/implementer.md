@@ -73,6 +73,8 @@ A single named test (`cargo test -p <crate> <name>`) must report at least `1 pas
 
 Run each planned test as its own bash call, `cargo test -p <crate> <exact name>`, with no pipe, no redirection and no loop, so the checks can read its output.
 
+A test that could hang (one that waits on a socket, a stream or a child process) runs alone with `timeout_secs: 120`; only the full gate takes 900. Search the gate log with `grep`, never with a script: E4 reads a heredoc as an edit.
+
 ## Safety
 
 Never `git reset` (the fold route the send-back names, and nothing else, is the one exception), `git checkout -- <file>`, `git stash`, `git clean` or `git add -A`: the tree may hold someone else's unfinished work. Never rebase. Commit nothing under `.scratch/`, and leave `.aigentic/rules.toml` alone.

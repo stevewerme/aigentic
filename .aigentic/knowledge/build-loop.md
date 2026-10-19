@@ -113,7 +113,12 @@ line ranges. The standard blocks:
   the person with `ask_human`;
 - the gate: three bare calls (`cargo fmt`, `cargo clippy --all-targets --
   -D warnings`, `cargo test --no-fail-fast > /tmp/<n>-gate.log 2>&1` with
-  `timeout_secs: 900`), then a separate `grep`;
+  `timeout_secs: 900`), then a separate `grep` over the log, never a
+  script: E4 reads a heredoc as an edit;
+- a test that could hang (it waits on a socket, a stream, a child process,
+  or a fix not made yet) runs alone with `timeout_secs: 120`; only the full
+  gate takes 900. A sleeping machine stops that clock, so a 900 s cap can
+  last hours;
 - #103: if the full run stalls once, run per crate. #119: a known flake,
   rerun it alone once;
 - a test that runs past about 2 minutes is a finding, not a stall;

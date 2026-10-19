@@ -4304,6 +4304,7 @@ fn the_loops_gate_names_the_proposal_once() {
 #[test]
 fn the_implementation_prompts_ask_for_one_unpiped_call_per_test() {
     const CALL: &str = "Run each planned test as its own bash call, `cargo test -p <crate> <exact name>`, with no pipe, no redirection and no loop, so the checks can read its output.";
+    const HANG: &str = "A test that could hang (one that waits on a socket, a stream or a child process) runs alone with `timeout_secs: 120`; only the full gate takes 900. Search the gate log with `grep`, never with a script: E4 reads a heredoc as an edit.";
 
     /// Every declared slot filled by its kind, so optional sections are
     /// kept and no tag is left empty.
@@ -4343,6 +4344,11 @@ fn the_implementation_prompts_ask_for_one_unpiped_call_per_test() {
         assert!(
             call < only(prompt, "## Safety"),
             "the sentence sits in the safety list"
+        );
+        let hang = only(prompt, HANG);
+        assert!(
+            call < hang && hang < only(prompt, "## Safety"),
+            "the short cap for a test that could hang sits in the gate section"
         );
         if carries_the_rule {
             assert!(
