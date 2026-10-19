@@ -25,6 +25,16 @@ One commit, subject `<crates>: <what the fix makes true>`. Run `cargo fmt` first
 
 Do not push: the runner does, and waits for CI.
 
+## A tui change gets a pty check, before the gate
+
+If the change touches what `crates/tui` draws, build and drive it, and put the dumps in `## Implementation`.
+
+`cargo build -p aigentic-tui` in its own bash call, then write `/tmp/{{issue}}-pty.steps` with `write_file` (a heredoc is an edit) and run `python3 tools/pty/drive.py --script /tmp/{{issue}}-pty.steps --out /tmp/{{issue}}-pty` in its own bash call with `timeout_secs: 300`. `tools/pty/README.md` lists the verbs (`send:`, `key:`, `wait:`, `sleep:`, `dump:`); paste each dump's text, and the `.raw` when rows appear or vanish.
+
+The driver starts `target/debug/aigentic`, never the installed one, in a pty whose `HOME`, the `XDG_*` paths and `TMPDIR` are private to the run, with a scratch cwd that has no `.env` in it or above it. It links your config file rather than copying it and deletes what it made when it exits.
+
+**This runs before the gate, never after.** E4 reads a bash call that names a file in the repo as an edit, `python3` included, so a driver run between the gate's `cargo fmt` and its `cargo test`, or after it, fails the step. Delete `/tmp/{{issue}}-pty` once the dumps are pasted. A check that runs past a minute is a finding, not a stall.
+
 ## The gate
 
 Each in its own bash call, nothing before or after it: `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, `cargo test > {{gate_log}} 2>&1` with `timeout_secs: 900`; then search `{{gate_log}}` in a separate call.

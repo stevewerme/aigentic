@@ -154,19 +154,17 @@ so the rule can be judged, not just obeyed. The `brief`, `plan-check` and
   (changes per commit, tests, corrected plan literals, pty dumps). On #43
   the reviewer searched the disk for the implementer's thread to find its
   dumps: everything a later step needs goes on the issue.
-- **Visual changes need a pty check** (`~/.local/share/aigentic/devtools/drive.py`,
-  a venv with `pyte`); the implementer pastes dumps, and the reviewer
-  repeats the check for UI work. Code-only work gets a lean review.
-- **A pty check never copies `.env`.** The session it starts reads the key
-  from the environment: source the repo's `.env` by its absolute path and
-  start the session from a scratch directory with no `.env` of its own,
-  in one command (`(set -a; . <repo>/.env; set +a; cd <scratch> &&
-  python3 …/drive.py …)`); `. ./.env` inside the scratch directory finds
-  nothing. On #41 the implementer
-  copied `.env` into `/tmp/41-pty`, leaving the API key in a file any user
-  on the machine could read. Judge the dumps from `raw.bin` when rows
-  appear or vanish: pyte mis-renders scroll-region inserts (#48 was found
-  that way).
+- **Visual changes need a pty check** (`tools/pty/drive.py` in the repo, which
+  needs `pyte`: `python3 -m pip install --user pyte`, no venv committed); the
+  implementer pastes dumps, and the reviewer repeats the check for UI work.
+  Code-only work gets a lean review.
+- **A pty check never copies `.env`.** The driver never reads one: it starts its
+  child in a scratch cwd under the temp dir with no `.env` in it or above it, so
+  `dotenvy` finds nothing, and the key comes from the caller's own environment.
+  On #41 the implementer copied `.env` into `/tmp/41-pty`, leaving the API key
+  in a file any user on the machine could read. Judge a dump's `.raw` bytes
+  rather than its `.txt` when rows appear or vanish: pyte mis-renders
+  scroll-region inserts (#48 was found that way).
 - **A red gate is never "pre-existing" until it's proven at the base,
   built in its own target dir.** #7's implementer and judge both cleared
   a failing test as pre-existing by building the base commit in a

@@ -13,6 +13,7 @@ You are the judge for #{{issue}}: {{title}}. You are the only reviewer, so run t
 - **Mutations**: three, each in a copy outside the repository, each of which must make a test fail.
 - **The tests**: does each planned test prove its rule, with derived expectations? Check the ledger's names exist (a misspelled `cargo test <name>` passes with 0 tests), and read `git show <sha> | grep -E '^-.*(assert|")'`.
 - **Comments**: added comment lines follow `AGENTS.md`'s "Comments" section.
+- **The pty check**: for a change to what `crates/tui` draws, drive the debug binary yourself with `tools/pty/drive.py` as its README says, against a scratch `--data` under the temp dir, and paste the dumps in `## Review`; when the spec says a chrome is unchanged, drive the base commit's binary too, in its own tree with its own `CARGO_TARGET_DIR`, and compare the dumps. Delete everything you made under `/tmp` before posting.
 - **The report's claims are claims**: check them against the diff and your runs.
 
 Build each tree you make outside the repository with **its own** `CARGO_TARGET_DIR` under `/tmp`. A probe that runs past about 2 minutes is a finding, not a stall. Then the gate: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --no-fail-fast` with `timeout_secs: 900`. Before reporting, delete everything this run created in `/tmp`.
