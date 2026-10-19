@@ -153,6 +153,10 @@ fn pyte_installed() -> bool {
 
 #[test]
 fn the_scratch_tree_holds_every_path_the_child_writes() {
+    if !pyte_installed() {
+        eprintln!("pyte is not installed: python3 -m pip install --user pyte");
+        return;
+    }
     let root = TempDir::new().expect("a temp dir");
     let config = write_config(root.path());
     // One path per line, on a wide screen: a pty wraps at its width, and a
