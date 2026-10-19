@@ -153,14 +153,10 @@ fn pyte_installed() -> bool {
 
 #[test]
 fn the_scratch_tree_holds_every_path_the_child_writes() {
-    if !pyte_installed() {
-        eprintln!("pyte is not installed: python3 -m pip install --user pyte");
-        return;
-    }
     let root = TempDir::new().expect("a temp dir");
     let config = write_config(root.path());
-    // One path per line, on a wide screen: a pty wraps at its width, and a
-    // wrapped path would read back as two broken tokens.
+    // One path per line, on a wide screen so the shell's echo of the typed
+    // line is not broken up by its own line editing.
     let steps = "send: pwd; echo H=$HOME; echo D=$XDG_DATA_HOME; echo C=$XDG_CONFIG_HOME; echo T=$TMPDIR\nsleep: 1\nsend: exit 0\n";
 
     let output = drive(
@@ -188,7 +184,10 @@ fn the_scratch_tree_holds_every_path_the_child_writes() {
         "the scratch tree is under the temp dir: {scratch:?}"
     );
 
-    let screen = fs::read_to_string(root.path().join("out/final.txt")).expect("the final dump");
+    // The raw bytes, not the rendered screen: the boundary is checked on a
+    // machine without pyte too, which is where CI runs.
+    let raw = fs::read(root.path().join("out/final.raw")).expect("the final raw dump");
+    let screen = String::from_utf8_lossy(&raw).into_owned();
     assert_eq!(
         PathBuf::from(value_of(&screen, "")),
         scratch.join("cwd"),
@@ -440,6 +439,50 @@ fn a_childs_non_zero_exit_fails_the_run() {
         stderr(&output).contains(&format!("child exited {CHILD_EXIT}")),
         "the line names the child's code: {}",
         stderr(&output)
+    );
+}
+
+#[test]
+fn a_cwd_under_the_data_dir_is_where_the_child_starts() {
+    let root = TempDir::new().expect("a temp dir");
+    let config = write_config(root.path());
+    let fixture = root.path().join("fixture");
+    fs::create_dir(&fixture).expect("make the fixture dir");
+    fs::write(fixture.join("marker.txt"), MARKER).expect("write the marker");
+    let fixture = fixture.canonicalize().expect("a canonical fixture dir");
+
+    let output = drive(
+        root.path(),
+        &config,
+        "send: pwd; cat marker.txt; echo\nsleep: 1\nsend: exit 0\n",
+        root.path(),
+        &[
+            "--bin",
+            SH,
+            "--cols",
+            "400",
+            "--cwd",
+            fixture.to_str().expect("a UTF-8 path"),
+        ],
+    );
+    assert_eq!(code(&output), 0, "stderr:\n{}", stderr(&output));
+    assert_eq!(
+        PathBuf::from(fact(&facts(&output), "cwd")),
+        fixture,
+        "the header names the cwd the child got"
+    );
+    let raw = fs::read(root.path().join("out/final.raw")).expect("the final raw dump");
+    let screen = String::from_utf8_lossy(&raw).into_owned();
+    assert_eq!(
+        PathBuf::from(value_of(&screen, "")),
+        fixture,
+        "the child starts in the given cwd:\n{screen}"
+    );
+    assert!(
+        screen
+            .lines()
+            .any(|line| line.trim_end_matches('\r') == MARKER),
+        "the child reads the fixture's file:\n{screen}"
     );
 }
 

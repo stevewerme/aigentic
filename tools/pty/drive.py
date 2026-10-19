@@ -469,6 +469,7 @@ def main(argv):
     pyte = load_pyte(any(verb in ("wait", "dump") for _, verb, _ in steps))
 
     link, config_home, data_home, dirs, dumps = make_tree(scratch, config, args.out)
+    os.makedirs(cwd, exist_ok=True)
     temp = None
     # Everything created below is removed on the way out, a failure included.
     try:
@@ -483,7 +484,7 @@ def main(argv):
 
         for key, value in (
             ("bin", binary),
-            ("cwd", dirs["cwd"]),
+            ("cwd", cwd),
             ("config", config),
             ("data", data),
             ("scratch", scratch),
@@ -499,7 +500,7 @@ def main(argv):
             binary,
             argv_child,
             child_env(config_home, data_home, dirs, temp),
-            dirs["cwd"],
+            cwd,
             args.cols,
             args.rows,
             pyte,
