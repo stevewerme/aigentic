@@ -3173,6 +3173,7 @@ async fn t10_the_followed_leads_lead_and_child_logs_fold_into_one_pushed_notice(
     let lead = Ulid::generate();
     let child = Ulid::generate();
     write_run(&daemon.fixture, lead, child, "spec");
+    let written = std::time::Instant::now();
     write_child(&daemon.fixture, child, COST_USD);
 
     // The fixture's own minimum: the ticker reads the clock itself, so
@@ -3205,7 +3206,15 @@ async fn t10_the_followed_leads_lead_and_child_logs_fold_into_one_pushed_notice(
     };
     assert_eq!(thread, lead, "the notice names the lead it follows");
     assert_eq!(status.issue, 139);
-    assert_eq!(status.idle_secs, 0, "the child wrote just now");
+    // Idle since the child's write, which is no longer ago than this
+    // test has run since; a loaded machine can make that whole seconds.
+    // The second of slack is the wall clock against the monotonic one.
+    let most = written.elapsed().as_secs() + 1;
+    assert!(
+        status.idle_secs <= most,
+        "the child wrote just now: idle {} s, at most {most} s",
+        status.idle_secs
+    );
     let aigentic_api::RunPhase::Step {
         step,
         attempt,
@@ -3244,7 +3253,12 @@ async fn t11_the_ticker_pushes_on_its_interval_and_no_faster() {
     let runs = Arc::new(Runs::new());
     let (tx, mut rx) = mpsc::unbounded_channel();
     runs.watch(lead, tx);
+    // The window is a request, not a measurement: under load the timeout
+    // fires late and the interval bursts to catch up, so the bound is
+    // the time the ticker actually ran.
+    let started = tokio::time::Instant::now();
     let pushed = push_for(&runs, &world, lead, every, window, &mut rx).await;
+    let ran = started.elapsed();
 
     assert!(!pushed.is_empty(), "the interval's first tick pushes");
     assert!(
@@ -3253,10 +3267,12 @@ async fn t11_the_ticker_pushes_on_its_interval_and_no_faster() {
             .all(|notice| matches!(notice, Notice::RunStatus { thread, .. } if *thread == lead)),
         "every notice is the watched lead's"
     );
-    let allowed = window.as_millis() / every.as_millis() + 2;
+    // One push per tick, and an interval ticks at its start and once per
+    // period after it.
+    let allowed = ran.as_millis() / every.as_millis() + 1;
     assert!(
         pushed.len() as u128 <= allowed,
-        "{} pushes in {window:?} at {every:?}",
+        "{} pushes in {ran:?} at {every:?}",
         pushed.len()
     );
     assert_eq!(
