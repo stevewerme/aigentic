@@ -4298,6 +4298,23 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 
+    /// `Lines` that also hands each line to a test driving the REPL, so
+    /// it can type the next line once the one it waits on is drawn.
+    struct Tee(Lines, mpsc::UnboundedSender<String>);
+
+    impl Printer for Tee {
+        fn line(&mut self, text: &str) {
+            self.0.line(text);
+            // The driver may have stopped listening; the copy kept in
+            // `Lines` is what the test asserts on.
+            let _ = self.1.send(text.to_owned());
+        }
+
+        fn view(&self) -> View {
+            self.0.view()
+        }
+    }
+
     #[tokio::test]
     async fn the_repl_streams_a_reply_reports_and_quits_over_an_embedded_daemon() {
         let dir = tempfile::tempdir().unwrap();
@@ -4339,11 +4356,36 @@ mod tests {
             "proj",
         );
         let (tx, rx) = mpsc::unbounded_channel();
-        // Lines arrive as a person would type them, with a pause for the
-        // turn to finish before the reports.
+        let (drawn_tx, mut drawn) = mpsc::unbounded_channel();
+        // Lines arrive as a person would type them, each sent once the
+        // REPL has drawn what it waits on. `/queue` answers from the
+        // state notices the REPL has already drawn, and `run` takes input
+        // and notices in either order, so the turn's end has to be on
+        // screen before the reports, not merely sent by the daemon.
         let feeder = async move {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+            let mut until = async |want: &dyn Fn(&str) -> bool| loop {
+                let line: String = tokio::time::timeout_at(deadline, drawn.recv())
+                    .await
+                    .expect("the line in time")
+                    .expect("the REPL running");
+                if want(&line) {
+                    return line;
+                }
+            };
             tx.send("hello".into()).unwrap();
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            // The reply's last line is drawn after the turn's running
+            // state, so an idle `/queue` from here on is the turn's end.
+            until(&|l| l == "Line two").await;
+            loop {
+                tx.send("/queue".into()).unwrap();
+                let answer =
+                    until(&|l| l.starts_with("turn running by") || l.starts_with("idle")).await;
+                if answer == "idle; nothing queued" {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
             tx.send("/cost".into()).unwrap();
             tx.send("/who".into()).unwrap();
             tx.send("/mode".into()).unwrap();
@@ -4351,13 +4393,13 @@ mod tests {
             tx.send("/queue".into()).unwrap();
             tx.send("/keys".into()).unwrap();
             tx.send("/nope".into()).unwrap();
-            // The mode notice is asynchronous; let it land before quitting.
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            // The mode notice is asynchronous; it is drawn before quitting.
+            until(&|l| l == "[mode auto]").await;
             tx.send("/quit".into()).unwrap();
         };
-        let mut out = Lines::default();
+        let mut out = Tee(Lines::default(), drawn_tx);
         let ((), ()) = tokio::join!(repl.run(rx, notices, &mut out), feeder);
-        let lines = out.0;
+        let lines = out.0.0;
         assert!(lines.contains(&"Hej Steve!".to_owned()), "{lines:#?}");
         assert!(lines.contains(&"Line two".to_owned()), "{lines:#?}");
         assert!(
