@@ -45,16 +45,37 @@ and memory across threads.
   place, and a killed run resumes from its log. The full path (plan, review,
   fix) is next
 
+## Install
+
+Each release carries a prebuilt `aigentic` for macOS (Apple silicon and
+Intel) and Linux (x86_64 and aarch64, glibc 2.35 or newer), with a SHA-256
+checksum beside each archive. Pick the version and your target, download,
+verify, and put the binary on your `PATH`:
+
+```bash
+VERSION=0.6.0 TARGET=aarch64-apple-darwin   # or x86_64-apple-darwin, x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu
+BASE=https://github.com/stevewerme/aigentic/releases/download/v$VERSION
+curl -fLO "$BASE/aigentic-$VERSION-$TARGET.tar.gz"
+curl -fLO "$BASE/aigentic-$VERSION-$TARGET.tar.gz.sha256"
+shasum -a 256 -c "aigentic-$VERSION-$TARGET.tar.gz.sha256"   # or sha256sum -c
+tar -xzf "aigentic-$VERSION-$TARGET.tar.gz"
+install -m 755 "aigentic-$VERSION-$TARGET/aigentic" ~/.local/bin/aigentic
+```
+
+On macOS a binary downloaded with `curl` carries no quarantine flag, so it
+runs without a Gatekeeper prompt; one downloaded with a browser needs
+`xattr -d com.apple.quarantine ~/.local/bin/aigentic` first.
+
+From source, with a stable Rust toolchain:
+
+```bash
+git clone https://github.com/stevewerme/aigentic && cd aigentic
+cargo install --path crates/tui --force --locked   # installs the `aigentic` binary
+```
+
 ## Getting started
 
-Needs a stable Rust toolchain.
-
-1. Install:
-
-   ```bash
-   git clone https://github.com/stevewerme/aigentic && cd aigentic
-   cargo install --path crates/tui          # installs the `aigentic` binary
-   ```
+1. Install `aigentic` as above.
 
 2. Configure the endpoint in `~/.config/aigentic/config.toml` (override
    with `--config`). The key itself is never in this file: each profile
