@@ -1,21 +1,22 @@
 //! Workspaces (phase 6 section 9b): a group of projects that belong
 //! together, one file each in `<config dir>/workspaces/`, per machine
 //! since the paths are. The daemon reads them all, so it knows every
-//! project's root and which workspace each is in.
+//! project's root and which workspace each is in. `save` writes one
+//! back whole.
 
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::config::{ConfigError, ProjectConfig};
 
 /// `workspaces/<name>.toml`.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Workspace {
     pub name: String,
     /// The folder whose `workspace/` subfolder holds the shared layer.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shared: Option<PathBuf>,
     /// Project roots.
     #[serde(default)]
@@ -34,6 +35,184 @@ pub fn expand(path: &Path) -> PathBuf {
             .unwrap_or_else(|| path.to_path_buf()),
         Err(_) => path.to_path_buf(),
     }
+}
+
+/// The inverse of [`expand`]: a path under `$HOME` as `~/x`, anything
+/// else as given.
+pub fn contract(path: &Path) -> PathBuf {
+    let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) else {
+        return path.to_path_buf();
+    };
+    match path.strip_prefix(&home) {
+        Ok(rest) if rest.as_os_str().is_empty() => PathBuf::from("~"),
+        Ok(rest) => Path::new("~").join(rest),
+        Err(_) => path.to_path_buf(),
+    }
+}
+
+/// A workspace that could not be written, or a change it refuses.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum WorkspaceError {
+    #[error("{0:?} has no letters or digits to name a file by")]
+    BadName(String),
+    #[error("a workspace named {0:?} already exists")]
+    Exists(String),
+    #[error("no workspace named {0:?}")]
+    NoWorkspace(String),
+    #[error("{} is already in workspace {workspace:?}", root.display())]
+    InOther { root: PathBuf, workspace: String },
+    #[error("no project {0:?} in a workspace")]
+    NoProject(String),
+    #[error("{project:?} is in more than one workspace: {}", workspaces.join(", "))]
+    Ambiguous {
+        project: String,
+        workspaces: Vec<String>,
+    },
+    #[error(transparent)]
+    Config(#[from] ConfigError),
+    #[error("{0}")]
+    Io(String),
+}
+
+/// A workspace's file name: the name lowercased, every run of other
+/// characters than letters and digits one `-`, trimmed, plus `.toml`.
+/// `None` when nothing is left.
+pub fn file_name(name: &str) -> Option<String> {
+    let mut slug = String::new();
+    for c in name.chars().flat_map(char::to_lowercase) {
+        if c.is_alphanumeric() {
+            slug.push(c);
+        } else if !slug.is_empty() && !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    let slug = slug.trim_end_matches('-');
+    (!slug.is_empty()).then(|| format!("{slug}.toml"))
+}
+
+/// A new, empty workspace, written. Refused when its file exists or a
+/// workspace has the name, compared without case. `shared` is absolute.
+pub fn create(
+    config_dir: &Path,
+    name: &str,
+    shared: Option<&Path>,
+) -> Result<Workspace, WorkspaceError> {
+    let file = file_name(name).ok_or_else(|| WorkspaceError::BadName(name.to_string()))?;
+    let taken = dir(config_dir).join(file).exists()
+        || load_all(config_dir)?
+            .iter()
+            .any(|w| w.name.to_lowercase() == name.to_lowercase());
+    if taken {
+        return Err(WorkspaceError::Exists(name.to_string()));
+    }
+    let w = Workspace {
+        name: name.to_string(),
+        shared: shared.map(Path::to_path_buf),
+        projects: Vec::new(),
+    };
+    save(config_dir, &w)?;
+    Ok(w)
+}
+
+/// Lists the absolute `root` in `workspace`, found without case. A root
+/// already there is left alone; one in another workspace is refused,
+/// since a project is in at most one.
+pub fn add_project(
+    config_dir: &Path,
+    workspace: &str,
+    root: &Path,
+) -> Result<Workspace, WorkspaceError> {
+    let all = load_all(config_dir)?;
+    let mut target = all
+        .iter()
+        .find(|w| w.name.to_lowercase() == workspace.to_lowercase())
+        .cloned()
+        .ok_or_else(|| WorkspaceError::NoWorkspace(workspace.to_string()))?;
+    if let Some(other) = all
+        .iter()
+        .find(|w| w.name != target.name && w.projects.iter().any(|p| p == root))
+    {
+        return Err(WorkspaceError::InOther {
+            root: root.to_path_buf(),
+            workspace: other.name.clone(),
+        });
+    }
+    if !target.projects.iter().any(|p| p == root) {
+        target.projects.push(root.to_path_buf());
+        save(config_dir, &target)?;
+    }
+    Ok(target)
+}
+
+/// Drops one project from its workspace's list, matched by name or by
+/// path (after [`expand`]), in `workspace` alone when given. More than
+/// one match is refused, naming the workspaces. The project's folder is
+/// not touched, and the last project out leaves `projects = []`.
+pub fn remove_project(
+    config_dir: &Path,
+    workspace: Option<&str>,
+    project: &str,
+) -> Result<Workspace, WorkspaceError> {
+    let path = expand(Path::new(project));
+    let mut all = load_all(config_dir)?;
+    if let Some(name) = workspace {
+        all.retain(|w| w.name.to_lowercase() == name.to_lowercase());
+        if all.is_empty() {
+            return Err(WorkspaceError::NoWorkspace(name.to_string()));
+        }
+    }
+    let matches: Vec<(usize, usize)> = all
+        .iter()
+        .enumerate()
+        .flat_map(|(wi, w)| {
+            w.projects
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| **p == path || project_name(p) == project)
+                .map(move |(pi, _)| (wi, pi))
+        })
+        .collect();
+    match matches.as_slice() {
+        [] => Err(WorkspaceError::NoProject(project.to_string())),
+        [(wi, pi)] => {
+            let mut w = all.swap_remove(*wi);
+            w.projects.remove(*pi);
+            save(config_dir, &w)?;
+            Ok(w)
+        }
+        _ => {
+            let mut workspaces: Vec<String> = matches
+                .iter()
+                .map(|(wi, _)| all[*wi].name.clone())
+                .collect();
+            workspaces.dedup();
+            Err(WorkspaceError::Ambiguous {
+                project: project.to_string(),
+                workspaces,
+            })
+        }
+    }
+}
+
+/// Rewrites `workspaces/<file_name>` whole, through a temporary file and
+/// a rename so a reader never sees half of it, paths under `$HOME` as
+/// `~/`. Comments in a hand-edited file are not kept.
+pub fn save(config_dir: &Path, w: &Workspace) -> Result<(), WorkspaceError> {
+    let file = file_name(&w.name).ok_or_else(|| WorkspaceError::BadName(w.name.clone()))?;
+    let dir = dir(config_dir);
+    let io = |e: std::io::Error| WorkspaceError::Io(format!("{}: {e}", dir.display()));
+    std::fs::create_dir_all(&dir).map_err(io)?;
+    let stored = Workspace {
+        name: w.name.clone(),
+        shared: w.shared.as_deref().map(contract),
+        projects: w.projects.iter().map(|p| contract(p)).collect(),
+    };
+    let body = toml::to_string(&stored).map_err(|e| WorkspaceError::Io(format!("{file}: {e}")))?;
+    let text =
+        format!("# A workspace. aigentic rewrites this file whole; comments are not kept.\n{body}");
+    let tmp = dir.join(format!(".{file}.tmp"));
+    std::fs::write(&tmp, text).map_err(io)?;
+    std::fs::rename(&tmp, dir.join(&file)).map_err(io)
 }
 
 /// Every workspace file, paths expanded, by name. A missing directory
@@ -156,6 +335,164 @@ mod tests {
         assert!(load_all(&dir.path().join("none")).unwrap().is_empty());
         std::fs::write(dir.path().join("cfg/workspaces/bad.toml"), "nope = 1\n").unwrap();
         assert!(load_all(&dir.path().join("cfg")).is_err());
+    }
+
+    #[test]
+    fn a_created_workspace_loads_back_and_its_name_is_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("notes");
+        let w = create(dir.path(), "My Work", Some(&shared)).unwrap();
+        assert!(dir.path().join("workspaces/my-work.toml").is_file());
+        assert_eq!(load_all(dir.path()).unwrap(), vec![w]);
+        assert_eq!(
+            create(dir.path(), "My Work", None),
+            Err(WorkspaceError::Exists("My Work".into()))
+        );
+        assert_eq!(
+            create(dir.path(), "my work", None),
+            Err(WorkspaceError::Exists("my work".into())),
+            "a name is unique without case"
+        );
+        assert_eq!(
+            create(dir.path(), "--", None),
+            Err(WorkspaceError::BadName("--".into()))
+        );
+    }
+
+    #[test]
+    fn a_file_name_is_the_name_slugged() {
+        assert_eq!(file_name("My Work").as_deref(), Some("my-work.toml"));
+        assert_eq!(file_name("  a__b..C  ").as_deref(), Some("a-b-c.toml"));
+        assert_eq!(file_name("Åsa 2").as_deref(), Some("åsa-2.toml"));
+        assert_eq!(file_name(" / "), None);
+        assert_eq!(file_name(""), None);
+    }
+
+    fn snapshot(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    out.push((p.clone(), Vec::new()));
+                    stack.push(p);
+                } else {
+                    out.push((p.clone(), std::fs::read(&p).unwrap()));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn adding_and_removing_a_project_changes_only_the_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("cfg");
+        let site = dir.path().join("site");
+        std::fs::create_dir_all(site.join(".aigentic/threads")).unwrap();
+        std::fs::write(site.join("aigentic.toml"), "[project]\nname = \"web\"\n").unwrap();
+        std::fs::write(site.join(".aigentic/threads/t1.jsonl"), "{}\n").unwrap();
+        std::fs::write(site.join("README.md"), "hi\n").unwrap();
+        let before = snapshot(&site);
+        create(&cfg, "work", None).unwrap();
+        create(&cfg, "home", None).unwrap();
+
+        let w = add_project(&cfg, "Work", &site).unwrap();
+        assert_eq!(w.projects, vec![site.clone()]);
+        assert_eq!(add_project(&cfg, "work", &site).unwrap(), w, "a no-op");
+        assert_eq!(
+            add_project(&cfg, "home", &site),
+            Err(WorkspaceError::InOther {
+                root: site.clone(),
+                workspace: "work".into()
+            })
+        );
+        assert_eq!(
+            add_project(&cfg, "nope", &site),
+            Err(WorkspaceError::NoWorkspace("nope".into()))
+        );
+        let loaded = load_all(&cfg).unwrap();
+        assert_eq!(workspace_of(&loaded, &site).unwrap().name, "work");
+
+        let w = remove_project(&cfg, None, "web").unwrap();
+        assert!(w.projects.is_empty());
+        let text = std::fs::read_to_string(cfg.join("workspaces/work.toml")).unwrap();
+        assert!(text.contains("projects = []"), "{text}");
+        assert!(
+            load_all(&cfg)
+                .unwrap()
+                .iter()
+                .all(|w| w.projects.is_empty())
+        );
+
+        add_project(&cfg, "home", &site).unwrap();
+        remove_project(&cfg, Some("home"), &site.display().to_string()).unwrap();
+        assert_eq!(
+            remove_project(&cfg, None, "web"),
+            Err(WorkspaceError::NoProject("web".into()))
+        );
+        assert_eq!(snapshot(&site), before, "the project's folder is untouched");
+    }
+
+    #[test]
+    fn a_name_in_two_workspaces_is_refused_naming_both() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a/app");
+        let b = dir.path().join("b/app");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        create(dir.path(), "one", None).unwrap();
+        create(dir.path(), "two", None).unwrap();
+        add_project(dir.path(), "one", &a).unwrap();
+        add_project(dir.path(), "two", &b).unwrap();
+        assert_eq!(
+            remove_project(dir.path(), None, "app"),
+            Err(WorkspaceError::Ambiguous {
+                project: "app".into(),
+                workspaces: vec!["one".into(), "two".into()]
+            })
+        );
+        let w = remove_project(dir.path(), Some("two"), "app").unwrap();
+        assert!(w.projects.is_empty());
+        assert_eq!(load_all(dir.path()).unwrap()[0].projects, vec![a]);
+    }
+
+    /// The paths sit under `$HOME` but are never created: only the
+    /// workspace file under the temporary config dir is written.
+    #[test]
+    fn a_hand_written_tilde_file_is_rewritten_with_tilde() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("workspaces")).unwrap();
+        std::fs::write(
+            dir.path().join("workspaces/mine.toml"),
+            "# mine\nname = \"mine\"\nshared = \"~/no-such-notes\"\nprojects = [\"~/no-such-a\"]\n",
+        )
+        .unwrap();
+        let home = PathBuf::from(std::env::var("HOME").unwrap());
+        let ws = load_all(dir.path()).unwrap();
+        assert_eq!(ws[0].projects, vec![home.join("no-such-a")]);
+        add_project(dir.path(), "mine", &home.join("no-such-b")).unwrap();
+        let text = std::fs::read_to_string(dir.path().join("workspaces/mine.toml")).unwrap();
+        assert!(text.contains("\"~/no-such-notes\""), "{text}");
+        assert!(text.contains("\"~/no-such-a\""), "{text}");
+        assert!(text.contains("\"~/no-such-b\""), "{text}");
+        assert!(!text.contains(&home.display().to_string()), "{text}");
+        assert!(!text.contains("# mine"), "comments are not kept");
+        assert_eq!(
+            load_all(dir.path()).unwrap()[0].projects,
+            vec![home.join("no-such-a"), home.join("no-such-b")]
+        );
+    }
+
+    #[test]
+    fn contract_undoes_expand() {
+        let home = PathBuf::from(std::env::var("HOME").unwrap());
+        assert_eq!(contract(&home.join("x/y")), PathBuf::from("~/x/y"));
+        assert_eq!(contract(&home), PathBuf::from("~"));
+        assert_eq!(contract(Path::new("/abs/x")), PathBuf::from("/abs/x"));
+        assert_eq!(expand(&contract(&home.join("x"))), home.join("x"));
     }
 
     #[test]
