@@ -194,17 +194,15 @@ impl RunState {
             .sum()
     }
 
-    /// The figure a step raise put in force for this visit of `step`,
-    /// read when `attempt` is about to start. `None` at a first attempt,
-    /// whose visit no raise has reached yet, and whenever the newest
-    /// record's figure is the declared one: a step freed by the run's
-    /// raise is not a raised step.
+    /// The figure a step raise put in force for the visit of `step` that
+    /// `attempt` belongs to: an attempt about to start, or the one still
+    /// open. `None` at a first attempt not yet started, whose visit no
+    /// raise has reached, and whenever the newest record's figure is the
+    /// declared one: a step freed by the run's raise is not a raised step.
     pub fn step_figure(&self, step: &str, attempt: u32) -> Option<f64> {
-        if attempt <= 1 {
-            return None;
-        }
         let record = self.steps.iter().rev().find(|r| r.step == step)?;
-        (record.figure_usd > record.budget_usd).then_some(record.figure_usd)
+        let this_visit = attempt > 1 || (record.attempt == attempt && record.open());
+        (this_visit && record.figure_usd > record.budget_usd).then_some(record.figure_usd)
     }
 
     /// The step the run last entered: the one a `step_stop` ask is about.

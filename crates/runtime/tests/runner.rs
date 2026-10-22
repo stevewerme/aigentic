@@ -9170,3 +9170,249 @@ async fn a_raise_at_a_step_stop_that_offered_none_is_refused() {
         "the child is untouched"
     );
 }
+
+/// Answer a run parked at its writing step's own figure with the figure
+/// its ask prefills, and take the answer; returns that figure.
+async fn raise_at_own_figure(fx: &Fixture) -> f64 {
+    let offered = checkpoints(&fx.lead_events())
+        .pop()
+        .and_then(|ask| ask.raise_usd)
+        .expect("the park prefills a figure");
+    let mut runner = fx.runner();
+    runner
+        .answer(
+            STEP_STOP,
+            CheckpointAnswer::Raise,
+            Some(format!("{offered:.2}")),
+            steve(),
+        )
+        .expect("the prefilled figure is above the spend");
+    assert_eq!(
+        runner.advance().await.expect("the answer is taken"),
+        Advanced::Moved
+    );
+    offered
+}
+
+/// `advance` a fresh runner until the run pauses, waits or ends.
+async fn drive_to_pause(fx: &Fixture) -> Advanced {
+    let mut runner = fx.runner();
+    loop {
+        match runner.advance().await.expect("the run advances") {
+            Advanced::Moved => {}
+            other => break other,
+        }
+    }
+}
+
+/// The raise is one more turn for the same child, told the room it now
+/// has, not a fresh child told the task again.
+#[tokio::test]
+async fn a_raised_step_continues_in_its_own_child_with_its_room() {
+    let (capped, spend) = parked_at_own_figure().await;
+    let before = prompts(&capped.fx.child_events_of(capped.write));
+    let offered = raise_at_own_figure(&capped.fx).await;
+    drive_to_pause(&capped.fx).await;
+
+    let events = capped.fx.lead_events();
+    let starts = step_started(&events);
+    let last = starts.last().unwrap();
+    assert_eq!(last.step, "implement-alone");
+    assert_eq!(last.attempt, 2);
+    assert_eq!(last.child_thread, capped.write, "the same child");
+
+    // The room the raise gave: the figure less what the park had spent.
+    let room = offered - spend;
+    let after = prompts(&capped.fx.child_events_of(capped.write));
+    assert_eq!(after.len(), before.len() + 1, "one new prompt: {after:?}");
+    let prompt = after.last().unwrap();
+    assert_ne!(prompt, CONTINUE_PROMPT);
+    assert!(prompt.contains(&format!("{room:.2}")), "the room: {prompt}");
+    assert!(prompt.contains(FINISH_STEP), "the call to make: {prompt}");
+}
+
+/// A step freed by the run's raise was never raised itself, so it is
+/// told to continue as it always was, and no record reads as raised.
+#[tokio::test]
+async fn a_run_raise_still_continues_with_continue() {
+    let room = BUDGET_ASK_AT * clearing_raise() - budget_figure();
+    let capped = capped_fixture(price_at_least(room), budget_workflow_unfigured());
+    let run = capped_run(&capped.fx).await;
+    assert_eq!(
+        run.terminal,
+        Advanced::WaitingHuman {
+            gate: BUDGET_GATE.to_owned()
+        }
+    );
+    let mut runner = capped.fx.runner();
+    runner
+        .answer(
+            BUDGET_GATE,
+            CheckpointAnswer::Raise,
+            Some(format!("{:.2}", budget_ceiling())),
+            steve(),
+        )
+        .expect("the raise clears the gate");
+    drop(runner);
+    drive_to_pause(&capped.fx).await;
+
+    let child = prompts(&capped.fx.child_events_of(capped.write));
+    assert_eq!(child.len(), 2, "the task, then the attempt the raise freed");
+    assert_eq!(child[1], CONTINUE_PROMPT);
+    let state = run_state(&capped.fx.lead_events()).unwrap();
+    for record in &state.steps {
+        assert_eq!(record.figure_usd, record.budget_usd, "{}", record.step);
+    }
+}
+
+/// The raised figure is log state: a runner rebuilt after the raise
+/// starts the attempt under it instead of parking at the declared one.
+#[tokio::test]
+async fn a_raised_step_reads_the_same_figure_after_a_rebuild() {
+    let (capped, _) = parked_at_own_figure().await;
+    let offered = raise_at_own_figure(&capped.fx).await;
+    drive_to_pause(&capped.fx).await;
+
+    let events = capped.fx.lead_events();
+    assert_eq!(
+        checkpoints(&events)
+            .iter()
+            .filter(|ask| ask.gate == STEP_STOP)
+            .count(),
+        1,
+        "no second park at the declared figure"
+    );
+    let state = run_state(&events).unwrap();
+    let raised = state
+        .steps
+        .iter()
+        .find(|record| record.step == "implement-alone" && record.attempt == 2)
+        .expect("the raised attempt started");
+    assert_eq!(raised.budget_usd, BUDGET_TRIVIAL, "the declared figure");
+    assert_eq!(raised.figure_usd, offered, "the figure it ran under");
+}
+
+/// A raise at an attempt whose crashed call spent the step's figure frees
+/// that attempt: the rebuilt run resumes it under the raised figure
+/// rather than parking at the declared one again.
+#[tokio::test]
+async fn a_raise_frees_an_open_attempt_whose_crashed_call_spent_the_figure() {
+    let capped = capped_fixture(budget_figure(), budget_workflow());
+    let run = capped_run(&capped.fx).await;
+    let lead = run.after_where(EventKind::StepStarted, 2);
+    let source = run.after(run.lead().len());
+    capped
+        .fx
+        .restore_child_prefix_from(lead, source, capped.write, |events| {
+            !events
+                .iter()
+                .any(|event| event.kind == EventKind::ToolResult)
+        });
+    let mut runner = capped.fx.runner();
+    assert_eq!(
+        runner.advance().await.expect("the run advances"),
+        Advanced::WaitingHuman {
+            gate: STEP_STOP.to_owned()
+        }
+    );
+    drop(runner);
+    let cut = capped.fx.child_events_of(capped.write).len();
+
+    raise_at_own_figure(&capped.fx).await;
+    drive_to_pause(&capped.fx).await;
+
+    let events = capped.fx.lead_events();
+    assert_eq!(
+        checkpoints(&events)
+            .iter()
+            .filter(|ask| ask.gate == STEP_STOP)
+            .count(),
+        1,
+        "the raise is not answered by the same park again"
+    );
+    assert!(
+        capped.fx.child_events_of(capped.write).len() > cut,
+        "the attempt resumed"
+    );
+}
+
+/// The workflow the run-gate test runs: `budget_workflow` with a step
+/// after the writing one, so a move follows the raised step's report.
+fn budget_workflow_with_review() -> String {
+    budget_workflow().replace("next = \"done\"", "next = \"review\"")
+        + r####"
+[[steps]]
+id = "review"
+role = "reviewer"
+profile = "flash"
+template = "templates/step.md"
+marker = "## Review"
+next = "done"
+wall_secs = 900
+"####
+}
+
+/// The step's own figure does not lift the run's: a raised step whose
+/// next attempt takes the run past its ask line parks the run's next
+/// move at the run's own gate.
+#[tokio::test]
+async fn the_runs_gate_still_parks_a_raised_step() {
+    let line = BUDGET_ASK_AT * clearing_raise();
+    // The report's cost takes the run from the brief's and the first
+    // call's spend to past the line.
+    let report_cost = line - 2.0 * budget_figure() + 0.4;
+    let brief = Ulid::generate();
+    let write = Ulid::generate();
+    let workflow = budget_workflow_with_review();
+    let fx = Fixture::with_workflow(
+        vec![
+            (
+                brief,
+                vec![priced_reply(
+                    brief_report_proposing(clearing_raise()),
+                    budget_figure(),
+                )],
+            ),
+            (
+                write,
+                vec![
+                    priced_works("w1", budget_figure()),
+                    priced_reply(implementer_report(), report_cost),
+                ],
+            ),
+        ],
+        &[
+            ("workflow.toml", workflow.as_str()),
+            ("templates/step.md", "do the step\n"),
+        ],
+    )
+    .priced(budget_prices());
+    assert_eq!(
+        drive_to_pause(&fx).await,
+        Advanced::WaitingHuman {
+            gate: STEP_STOP.to_owned()
+        }
+    );
+    // Room for the report, so the raised attempt ends on it.
+    let figure = budget_figure() + report_cost + 1.0;
+    let mut runner = fx.runner();
+    runner
+        .answer(
+            STEP_STOP,
+            CheckpointAnswer::Raise,
+            Some(format!("{figure:.2}")),
+            steve(),
+        )
+        .expect("the figure is above the spend");
+    drop(runner);
+
+    assert_eq!(
+        drive_to_pause(&fx).await,
+        Advanced::WaitingHuman {
+            gate: BUDGET_GATE.to_owned()
+        }
+    );
+    let state = run_state(&fx.lead_events()).unwrap();
+    assert!(state.cost_usd >= line, "the run is past its line");
+    assert_eq!(state.budget_usd, clearing_raise(), "the step raise left it");
+}

@@ -53,6 +53,16 @@ pub const CALL_FINISH_STEP: &str = "Your turn ended without calling `finish_step
 /// cap: the work is not finished, so it continues.
 pub const CONTINUE_PROMPT: &str = "continue";
 
+/// What a step's next attempt is told when a person raised its figure
+/// after a cap: the figure it now runs under and the room that leaves.
+pub fn raised_prompt(figure: f64, room: f64) -> String {
+    format!(
+        "Your step's figure was raised to {figure:.2}; {room:.2} of room is left. Carry on from \
+         where you stopped, finish the work the prompt asks for and its gate, and call \
+         `finish_step` with your report."
+    )
+}
+
 /// The end reason of an attempt whose report had no body: there is
 /// nothing to post, so the attempt is partial and asked to report again.
 pub const REPORT_WITHOUT_BODY: &str = "report_without_body";
@@ -1983,6 +1993,12 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
             // It stopped on its own or was picked up without reporting.
             "done" | "resumed" => CALL_FINISH_STEP.to_owned(),
             REPORT_WITHOUT_BODY => REPORT_AGAIN_PROMPT.to_owned(),
+            // `max_usd` is written whichever room capped the turn; only a
+            // raise of the step's own figure has new room to name.
+            MAX_USD => match self.state()?.step_figure(&step.id, attempt) {
+                Some(figure) => raised_prompt(figure, figure - self.state()?.step_spend(&step.id)),
+                None => CONTINUE_PROMPT.to_owned(),
+            },
             _ => CONTINUE_PROMPT.to_owned(),
         })
     }
@@ -2272,8 +2288,9 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
         child: Option<Ulid>,
     ) -> Result<StepRoom, RunnerError> {
         let state = self.state()?;
-        let own = step
-            .budget
+        let own = state
+            .step_figure(&step.id, attempt)
+            .or(step.budget)
             .filter(|figure| figure.is_finite() && *figure > 0.0);
         // An unposted prompt spends nothing, so a missing child, a child
         // with no prompt for this attempt and an unstarted attempt all
@@ -2379,7 +2396,11 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
         attempt: u32,
         left: f64,
     ) -> Result<Advanced, RunnerError> {
-        let figure = step.budget.unwrap_or(0.0);
+        let figure = self
+            .state()?
+            .step_figure(&step.id, attempt)
+            .or(step.budget)
+            .unwrap_or(0.0);
         let shown = vec![
             step.id.clone(),
             attempt.to_string(),
