@@ -417,11 +417,16 @@ fn render_cell(cell: &Cell, first: bool, width: usize, view: View) -> Vec<Line<'
             } else {
                 (text.clone(), Style::default())
             };
-            hang(
-                Line::from(Span::styled(shown, style)),
-                Span::raw("  "),
-                width,
-            )
+            shown
+                .split('\n')
+                .flat_map(|l| {
+                    hang(
+                        Line::from(Span::styled(l.to_owned(), style)),
+                        Span::raw("  "),
+                        width,
+                    )
+                })
+                .collect()
         }
     }
 }

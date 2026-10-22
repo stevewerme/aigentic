@@ -24,6 +24,7 @@ pub mod status;
 pub mod tui;
 pub(crate) mod watch;
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -147,6 +148,9 @@ struct ShellOut {
     /// Whether a step header is open, so the cells under it indent. Set
     /// on a committed `Step`, cleared by the next header or a `Done`.
     in_step: bool,
+    /// The prompt bodies already written whole to the transcript, by
+    /// prompt id and body, so a redraw of the same gate writes none.
+    in_full: HashSet<(String, String)>,
 }
 
 impl ShellOut {
@@ -165,7 +169,26 @@ impl ShellOut {
             last: None,
             view: View::default(),
             in_step: false,
+            in_full: HashSet::new(),
         }
+    }
+
+    /// Whether the transcript holds `menu`'s whole body: a body longer
+    /// than [`BODY_ROWS`] at this width is committed once per prompt,
+    /// title first, so the person can read in the scrollback what the
+    /// live block caps.
+    fn body_in_full(&mut self, id: Option<String>, menu: &Menu) -> bool {
+        if menu.body.is_empty()
+            || hang(&menu.body, 3, self.width, Style::default()).len() <= BODY_ROWS
+        {
+            return false;
+        }
+        let key = (id.unwrap_or_default(), menu.body.clone());
+        if !self.in_full.contains(&key) {
+            self.commit(Cell::Note(format!("{}\n{}", menu.title, menu.body)));
+            self.in_full.insert(key);
+        }
+        true
     }
 
     fn commit(&mut self, cell: Cell) {
@@ -427,13 +450,13 @@ fn popup_lines(popup: &Popup) -> Vec<Line<'static>> {
 /// about in full (wrapped, capped), and the rows to pick from with the
 /// selected one marked. Already wrapped; the pane draws them as they
 /// are.
-fn block_lines(menu: &Menu, width: usize) -> Vec<Line<'static>> {
+fn block_lines(menu: &Menu, width: usize, full_above: bool) -> Vec<Line<'static>> {
     let head = Style::default()
         .fg(Color::Yellow)
         .add_modifier(Modifier::BOLD);
     let dim = Style::default().add_modifier(Modifier::DIM);
     let mut lines = vec![Line::from(Span::styled(format!(" {}", menu.title), head))];
-    lines.extend(body_lines(menu, width));
+    lines.extend(body_lines(menu, width, full_above));
     let inner = width.saturating_sub(6).max(1);
     for (i, row) in menu.rows.iter().enumerate() {
         let selected = i == menu.selected;
@@ -500,13 +523,14 @@ fn hang(text: &str, indent: usize, width: usize, style: Style) -> Vec<Line<'stat
         .collect()
 }
 
-/// Rows the body may take before it is capped head and tail, as tool
-/// output is.
+/// Rows the body may take in the live block before it is capped head
+/// and tail; a longer body is also written whole to the transcript.
 const BODY_ROWS: usize = 8;
 
 /// The body wrapped and hanging; a very long one keeps its head and
-/// tail with a note of what fell out.
-fn body_lines(menu: &Menu, width: usize) -> Vec<Line<'static>> {
+/// tail with a note of what fell out, which says the whole body is in
+/// the scrollback when `full_above`.
+fn body_lines(menu: &Menu, width: usize, full_above: bool) -> Vec<Line<'static>> {
     if menu.body.is_empty() {
         return Vec::new();
     }
@@ -516,8 +540,9 @@ fn body_lines(menu: &Menu, width: usize) -> Vec<Line<'static>> {
         let kept = BODY_ROWS - 3;
         let omitted = rows.len() - kept - 2;
         let mut capped: Vec<_> = rows.drain(..kept).collect();
+        let above = if full_above { ", in full above" } else { "" };
         capped.push(Line::from(Span::styled(
-            format!("   … {omitted} rows"),
+            format!("   … {omitted} rows{above}"),
             dim,
         )));
         capped.extend(rows.into_iter().skip(omitted));
@@ -774,6 +799,9 @@ async fn run_shell(
         // Everything the last step produced, then the pane. The window
         // may have been resized since the last pass.
         out.width = out.shell.width();
+        let full_above = engine
+            .menu()
+            .is_some_and(|m| out.body_in_full(engine.menu_id(), m));
         out.flush()?;
         let state = engine.state().clone();
         status.apply_state(&state);
@@ -835,7 +863,7 @@ async fn run_shell(
         block.extend(
             engine
                 .menu()
-                .map(|m| block_lines(m, out.width))
+                .map(|m| block_lines(m, out.width, full_above))
                 .unwrap_or_default(),
         );
         if files.is_none()
@@ -1795,7 +1823,7 @@ mod tests {
     #[test]
     fn the_approval_menu_renders_as_the_issue_draws_it() {
         let menu = approval("sed -n '/^## 4\\./,/^## 10\\./p' docs/PLAN-phase6.md");
-        let lines = text(&block_lines(&menu, 76));
+        let lines = text(&block_lines(&menu, 76, false));
         assert_eq!(
             lines,
             vec![
@@ -1813,7 +1841,7 @@ mod tests {
     #[test]
     fn the_body_wraps_and_a_very_long_one_is_capped() {
         let menu = approval("grep pattern crates/tui/src");
-        let lines = text(&block_lines(&menu, 40));
+        let lines = text(&block_lines(&menu, 40, false));
         assert_eq!(
             lines,
             vec![
@@ -1830,7 +1858,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let menu = approval(&command);
-        let lines = text(&block_lines(&menu, 40));
+        let lines = text(&block_lines(&menu, 40, false));
         assert_eq!(
             lines[..9],
             [
@@ -1847,6 +1875,56 @@ mod tests {
                 "   line12",
             ]
         );
+    }
+
+    fn numbered(n: usize) -> String {
+        (1..=n)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// A gate waits on the person, so the rows the live block caps must
+    /// still be readable: the scrollback holds every one of them.
+    #[test]
+    fn a_long_body_is_written_whole_once_and_the_cap_points_at_it() {
+        let menu = approval(&numbered(25));
+        let mut out = out_at(40);
+        assert!(out.body_in_full(Some("chat:c1".into()), &menu));
+        assert_eq!(out.transcript.len(), 1, "one cell");
+        let committed = text(&out.pending);
+        for i in 1..=25 {
+            let row = format!("  line{i}");
+            assert!(committed.contains(&row), "{row} in {committed:?}");
+        }
+        let lines = text(&block_lines(&menu, 40, true));
+        assert_eq!(lines[6], "   … 18 rows, in full above");
+        assert_eq!(lines[7], "   line24");
+    }
+
+    #[test]
+    fn a_body_that_fits_writes_no_cell() {
+        let menu = approval(&numbered(8));
+        let mut out = out_at(40);
+        assert!(!out.body_in_full(Some("chat:c1".into()), &menu));
+        assert!(out.transcript.is_empty());
+        assert!(out.pending.is_empty());
+        assert!(
+            !text(&block_lines(&menu, 40, false))
+                .iter()
+                .any(|l| l.contains('…'))
+        );
+    }
+
+    #[test]
+    fn a_redraw_or_resize_of_the_same_gate_writes_no_second_cell() {
+        let menu = approval(&numbered(25));
+        let mut out = out_at(40);
+        assert!(out.body_in_full(Some("gate:g".into()), &menu));
+        assert!(out.body_in_full(Some("gate:g".into()), &menu));
+        out.width = 30;
+        assert!(out.body_in_full(Some("gate:g".into()), &menu));
+        assert_eq!(out.transcript.len(), 1);
     }
 
     /// A question with options on the same widget: Other last, the
@@ -1886,7 +1964,7 @@ mod tests {
             },
         ]);
         assert_eq!(
-            text(&block_lines(&menu, 60)),
+            text(&block_lines(&menu, 60, false)),
             vec![
                 " Which colour?",
                 " ❯ 1. Red  the warm one",
@@ -1898,7 +1976,7 @@ mod tests {
         menu.answer("colour: Red");
         menu.picked[1] = true;
         assert_eq!(
-            text(&block_lines(&menu, 60)),
+            text(&block_lines(&menu, 60, false)),
             vec![
                 " Which tests?",
                 " ❯ 1. [ ] unit",
@@ -1921,7 +1999,7 @@ mod tests {
             multi: false,
         }]);
         assert_eq!(
-            text(&block_lines(&menu, 40)),
+            text(&block_lines(&menu, 40, false)),
             vec![" which colour?", "   type the answer"]
         );
         let call = ToolCall {
@@ -1930,7 +2008,7 @@ mod tests {
             args: json!({"query": "phase 6"}),
         };
         let menu = Menu::permission(&call, RiskClass::Network, "mcp.docs: the plan says ask");
-        let lines = block_lines(&menu, 76);
+        let lines = block_lines(&menu, 76, false);
         let last = lines.last().unwrap();
         assert_eq!(
             last.spans
@@ -1998,7 +2076,7 @@ mod tests {
             &["stop".to_owned()],
             None,
         );
-        let drawn = text(&block_lines(&menu, 40));
+        let drawn = text(&block_lines(&menu, 40, false));
         // The first row carries the selection marker; the labels are the
         // picks, and the title and body are the gate's.
         let labels: Vec<&str> = menu.rows.iter().map(|row| row.label.as_str()).collect();
