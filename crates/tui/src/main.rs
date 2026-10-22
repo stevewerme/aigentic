@@ -18,6 +18,7 @@ mod skills_cmd;
 mod start_ask;
 mod stats;
 mod threads_index;
+mod workspace_cmd;
 
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -39,6 +40,7 @@ use crate::build_cmd::BuildArgs;
 use crate::config::Config;
 use crate::project_cmd::ProjectCommand;
 use crate::skills_cmd::{SkillPaths, SkillsCommand};
+use crate::workspace_cmd::WorkspaceCommand;
 
 /// The version `aigentic --version` prints: the package version, and the
 /// commit the binary was built from. The commit is put in the environment
@@ -100,6 +102,12 @@ enum Command {
     Project {
         #[command(subcommand)]
         command: ProjectCommand,
+    },
+    /// Create, fill and list workspaces: groups of projects that belong
+    /// together.
+    Workspace {
+        #[command(subcommand)]
+        command: WorkspaceCommand,
     },
     /// List this folder's project's threads, newest first.
     Threads,
@@ -383,6 +391,13 @@ async fn run() -> anyhow::Result<()> {
         Some(Command::Project {
             command: ProjectCommand::Setup,
         }) => std::process::exit(pocock::run(opened.as_ref())?),
+        Some(Command::Workspace { command }) => std::process::exit(workspace_cmd::run(
+            command,
+            &config_dir,
+            &cwd,
+            &mut std::io::stdout(),
+            &mut std::io::stderr(),
+        )?),
         Some(Command::Threads) if cli.server.is_some() => {
             let (client, project) = connect_remote(
                 cli.server.as_deref().expect("checked"),

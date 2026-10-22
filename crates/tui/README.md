@@ -82,6 +82,7 @@ cargo run -p aigentic-tui -- --thread <ULID> --profile anthropic # same thread, 
 cargo run -p aigentic-tui -- project init                        # aigentic.toml + .aigentic/{knowledge,memory}
 cargo run -p aigentic-tui -- project setup                       # render docs/agents/*.md from [pocock]
 cargo run -p aigentic-tui -- project show                        # layers, knowledge mode, every tool's fate; over the API with --server
+cargo run -p aigentic-tui -- workspace new <name> [--shared <dir>]   # an empty workspace; also add <path> [--workspace <name>], remove <project>, list
 cargo run -p aigentic-tui -- threads                             # this project's threads, newest first; over the API with --server
 cargo run -p aigentic-tui -- doctor [--probe]                    # config, keys, threads dir, project, participants, skills, gh; exit 1 on a fail
 cargo run -p aigentic-tui -- init                                # guided setup: config, project, GitHub, knowledge links
@@ -147,6 +148,16 @@ name = "aigentic"
 shared = "~/Projects/aigentic-marketing"   # its workspace/ folder: instructions.md, memory/
 projects = ["~/Projects/aigentic", "~/Projects/aigentic-site", "~/Projects/aigentic-marketing"]
 ```
+
+`aigentic workspace` manages them without a prompt: `new <name> [--shared
+<dir>]` creates one; `add <path> [--workspace <name>]` lists an existing
+folder (relative to the current directory, no `aigentic.toml` needed;
+`--workspace` may be left out while there is only one workspace); `remove
+<project> [--workspace <name>]` drops a project by name or path from the
+list and touches nothing on disk; `list` prints each workspace's shared
+folder and projects, marking a folder that is not on this machine
+`(missing)`, and exits 1 when a file does not parse. Editing a file by hand
+works too.
 
 The daemon reads them all, so it knows every project's root; a project's
 name is its `aigentic.toml`'s, or its folder's. Every project in a workspace

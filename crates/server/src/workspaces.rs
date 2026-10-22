@@ -218,6 +218,21 @@ pub fn save(config_dir: &Path, w: &Workspace) -> Result<(), WorkspaceError> {
 /// Every workspace file, paths expanded, by name. A missing directory
 /// is none; a file that does not parse is an error naming it.
 pub fn load_all(config_dir: &Path) -> Result<Vec<Workspace>, ConfigError> {
+    let mut out = load_each(config_dir)?
+        .into_iter()
+        .map(|(_, w)| w)
+        .collect::<Result<Vec<_>, _>>()?;
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
+
+/// One workspace file and what it held, or the error naming it.
+pub type Loaded = (PathBuf, Result<Workspace, ConfigError>);
+
+/// Every `*.toml` in the workspace directory by file name, each with its
+/// workspace (paths expanded) or the error naming the file, so one bad
+/// file does not hide the rest. A missing directory is none.
+pub fn load_each(config_dir: &Path) -> Result<Vec<Loaded>, ConfigError> {
     let dir = dir(config_dir);
     let entries = match std::fs::read_dir(&dir) {
         Ok(e) => e,
@@ -230,18 +245,23 @@ pub fn load_all(config_dir: &Path) -> Result<Vec<Workspace>, ConfigError> {
         .filter(|p| p.extension().is_some_and(|x| x == "toml"))
         .collect();
     files.sort();
-    let mut out = Vec::new();
-    for f in files {
-        let text = std::fs::read_to_string(&f)
-            .map_err(|e| ConfigError::msg(format!("{}: {e}", f.display())))?;
-        let mut w: Workspace =
-            toml::from_str(&text).map_err(|e| ConfigError::msg(format!("{}: {e}", f.display())))?;
-        w.shared = w.shared.as_deref().map(expand);
-        w.projects = w.projects.iter().map(|p| expand(p)).collect();
-        out.push(w);
-    }
-    out.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(out)
+    Ok(files
+        .into_iter()
+        .map(|f| {
+            let loaded = load_file(&f);
+            (f, loaded)
+        })
+        .collect())
+}
+
+fn load_file(f: &Path) -> Result<Workspace, ConfigError> {
+    let text = std::fs::read_to_string(f)
+        .map_err(|e| ConfigError::msg(format!("{}: {e}", f.display())))?;
+    let mut w: Workspace =
+        toml::from_str(&text).map_err(|e| ConfigError::msg(format!("{}: {e}", f.display())))?;
+    w.shared = w.shared.as_deref().map(expand);
+    w.projects = w.projects.iter().map(|p| expand(p)).collect();
+    Ok(w)
 }
 
 /// A project's name: its `aigentic.toml`'s, else the folder's.
