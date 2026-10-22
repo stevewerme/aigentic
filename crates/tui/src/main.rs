@@ -926,6 +926,7 @@ async fn run() -> anyhow::Result<()> {
         &project_name,
     )
     .with_skills(skills)
+    .with_workspaces(workspaces)
     .with_title(title);
     app::run(repl, notices, history, project_name, project_root).await?;
     drop(embedded);

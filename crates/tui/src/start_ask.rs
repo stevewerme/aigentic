@@ -389,6 +389,16 @@ fn rows(
     (first, shadowed)
 }
 
+/// The bare `/project use` picker's rows: every project the daemon
+/// knows, in the ask's order, with row 1 the one Enter takes.
+pub fn pick_rows(
+    projects: &[ProjectInfo],
+    threads: &[StartRow],
+    workspaces: &[Workspace],
+) -> Vec<Row> {
+    rows(projects, threads, workspaces, None).0
+}
+
 /// Two roots are the same project directory: canonicalised when both
 /// exist, compared as written otherwise (a workspace file may name a path
 /// that is not there yet).

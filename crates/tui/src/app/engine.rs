@@ -24,6 +24,7 @@ use aigentic_runtime::aigentic_log::{
 };
 use aigentic_runtime::harness_tools::{TaskState, open_checklist};
 use aigentic_runtime::{ASKED_HUMAN, INTERRUPTED, LENGTH_STOP, NOT_RUN_OVER_LIMIT, NOT_RUN_SOLO};
+use aigentic_server::workspaces::Workspace;
 
 use crate::app::cells::full_command;
 use crate::app::composer::Composer;
@@ -555,6 +556,12 @@ pub struct ClientRepl {
     /// row's build number can be resolved when it is taken.
     jobs: Option<Menu>,
     jobs_rows: Vec<aigentic_api::JobRow>,
+    /// The bare `/project use` picker, in a slot of its own as the `/new`
+    /// question is, so a daemon prompt arriving cannot overwrite it.
+    /// Answered here; only the move a row picks is sent.
+    project_pick: Option<Menu>,
+    /// The workspaces read at start-up: the picker's groups.
+    workspaces: Vec<Workspace>,
     /// The running issue's step this REPL watches, if any: its own
     /// engine, its figures and its moves. The front thread's state is
     /// untouched while it is open.
@@ -646,6 +653,8 @@ impl ClientRepl {
             confirm_new: None,
             jobs: None,
             jobs_rows: Vec::new(),
+            project_pick: None,
+            workspaces: Vec::new(),
             quit: false,
             home_project: project.to_owned(),
             following: None,
@@ -659,6 +668,12 @@ impl ClientRepl {
     /// The user-invoked skills, so `/<skill>` dispatches.
     pub fn with_skills(mut self, skills: Vec<String>) -> Self {
         self.skills = skills;
+        self
+    }
+
+    /// The workspaces the bare `/project use` picker groups by.
+    pub fn with_workspaces(mut self, workspaces: Vec<Workspace>) -> Self {
+        self.workspaces = workspaces;
         self
     }
 
@@ -979,7 +994,10 @@ impl ClientRepl {
                         // answered by `apply_jobs`, and never reach a
                         // daemon prompt's menu here.
                         | Pick::Job { .. }
-                        | Pick::CloseJob => {}
+                        | Pick::CloseJob
+                        // The project picker's picks are `apply_project_pick`'s.
+                        | Pick::UseProject { .. }
+                        | Pick::KeepProject => {}
                     }
                     return;
                 }
@@ -1020,15 +1038,8 @@ impl ClientRepl {
                     "unknown view {other:?} · dev or normal"
                 )),
             },
-            Command::ProjectUse(name) => {
-                let r = self
-                    .request(Request::SwitchProject {
-                        thread: self.thread,
-                        project: name.to_owned(),
-                    })
-                    .await;
-                self.show(r, "", out);
-            }
+            Command::ProjectUse(name) => self.switch_project(name, out).await,
+            Command::ProjectPick => self.pick_project(out).await,
             Command::Rename(title) => {
                 let r = self
                     .request(Request::Rename {
@@ -1346,8 +1357,9 @@ impl ClientRepl {
         self.last_stop = None;
         self.awaiting_turn = false;
         // The `/new` question was about the old thread (issue #108): it
-        // does not follow this REPL over.
+        // does not follow this REPL over, and nor does the project picker.
         self.confirm_new = None;
+        self.project_pick = None;
         // The role is the new project's, and only the daemon knows it:
         // `Welcome` named the project the client started in.
         let project = self
@@ -1542,6 +1554,60 @@ impl ClientRepl {
                 }
             }
             other => self.show(other, "", out),
+        }
+    }
+
+    /// Move this thread to `project`, as `/project use <name>` and the
+    /// picker's rows both do.
+    async fn switch_project(&mut self, project: &str, out: &mut dyn Printer) {
+        let r = self
+            .request(Request::SwitchProject {
+                thread: self.thread,
+                project: project.to_owned(),
+            })
+            .await;
+        self.show(r, "", out);
+    }
+
+    /// A bare `/project use`: every project, in the start-up ask's order,
+    /// from the daemon's listings. A terminal gets a picker; a pipe has
+    /// no keys to answer one, so it gets the rows and the named form.
+    async fn pick_project(&mut self, out: &mut dyn Printer) {
+        let projects = match self.request(Request::ListProjects).await {
+            Response::Projects { projects } => projects,
+            other => return self.show(other, "", out),
+        };
+        let threads = match self.request(Request::StartRows).await {
+            Response::StartRows { rows } => rows,
+            other => return self.show(other, "", out),
+        };
+        let rows = crate::start_ask::pick_rows(&projects, &threads, &self.workspaces);
+        if rows.is_empty() {
+            out.line("[no project to move this thread to]");
+            return;
+        }
+        let mut menu = Menu::projects(&rows, std::time::SystemTime::now());
+        // The same terminal test as the `/jobs` picker's.
+        if detailed(out) {
+            self.project_pick = Some(menu);
+        } else {
+            menu.note = Some("/project use <name> moves this thread".into());
+            for l in menu.plain() {
+                out.line(&l);
+            }
+        }
+    }
+
+    /// What the project picker came to: a row sends the move the named
+    /// form sends; Esc sends nothing.
+    async fn apply_project_pick(&mut self, keyed: Keyed, out: &mut dyn Printer) {
+        let Keyed::Decide { pick, echo, .. } = keyed else {
+            return;
+        };
+        self.project_pick = None;
+        out.line(&echo);
+        if let Pick::UseProject { name } = pick {
+            self.switch_project(&name, out).await;
         }
     }
 
@@ -1953,7 +2019,10 @@ impl ClientRepl {
             | Pick::NewYes
             | Pick::NewNo
             | Pick::Job { .. }
-            | Pick::CloseJob => {}
+            | Pick::CloseJob
+            // The project picker's picks are `apply_project_pick`'s.
+            | Pick::UseProject { .. }
+            | Pick::KeepProject => {}
         }
     }
 
@@ -2144,6 +2213,9 @@ impl ClientRepl {
         if self.confirm_new.is_some() {
             return self.confirm_new.as_ref();
         }
+        if self.project_pick.is_some() {
+            return self.project_pick.as_ref();
+        }
         if self.prompted.is_some() {
             return self.menu.as_ref();
         }
@@ -2166,6 +2238,9 @@ impl ClientRepl {
         }
         if self.confirm_new.is_some() {
             return Some("confirm:new".to_owned());
+        }
+        if self.project_pick.is_some() {
+            return Some("project:pick".to_owned());
         }
         if let Some(call_id) = self.prompted.as_ref() {
             return self.menu.as_ref().map(|_| format!("chat:{call_id}"));
@@ -2232,6 +2307,24 @@ impl ClientRepl {
                 Keyed::Flat => MenuKey::Passed,
                 keyed @ (Keyed::Decide { .. } | Keyed::Answer { .. }) => {
                     self.apply_confirm(keyed, out).await;
+                    MenuKey::Used
+                }
+            };
+        }
+        // The project picker next: it has no text input, and its Esc is
+        // its own, never the keymap's interrupt.
+        if self.project_pick.is_some() {
+            let keyed = {
+                let Some(menu) = self.project_pick.as_mut() else {
+                    return MenuKey::Passed;
+                };
+                menu.key(key, composer_empty, settled)
+            };
+            return match keyed {
+                Keyed::Passed | Keyed::Text | Keyed::Flat => MenuKey::Passed,
+                Keyed::Used => MenuKey::Used,
+                keyed @ (Keyed::Decide { .. } | Keyed::Answer { .. }) => {
+                    self.apply_project_pick(keyed, out).await;
                     MenuKey::Used
                 }
             };
@@ -2347,7 +2440,10 @@ impl ClientRepl {
                     | Pick::NewNo
                     // The picker's own picks are `apply_jobs`'s.
                     | Pick::Job { .. }
-                    | Pick::CloseJob => {}
+                    | Pick::CloseJob
+                    // The project picker's picks are `apply_project_pick`'s.
+                    | Pick::UseProject { .. }
+                    | Pick::KeepProject => {}
                 }
             }
             Keyed::Answer { text, echo } => {
@@ -2514,8 +2610,8 @@ impl ClientRepl {
             // keys are digits and `y`/`n`, and there is nothing for the
             // composer to send.
             Some(Kind::NewThread) => {}
-            // The picker has none either.
-            Some(Kind::Job { .. } | Kind::ShowJob { .. }) => {}
+            // The pickers have none either.
+            Some(Kind::Job { .. } | Kind::ShowJob { .. } | Kind::ProjectPick) => {}
             // A checkpoint has no text input: nothing to send.
             Some(Kind::Checkpoint) => {}
             // A switch proposal's text input is where it belongs
@@ -11636,6 +11732,139 @@ mod tests {
         assert!(own < other, "{lines}");
         assert!(!out.lines[own].ends_with(" · b"), "{lines}");
         assert!(out.lines[other].ends_with(" · a"), "{lines}");
+    }
+
+    /// A REPL on a thread in `b` while the front thread is in `a`, so the
+    /// picker's row 1 (the last-used project) is not where the thread is.
+    async fn picker_rig(dir: &std::path::Path) -> (ClientRepl, Client, Ulid) {
+        let a = project(dir, "a", "[participants]\nsteve = \"admin\"\n");
+        let b = project(dir, "b", "[participants]\nsteve = \"admin\"\n");
+        let addr = crate::app::rig::daemon(dir, &[("steve", "t")], &[("a", a), ("b", b)]).await;
+        let (client, welcome) = Client::connect(&addr, "t").await.unwrap();
+        crate::front::pick_thread(&client, None, false, "a", None, None)
+            .await
+            .unwrap();
+        let role = welcome
+            .projects
+            .iter()
+            .find(|p| p.name == "b")
+            .and_then(|p| p.role.clone());
+        let (thread, state, mode) = open(&client, "b", None).await;
+        let repl = ClientRepl::new(
+            client,
+            thread,
+            "steve",
+            role,
+            state,
+            mode,
+            Identity::default(),
+            "b",
+        );
+        let (second, _) = Client::connect(&addr, "t").await.unwrap();
+        (repl, second, thread)
+    }
+
+    /// The projects a thread is listed in, asked of the daemon.
+    async fn listed_in(client: &Client, project: &str, thread: Ulid) -> bool {
+        let Response::Threads { threads } = client
+            .request(Request::ListThreads {
+                project: Some(project.into()),
+            })
+            .await
+            .unwrap()
+        else {
+            panic!()
+        };
+        threads.iter().any(|t| t.id == thread)
+    }
+
+    /// A bare `/project use` draws every project, the last-used first,
+    /// and Enter sends the same move `/project use <name>` sends.
+    #[tokio::test]
+    async fn bare_project_use_shows_the_rows_and_enter_switches_to_the_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut repl, second, thread) = picker_rig(dir.path()).await;
+        let mut out = Lines::detail_on();
+        repl.handle_line("/project use", &mut out).await;
+        let menu = repl.menu().expect("the picker is up").clone();
+        assert_eq!(menu.kind, Kind::ProjectPick);
+        let labels: Vec<&str> = menu.rows.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(labels, ["a", "b"], "the last-used project leads");
+        assert_eq!(
+            menu.rows[0]
+                .desc
+                .as_deref()
+                .map(|d| d.starts_with("other ·")),
+            Some(true)
+        );
+        assert!(listed_in(&second, "b", thread).await);
+
+        let used = repl.menu_key(&key_for_enter(), true, true, &mut out).await;
+        assert_eq!(used, MenuKey::Used);
+        assert!(repl.menu().is_none(), "the picker is put away");
+        assert!(out.0.contains(&"↳ a".to_owned()), "{:?}", out.0);
+        assert!(
+            listed_in(&second, "a", thread).await,
+            "the thread moved to a"
+        );
+        assert!(!listed_in(&second, "b", thread).await);
+    }
+
+    /// Esc puts the picker away and sends nothing: the thread stays.
+    #[tokio::test]
+    async fn esc_on_the_project_picker_leaves_the_project_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut repl, second, thread) = picker_rig(dir.path()).await;
+        let mut out = Lines::detail_on();
+        repl.handle_line("/project use", &mut out).await;
+        assert!(repl.menu().is_some());
+        let used = repl.menu_key(&key_for_esc(), true, true, &mut out).await;
+        assert_eq!(used, MenuKey::Used);
+        assert!(repl.menu().is_none());
+        assert!(
+            out.0.contains(&"↳ kept this project".to_owned()),
+            "{:?}",
+            out.0
+        );
+        assert!(
+            listed_in(&second, "b", thread).await,
+            "the thread stayed in b"
+        );
+        assert!(!listed_in(&second, "a", thread).await);
+    }
+
+    /// `/project use <name>` still moves the thread at once, no picker.
+    #[tokio::test]
+    async fn named_project_use_moves_the_thread_without_a_picker() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut repl, second, thread) = picker_rig(dir.path()).await;
+        let mut out = Lines::detail_on();
+        repl.handle_line("/project use a", &mut out).await;
+        assert!(repl.menu().is_none());
+        assert!(listed_in(&second, "a", thread).await);
+    }
+
+    /// A pipe has no keys: the rows are printed with the named form to
+    /// type, no picker opens and nothing moves.
+    #[tokio::test]
+    async fn bare_project_use_in_plain_mode_prints_the_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut repl, second, thread) = picker_rig(dir.path()).await;
+        let mut out = Lines::default();
+        repl.handle_line("/project use", &mut out).await;
+        assert!(repl.menu().is_none(), "no picker in plain mode");
+        let lines = out.0.join("\n");
+        assert!(
+            lines.contains("[project] move this thread to which project?"),
+            "{lines}"
+        );
+        assert!(lines.contains("  1. a · other"), "{lines}");
+        assert!(lines.contains("  2. b · other"), "{lines}");
+        assert!(
+            lines.contains("/project use <name> moves this thread"),
+            "{lines}"
+        );
+        assert!(listed_in(&second, "b", thread).await);
     }
 
     /// T5 and T7: `/new` starts a new front thread, the REPL follows it

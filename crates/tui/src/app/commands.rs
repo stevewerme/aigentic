@@ -59,6 +59,8 @@ pub enum Command<'a> {
     Rename(&'a str),
     /// Move the thread to another project.
     ProjectUse(&'a str),
+    /// `/project use` with no name: pick the project from a list.
+    ProjectPick,
     /// Start a new front thread, leaving the old one listed. With a turn
     /// open, the REPL asks first (issue #108).
     New,
@@ -92,6 +94,7 @@ pub fn parse_line<'a>(line: &'a str, skills: &[String]) -> Command<'a> {
         ("project", rest) if rest.starts_with("use ") && !rest[4..].trim().is_empty() => {
             Command::ProjectUse(rest[4..].trim())
         }
+        ("project", "use") => Command::ProjectPick,
         ("project", _) => Command::Project,
         ("threads", _) => Command::Threads,
         ("new", _) => Command::New,
@@ -208,6 +211,7 @@ pub const HELP: &str = "\
 /skills          list enabled skills; user-invoked ones are slash commands
 /project         the layers, the knowledge mode and every tool's fate
 /project use <n> move this thread to project <n>, keeping the conversation
+/project use     pick the project from a list: Enter moves the thread, Esc keeps it
 /threads         your threads in every project: front, builds, then by workspace
 /new             start a new front thread; the old one stays listed; asks first if a turn is running
 /build <n> [w]   follow a build of issue n here (workflow w, else build), and answer its checkpoints
@@ -491,5 +495,21 @@ mod tests {
             "{COMMANDS:#?}"
         );
         assert!(HELP.contains("/jobs"), "{HELP}");
+    }
+
+    /// A bare `/project use` is the picker; with a name it is the move it
+    /// always was, so a script that names the project is unchanged.
+    #[test]
+    fn bare_project_use_parses_to_the_picker() {
+        let none: Vec<String> = Vec::new();
+        assert_eq!(parse_line("/project use", &none), Command::ProjectPick);
+        assert_eq!(parse_line("/project use ", &none), Command::ProjectPick);
+        assert_eq!(parse_line("/project use  ", &none), Command::ProjectPick);
+        assert_eq!(
+            parse_line("/project use web", &none),
+            Command::ProjectUse("web")
+        );
+        assert_eq!(parse_line("/project", &none), Command::Project);
+        assert!(HELP.contains("/project use     pick the project"), "{HELP}");
     }
 }

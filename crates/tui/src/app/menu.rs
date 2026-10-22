@@ -74,6 +74,11 @@ pub enum Pick {
     Job { id: Ulid },
     /// Put the listing away. On a row taken, this leaves that build too.
     CloseJob,
+    /// Move the thread to this project: a row of the bare `/project use`
+    /// picker.
+    UseProject { name: String },
+    /// Put the project picker away: the thread stays where it is.
+    KeepProject,
 }
 
 /// One row of the menu.
@@ -112,6 +117,9 @@ pub enum Kind {
         id: Ulid,
         issue: u64,
     },
+    /// The bare `/project use` picker: one row per project. The engine's
+    /// own menu; only the move a row picks is sent.
+    ProjectPick,
 }
 
 /// What a key or a line came to.
@@ -543,6 +551,41 @@ impl Menu {
         }
     }
 
+    /// The bare `/project use` picker: the start-up ask's rows, in its
+    /// order (workspaces in order, `other` last, the last-used project
+    /// first), so Enter takes what the ask would have offered. Each row's
+    /// dim line is its workspace and how long since a thread was started
+    /// there.
+    pub fn projects(rows: &[crate::start_ask::Row], now: std::time::SystemTime) -> Self {
+        let picked: Vec<Row> = rows
+            .iter()
+            .map(|row| Row {
+                label: row.project.clone(),
+                desc: Some(format!(
+                    "{} {}",
+                    row.workspace.as_deref().unwrap_or("other"),
+                    row.note(now)
+                )),
+                pick: Pick::UseProject {
+                    name: row.project.clone(),
+                },
+            })
+            .collect();
+        Self {
+            kind: Kind::ProjectPick,
+            title: "move this thread to which project?".into(),
+            body: String::new(),
+            note: Some("Enter moves the thread; Esc keeps it here".into()),
+            rows: picked,
+            selected: 0,
+            multi: false,
+            picked: Vec::new(),
+            questions: None,
+            lead: None,
+            flat: None,
+        }
+    }
+
     /// The listing with one row taken: the same menu, so
     /// Down and Up still walk the builds while one is shown read-only,
     /// and Esc leaves it the way it leaves the listing.
@@ -822,6 +865,12 @@ impl Menu {
                     echo: "↳ closed the listing".into(),
                 }
             }
+            // Esc on the project picker sends nothing and moves nothing.
+            KeyCode::Esc if self.kind == Kind::ProjectPick => Keyed::Decide {
+                pick: Pick::KeepProject,
+                reason: None,
+                echo: "↳ kept this project".into(),
+            },
             _ if !settled => Keyed::Passed,
             KeyCode::Char(' ') if plain && self.multi && typing_safe => {
                 self.toggle(self.selected);
@@ -973,6 +1022,11 @@ impl Menu {
             // listing closed are both read by the engine, nothing goes
             // to the daemon from here.
             Pick::Job { .. } | Pick::CloseJob => Keyed::Decide {
+                pick: row.pick.clone(),
+                reason: None,
+                echo: format!("↳ {}", row.label),
+            },
+            Pick::UseProject { .. } | Pick::KeepProject => Keyed::Decide {
                 pick: row.pick.clone(),
                 reason: None,
                 echo: format!("↳ {}", row.label),
@@ -1180,6 +1234,7 @@ impl Menu {
             Kind::Switch => "switch",
             Kind::NewThread => "new thread",
             Kind::Job { .. } | Kind::ShowJob { .. } => "jobs",
+            Kind::ProjectPick => "project",
         };
         let mut lines = vec![format!("[{tag}] {}", self.title)];
         if !self.body.is_empty() {

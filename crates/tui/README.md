@@ -172,7 +172,10 @@ gets the workspace's instructions and memory between the global and project
 layers. `/project use <name>` moves the thread to another project: the
 conversation stays, the instructions, knowledge, memory, skills, policy,
 tools and working directory become the new project's, the model is told,
-and a restart resumes the thread there.
+and a restart resumes the thread there. A bare `/project use` lists the
+projects as the start-up ask does, grouped by workspace with the last-used
+first: Enter moves the thread to the selected one, Esc keeps it where it
+is. A pipe gets the list printed instead, to answer with a name.
 
 `utility_profile = "<profile>"` at the top of `config.toml` names a profile
 for side jobs: thread titles and memory extraction. Without it there are no
@@ -262,7 +265,8 @@ mode, and the session grants with who gave them), `/memory` (the memory
 files with line counts, the `through_seq` of the last extraction, and
 the block as the prefix carries it), `/skills` (the enabled set), `/project`
 (the same report as `project show`, over the live registry so MCP tools are
-included), `/project use <name>` (move the thread to another project),
+included), `/project use <name>` (move the thread to another project;
+bare, a picker of every project),
 `/threads`, `/new` (start a new front thread; the old one stays listed),
 `/<skill> [args]` for every enabled user-invoked
 skill, `/help`, `/quit`. Anything else starting with `/` prints `unknown
