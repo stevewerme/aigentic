@@ -265,15 +265,17 @@ impl Call {
 }
 
 /// E4: the gate ran in template form — `cargo fmt`, then `cargo clippy
-/// --all-targets -- -D warnings`, then `cargo test > <log> 2>&1` — each
-/// before the last, all three passing, nothing edited between the format
-/// and the suite, and the tested tree committed. A gate command may carry
-/// one leading `cd <dir> &&` (the shared working directory's habit,
-/// `## Supervisor findings` item 3); nothing else may precede it.
+/// --all-targets -- -D warnings`, then `cargo test > <log> 2>&1`, then
+/// `scripts/comment-check.sh origin/main` — in that order, all four
+/// passing, nothing edited between the format and the suite or after it,
+/// and the tested tree committed. A gate command may carry one leading
+/// `cd <dir> &&` (the shared working directory's habit, `## Supervisor
+/// findings` item 3); nothing else may precede it.
 fn e4_gate(input: &CheckInput<'_>) -> Result<(), String> {
     let calls = calls(input.events);
     let format = calls.iter().rfind(|call| is_gate(call, GATE_FORMAT));
     let clippy = calls.iter().rfind(|call| is_gate(call, GATE_CLIPPY));
+    let comments = calls.iter().rfind(|call| is_gate(call, GATE_COMMENTS));
     let suite = calls
         .iter()
         .rfind(|call| call.command().is_some_and(is_gate_suite));
@@ -301,13 +303,26 @@ fn e4_gate(input: &CheckInput<'_>) -> Result<(), String> {
     let Some(clippy) = clippy else {
         return Err("no `cargo clippy --all-targets -- -D warnings` gate".to_string());
     };
+    let Some(comments) = comments else {
+        return Err(format!("no `{GATE_COMMENTS}` gate"));
+    };
     if format.seq > clippy.seq || clippy.seq > suite.seq {
         return Err(format!(
             "gate out of order: fmt seq {}, clippy seq {}, suite seq {}",
             format.seq, clippy.seq, suite.seq
         ));
     }
-    for (label, call) in [("cargo fmt", format), ("cargo clippy", clippy)] {
+    if comments.seq < suite.seq {
+        return Err(format!(
+            "the comment check ran before the test suite (seq {}, suite seq {})",
+            comments.seq, suite.seq
+        ));
+    }
+    for (label, call) in [
+        ("cargo fmt", format),
+        ("cargo clippy", clippy),
+        (GATE_COMMENTS, comments),
+    ] {
         if call.answer.as_ref().is_some_and(|answer| answer.is_error) {
             return Err(format!("{label} failed (seq {})", call.seq));
         }
@@ -325,10 +340,11 @@ fn e4_gate(input: &CheckInput<'_>) -> Result<(), String> {
             edit.seq
         ));
     }
-    if let Some(edit) = calls
-        .iter()
-        .find(|call| call.is_edit(input.root) && call.seq > suite.seq)
-    {
+    // The comment check names a script in the repo, which the edit table
+    // reads as a write; in the gate's own form it only reads the commits.
+    if let Some(edit) = calls.iter().find(|call| {
+        call.is_edit(input.root) && call.seq > suite.seq && !is_gate(call, GATE_COMMENTS)
+    }) {
         return Err(format!(
             "edit after the gate: {} (seq {})",
             edit.what(),
@@ -493,9 +509,12 @@ fn calls(events: &[Event]) -> Vec<Call> {
     calls
 }
 
-/// The gate's two fixed commands, verbatim, behind one optional `cd`.
+/// The gate's three fixed commands, verbatim, behind one optional `cd`.
+/// The comment check's base is `origin/main` because the loop pushes to
+/// main, and that is the range CI checks.
 const GATE_FORMAT: &str = "cargo fmt";
 const GATE_CLIPPY: &str = "cargo clippy --all-targets -- -D warnings";
+const GATE_COMMENTS: &str = "scripts/comment-check.sh origin/main";
 
 /// A gate command, behind the one leading `cd` a build habitually uses.
 fn is_gate(call: &Call, form: &str) -> bool {

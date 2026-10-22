@@ -434,7 +434,7 @@ impl Log {
     }
 }
 
-/// The three template gate calls, all passing. With `cd` each command
+/// The four template gate calls, all passing. With `cd` each command
 /// carries the one leading `cd <dir> &&` a shared working directory makes
 /// a tool reach for (T7's accepted rows).
 fn healthy_gate(log: &mut Log, cd: bool) {
@@ -455,6 +455,8 @@ fn healthy_gate(log: &mut Log, cd: bool) {
         &suite,
         "test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out",
     );
+    let comments = log.bash(7, &format!("{prefix}scripts/comment-check.sh origin/main"));
+    log.ok(8, &comments, "");
 }
 
 /// The fixture lines, parsed through the core types.
@@ -676,6 +678,8 @@ fn e4_edit_table_row_by_row() {
         log.ok(6, &clippy, "");
         let suite = log.bash(7, "cargo test > /tmp/issue56-gate.log 2>&1");
         log.ok(8, &suite, "test result: ok. 12 passed; 0 failed");
+        let comments = log.bash(9, "scripts/comment-check.sh origin/main");
+        log.ok(10, &comments, "");
 
         let got = verdict_of(&log.take(), "E4");
         if is_edit {
@@ -750,6 +754,8 @@ fn t10_e4_a_temp_path_write_is_not_an_edit() {
         log.ok(6, &clippy, "");
         let suite = log.bash(7, "cargo test > /tmp/65-gate.log 2>&1");
         log.ok(8, &suite, "test result: ok. 12 passed; 0 failed");
+        let comments = log.bash(9, "scripts/comment-check.sh origin/main");
+        log.ok(10, &comments, "");
 
         let got = verdict_of(&log.take(), "E4");
         if is_edit {
@@ -767,14 +773,14 @@ fn t10_e4_a_temp_path_write_is_not_an_edit() {
 fn e4_reads_a_cleanup_by_where_it_lands() {
     let mut log = Log::new();
     healthy_gate(&mut log, false);
-    let cleanup = log.bash(7, "rm -f /tmp/base-runs.rs /tmp/140-restore-comments.py");
-    log.ok(8, &cleanup, "");
+    let cleanup = log.bash(9, "rm -f /tmp/base-runs.rs /tmp/140-restore-comments.py");
+    log.ok(10, &cleanup, "");
     assert_eq!(verdict_of(&log.take(), "E4"), Ok(()));
 
     let mut log = Log::new();
     healthy_gate(&mut log, false);
-    let edit = log.bash(7, "rm -f crates/runtime/src/new.rs");
-    log.ok(8, &edit, "");
+    let edit = log.bash(9, "rm -f crates/runtime/src/new.rs");
+    log.ok(10, &edit, "");
     let got = verdict_of(&log.take(), "E4").expect_err("a repo path");
     assert!(got.contains("edit after the gate"), "{got}");
 }
@@ -847,8 +853,8 @@ fn e4_reads_a_bare_argument_as_a_path_in_the_tree() {
     for (command, is_edit) in [("touch x.rs", true), ("rm -f /tmp/x.rs", false)] {
         let mut log = Log::new();
         healthy_gate(&mut log, false);
-        let call = log.bash(7, command);
-        log.ok(8, &call, "");
+        let call = log.bash(9, command);
+        log.ok(10, &call, "");
         let got = verdict_of(&log.take(), "E4");
         if is_edit {
             let detail = got.expect_err("an edit after the gate");
@@ -924,8 +930,8 @@ fn e4_reads_the_tools_writes_by_where_they_land() {
             Some(path) => json!({"path": path, "content": "x"}),
             None => json!({"content": "x"}),
         };
-        let call = log.call(7, "edit_file", args);
-        log.ok(8, &call, "wrote");
+        let call = log.call(9, "edit_file", args);
+        log.ok(10, &call, "wrote");
         let got = verdict_of(&log.take(), "E4");
         if is_edit {
             let detail = got.expect_err("an edit after the gate");
@@ -945,6 +951,82 @@ fn e4_passes_a_healthy_gate() {
     assert_eq!(verdict_of(&log.take(), "E4"), Ok(()));
 }
 
+/// The gate's first three calls, all passing, at seqs 1 to 6.
+fn gate_without_the_comment_check(log: &mut Log) {
+    let fmt = log.bash(1, "cargo fmt");
+    log.ok(2, &fmt, "");
+    let clippy = log.bash(3, "cargo clippy --all-targets -- -D warnings");
+    log.ok(4, &clippy, "");
+    let suite = log.bash(5, "cargo test > /tmp/issue56-gate.log 2>&1");
+    log.ok(6, &suite, "test result: ok. 12 passed; 0 failed");
+}
+
+/// CI fails a push on a comment the check refuses, so a gate that
+/// never ran the check has not shown the push will pass.
+#[test]
+fn e4_fails_a_gate_without_the_comment_check_naming_it() {
+    let mut log = Log::new();
+    gate_without_the_comment_check(&mut log);
+    let got = verdict_of(&log.take(), "E4").expect_err("no comment check");
+    assert_eq!(got, "no `scripts/comment-check.sh origin/main` gate");
+}
+
+/// The check reads the commits the suite tested, so a run before the
+/// suite does not count as the gate's.
+#[test]
+fn e4_fails_a_comment_check_before_the_test_suite() {
+    let mut log = Log::new();
+    let fmt = log.bash(1, "cargo fmt");
+    log.ok(2, &fmt, "");
+    let clippy = log.bash(3, "cargo clippy --all-targets -- -D warnings");
+    log.ok(4, &clippy, "");
+    let comments = log.bash(5, "scripts/comment-check.sh origin/main");
+    log.ok(6, &comments, "");
+    let suite = log.bash(7, "cargo test > /tmp/issue56-gate.log 2>&1");
+    log.ok(8, &suite, "test result: ok. 12 passed; 0 failed");
+    let got = verdict_of(&log.take(), "E4").expect_err("the check ran first");
+    assert_eq!(
+        got,
+        "the comment check ran before the test suite (seq 5, suite seq 7)"
+    );
+}
+
+/// A hit exits non-zero, and a step must not push a tree CI will refuse.
+#[test]
+fn e4_fails_a_gate_whose_comment_check_failed() {
+    let mut log = Log::new();
+    gate_without_the_comment_check(&mut log);
+    let comments = log.bash(7, "scripts/comment-check.sh origin/main");
+    log.answer(8, &comments, true, "crates/x.rs:3: (issue #189)");
+    let got = verdict_of(&log.take(), "E4").expect_err("a hit");
+    assert_eq!(got, "scripts/comment-check.sh origin/main failed (seq 7)");
+}
+
+/// The gate's own call names a script in the repo, which the edit table
+/// reads as a write; in the gate's form it is not an edit after the
+/// gate, and a rerun after a reworded comment is the gate's.
+#[test]
+fn e4_reads_the_gate_form_comment_check_as_no_edit() {
+    let mut log = Log::new();
+    healthy_gate(&mut log, false);
+    let rerun = log.bash(9, "scripts/comment-check.sh origin/main");
+    log.ok(10, &rerun, "");
+    assert_eq!(verdict_of(&log.take(), "E4"), Ok(()));
+
+    for command in [
+        "scripts/comment-check.sh HEAD",
+        "sh scripts/comment-check.sh origin/main",
+        "scripts/comment-check.sh origin/main > crates/x.log",
+    ] {
+        let mut log = Log::new();
+        healthy_gate(&mut log, false);
+        let call = log.bash(9, command);
+        log.ok(10, &call, "");
+        let got = verdict_of(&log.take(), "E4").expect_err(command);
+        assert!(got.starts_with("edit after the gate"), "{command}: {got}");
+    }
+}
+
 /// T10a: #53's verbatim fixture has no gate in template form; the suite
 /// there is chained and echo-suffixed.
 #[test]
@@ -960,8 +1042,8 @@ fn e4_fails_53s_fixture_for_want_of_a_template_gate() {
 fn e4_fails_an_edit_after_the_gate_naming_the_edit() {
     let mut log = Log::new();
     healthy_gate(&mut log, false);
-    let edit = log.write_file(7, "crates/runtime/src/checks/mod.rs");
-    log.ok(8, &edit, "wrote");
+    let edit = log.write_file(9, "crates/runtime/src/checks/mod.rs");
+    log.ok(10, &edit, "wrote");
     let got = verdict_of(&log.take(), "E4").expect_err("an edit after the gate");
     assert!(got.contains("edit after the gate"), "{got}");
     assert!(got.contains("crates/runtime/src/checks/mod.rs"), "{got}");
@@ -975,16 +1057,16 @@ fn e4_reads_a_read_only_substitution_after_the_gate() {
     let mut log = Log::new();
     healthy_gate(&mut log, false);
     let call = log.bash(
-        7,
+        9,
         "git log --format='%h %s' 3e99082..HEAD; echo \"--- count: $(git rev-list --count 3e99082..HEAD)\"",
     );
-    log.ok(8, &call, "");
+    log.ok(10, &call, "");
     assert_eq!(verdict_of(&log.take(), "E4"), Ok(()));
 
     let mut log = Log::new();
     healthy_gate(&mut log, false);
-    let edit = log.bash(7, "echo $(touch crates/runtime/src/new.rs)");
-    log.ok(8, &edit, "");
+    let edit = log.bash(9, "echo $(touch crates/runtime/src/new.rs)");
+    log.ok(10, &edit, "");
     let got = verdict_of(&log.take(), "E4").expect_err("a write inside a substitution");
     assert!(got.contains("edit after the gate"), "{got}");
 }
