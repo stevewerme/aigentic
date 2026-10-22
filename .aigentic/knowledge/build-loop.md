@@ -113,10 +113,12 @@ line ranges. The standard blocks:
 - **existing tests:** never change an assertion; the only allowed edits are
   the ones the spec lists. If anything else fails, stop and report, or ask
   the person with `ask_human`;
-- the gate: three bare calls (`cargo fmt`, `cargo clippy --all-targets --
-  -D warnings`, `cargo test --no-fail-fast > /tmp/<n>-gate.log 2>&1` with
-  `timeout_secs: 900`), then a separate `grep` over the log, never a
-  script: E4 reads a heredoc as an edit;
+- the gate: four bare calls (`cargo fmt`, `cargo clippy --all-targets --
+  -D warnings`, `cargo test > /tmp/<n>-gate.log 2>&1` with
+  `timeout_secs: 900`, `scripts/comment-check.sh origin/main`), then a
+  separate `grep` over the log, never a script: E4 reads a heredoc as an
+  edit. The comment check reads the commits, so it runs after the last
+  one, and a hit is fixed like a failing test;
 - a test that could hang (it waits on a socket, a stream, a child process,
   or a fix not made yet) runs alone with `timeout_secs: 120`; only the full
   gate takes 900. A sleeping machine stops that clock, so a 900 s cap can
