@@ -63,7 +63,7 @@ pub use knowledge::{Knowledge, KnowledgeMode, ScopeSources};
 pub use layers::{Decided, GlobalLayer, Layers, PERSON_MEMORY_HEADING, WorkspaceLayer};
 pub use memory::{MEMORY_FILES, MEMORY_PROMPT, MEMORY_REQUEST};
 pub use mode::Mode;
-pub use project::{Project, ProjectError, ProjectFile};
+pub use project::{Project, ProjectError, ProjectFile, ProjectKind};
 pub use resume::{DAEMON_RESTARTED, INTERRUPTED_RESULT, Resumed};
 pub use run_status::{Phase, RunStatus, run_status};
 pub use runtime::{

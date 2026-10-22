@@ -34,7 +34,7 @@ stated. Edit these files outside the thread; a tool call that writes them is ref
 /// The keys of each table in `aigentic.toml`, in one place so a struct
 /// that gains a field has one line to add here. The walk in
 /// `config_keys` reads them; the spec tree below is built from them.
-pub const PROJECT_SECTION_KEYS: &[&str] = &["name", "description", "related"];
+pub const PROJECT_SECTION_KEYS: &[&str] = &["name", "description", "related", "kind"];
 pub const MODEL_SECTION_KEYS: &[&str] = &["profile"];
 // BUDGET_KEYS and COMPACTION_KEYS live beside the shared structs below:
 // `[budget]` and `[compaction]` appear in `aigentic.toml` and in a
@@ -194,11 +194,26 @@ pub struct ProjectSection {
     #[serde(default)]
     pub description: Option<String>,
     /// Projects in other workspaces this thread's project declares it
-    /// understands (issue #129): each `<workspace>/<project>`, checked
-    /// at parse. Empty when absent, so a file without the key is
-    /// unchanged.
+    /// understands: each `<workspace>/<project>`, checked at parse.
+    /// Empty when absent.
     #[serde(default)]
     pub related: Vec<String>,
+    /// What the project holds. Absent reads as `Code`; an unknown value
+    /// is a parse error.
+    #[serde(default)]
+    pub kind: ProjectKind,
+}
+
+/// `[project] kind`: what a project holds. The harness behaves the same
+/// for every kind; only `doctor` reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectKind {
+    /// A code repository.
+    #[default]
+    Code,
+    /// Notes and documents with no repository.
+    Notes,
 }
 
 /// Keys in `MODEL_SECTION_KEYS`.
@@ -678,6 +693,15 @@ impl Project {
         Ok(project)
     }
 
+    /// `[project] kind`, `Code` when the file has no `[project]` table
+    /// or no `kind` key.
+    pub fn kind(&self) -> ProjectKind {
+        self.file
+            .project
+            .as_ref()
+            .map_or(ProjectKind::default(), |p| p.kind)
+    }
+
     pub fn dot_dir(&self) -> PathBuf {
         self.root.join(DOT_DIR)
     }
@@ -964,6 +988,48 @@ enabled = ["implement"]
         )
         .unwrap();
         assert_eq!(unknown, vec!["project.bogus", "tools.bash_timout_secs"]);
+    }
+
+    #[test]
+    fn a_notes_kind_parses() {
+        let (file, unknown) =
+            ProjectFile::parse_with("[project]\nname = \"p\"\nkind = \"notes\"\n").unwrap();
+        assert_eq!(file.project.unwrap().kind, ProjectKind::Notes);
+        assert_eq!(unknown, Vec::<String>::new());
+    }
+
+    #[test]
+    fn an_absent_kind_reads_as_code() {
+        let absent = ProjectFile::parse("[project]\nname = \"p\"\n").unwrap();
+        assert_eq!(absent.project.as_ref().unwrap().kind, ProjectKind::Code);
+        let explicit = ProjectFile::parse("[project]\nname = \"p\"\nkind = \"code\"\n").unwrap();
+        assert_eq!(explicit, absent);
+    }
+
+    #[test]
+    fn an_unknown_kind_is_a_parse_error_naming_the_key() {
+        let err = ProjectFile::parse("[project]\nname = \"p\"\nkind = \"other\"\n").unwrap_err();
+        assert!(err.contains("kind"), "{err}");
+        assert!(err.contains("other"), "{err}");
+    }
+
+    #[test]
+    fn a_project_without_a_project_table_is_code() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(FILE_NAME), "").unwrap();
+        assert_eq!(
+            Project::open_root(dir.path()).unwrap().kind(),
+            ProjectKind::Code
+        );
+        std::fs::write(
+            dir.path().join(FILE_NAME),
+            "[project]\nname = \"p\"\nkind = \"notes\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            Project::open_root(dir.path()).unwrap().kind(),
+            ProjectKind::Notes
+        );
     }
 
     #[test]
