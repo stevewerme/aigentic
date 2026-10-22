@@ -500,7 +500,10 @@ pub fn project(events: &[Event]) -> Result<Projection, LogError> {
             // model through what it caused (a `project_switched`, a job's
             // summary), not through the record itself.
             | EventKind::DecisionProposed
-            | EventKind::DecisionAnswered => {}
+            | EventKind::DecisionAnswered
+            // A brief's refresh records a write to the brief's file; the
+            // model reads the brief, never the record of its rewrite.
+            | EventKind::BriefRefreshed => {}
         }
     }
 
@@ -1607,6 +1610,28 @@ mod tests {
                 summary
             ))]
         );
+    }
+
+    /// A brief's refresh changes nothing the model sees: the brief's file
+    /// is what reaches context, and a record of its rewrite in the body
+    /// would change the cached prefix for no gain.
+    #[test]
+    fn a_refreshed_brief_never_reaches_context() {
+        let events = vec![user(0, "build it"), assistant(1, "on it", false), ended(2)];
+        let mut with = events.clone();
+        with.push(ev(
+            3,
+            EventKind::BriefRefreshed,
+            Author::System,
+            json!({
+                "through_seq": 2,
+                "old_hash": "0a1b",
+                "new_hash": "2c3d",
+                "model": "m",
+                "usage": {"input_tokens": 10, "output_tokens": 2},
+            }),
+        ));
+        assert_eq!(project(&with).unwrap(), project(&events).unwrap());
     }
 
     #[test]

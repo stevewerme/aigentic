@@ -598,6 +598,22 @@ pub struct MemoryExtractedPayload {
     pub usage: Usage,
 }
 
+/// Payload of a `brief_refreshed` event: the utility model rewrote a
+/// brief's current state from the thread's events up to `through_seq`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BriefRefreshedPayload {
+    /// Events considered, inclusive; the cursor the next refresh reads
+    /// from.
+    pub through_seq: u64,
+    /// The brief's content hash before and after, lowercase hex as
+    /// `aigentic_skills::hash_bytes` returns it.
+    pub old_hash: String,
+    pub new_hash: String,
+    /// The model that ran the refresh.
+    pub model: String,
+    pub usage: Usage,
+}
+
 /// Payload of a `memory_remembered` event (issue #14): a person ran
 /// `/remember` and the runtime appended a line directly, no model call.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1511,6 +1527,31 @@ mod tests {
         }))
         .unwrap();
         assert!(bare.written.is_empty());
+    }
+
+    #[test]
+    fn brief_refreshed_round_trips_with_every_field_on_the_wire() {
+        let p = BriefRefreshedPayload {
+            through_seq: 12,
+            old_hash: "0a1b".into(),
+            new_hash: "2c3d".into(),
+            model: "m".into(),
+            usage: Usage::reported(aigentic_core::Usage {
+                input_tokens: 10,
+                output_tokens: 2,
+                ..Default::default()
+            }),
+        };
+        let value = serde_json::to_value(&p).unwrap();
+        assert_eq!(value["through_seq"], 12);
+        assert_eq!(value["old_hash"], "0a1b");
+        assert_eq!(value["new_hash"], "2c3d");
+        assert_eq!(value["model"], "m");
+        assert_eq!(value["usage"]["input_tokens"], 10);
+        assert_eq!(
+            serde_json::from_value::<BriefRefreshedPayload>(value).unwrap(),
+            p
+        );
     }
 
     #[test]

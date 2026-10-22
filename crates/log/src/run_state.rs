@@ -364,7 +364,9 @@ fn runner_kind(kind: EventKind) -> Option<RunnerKind> {
         | EventKind::DecisionAnswered
         // Nor is a finished job: the front thread's record of work in
         // another thread is not a move of its own run.
-        | EventKind::JobFinished => None,
+        | EventKind::JobFinished
+        // Nor is a brief's refresh: it rewrites a file, not a step.
+        | EventKind::BriefRefreshed => None,
     }
 }
 
@@ -1445,6 +1447,29 @@ mod tests {
         let plain = run_state(&numbered(base)).unwrap();
         let held = run_state(&numbered(with)).unwrap();
         assert_eq!(held.next_move(), plain.next_move());
+    }
+
+    /// A brief's refresh on a lead thread changes no move: `runner_kind`
+    /// reads none of it, and the run folds as it would without it.
+    #[test]
+    fn a_refreshed_brief_is_not_a_runner_fact() {
+        assert_eq!(runner_kind(EventKind::BriefRefreshed), None);
+        let base = vec![run_started(), step_started(1, child())];
+        let mut with = base.clone();
+        with.push(ev(
+            0,
+            EventKind::BriefRefreshed,
+            serde_json::json!({
+                "through_seq": 1,
+                "old_hash": "0a1b",
+                "new_hash": "2c3d",
+                "model": "m",
+                "usage": {"input_tokens": 10, "output_tokens": 2},
+            }),
+        ));
+        let plain = run_state(&numbered(base)).unwrap();
+        let held = run_state(&numbered(with)).unwrap();
+        assert_eq!(held, plain);
     }
 
     /// T20: a `step_finished` before any `step_started` is an ordering

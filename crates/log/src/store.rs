@@ -343,7 +343,9 @@ fn read_file(path: &Path, thread_id: Ulid) -> Result<Vec<Event>, LogError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::payload::{AssistantMessagePayload, TurnEndedPayload, Usage, UserMessagePayload};
+    use crate::payload::{
+        AssistantMessagePayload, BriefRefreshedPayload, TurnEndedPayload, Usage, UserMessagePayload,
+    };
     use crate::project;
     use aigentic_core::{AgentId, ContentBlock, Role, ToolCall, ToolResult, UserId};
     use serde_json::json;
@@ -640,6 +642,54 @@ mod tests {
         assert_eq!(messages[1].blocks[1], ContentBlock::ToolCall(call));
         assert_eq!(messages[2].role, Role::Tool);
         assert_eq!(messages[2].blocks, vec![ContentBlock::ToolResult(result)]);
+    }
+
+    /// A log written before `brief_refreshed` existed reopens and projects
+    /// as it did; one with the event appended reads it back intact and
+    /// projects the same body.
+    #[test]
+    fn brief_refreshed_round_trips_and_an_old_log_replays_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let thread = Ulid::generate();
+        let mut log = ThreadLog::open(dir.path(), thread).unwrap();
+        log.append(user("hi")).unwrap();
+        log.append(assistant(vec![ContentBlock::Text("hello".into())]))
+            .unwrap();
+        log.append(turn_ended()).unwrap();
+        drop(log);
+
+        let mut log = ThreadLog::open(dir.path(), thread).unwrap();
+        let old = log.read_all().unwrap();
+        let old_view = project(&old).unwrap();
+
+        let payload = BriefRefreshedPayload {
+            through_seq: 2,
+            old_hash: "0a1b".into(),
+            new_hash: "2c3d".into(),
+            model: "m".into(),
+            usage: Usage::reported(aigentic_core::Usage::default()),
+        };
+        let refreshed = log
+            .append(NewEvent {
+                kind: EventKind::BriefRefreshed,
+                author: Author::System,
+                payload: serde_json::to_value(&payload).unwrap(),
+                parent_event: None,
+            })
+            .unwrap();
+        drop(log);
+
+        let read = ThreadLog::open(dir.path(), thread)
+            .unwrap()
+            .read_all()
+            .unwrap();
+        assert_eq!(read[..old.len()], old[..]);
+        assert_eq!(read.last(), Some(&refreshed));
+        assert_eq!(
+            serde_json::from_value::<BriefRefreshedPayload>(refreshed.payload).unwrap(),
+            payload
+        );
+        assert_eq!(project(&read).unwrap(), old_view);
     }
 
     #[test]

@@ -160,6 +160,11 @@ pub enum EventKind {
     /// ended. The job's own work is in that thread's log; this event is the
     /// front thread's record that the job returned.
     JobFinished,
+    /// The utility model rewrote a brief's current state. Author `system`;
+    /// the payload carries the cursor it read through, the brief's hash
+    /// before and after, and the model and usage of the call. Never
+    /// projected into model context.
+    BriefRefreshed,
 }
 
 /// One line of a thread's append-only log. The log is the source of truth;
@@ -407,6 +412,20 @@ mod tests {
                 "cost_usd": 0.42,
             }),
         ));
+        // A brief's refresh sits after every kind the wire-shape test reads
+        // by position.
+        events.push(event(
+            28,
+            EventKind::BriefRefreshed,
+            Author::System,
+            json!({
+                "through_seq": 27,
+                "old_hash": "0a1b",
+                "new_hash": "2c3d",
+                "model": "m",
+                "usage": {"input_tokens": 10, "output_tokens": 2},
+            }),
+        ));
         events
     }
 
@@ -557,6 +576,34 @@ mod tests {
                 "outcome": "finished",
                 "summary": "one screen",
                 "cost_usd": 0.42,
+            }),
+        );
+        let line = serde_json::to_string(&event).unwrap();
+        assert!(!line.contains('\n'), "an event must fit on one line");
+        assert_eq!(serde_json::from_str::<Event>(&line).unwrap(), event);
+    }
+
+    /// A brief's refresh lands on the wire as `brief_refreshed`, derived
+    /// from the variant, and rides one JSONL line like every other kind.
+    #[test]
+    fn the_brief_refreshed_kind_round_trips_under_the_snake_case_rule() {
+        let kind = EventKind::BriefRefreshed;
+        let wire = serde_json::to_value(kind).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::Value::String(snake_case(&format!("{kind:?}")))
+        );
+        assert_eq!(wire, "brief_refreshed");
+        let event = event(
+            0,
+            kind,
+            Author::System,
+            json!({
+                "through_seq": 12,
+                "old_hash": "0a1b",
+                "new_hash": "2c3d",
+                "model": "m",
+                "usage": {"input_tokens": 10, "output_tokens": 2},
             }),
         );
         let line = serde_json::to_string(&event).unwrap();
