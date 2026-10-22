@@ -12,7 +12,8 @@ use aigentic_core::{
 };
 use aigentic_log::{
     BUDGET_GATE, BudgetRaisedPayload, CheckpointAnswer, NextMove, PermissionRequestedPayload,
-    RunStartedPayload, StepReport, StepStatus, ThreadLog, ThreadStartedPayload, run_state,
+    RunStartedPayload, STEP_STOP, StepReport, StepStatus, ThreadLog, ThreadStartedPayload,
+    run_state,
 };
 use aigentic_policy::Policy;
 use aigentic_runtime::runner::{
@@ -28,6 +29,7 @@ use aigentic_runtime::{
     harness_tools::FINISH_STEP,
     runner::{
         BUDGET_ASK_AT, CALL_FINISH_STEP, CONTINUE_PROMPT, REPORT_AGAIN_PROMPT, REPORT_WITHOUT_BODY,
+        STEP_RAISE_BY, next_cent_above,
     },
 };
 use aigentic_tools::ToolRegistry;
@@ -8996,5 +8998,175 @@ async fn a_fresh_attempt_is_prompted_once_across_a_rebuild() {
         attempts_finished(&fx, "implement-alone"),
         2,
         "one step_finished for the fresh attempt, not two"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A step held to its own figure can be raised, not only stopped
+// ---------------------------------------------------------------------------
+
+/// A run whose writing step spent its own figure and parked at
+/// `step_stop`, with what that step had spent by the park.
+async fn parked_at_own_figure() -> (BudgetFixture, f64) {
+    let capped = capped_fixture(budget_figure(), budget_workflow());
+    let run = capped_run(&capped.fx).await;
+    assert_eq!(
+        run.terminal,
+        Advanced::WaitingHuman {
+            gate: STEP_STOP.to_owned()
+        }
+    );
+    let spend = run_state(&capped.fx.lead_events())
+        .unwrap()
+        .step_spend("implement-alone");
+    (capped, spend)
+}
+
+/// Every `budget_raised` payload, oldest first.
+fn budget_raises(events: &[Event]) -> Vec<BudgetRaisedPayload> {
+    events
+        .iter()
+        .filter(|event| event.kind == EventKind::BudgetRaised)
+        .map(|event| serde_json::from_value(event.payload.clone()).unwrap())
+        .collect()
+}
+
+/// The park a spent figure opens is not a dead end: it offers the raise
+/// beside the stop, and the picker's row is prefilled from the figure.
+#[tokio::test]
+async fn a_step_at_its_own_figure_offers_a_raise() {
+    let (capped, spend) = parked_at_own_figure().await;
+    let asks = checkpoints(&capped.fx.lead_events());
+    assert_eq!(asks.len(), 1);
+    assert_eq!(asks[0].gate, STEP_STOP);
+    assert_eq!(asks[0].options, vec!["raise", "stop"]);
+    assert_eq!(
+        asks[0].raise_usd,
+        Some((BUDGET_TRIVIAL + STEP_RAISE_BY).max(next_cent_above(spend)))
+    );
+}
+
+/// A step's raise is the step's figure, not the run's: one `budget_raised`
+/// naming the step, the run's figure where the route left it.
+#[tokio::test]
+async fn a_step_raise_records_the_step_and_leaves_the_runs_figure() {
+    let (capped, _) = parked_at_own_figure().await;
+    let offered = checkpoints(&capped.fx.lead_events())[0]
+        .raise_usd
+        .expect("the park prefills a figure");
+    let mut runner = capped.fx.runner();
+    runner
+        .answer(
+            STEP_STOP,
+            CheckpointAnswer::Raise,
+            Some(format!("{offered:.2}")),
+            steve(),
+        )
+        .expect("the prefilled figure is above the spend");
+    assert_eq!(
+        runner.advance().await.expect("the answer is taken"),
+        Advanced::Moved
+    );
+
+    let events = capped.fx.lead_events();
+    let raised = budget_raises(&events);
+    assert_eq!(raised.len(), 1, "one raise: {raised:?}");
+    assert_eq!(raised[0].step.as_deref(), Some("implement-alone"));
+    assert_eq!(raised[0].usd, offered);
+    let state = run_state(&events).unwrap();
+    assert_eq!(
+        state.budget_usd,
+        clearing_raise(),
+        "the run's figure stands"
+    );
+    let record = state
+        .steps
+        .iter()
+        .rev()
+        .find(|record| record.step == "implement-alone")
+        .unwrap();
+    assert_eq!(record.figure_usd, offered);
+}
+
+/// A raise the step has already spent past would park again at once, so
+/// it is refused with the least figure that frees the step, and nothing
+/// is written.
+#[tokio::test]
+async fn a_raise_below_a_steps_spend_is_refused() {
+    let (capped, spend) = parked_at_own_figure().await;
+    let before = capped.fx.lead_events().len();
+    let mut runner = capped.fx.runner();
+    let error = runner
+        .answer(
+            STEP_STOP,
+            CheckpointAnswer::Raise,
+            Some(format!("{BUDGET_TRIVIAL:.2}")),
+            steve(),
+        )
+        .expect_err("the declared figure is not above the spend");
+    assert!(
+        matches!(
+            error,
+            RunnerError::StepRaiseRefused { ref step, least, .. }
+                if step == "implement-alone" && least == next_cent_above(spend)
+        ),
+        "the refusal names the step and the least figure: {error:?}"
+    );
+    let events = capped.fx.lead_events();
+    assert_eq!(events.len(), before, "nothing is written");
+    assert!(budget_raises(&events).is_empty());
+    assert_eq!(gate(&events).as_deref(), Some(STEP_STOP));
+}
+
+/// Only the park at a spent figure offers a raise: at a park that offered
+/// `stop` alone the word is written and the move refuses it.
+#[tokio::test]
+async fn a_raise_at_a_step_stop_that_offered_none_is_refused() {
+    let brief_child = Ulid::generate();
+    let implementer_child = Ulid::generate();
+    let fx = Fixture::new(vec![
+        (brief_child, vec![report("r1", brief_report())]),
+        (
+            implementer_child,
+            vec![a_fault(ProviderError::Http {
+                status: 404,
+                body: "not found".into(),
+            })],
+        ),
+    ]);
+    let (fx, _, mut rebuilt) = a_dead_turn_restarted(fx).await;
+    assert_eq!(
+        drive_with(&fx, &mut rebuilt, || {}).await,
+        Advanced::WaitingHuman {
+            gate: STEP_STOP.to_owned()
+        }
+    );
+    assert_eq!(
+        checkpoints(&fx.lead_events()).pop().unwrap().options,
+        vec!["stop"]
+    );
+    let child = fx.child_events_of(implementer_child);
+
+    rebuilt
+        .answer(
+            STEP_STOP,
+            CheckpointAnswer::Raise,
+            Some("9.00".into()),
+            steve(),
+        )
+        .expect("the runner writes the answer it was not offered");
+    let error = rebuilt
+        .advance()
+        .await
+        .expect_err("the move refuses the word the ask never offered");
+    assert!(
+        matches!(error, RunnerError::SliceTwo { ref gate } if gate == STEP_STOP),
+        "the refusal names the gate: {error:?}"
+    );
+    assert!(budget_raises(&fx.lead_events()).is_empty());
+    assert_eq!(
+        fx.child_events_of(implementer_child),
+        child,
+        "the child is untouched"
     );
 }

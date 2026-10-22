@@ -28,8 +28,8 @@ use aigentic_log::{
     CheckpointAnsweredPayload, CheckpointAskedPayload, ChecksOutcome, ChecksRunPayload, CommitRef,
     DecideItemKind, DecideProposal, LogError, NewEvent, NextMove, PushedPayload, ReleaseImpact,
     ReportStatus, RouteTakenPayload, RunErroredPayload, RunFinishedPayload, RunOutcome,
-    RunStartedPayload, RunState, StepFinishedPayload, StepReport, StepStartedPayload, StepStatus,
-    ThreadLog, TurnEndedPayload, Verdict, run_state,
+    RunStartedPayload, RunState, STEP_STOP, StepFinishedPayload, StepReport, StepStartedPayload,
+    StepStatus, ThreadLog, TurnEndedPayload, Verdict, run_state,
 };
 use serde_json::Value;
 use ulid::Ulid;
@@ -64,6 +64,10 @@ pub const REPORT_AGAIN_PROMPT: &str = "Your finish_step call had no `body`. Call
 /// anything else. The step in flight is never interrupted, so this covers a
 /// run at 100% of its budget too; the gate's `shown` lines quote it.
 pub const BUDGET_ASK_AT: f64 = 0.8;
+
+/// How far above its figure in force a step's `step_stop` ask proposes
+/// to raise it: the prefill of the picker's raise row.
+pub const STEP_RAISE_BY: f64 = 1.0;
 
 /// What the budget guard found.
 enum Park {
@@ -132,6 +136,23 @@ pub enum RunnerError {
         /// What the run had spent then.
         spent: f64,
         /// The smallest figure that clears the line.
+        least: f64,
+    },
+    /// A `raise` at `step_stop` that is not above what the step has spent.
+    /// Nothing is written: the run stays parked at the gate and the person
+    /// may answer again.
+    #[error(
+        "a raise of `{offered}` does not free step `{step}`: it has spent {spent:.2}, and \
+         {least:.2} would"
+    )]
+    StepRaiseRefused {
+        /// The figure the answer offered, as it was written.
+        offered: String,
+        /// The step the park holds.
+        step: String,
+        /// What the step had spent then.
+        spent: f64,
+        /// The smallest figure the gate accepts.
         least: f64,
     },
     /// Installing the binary failed, or the installed binary could not be
@@ -465,6 +486,15 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
         if gate == BUDGET_GATE && answer == CheckpointAnswer::Raise {
             self.checked_raise(amendment.as_deref())?;
         }
+        // Only a park that offered `raise` validates one; an unoffered word
+        // is written and refused at the move, as at every other gate.
+        if gate == STEP_STOP
+            && answer == CheckpointAnswer::Raise
+            && self.offered(STEP_STOP, "raise")?
+            && let Some(step) = self.state()?.parked_step()
+        {
+            self.checked_step_raise(step, amendment.as_deref())?;
+        }
         let payload = CheckpointAnsweredPayload {
             answer,
             amendment,
@@ -494,6 +524,28 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
         };
         let usd = budget_usd(&Value::String(offered.to_owned())).ok_or_else(refused)?;
         if usd > state.budget_usd && state.cost_usd < BUDGET_ASK_AT * usd {
+            return Ok(usd);
+        }
+        Err(refused())
+    }
+
+    /// The figure a `raise` at `step_stop` offers `step`.
+    ///
+    /// `Err` when the amendment carries no number or the number is not
+    /// above what the step has spent. A step's figure parks at its whole,
+    /// not at a share of it, so nothing else is weighed here; the run's own
+    /// guard still runs at the next move. Nothing is written on a refusal.
+    fn checked_step_raise(&self, step: &str, amendment: Option<&str>) -> Result<f64, RunnerError> {
+        let spent = self.state()?.step_spend(step);
+        let offered = amendment.unwrap_or_default();
+        let refused = || RunnerError::StepRaiseRefused {
+            offered: offered.to_owned(),
+            step: step.to_owned(),
+            spent,
+            least: next_cent_above(spent),
+        };
+        let usd = budget_usd(&Value::String(offered.to_owned())).ok_or_else(refused)?;
+        if usd > spent {
             return Ok(usd);
         }
         Err(refused())
@@ -646,9 +698,12 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
     /// answers here are a larger figure and a stop.
     fn park_at_budget(&mut self, park: Park) -> Result<Advanced, RunnerError> {
         match park {
-            Park::Ask(shown) => {
-                self.escalate_with(BUDGET_GATE, shown, vec!["raise".into(), "stop".into()])
-            }
+            Park::Ask(shown) => self.escalate_with(
+                BUDGET_GATE,
+                shown,
+                vec!["raise".into(), "stop".into()],
+                None,
+            ),
             Park::AlreadyAsked => Ok(Advanced::WaitingHuman {
                 gate: BUDGET_GATE.into(),
             }),
@@ -805,7 +860,7 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
             StepStatus::Done => {
                 let Some((report, _)) = self.report_of(step_id, attempt)? else {
                     return self.escalate(
-                        "step_stop",
+                        STEP_STOP,
                         vec![
                             step.id.clone(),
                             attempt.to_string(),
@@ -823,7 +878,7 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
                     self.start_step(step_id, attempt + 1, Some(child)).await
                 } else {
                     self.escalate(
-                        "step_stop",
+                        STEP_STOP,
                         vec![step.id.clone(), attempt.to_string(), reason],
                     )
                 }
@@ -831,7 +886,7 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
             StepStatus::Failed => {
                 let reason = self.end_reason(step_id, attempt)?;
                 self.escalate(
-                    "step_stop",
+                    STEP_STOP,
                     vec![step.id.clone(), attempt.to_string(), reason],
                 )
             }
@@ -959,6 +1014,7 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
                 BUDGET_GATE,
                 spent_shown(&self.state()?, Some((usd, ceiling))),
                 vec!["raise".into(), "stop".into()],
+                None,
             ),
             None => Ok(Advanced::Moved),
         }
@@ -1013,6 +1069,7 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
             &step.id.clone(),
             vec![shown],
             vec!["go".into(), "amend".into(), "stop".into()],
+            None,
         )
     }
 
@@ -1033,7 +1090,7 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
         }
         let Some((report, _)) = self.report_of(&step.id, attempt)? else {
             return self.escalate(
-                "step_stop",
+                STEP_STOP,
                 vec![
                     step.id.clone(),
                     attempt.to_string(),
@@ -1143,6 +1200,7 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
                     "checks_failed",
                     shown,
                     vec!["retry".to_owned(), "stop".to_owned()],
+                    None,
                 )
             }
         }
@@ -1646,6 +1704,27 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
             // from here: the next `advance` runs it.
             return Ok(Advanced::Moved);
         }
+        if gate == STEP_STOP
+            && answer == CheckpointAnswer::Raise
+            && self.offered(STEP_STOP, "raise")?
+        {
+            let Some(step) = self.state()?.parked_step().map(str::to_owned) else {
+                return Err(RunnerError::SliceTwo {
+                    gate: gate.to_owned(),
+                });
+            };
+            let usd = self.checked_step_raise(&step, amendment.as_deref())?;
+            self.append(
+                EventKind::BudgetRaised,
+                &BudgetRaisedPayload {
+                    usd,
+                    step: Some(step),
+                },
+            )?;
+            // The fold gives back the move the park interrupted, which
+            // starts the step's next attempt under the raised figure.
+            return Ok(Advanced::Moved);
+        }
         let checkpoint = self
             .workflow
             .workflow
@@ -1660,8 +1739,8 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
             return self.retry_attempt().await;
         }
         if answer == CheckpointAnswer::Retry
-            && gate == "step_stop"
-            && self.offered("step_stop", "retry")?
+            && gate == STEP_STOP
+            && self.offered(STEP_STOP, "retry")?
         {
             return self.retry_failed_step().await;
         }
@@ -1764,22 +1843,24 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
     /// Write `checkpoint_asked` and hand the run to the human. This is the
     /// one act safe to repeat after a crash.
     fn escalate(&mut self, gate: &str, shown: Vec<String>) -> Result<Advanced, RunnerError> {
-        self.escalate_with(gate, shown, vec!["stop".into()])
+        self.escalate_with(gate, shown, vec!["stop".into()], None)
     }
 
-    /// `escalate`, offering `options` instead of `stop` alone. The budget
-    /// gate's ask carries the figure a raise takes; no other gate needs
-    /// one.
+    /// `escalate`, offering `options` instead of `stop` alone. An ask that
+    /// offers a raise carries the figure the picker prefills: `raise_usd`
+    /// when the caller names one, else the budget gate's clearing figure,
+    /// and none at any other gate.
     fn escalate_with(
         &mut self,
         gate: &str,
         shown: Vec<String>,
         options: Vec<String>,
+        raise_usd: Option<f64>,
     ) -> Result<Advanced, RunnerError> {
-        let raise_usd = if gate == BUDGET_GATE {
-            Some(least_clearing_raise(&self.state()?))
-        } else {
-            None
+        let raise_usd = match raise_usd {
+            Some(usd) => Some(usd),
+            None if gate == BUDGET_GATE => Some(least_clearing_raise(&self.state()?)),
+            None => None,
         };
         self.append(
             EventKind::CheckpointAsked,
@@ -1985,13 +2066,14 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
                 match end.error.as_ref() {
                     Some(fault) if recoverable_fault(fault) => {
                         self.escalate_with(
-                            "step_stop",
+                            STEP_STOP,
                             shown,
                             vec!["retry".to_owned(), "stop".to_owned()],
+                            None,
                         )?;
                     }
                     _ => {
-                        self.escalate("step_stop", shown)?;
+                        self.escalate(STEP_STOP, shown)?;
                     }
                 }
                 Ok(())
@@ -2286,9 +2368,11 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
         }
     }
 
-    /// Park a step that has spent its own figure. `stop` is the only
-    /// answer: a raise records the run's figure, which cannot free a step
-    /// held to a figure of its own.
+    /// Park a step that has spent its own figure, offering `raise` and
+    /// `stop`. A raise records this step's figure for the rest of its visit
+    /// and leaves the run's alone; the prefill is the figure plus
+    /// `STEP_RAISE_BY`, or the first cent above the spend when a call cut
+    /// mid-way left the spend past that.
     fn park_at_step_stop(
         &mut self,
         step: &Step,
@@ -2301,7 +2385,14 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
             attempt.to_string(),
             format!("spent {:.2} of its {:.2} figure", figure - left, figure),
         ];
-        self.escalate("step_stop", shown)
+        let prefill =
+            (figure + STEP_RAISE_BY).max(next_cent_above(self.state()?.step_spend(&step.id)));
+        self.escalate_with(
+            STEP_STOP,
+            shown,
+            vec!["raise".into(), "stop".into()],
+            Some(prefill),
+        )
     }
 }
 
@@ -2369,6 +2460,20 @@ fn budget_usd(value: &serde_json::Value) -> Option<f64> {
         .find(|c: char| !(c.is_ascii_digit() || c == '.'))
         .unwrap_or(text.len());
     text[..end].parse::<f64>().ok().filter(|n| n.is_finite())
+}
+
+/// The smallest whole number of cents strictly above `spend`: the least
+/// figure a `step_stop` raise is accepted at. A spend that is not finite
+/// counts as zero.
+pub fn next_cent_above(spend: f64) -> f64 {
+    let spend = if spend.is_finite() { spend } else { 0.0 };
+    let mut cents = (spend * 100.0).floor() + 1.0;
+    // A spend whose product rounds a hair low (0.29 × 100) lands back on
+    // itself after the division, so the walk steps past it.
+    while cents / 100.0 <= spend {
+        cents += 1.0;
+    }
+    cents / 100.0
 }
 
 /// The smallest whole number of cents that clears the budget gate: above
