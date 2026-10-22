@@ -66,8 +66,11 @@ Run these exactly as written, each in its own bash call:
 1. `cargo fmt`
 2. `cargo clippy --all-targets -- -D warnings`
 3. `cargo test > {{gate_log}} 2>&1` with `timeout_secs: 900`
+4. `scripts/comment-check.sh origin/main`
 
-Then search `{{gate_log}}` (`grep -E 'test result:|FAILED|panicked' {{gate_log}}`). Never re-run the suite to read other lines of the same result. If you change code after the gate, run all three again. Nothing runs after the gate but reading its log, so any reference or pty check above runs before it.
+The comment check reads your commits against `origin/main`, as CI does, so commit before you run it; a hit is fixed like a failing test: reword the comment, commit, and run the gate again.
+
+Then search `{{gate_log}}` (`grep -E 'test result:|FAILED|panicked' {{gate_log}}`). Never re-run the suite to read other lines of the same result. If you change code after the gate, run all four again. Nothing runs after the gate but reading its log, so any reference or pty check above runs before it.
 
 A single named test (`cargo test -p <crate> <name>`) must report at least `1 passed`. `0 passed` means the name matched nothing or the test binary is stale: fix the name, or touch the file and rebuild, before concluding anything.
 

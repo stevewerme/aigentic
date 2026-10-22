@@ -50,8 +50,11 @@ Run these exactly as written, each in its own bash call, with nothing before or 
 1. `cargo fmt`
 2. `cargo clippy --all-targets -- -D warnings`
 3. `cargo test > {{gate_log}} 2>&1` with `timeout_secs: 900`
+4. `scripts/comment-check.sh origin/main`
 
-Then search `{{gate_log}}` in a separate call (`grep -E 'test result:|FAILED|panicked' {{gate_log}}`). `cargo test` stops at the first failing test binary: when it fails, see every failure with `cargo test --no-fail-fast -p <crate>`, fix them, then run the gate again. If you change code after the gate, run all three again.
+The comment check reads your commits against `origin/main`, as CI does, so commit before you run it; a hit is fixed like a failing test: reword the comment, commit, and run the gate again.
+
+Then search `{{gate_log}}` in a separate call (`grep -E 'test result:|FAILED|panicked' {{gate_log}}`). `cargo test` stops at the first failing test binary: when it fails, see every failure with `cargo test --no-fail-fast -p <crate>`, fix them, then run the gate again. If you change code after the gate, run all four again.
 
 A single named test must report at least `1 passed`. A test or probe that runs past about 2 minutes is a finding: stop it, shrink the input and look for the cost. A red test is "pre-existing" only once proven red at the base, built in its own `CARGO_TARGET_DIR` under `/tmp` (deleted afterwards). `t6_new_front_makes_a_second_front_thread_the_front_now_resumes` in `crates/server/tests/front.rs` is a known flake: if it's the only red test, rerun it alone once and quote both results.
 
