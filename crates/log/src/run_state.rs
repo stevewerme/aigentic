@@ -25,6 +25,11 @@ use crate::store::LogError;
 /// home.
 pub const BUDGET_GATE: &str = "budget";
 
+/// The gate a run parks at when a step cannot go on: its own figure is
+/// spent, it failed, or it ended without what it owed. Only the park at
+/// a spent figure offers `raise`.
+pub const STEP_STOP: &str = "step_stop";
+
 /// How a step's checks did as a whole: what `NextMove::ChecksDone`
 /// reports. The runner decides a send-back and its limit from this; the
 /// state does not.
@@ -63,6 +68,10 @@ pub struct StepRecord {
     pub child_thread: Ulid,
     /// The budget `step_started` was given.
     pub budget_usd: f64,
+    /// The figure the step runs under: the declared one, raised by a
+    /// `budget_raised` for this visit. A visit's first attempt starts
+    /// at the declared figure, so a raise never carries to a later visit.
+    pub figure_usd: f64,
     pub status: Option<StepStatus>,
     pub end_reason: Option<String>,
     pub cost_usd: f64,
@@ -168,6 +177,9 @@ pub struct RunState {
     /// kind back as `last`: a replay then derives the move the park
     /// blocked instead of parking again.
     parked_at_budget: Option<EventKind>,
+    /// The decisive kind a `step_stop` ask interrupted, given back by a
+    /// raise that names a step, as `parked_at_budget` is by the run's.
+    parked_at_step: Option<EventKind>,
 }
 
 impl RunState {
@@ -180,6 +192,24 @@ impl RunState {
             .filter(|record| record.step == step && record.status.is_some())
             .map(|record| record.cost_usd)
             .sum()
+    }
+
+    /// The figure a step raise put in force for this visit of `step`,
+    /// read when `attempt` is about to start. `None` at a first attempt,
+    /// whose visit no raise has reached yet, and whenever the newest
+    /// record's figure is the declared one: a step freed by the run's
+    /// raise is not a raised step.
+    pub fn step_figure(&self, step: &str, attempt: u32) -> Option<f64> {
+        if attempt <= 1 {
+            return None;
+        }
+        let record = self.steps.iter().rev().find(|r| r.step == step)?;
+        (record.figure_usd > record.budget_usd).then_some(record.figure_usd)
+    }
+
+    /// The step the run last entered: the one a `step_stop` ask is about.
+    pub fn parked_step(&self) -> Option<&str> {
+        self.steps.last().map(|r| r.step.as_str())
     }
 
     /// Where the run is, from the last decisive event of the log. The
@@ -380,6 +410,7 @@ pub fn run_state(events: &[Event]) -> Result<RunState, LogError> {
         last: None,
         answered: None,
         parked_at_budget: None,
+        parked_at_step: None,
     };
     let mut opened: Option<usize> = None;
     for event in events {
@@ -410,6 +441,10 @@ pub fn run_state(events: &[Event]) -> Result<RunState, LogError> {
                     ));
                 }
                 let p: StepStartedPayload = payload(event)?;
+                let figure_usd = match st.steps.iter().rev().find(|r| r.step == p.step) {
+                    Some(prior) if p.attempt > 1 => prior.figure_usd.max(p.budget_usd),
+                    _ => p.budget_usd,
+                };
                 st.steps.push(StepRecord {
                     step: p.step,
                     attempt: p.attempt,
@@ -417,6 +452,7 @@ pub fn run_state(events: &[Event]) -> Result<RunState, LogError> {
                     profile: p.profile,
                     child_thread: p.child_thread,
                     budget_usd: p.budget_usd,
+                    figure_usd,
                     status: None,
                     end_reason: None,
                     cost_usd: 0.0,
@@ -457,6 +493,9 @@ pub fn run_state(events: &[Event]) -> Result<RunState, LogError> {
                     // raise must give back is the move it interrupted.
                     st.parked_at_budget = st.last;
                 }
+                if p.gate == STEP_STOP {
+                    st.parked_at_step = st.last;
+                }
                 st.pending_checkpoint = Some(p.gate);
             }
             RunnerKind::CheckpointAnswered => {
@@ -468,9 +507,29 @@ pub fn run_state(events: &[Event]) -> Result<RunState, LogError> {
             }
             RunnerKind::BudgetRaised => {
                 let p: BudgetRaisedPayload = payload(event)?;
-                st.budget_usd = p.usd;
-                let Some(parked) = st.parked_at_budget.take() else {
-                    return Err(ordering(event, "no budget gate to raise at"));
+                let parked = match &p.step {
+                    None => {
+                        st.budget_usd = p.usd;
+                        st.parked_at_budget.take()
+                    }
+                    // A step's raise moves that step's figure alone; the
+                    // run's figure and its own park are left as they are.
+                    Some(step) => {
+                        let Some(record) = st.steps.iter_mut().rev().find(|r| &r.step == step)
+                        else {
+                            return Err(ordering(event, &format!("no step named {step} to raise")));
+                        };
+                        record.figure_usd = p.usd;
+                        st.parked_at_step.take()
+                    }
+                };
+                let Some(parked) = parked else {
+                    let gate = if p.step.is_some() {
+                        STEP_STOP
+                    } else {
+                        BUDGET_GATE
+                    };
+                    return Err(ordering(event, &format!("no {gate} gate to raise at")));
                 };
                 st.last = Some(parked);
                 continue;
@@ -753,8 +812,34 @@ mod tests {
         )
     }
 
-    fn budget_raised(usd: f64) -> Event {
-        at(EventKind::BudgetRaised, BudgetRaisedPayload { usd })
+    fn budget_raised(usd: f64, step: Option<&str>) -> Event {
+        at(
+            EventKind::BudgetRaised,
+            BudgetRaisedPayload {
+                usd,
+                step: step.map(str::to_owned),
+            },
+        )
+    }
+
+    /// The declared figure `step_started_named` gives every step.
+    fn step_budget() -> f64 {
+        let p: StepStartedPayload =
+            serde_json::from_value(step_started(1, child()).payload).unwrap();
+        p.budget_usd
+    }
+
+    /// A step that spent past its figure, parked at `step_stop`, and the
+    /// raise that answers it, naming `step` or not.
+    fn raised_at_step_stop(usd: f64, step: Option<&str>) -> Vec<Event> {
+        vec![
+            run_started(),
+            step_started(1, child()),
+            step_finished(StepStatus::Partial, step_budget() + 0.2),
+            checkpoint_asked(STEP_STOP),
+            checkpoint_answered(CheckpointAnswer::Raise, Some(&format!("{usd:.2}"))),
+            budget_raised(usd, step),
+        ]
     }
 
     /// The `run_started()` fixture's provisional budget, read from its
@@ -1497,7 +1582,7 @@ mod tests {
                 CheckpointAnswer::Raise,
                 Some(&format!("{:.2}", run_budget() * 2.0)),
             ));
-            log.push(budget_raised(run_budget() * 2.0));
+            log.push(budget_raised(run_budget() * 2.0, None));
             run_state(&numbered(log)).unwrap()
         };
 
@@ -1534,6 +1619,87 @@ mod tests {
             NextMove::AwaitingCheckpoint {
                 gate: BUDGET_GATE.into()
             }
+        );
+    }
+
+    /// A step's raise and the run's are two figures: the one names its
+    /// step and leaves the run's alone, the other moves the run's and
+    /// leaves the step's at its declaration.
+    #[test]
+    fn a_raise_naming_a_step_leaves_the_runs_figure() {
+        let usd = step_budget() + 1.5;
+        let step = run_state(&numbered(raised_at_step_stop(usd, Some("implement")))).unwrap();
+        assert_eq!(step.budget_usd, run_budget());
+        assert_eq!(step.steps.last().unwrap().figure_usd, usd);
+        assert_eq!(step.step_figure("implement", 2), Some(usd));
+
+        let mut run_log = raised_at_step_stop(usd, None);
+        run_log[3] = checkpoint_asked(BUDGET_GATE);
+        let run = run_state(&numbered(run_log)).unwrap();
+        assert_eq!(run.budget_usd, usd);
+        assert_eq!(run.steps.last().unwrap().figure_usd, step_budget());
+        assert_eq!(run.step_figure("implement", 2), None);
+    }
+
+    /// The raise buys the rest of the visit, so the attempt it frees
+    /// runs under the raised figure, not the one `step_started` carries.
+    #[test]
+    fn an_attempt_after_a_raise_keeps_the_raised_figure() {
+        let usd = step_budget() + 1.5;
+        let mut log = raised_at_step_stop(usd, Some("implement"));
+        log.push(step_started(2, child()));
+        let st = run_state(&numbered(log)).unwrap();
+        let record = st.steps.last().unwrap();
+        assert_eq!(record.attempt, 2);
+        assert_eq!(record.budget_usd, step_budget());
+        assert_eq!(record.figure_usd, usd);
+        assert_eq!(st.step_figure("implement", 3), Some(usd));
+    }
+
+    /// A raise buys one visit: entering the step afresh starts at the
+    /// figure the workflow declares.
+    #[test]
+    fn a_fresh_visit_to_a_raised_step_starts_at_the_declared_figure() {
+        let usd = step_budget() + 1.5;
+        let mut log = raised_at_step_stop(usd, Some("implement"));
+        log.push(step_started(2, child()));
+        log.push(step_finished(StepStatus::Done, 0.3));
+        log.push(step_started(1, other_child()));
+        let st = run_state(&numbered(log)).unwrap();
+        let record = st.steps.last().unwrap();
+        assert_eq!(record.figure_usd, record.budget_usd);
+        assert_eq!(st.step_figure("implement", 1), None);
+        assert_eq!(st.step_figure("implement", 2), None);
+    }
+
+    /// A step's raise answers a `step_stop` park of a step the run
+    /// entered; with no such ask, or naming a step never entered, the
+    /// log is out of order rather than silently raised.
+    #[test]
+    fn a_raise_naming_a_step_with_no_gate_is_refused() {
+        let usd = step_budget() + 1.5;
+        let no_gate = numbered(vec![
+            run_started(),
+            step_started(1, child()),
+            step_finished(StepStatus::Partial, step_budget() + 0.2),
+            budget_raised(usd, Some("implement")),
+        ]);
+        assert!(run_state(&no_gate).is_err());
+
+        let no_step = numbered(raised_at_step_stop(usd, Some("review")));
+        assert!(run_state(&no_step).is_err());
+    }
+
+    /// A `budget_raised` written before it could name a step reads as
+    /// the run's raise, and writing one without a step adds no field.
+    #[test]
+    fn a_raise_without_a_step_keeps_its_old_shape() {
+        let old: BudgetRaisedPayload =
+            serde_json::from_value(serde_json::json!({"usd": 4.5})).unwrap();
+        assert_eq!(old.step, None);
+        assert_eq!(
+            serde_json::to_value(&old).unwrap(),
+            serde_json::json!({"usd": 4.5})
         );
     }
 }

@@ -877,11 +877,14 @@ pub struct BudgetWarnedPayload {
     pub limit_usd: f64,
 }
 
-/// Payload of a `budget_raised` event: the figure in USD the run compares
-/// its cost against from here on.
+/// Payload of a `budget_raised` event: a figure in USD compared against
+/// from here on. Without `step` it is the run's figure; with one it is
+/// that step's figure for its current visit, and the run's is untouched.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BudgetRaisedPayload {
     pub usd: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step: Option<String>,
 }
 
 /// Payload of a `pushed` event: the commits, the remote ref before and

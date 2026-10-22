@@ -1638,7 +1638,10 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
             // answer, so the figure is checked here too: a refusal writes
             // nothing and leaves the run parked.
             let usd = self.checked_raise(amendment.as_deref())?;
-            self.append(EventKind::BudgetRaised, &BudgetRaisedPayload { usd })?;
+            self.append(
+                EventKind::BudgetRaised,
+                &BudgetRaisedPayload { usd, step: None },
+            )?;
             // The move this raise unblocked is the one the fold derives
             // from here: the next `advance` runs it.
             return Ok(Advanced::Moved);
