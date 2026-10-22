@@ -84,7 +84,7 @@ cargo run -p aigentic-tui -- project setup                       # render docs/a
 cargo run -p aigentic-tui -- project show                        # layers, knowledge mode, every tool's fate; over the API with --server
 cargo run -p aigentic-tui -- workspace new <name> [--shared <dir>]   # an empty workspace; also add <path> [--workspace <name>], remove <project>, list
 cargo run -p aigentic-tui -- threads                             # this project's threads, newest first; over the API with --server
-cargo run -p aigentic-tui -- doctor [--probe]                    # config, keys, threads dir, project, participants, skills, gh; exit 1 on a fail
+cargo run -p aigentic-tui -- doctor [--probe]                    # config, keys, threads dir, workspaces, project, participants, skills, gh; exit 1 on a fail
 cargo run -p aigentic-tui -- init                                # guided setup: config, project, GitHub, knowledge links
 cargo run -p aigentic-tui -- serve [--listen unix:/path|tcp:host:port]   # the daemon (phase 5): server.toml's users and projects
 cargo run -p aigentic-tui -- serve --new-token magnus            # a fresh token for a user, printed once, never stored

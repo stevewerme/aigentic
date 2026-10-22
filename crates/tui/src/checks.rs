@@ -14,10 +14,11 @@ use aigentic_runtime::aigentic_core::{
 };
 use aigentic_runtime::aigentic_tools::{ToolRegistry, Workdir};
 use aigentic_runtime::project::{DOT_DIR, FILE_NAME, INSTRUCTIONS_FILE, person_memory_dir};
-use aigentic_runtime::{GlobalLayer, Knowledge, KnowledgeMode, Layers, Project};
+use aigentic_runtime::{GlobalLayer, Knowledge, KnowledgeMode, Layers, Project, ProjectKind};
 use futures_util::StreamExt;
 
 use aigentic_server::awake::KeepAwake;
+use aigentic_server::workspaces::{self, Workspace};
 
 use crate::config::{Config, Profile, ProviderKind};
 use crate::skills_cmd::{SkillPaths, load_enabled};
@@ -252,8 +253,12 @@ pub fn check_window(name: &str, profile: &Profile) -> Check {
 }
 
 /// A project's `.env` is gitignored when the project is a repository:
-/// it holds the model key next to the app's secrets.
-pub fn check_env_ignored(root: &Path) -> Check {
+/// it holds the model key next to the app's secrets. `skip` for a notes
+/// project, which has no repository to leak it from.
+pub fn check_env_ignored(root: &Path, kind: ProjectKind) -> Check {
+    if kind == ProjectKind::Notes {
+        return Check::skip("env", "a notes project");
+    }
     let env = root.join(".env");
     if !env.is_file() {
         return Check::skip("env", "no .env here");
@@ -313,6 +318,117 @@ pub fn check_threads_dir(dir: &Path) -> Check {
     match std::fs::create_dir_all(dir) {
         Ok(()) => Check::ok("threads", format!("{} created", dir.display())),
         Err(e) => Check::fail("threads", format!("cannot create {}: {e}", dir.display())),
+    }
+}
+
+/// The workspace files in `<config_dir>/workspaces/`, read on their own so
+/// a broken one is reported here rather than swallowed as at start-up.
+/// `fail` for a file that does not parse, a project in two workspaces or
+/// two workspaces with one name; `warn` for a folder missing on this
+/// machine, two projects with one name (the later is shadowed) or a file
+/// not named after its workspace. `skip` with no workspace directory.
+pub fn check_workspaces(config_dir: &Path) -> Check {
+    const NAME: &str = "workspaces";
+    let dir = workspaces::dir(config_dir);
+    if !dir.is_dir() {
+        return Check::skip(NAME, format!("no {}", dir.display()));
+    }
+    let each = match workspaces::load_each(config_dir) {
+        Ok(each) => each,
+        Err(e) => return Check::fail(NAME, e.to_string()),
+    };
+    let mut fails: Vec<String> = Vec::new();
+    let mut warns: Vec<String> = Vec::new();
+    let mut loaded: Vec<Workspace> = Vec::new();
+    for (file, w) in each {
+        match w {
+            Ok(w) => {
+                let expected = workspaces::file_name(&w.name);
+                let actual = file.file_name().map(|n| n.to_string_lossy().into_owned());
+                if expected != actual {
+                    warns.push(format!(
+                        "{} holds {:?}, whose file would be {}",
+                        file.display(),
+                        w.name,
+                        expected.as_deref().unwrap_or("(none)")
+                    ));
+                }
+                loaded.push(w);
+            }
+            Err(e) => fails.push(one_line(&e.to_string())),
+        }
+    }
+    loaded.sort_by(|a, b| a.name.cmp(&b.name));
+
+    for (i, w) in loaded.iter().enumerate() {
+        if loaded[..i]
+            .iter()
+            .any(|o| o.name.to_lowercase() == w.name.to_lowercase())
+        {
+            fails.push(format!("two workspaces are named {:?}", w.name));
+        }
+        if let Some(shared) = w.shared.as_deref().filter(|s| !s.exists()) {
+            warns.push(format!(
+                "{}: shared {} is missing",
+                w.name,
+                shared.display()
+            ));
+        }
+    }
+    // Every listed project in the daemon's order, which decides who
+    // shadows whom.
+    let listed: Vec<(&Workspace, &Path)> = loaded
+        .iter()
+        .flat_map(|w| w.projects.iter().map(move |p| (w, p.as_path())))
+        .collect();
+    let mut named: Vec<(String, &Path)> = Vec::new();
+    for (i, (w, root)) in listed.iter().enumerate() {
+        if !root.exists() {
+            warns.push(format!("{}: {} is missing", w.name, root.display()));
+        }
+        if let Some((first, _)) = listed[..i].iter().find(|(_, r)| r == root) {
+            if first.name != w.name {
+                fails.push(format!(
+                    "{} is in two workspaces: {}, {}",
+                    root.display(),
+                    first.name,
+                    w.name
+                ));
+            }
+            continue;
+        }
+        let name = workspaces::project_name(root);
+        if let Some((_, earlier)) = named.iter().find(|(n, _)| *n == name) {
+            warns.push(format!(
+                "two projects are named {name:?}: {} shadows {}",
+                earlier.display(),
+                root.display()
+            ));
+        }
+        named.push((name, root));
+    }
+
+    if !fails.is_empty() {
+        fails.extend(warns);
+        return Check::fail(NAME, fails.join("; "));
+    }
+    if !warns.is_empty() {
+        return Check::new(NAME, Status::Warn, warns.join("; "));
+    }
+    Check::ok(
+        NAME,
+        format!("{} workspaces, {} projects", loaded.len(), listed.len()),
+    )
+}
+
+/// A TOML error's first line and its last, the cause, without the
+/// source excerpt between them, so the report stays one line a check.
+fn one_line(error: &str) -> String {
+    let mut lines = error.lines().map(str::trim).filter(|l| !l.is_empty());
+    let first = lines.next().unwrap_or_default();
+    match lines.next_back() {
+        Some(last) => format!("{first}: {last}"),
+        None => first.to_string(),
     }
 }
 
@@ -463,8 +579,11 @@ pub fn check_skills(
 
 /// With `[pocock] issue_tracker = "github"`: `gh auth status` succeeds and
 /// `remote` (the origin URL, `None` when there is none) is on GitHub.
-/// `skip` for any other tracker or no project.
+/// `skip` for any other tracker, no project or a notes project.
 pub fn check_github(project: Option<&Project>, gh: &dyn Gh, remote: Option<&str>) -> Check {
+    if project.is_some_and(|p| p.kind() == ProjectKind::Notes) {
+        return Check::skip("github", "a notes project");
+    }
     let tracker = project
         .and_then(|p| p.file.pocock.as_ref())
         .map(|p| p.issue_tracker.as_str());
@@ -1794,9 +1913,16 @@ pub(crate) mod tests {
     fn an_env_file_outside_gitignore_warns() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        assert_eq!(check_env_ignored(root).status, Status::Skip);
+        assert_eq!(
+            check_env_ignored(root, ProjectKind::Code).status,
+            Status::Skip
+        );
         std::fs::write(root.join(".env"), "K=v\n").unwrap();
-        assert_eq!(check_env_ignored(root).status, Status::Ok, "no repository");
+        assert_eq!(
+            check_env_ignored(root, ProjectKind::Code).status,
+            Status::Ok,
+            "no repository"
+        );
         let git = |args: &[&str]| {
             std::process::Command::new("git")
                 .args(args)
@@ -1808,9 +1934,15 @@ pub(crate) mod tests {
         // A local rule wins over a global excludes file that may ignore
         // .env on the machine running the test.
         std::fs::write(root.join(".gitignore"), "!.env\n").unwrap();
-        assert_eq!(check_env_ignored(root).status, Status::Warn);
+        assert_eq!(
+            check_env_ignored(root, ProjectKind::Code).status,
+            Status::Warn
+        );
         std::fs::write(root.join(".gitignore"), ".env\n").unwrap();
-        assert_eq!(check_env_ignored(root).status, Status::Ok);
+        assert_eq!(
+            check_env_ignored(root, ProjectKind::Code).status,
+            Status::Ok
+        );
     }
 
     /// T16 (issue #47): the doctor's keep-awake line follows the config
@@ -1987,5 +2119,213 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(code, 2);
+    }
+
+    /// A config dir under `dir` with `files` written into its
+    /// `workspaces/`, `{root}` in each replaced by `dir`.
+    fn workspace_files(dir: &Path, files: &[(&str, &str)]) -> std::path::PathBuf {
+        let cfg = dir.join("cfg");
+        std::fs::create_dir_all(cfg.join("workspaces")).unwrap();
+        for (name, text) in files {
+            let text = text.replace("{root}", &dir.display().to_string());
+            std::fs::write(cfg.join("workspaces").join(name), text).unwrap();
+        }
+        cfg
+    }
+
+    #[test]
+    fn workspaces_skip_without_a_directory_and_count_when_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(check_workspaces(dir.path()).status, Status::Skip);
+        for p in ["a", "b", "notes"] {
+            std::fs::create_dir_all(dir.path().join(p)).unwrap();
+        }
+        let cfg = workspace_files(
+            dir.path(),
+            &[
+                (
+                    "one.toml",
+                    "name = \"one\"\nshared = \"{root}/notes\"\nprojects = [\"{root}/a\", \"{root}/b\"]\n",
+                ),
+                ("two.toml", "name = \"two\"\n"),
+            ],
+        );
+        let c = check_workspaces(&cfg);
+        assert_eq!(c.status, Status::Ok, "{}", c.message);
+        assert_eq!(c.message, "2 workspaces, 2 projects");
+        assert_eq!(c.name, "workspaces");
+    }
+
+    #[test]
+    fn a_workspace_file_that_does_not_parse_fails_naming_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = workspace_files(
+            dir.path(),
+            &[
+                ("good.toml", "name = \"good\"\n"),
+                ("bad.toml", "nope = 1\n"),
+            ],
+        );
+        let c = check_workspaces(&cfg);
+        assert_eq!(c.status, Status::Fail);
+        assert!(
+            c.message
+                .starts_with(&cfg.join("workspaces/bad.toml").display().to_string()),
+            "{}",
+            c.message
+        );
+        assert!(!c.message.contains('\n'), "one line: {}", c.message);
+        assert!(c.message.contains("nope"), "the cause: {}", c.message);
+    }
+
+    #[test]
+    fn a_project_in_two_workspaces_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("a")).unwrap();
+        let cfg = workspace_files(
+            dir.path(),
+            &[
+                ("one.toml", "name = \"one\"\nprojects = [\"{root}/a\"]\n"),
+                ("two.toml", "name = \"two\"\nprojects = [\"{root}/a\"]\n"),
+            ],
+        );
+        let c = check_workspaces(&cfg);
+        assert_eq!(c.status, Status::Fail);
+        assert_eq!(
+            c.message,
+            format!(
+                "{} is in two workspaces: one, two",
+                dir.path().join("a").display()
+            )
+        );
+    }
+
+    #[test]
+    fn two_workspaces_with_one_name_fail() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = workspace_files(
+            dir.path(),
+            &[
+                ("work.toml", "name = \"work\"\n"),
+                ("work-2.toml", "name = \"Work\"\n"),
+            ],
+        );
+        let c = check_workspaces(&cfg);
+        assert_eq!(c.status, Status::Fail);
+        assert!(
+            c.message.contains("two workspaces are named"),
+            "{}",
+            c.message
+        );
+    }
+
+    #[test]
+    fn a_missing_shared_or_project_folder_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = workspace_files(
+            dir.path(),
+            &[(
+                "one.toml",
+                "name = \"one\"\nshared = \"{root}/gone-notes\"\nprojects = [\"{root}/gone\"]\n",
+            )],
+        );
+        let c = check_workspaces(&cfg);
+        assert_eq!(c.status, Status::Warn);
+        assert_eq!(
+            c.message,
+            format!(
+                "one: shared {} is missing; one: {} is missing",
+                dir.path().join("gone-notes").display(),
+                dir.path().join("gone").display()
+            )
+        );
+    }
+
+    #[test]
+    fn two_projects_with_one_name_warn_that_the_later_is_shadowed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("x/app")).unwrap();
+        std::fs::create_dir_all(dir.path().join("y/app")).unwrap();
+        let cfg = workspace_files(
+            dir.path(),
+            &[
+                (
+                    "one.toml",
+                    "name = \"one\"\nprojects = [\"{root}/x/app\"]\n",
+                ),
+                (
+                    "two.toml",
+                    "name = \"two\"\nprojects = [\"{root}/y/app\"]\n",
+                ),
+            ],
+        );
+        let c = check_workspaces(&cfg);
+        assert_eq!(c.status, Status::Warn);
+        assert_eq!(
+            c.message,
+            format!(
+                "two projects are named \"app\": {} shadows {}",
+                dir.path().join("x/app").display(),
+                dir.path().join("y/app").display()
+            )
+        );
+    }
+
+    #[test]
+    fn a_file_not_named_after_its_workspace_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = workspace_files(dir.path(), &[("old.toml", "name = \"My Work\"\n")]);
+        let c = check_workspaces(&cfg);
+        assert_eq!(c.status, Status::Warn);
+        assert!(
+            c.message.ends_with("whose file would be my-work.toml"),
+            "{}",
+            c.message
+        );
+    }
+
+    #[test]
+    fn a_fail_outranks_a_warning_and_keeps_both() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = workspace_files(
+            dir.path(),
+            &[("bad.toml", "nope = 1\n"), ("old.toml", "name = \"x\"\n")],
+        );
+        let c = check_workspaces(&cfg);
+        assert_eq!(c.status, Status::Fail);
+        assert!(c.message.contains("; "), "{}", c.message);
+        assert!(c.message.contains("x.toml"), "{}", c.message);
+    }
+
+    #[test]
+    fn a_notes_project_skips_the_env_and_github_checks_and_a_code_project_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join(".env"), "K=v\n").unwrap();
+        let ok = ScriptedGh {
+            auth: Ok("Logged in".into()),
+        };
+        let file = |kind: &str| {
+            format!("[project]\nname = \"p\"\n{kind}[pocock]\nissue_tracker = \"github\"\n")
+        };
+
+        std::fs::write(root.join(FILE_NAME), file("kind = \"notes\"\n")).unwrap();
+        let notes = Project::open_root(root).unwrap();
+        let env = check_env_ignored(root, notes.kind());
+        assert_eq!(
+            (env.status, env.message.as_str()),
+            (Status::Skip, "a notes project")
+        );
+        let gh = check_github(Some(&notes), &ok, None);
+        assert_eq!(
+            (gh.status, gh.message.as_str()),
+            (Status::Skip, "a notes project")
+        );
+
+        std::fs::write(root.join(FILE_NAME), file("")).unwrap();
+        let code = Project::open_root(root).unwrap();
+        assert_eq!(code.kind(), ProjectKind::Code);
+        assert_eq!(check_env_ignored(root, code.kind()).status, Status::Ok);
+        assert_eq!(check_github(Some(&code), &ok, None).status, Status::Fail);
     }
 }

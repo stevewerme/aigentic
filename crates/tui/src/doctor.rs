@@ -3,15 +3,16 @@
 //! project is a line in the report, not a startup error. Network only
 //! behind `--probe`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use aigentic_runtime::aigentic_providers::ReasoningEffort;
+use aigentic_runtime::{Project, ProjectKind};
 
 use crate::checks::{
     Check, EffortVerdict, GhCli, JudgedMetric, SAMPLES, Status, check_api_key_env, check_config,
     check_env_ignored, check_github, check_keep_awake, check_participants, check_probe,
-    check_project, check_skills, check_threads_dir, check_window, compare_efforts, compare_medians,
-    judged_metric, origin_url, reachable_profiles, unknown_keys,
+    check_project, check_skills, check_threads_dir, check_window, check_workspaces,
+    compare_efforts, compare_medians, judged_metric, origin_url, reachable_profiles, unknown_keys,
 };
 use crate::config;
 use crate::skills_cmd::SkillPaths;
@@ -163,6 +164,8 @@ pub async fn run(
     let (found, config) = check_config(config_path);
     checks.extend(found);
     let Some(config) = config else {
+        // The workspace files stand apart from config.toml.
+        checks.push(check_workspaces(&config_dir(config_path)));
         return Ok(finish(&checks, strict));
     };
 
@@ -191,6 +194,7 @@ pub async fn run(
         .clone()
         .unwrap_or_else(config::default_threads_dir);
     checks.push(check_threads_dir(&threads_base));
+    checks.push(check_workspaces(&config_dir(config_path)));
     checks.push(project_check);
     // `aigentic.toml`'s unknown keys, beside the config's: the project
     // check above already opened the file, so this is the same walk's
@@ -201,9 +205,7 @@ pub async fn run(
         }));
     }
 
-    let config_dir = config_path
-        .parent()
-        .map_or_else(|| Path::new(".").to_path_buf(), Path::to_path_buf);
+    let config_dir = config_dir(config_path);
     // The daemon's owner: server.toml's first user when that file is
     // beside config.toml, else the config's user, who owns the embedded
     // daemon. Never a token, never printed beyond the name.
@@ -223,6 +225,7 @@ pub async fn run(
     ));
     checks.push(check_env_ignored(
         project.as_ref().map_or(cwd, |p| p.root.as_path()),
+        project.as_ref().map_or(ProjectKind::Code, Project::kind),
     ));
     let project_root = project
         .as_ref()
@@ -251,6 +254,12 @@ pub async fn run(
         }
     }
     Ok(finish(&checks, strict))
+}
+
+fn config_dir(config_path: &Path) -> PathBuf {
+    config_path
+        .parent()
+        .map_or_else(|| Path::new(".").to_path_buf(), Path::to_path_buf)
 }
 
 fn finish(checks: &[Check], strict: bool) -> i32 {
