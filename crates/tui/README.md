@@ -79,7 +79,7 @@ cargo run -p aigentic-tui --                                     # resume the fr
 cargo run -p aigentic-tui -- --server tcp:vm:7420 --project vendela   # the same client against a remote daemon; token in AIGENTIC_TOKEN
 cargo run -p aigentic-tui -- --thread <ULID>                     # resume by replaying the log
 cargo run -p aigentic-tui -- --thread <ULID> --profile anthropic # same thread, other backend (embedded daemon only)
-cargo run -p aigentic-tui -- project init                        # aigentic.toml + .aigentic/{knowledge,memory}
+cargo run -p aigentic-tui -- project init [--workspace <name|none>]   # aigentic.toml + .aigentic/{knowledge,memory}; asks which workspace at a terminal
 cargo run -p aigentic-tui -- project setup                       # render docs/agents/*.md from [pocock]
 cargo run -p aigentic-tui -- project show                        # layers, knowledge mode, every tool's fate; over the API with --server
 cargo run -p aigentic-tui -- workspace new <name> [--shared <dir>]   # an empty workspace; also add <path> [--workspace <name>], remove <project>, list
@@ -158,6 +158,13 @@ list and touches nothing on disk; `list` prints each workspace's shared
 folder and projects, marking a folder that is not on this machine
 `(missing)`, and exits 1 when a file does not parse. Editing a file by hand
 works too.
+
+`aigentic project init` asks at a terminal which workspace the folder
+joins: an existing one, `none`, or `new` (a name, then the shared folder).
+The default is the workspace already beside the folder. `--workspace
+<name|none>` answers without asking; with neither a terminal nor the flag
+the folder joins none, as a script expects. A folder with no `.git` at or
+above it gets `kind = "notes"`.
 
 The daemon reads them all, so it knows every project's root; a project's
 name is its `aigentic.toml`'s, or its folder's. Every project in a workspace

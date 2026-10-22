@@ -2,42 +2,99 @@
 //! `project show` report lives in the daemon crate's `reports` since
 //! phase 5 step 9. See `docs/PLAN-phase4.md` sections 5, 7 and 8.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use aigentic_runtime::ProjectKind;
 use aigentic_runtime::aigentic_core::{ContentBlock, Event, EventKind};
 use aigentic_runtime::aigentic_log::UserMessagePayload;
 use aigentic_runtime::project::{DOT_DIR, FILE_NAME, INSTRUCTIONS_FILE, KNOWLEDGE_DIR, MEMORY_DIR};
-use aigentic_server::workspaces::Workspace;
+use aigentic_server::workspaces::{self, Workspace};
 use anyhow::{Context, bail};
 use time::format_description::well_known::Rfc3339;
 use ulid::Ulid;
 
+use crate::init_cmd::{Ask, Terminal};
 use crate::threads_index::{Found, catalogue, label, project_of};
 
 #[derive(Debug, clap::Subcommand)]
 pub enum ProjectCommand {
     /// Write a minimal aigentic.toml here and create .aigentic/{knowledge,memory}.
-    Init,
+    Init {
+        /// The workspace this folder joins, or `none`. Without it a
+        /// terminal is asked; anything else joins none.
+        #[arg(long, value_name = "NAME|none")]
+        workspace: Option<String>,
+    },
     /// Render docs/agents/*.md and the `## Agent skills` block from [pocock].
     Setup,
     /// The layers, the knowledge mode and every tool's fate.
     Show,
 }
 
-/// `aigentic project init`: refuses to nest inside an existing project.
-pub fn init(cwd: &Path) -> anyhow::Result<i32> {
+/// `aigentic project init` at the terminal, asking for the workspace
+/// when stdin is one and `--workspace` is absent.
+pub fn init(cwd: &Path, config_dir: &Path, workspace: Option<&str>) -> anyhow::Result<i32> {
+    init_with(cwd, config_dir, workspace, &mut Terminal)
+}
+
+/// Which workspace the new project joins.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Join {
+    None,
+    Existing(String),
+    New { name: String, shared: PathBuf },
+}
+
+/// `aigentic project init` over any answer source. Refuses to nest inside
+/// an existing project. Every question is asked before anything is
+/// written; `kind = "notes"` is written when no `.git` is at or above
+/// `cwd`. Without `workspace` and without a terminal the project joins
+/// no workspace and a line says how to join one.
+pub fn init_with(
+    cwd: &Path,
+    config_dir: &Path,
+    workspace: Option<&str>,
+    ask: &mut dyn Ask,
+) -> anyhow::Result<i32> {
     if let Some(root) = aigentic_runtime::project::find_root(cwd) {
         bail!(
             "already a project: {} (delete it first to start over)",
             root.join(FILE_NAME).display()
         );
     }
+    let all = workspaces::load_all(config_dir)?;
+    let listed = workspaces::workspace_of(&all, cwd).map(|w| w.name.clone());
+    let join = match (&listed, workspace) {
+        (Some(current), Some(name))
+            if !name.eq_ignore_ascii_case("none") && !same_name(current, name) =>
+        {
+            bail!("{} is already in workspace {current:?}", cwd.display())
+        }
+        (Some(_), _) => Join::None,
+        (None, Some(name)) if name.eq_ignore_ascii_case("none") => Join::None,
+        (None, Some(name)) => match all.iter().find(|w| same_name(&w.name, name)) {
+            Some(w) => Join::Existing(w.name.clone()),
+            None => bail!("no workspace named {name:?}"),
+        },
+        (None, None) if !ask.interactive() => Join::None,
+        (None, None) => choose(cwd, &all, ask)?,
+    };
+
     let name = cwd
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "project".into());
+    let kind = kind_at(cwd);
+    // A refused name or a taken one stops here, before any file is written.
+    let joined = match join {
+        Join::None => None,
+        Join::Existing(w) => Some(w),
+        Join::New { name, shared } => {
+            Some(workspaces::create(config_dir, &name, Some(&shared))?.name)
+        }
+    };
     let file = cwd.join(FILE_NAME);
-    std::fs::write(&file, init_template(&name))
+    std::fs::write(&file, init_template(&name, kind))
         .with_context(|| format!("writing {}", file.display()))?;
     for dir in [KNOWLEDGE_DIR, MEMORY_DIR] {
         let path = cwd.join(DOT_DIR).join(dir);
@@ -46,20 +103,101 @@ pub fn init(cwd: &Path) -> anyhow::Result<i32> {
         // is neither knowledge nor memory.
         std::fs::write(path.join(".gitkeep"), "")?;
     }
-    println!("wrote {}", file.display());
-    println!(
+    ask.show(&format!("wrote {}", file.display()));
+    ask.show(&format!(
         "created {}/{{{KNOWLEDGE_DIR},{MEMORY_DIR}}}",
         cwd.join(DOT_DIR).display()
-    );
-    println!("instructions: {DOT_DIR}/{INSTRUCTIONS_FILE} if present, else AGENTS.md");
+    ));
+    ask.show(&format!(
+        "instructions: {DOT_DIR}/{INSTRUCTIONS_FILE} if present, else AGENTS.md"
+    ));
+    match (joined, listed) {
+        (Some(w), _) => {
+            workspaces::add_project(config_dir, &w, cwd)?;
+            ask.show(&format!("joined workspace {w}"));
+        }
+        (None, Some(current)) => ask.show(&format!("already in workspace {current}")),
+        (None, None) if workspace.is_none() && !ask.interactive() => {
+            ask.show("in no workspace; join one with `aigentic workspace add . --workspace <name>`")
+        }
+        (None, None) => {}
+    }
     Ok(0)
 }
 
-pub fn init_template(name: &str) -> String {
+fn same_name(a: &str, b: &str) -> bool {
+    a.to_lowercase() == b.to_lowercase()
+}
+
+/// Asks which workspace to join: an existing one, `none` or `new`. The
+/// default is the workspace whose shared folder or one of whose projects
+/// sits beside `cwd`, else `none`.
+fn choose(cwd: &Path, all: &[Workspace], ask: &mut dyn Ask) -> anyhow::Result<Join> {
+    let parent = cwd.parent();
+    let beside = all.iter().find(|w| {
+        parent.is_some_and(|parent| {
+            w.shared.as_deref() == Some(parent)
+                || w.projects.iter().any(|p| p.parent() == Some(parent))
+        })
+    });
+    let default = beside.map_or("none", |w| w.name.as_str());
+    let mut options: Vec<&str> = all.iter().map(|w| w.name.as_str()).collect();
+    options.extend(["none", "new"]);
+    ask.show(&format!("workspaces: {}", options.join(", ")));
+    let answer = ask.ask("join which workspace", default)?;
+    let answer = answer.trim();
+    if answer.eq_ignore_ascii_case("none") {
+        return Ok(Join::None);
+    }
+    if answer.eq_ignore_ascii_case("new") {
+        let name = ask.ask("new workspace's name", "")?;
+        let name = name.trim();
+        if name.is_empty() {
+            bail!("a new workspace needs a name");
+        }
+        let shared = ask.ask("its shared folder", &cwd.display().to_string())?;
+        // Collecting the components drops a `.`, so the default's `.`
+        // answer is stored as the folder itself.
+        let shared: PathBuf = cwd
+            .join(workspaces::expand(Path::new(shared.trim())))
+            .components()
+            .collect();
+        return Ok(Join::New {
+            name: name.to_string(),
+            shared,
+        });
+    }
+    match all.iter().find(|w| same_name(&w.name, answer)) {
+        Some(w) => Ok(Join::Existing(w.name.clone())),
+        None => bail!("no workspace named {answer:?}"),
+    }
+}
+
+/// `Notes` when neither `cwd` nor any folder above it has a `.git` entry,
+/// a directory or a file (a worktree's or a submodule's).
+fn kind_at(cwd: &Path) -> ProjectKind {
+    if cwd
+        .ancestors()
+        .any(|d| d.join(".git").symlink_metadata().is_ok())
+    {
+        ProjectKind::Code
+    } else {
+        ProjectKind::Notes
+    }
+}
+
+/// A new `aigentic.toml`: the name, `kind = "notes"` for a notes
+/// project (a code project leaves the key out), and every other key
+/// commented.
+pub fn init_template(name: &str, kind: ProjectKind) -> String {
+    let kind = match kind {
+        ProjectKind::Notes => "kind = \"notes\"\n",
+        ProjectKind::Code => "",
+    };
     format!(
         r#"[project]
 name = "{name}"
-# description = ""
+{kind}# description = ""
 
 # [model]
 # profile = "tensorx"            # a profile in config.toml; --profile overrides
@@ -271,20 +409,224 @@ mod tests {
         Ulid::from_parts(1_700_000_000_000 + n * 1_000, n as u128 + 1)
     }
 
+    /// Answers by prompt fragment, else the default; `interactive` false
+    /// stands for no terminal.
+    struct Scripted {
+        answers: Vec<(&'static str, &'static str)>,
+        interactive: bool,
+        shown: Vec<String>,
+    }
+    impl Scripted {
+        fn new(answers: &[(&'static str, &'static str)]) -> Self {
+            Self {
+                answers: answers.to_vec(),
+                interactive: true,
+                shown: Vec::new(),
+            }
+        }
+    }
+    impl Ask for Scripted {
+        fn show(&mut self, text: &str) {
+            self.shown.push(text.to_owned());
+        }
+        fn ask(&mut self, prompt: &str, default: &str) -> anyhow::Result<String> {
+            assert!(self.interactive, "asked {prompt:?} with no terminal");
+            Ok(self
+                .answers
+                .iter()
+                .find(|(k, _)| prompt.contains(k))
+                .map_or(default, |(_, v)| v)
+                .to_owned())
+        }
+        fn confirm(&mut self, prompt: &str, _default: bool) -> anyhow::Result<bool> {
+            panic!("unexpected confirm {prompt:?}")
+        }
+        fn interactive(&self) -> bool {
+            self.interactive
+        }
+    }
+
+    /// A temp dir with a config dir and one workspace, `brand`, whose
+    /// project `site` sits in `projects/`.
+    fn with_brand() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("cfg");
+        let projects = dir.path().join("projects");
+        std::fs::create_dir_all(projects.join("site")).unwrap();
+        workspaces::create(&cfg, "brand", None).unwrap();
+        workspaces::add_project(&cfg, "brand", &projects.join("site")).unwrap();
+        (dir, cfg, projects)
+    }
+
+    fn workspace_of_dir(cfg: &Path, root: &Path) -> Option<String> {
+        let all = workspaces::load_all(cfg).unwrap();
+        workspaces::workspace_of(&all, root).map(|w| w.name.clone())
+    }
+
     #[test]
     fn init_writes_the_file_and_folders_and_refuses_to_nest() {
         let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("cfg");
         let root = dir.path().join("myapp");
         std::fs::create_dir_all(root.join("sub")).unwrap();
-        assert_eq!(init(&root).unwrap(), 0);
+        let mut ask = Scripted::new(&[]);
+        assert_eq!(init_with(&root, &cfg, None, &mut ask).unwrap(), 0);
         let p = Project::open_root(&root).unwrap();
         assert_eq!(p.name, "myapp");
         assert!(root.join(".aigentic/knowledge/.gitkeep").is_file());
         assert!(root.join(".aigentic/memory/.gitkeep").is_file());
         assert!(p.memory.is_empty(), ".gitkeep is not a memory file");
-        let err = init(&root.join("sub")).unwrap_err().to_string();
+        let err = init_with(&root.join("sub"), &cfg, None, &mut ask)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("already a project"), "{err}");
-        assert!(init(&root).is_err());
+        assert!(init_with(&root, &cfg, None, &mut ask).is_err());
+    }
+
+    #[test]
+    fn a_scripted_answer_joins_the_workspace_beside_it_by_default() {
+        let (_dir, cfg, projects) = with_brand();
+        let app = projects.join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        let mut ask = Scripted::new(&[]);
+        init_with(&app, &cfg, None, &mut ask).unwrap();
+        assert!(
+            ask.shown
+                .contains(&"workspaces: brand, none, new".to_owned()),
+            "{:?}",
+            ask.shown
+        );
+        assert_eq!(workspace_of_dir(&cfg, &app).as_deref(), Some("brand"));
+        assert!(ask.shown.contains(&"joined workspace brand".to_owned()));
+    }
+
+    #[test]
+    fn a_scripted_answer_creates_a_new_workspace() {
+        let (dir, cfg, _) = with_brand();
+        let notes = dir.path().join("elsewhere/notes");
+        std::fs::create_dir_all(&notes).unwrap();
+        let mut ask = Scripted::new(&[
+            ("join which", "new"),
+            ("name", "Writing"),
+            ("shared folder", "."),
+        ]);
+        init_with(&notes, &cfg, None, &mut ask).unwrap();
+        let all = workspaces::load_all(&cfg).unwrap();
+        let w = all.iter().find(|w| w.name == "Writing").unwrap();
+        assert_eq!(w.projects, vec![notes.clone()]);
+        assert_eq!(w.shared.as_ref(), Some(&notes));
+        let text = std::fs::read_to_string(cfg.join("workspaces/writing.toml")).unwrap();
+        assert!(!text.contains("/.\""), "{text}");
+    }
+
+    #[test]
+    fn a_scripted_answer_chooses_none() {
+        let (_dir, cfg, projects) = with_brand();
+        let app = projects.join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        let before = workspaces::load_all(&cfg).unwrap();
+        let mut ask = Scripted::new(&[("join which", "none")]);
+        init_with(&app, &cfg, None, &mut ask).unwrap();
+        assert!(app.join(FILE_NAME).is_file());
+        assert_eq!(workspaces::load_all(&cfg).unwrap(), before);
+    }
+
+    #[test]
+    fn an_unknown_answer_is_refused_before_anything_is_written() {
+        let (_dir, cfg, projects) = with_brand();
+        let app = projects.join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        let mut ask = Scripted::new(&[("join which", "nope")]);
+        let err = init_with(&app, &cfg, None, &mut ask).unwrap_err();
+        assert_eq!(err.to_string(), "no workspace named \"nope\"");
+        assert!(!app.join(FILE_NAME).exists());
+        let err = init_with(&app, &cfg, Some("nope"), &mut ask).unwrap_err();
+        assert_eq!(err.to_string(), "no workspace named \"nope\"");
+        assert!(!app.join(FILE_NAME).exists());
+    }
+
+    #[test]
+    fn the_flag_names_the_workspace_without_asking() {
+        let (_dir, cfg, projects) = with_brand();
+        let app = projects.join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        let mut ask = Scripted::new(&[]);
+        ask.interactive = false;
+        init_with(&app, &cfg, Some("Brand"), &mut ask).unwrap();
+        assert_eq!(workspace_of_dir(&cfg, &app).as_deref(), Some("brand"));
+    }
+
+    #[test]
+    fn with_no_terminal_and_no_flag_the_file_is_written_and_no_workspace_changes() {
+        let (_dir, cfg, projects) = with_brand();
+        let app = projects.join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        let before = workspaces::load_all(&cfg).unwrap();
+        let mut ask = Scripted::new(&[]);
+        ask.interactive = false;
+        init_with(&app, &cfg, None, &mut ask).unwrap();
+        assert!(app.join(FILE_NAME).is_file());
+        assert_eq!(workspaces::load_all(&cfg).unwrap(), before);
+        assert_eq!(
+            ask.shown.last().map(String::as_str),
+            Some("in no workspace; join one with `aigentic workspace add . --workspace <name>`")
+        );
+    }
+
+    #[test]
+    fn a_folder_already_in_a_workspace_is_a_no_op() {
+        let (_dir, cfg, projects) = with_brand();
+        let site = projects.join("site");
+        let before = workspaces::load_all(&cfg).unwrap();
+        let mut ask = Scripted::new(&[]);
+        ask.interactive = false;
+        let err = init_with(&site, &cfg, Some("other"), &mut ask).unwrap_err();
+        assert!(err.to_string().contains("already in workspace"), "{err}");
+        init_with(&site, &cfg, Some("brand"), &mut ask).unwrap();
+        assert_eq!(workspaces::load_all(&cfg).unwrap(), before);
+        assert_eq!(
+            ask.shown.last().map(String::as_str),
+            Some("already in workspace brand")
+        );
+    }
+
+    #[test]
+    fn a_folder_with_no_git_gets_kind_notes() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("cfg");
+        let notes = dir.path().join("notes");
+        std::fs::create_dir_all(&notes).unwrap();
+        // The temp dir must not sit inside a repository for this to mean
+        // anything.
+        assert_eq!(kind_at(&notes), ProjectKind::Notes);
+        init_with(&notes, &cfg, Some("none"), &mut Scripted::new(&[])).unwrap();
+        let text = std::fs::read_to_string(notes.join(FILE_NAME)).unwrap();
+        assert!(
+            text.contains("[project]\nname = \"notes\"\nkind = \"notes\"\n"),
+            "{text}"
+        );
+        assert_eq!(
+            Project::open_root(&notes).unwrap().kind(),
+            ProjectKind::Notes
+        );
+    }
+
+    #[test]
+    fn a_folder_under_a_git_directory_or_file_leaves_kind_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("cfg");
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("app")).unwrap();
+        let worktree = dir.path().join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(worktree.join(".git"), "gitdir: /elsewhere\n").unwrap();
+        for root in [repo.join("app"), worktree] {
+            init_with(&root, &cfg, Some("none"), &mut Scripted::new(&[])).unwrap();
+            let text = std::fs::read_to_string(root.join(FILE_NAME)).unwrap();
+            assert!(!text.contains("kind"), "{text}");
+            assert_eq!(Project::open_root(&root).unwrap().kind(), ProjectKind::Code);
+        }
     }
 
     /// T6 (issue #83): the local `aigentic threads` lists the threads

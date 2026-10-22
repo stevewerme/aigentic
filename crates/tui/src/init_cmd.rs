@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use aigentic_runtime::project::{
     DOT_DIR, FILE_NAME, INSTRUCTIONS_FILE, KNOWLEDGE_DIR, MEMORY_DIR, PocockSection,
 };
-use aigentic_runtime::{Project, ProjectFile};
+use aigentic_runtime::{Project, ProjectFile, ProjectKind};
 use anyhow::{Context, bail};
 
 use crate::checks::{
@@ -33,6 +33,10 @@ pub trait Ask {
     fn ask(&mut self, prompt: &str, default: &str) -> anyhow::Result<String>;
     /// A yes/no question; Enter accepts `default`.
     fn confirm(&mut self, prompt: &str, default: bool) -> anyhow::Result<bool>;
+    /// Whether a person is there to answer.
+    fn interactive(&self) -> bool {
+        true
+    }
 }
 
 /// The terminal.
@@ -72,6 +76,9 @@ impl Ask for Terminal {
             "y" | "yes" => true,
             _ => false,
         })
+    }
+    fn interactive(&self) -> bool {
+        std::io::stdin().is_terminal()
     }
 }
 
@@ -468,7 +475,7 @@ pub fn render_project_file(
     description: &str,
     profile: &str,
 ) -> String {
-    let mut text = existing.map_or_else(|| init_template(name), str::to_owned);
+    let mut text = existing.map_or_else(|| init_template(name, ProjectKind::Code), str::to_owned);
     text = set_toml_key(&text, "project", "name", &format!("{name:?}"));
     if !description.trim().is_empty() {
         text = set_toml_key(&text, "project", "description", &format!("{description:?}"));
@@ -739,7 +746,7 @@ mod tests {
 
     #[test]
     fn toml_keys_are_set_uncommented_added_or_appended() {
-        let t = init_template("x");
+        let t = init_template("x", ProjectKind::Code);
         let t = set_toml_key(&t, "project", "name", "\"y\"");
         assert!(t.contains("[project]\nname = \"y\"\n"), "{t}");
         let t = set_toml_key(&t, "project", "description", "\"d\"");

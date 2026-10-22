@@ -386,8 +386,8 @@ async fn run() -> anyhow::Result<()> {
             std::process::exit(code);
         }
         Some(Command::Project {
-            command: ProjectCommand::Init,
-        }) => std::process::exit(project_cmd::init(&cwd)?),
+            command: ProjectCommand::Init { workspace },
+        }) => std::process::exit(project_cmd::init(&cwd, &config_dir, workspace.as_deref())?),
         Some(Command::Project {
             command: ProjectCommand::Setup,
         }) => std::process::exit(pocock::run(opened.as_ref())?),
