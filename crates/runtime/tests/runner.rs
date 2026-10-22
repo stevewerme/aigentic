@@ -4596,10 +4596,11 @@ fn the_repositorys_loop_workflow_loads() {
     );
 }
 
-/// The loop's two reading steps carry a figure of their own: a check that
-/// runs long costs more than the step that writes the code, so it is held
-/// to a number rather than to the run's room. The figure sits above every
-/// check that has finished and below the one that ran away.
+/// The loop's spec and its two checking steps carry a figure of their
+/// own: a step that runs long costs more than the step that writes the
+/// code, so it is held to a number rather than to the run's room. Each
+/// figure sits above every such step that has finished and below the one
+/// that ran away.
 #[test]
 fn the_loops_checking_steps_carry_their_own_figure() {
     let loaded = WorkflowFile::load_dir(
@@ -4613,8 +4614,10 @@ fn the_loops_checking_steps_carry_their_own_figure() {
         assert_eq!(step.budget, Some(figure), "{id}");
         assert_eq!(step.profile, "tensorx", "{id}");
     }
+    let spec = loaded.step("spec").expect("the spec step");
+    assert_eq!(spec.budget, Some(2.0), "spec");
     for step in &loaded.workflow.steps {
-        if step.id == "speccheck" || step.id == "decider" {
+        if ["spec", "speccheck", "decider"].contains(&step.id.as_str()) {
             continue;
         }
         assert_eq!(step.budget, None, "{} carries no figure", step.id);

@@ -81,6 +81,7 @@ profile = "flash"
 template = "templates/spec.md"
 marker = "## Spec"
 wall_secs = 3600
+budget = 2.00
 deny = [
     "git push",
     "git commit",
