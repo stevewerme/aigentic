@@ -61,6 +61,8 @@ pub const COMPACTION_KEYS: &[&str] = &[
 pub const TOOLS_SECTION_KEYS: &[&str] = &["allow", "bash_timeout_secs"];
 pub const KNOWLEDGE_SECTION_KEYS: &[&str] = &["threshold_fraction", "max_hits"];
 pub const MEMORY_SECTION_KEYS: &[&str] = &["enabled", "every_n_turns"];
+/// `[brief]`: whether the harness keeps the brief's current state fresh.
+pub const BRIEF_SECTION_KEYS: &[&str] = &["refresh"];
 pub const POCOCK_SECTION_KEYS: &[&str] = &[
     "issue_tracker",
     "triage_labels",
@@ -105,6 +107,7 @@ pub fn project_spec() -> Table {
         ("tools", Table::new(TOOLS_SECTION_KEYS)),
         ("knowledge", Table::new(KNOWLEDGE_SECTION_KEYS)),
         ("memory", Table::new(MEMORY_SECTION_KEYS)),
+        ("brief", Table::new(BRIEF_SECTION_KEYS)),
         ("pocock", Table::new(POCOCK_SECTION_KEYS)),
         ("skills", Table::new(SKILLS_SECTION_KEYS)),
         ("policy", Table::new(POLICY_SECTION_KEYS)),
@@ -121,6 +124,7 @@ pub fn project_spec() -> Table {
             "tools",
             "knowledge",
             "memory",
+            "brief",
             "pocock",
             "skills",
             "policy",
@@ -168,6 +172,9 @@ pub struct ProjectFile {
     pub knowledge: KnowledgeSection,
     #[serde(default)]
     pub memory: MemorySection,
+    /// `[brief]`: absent keeps the brief's current state refreshed.
+    #[serde(default)]
+    pub brief: BriefSection,
     #[serde(default)]
     pub pocock: Option<PocockSection>,
     #[serde(default)]
@@ -291,6 +298,21 @@ pub struct MemorySection {
     pub enabled: bool,
     #[serde(default = "default_one")]
     pub every_n_turns: u32,
+}
+
+/// Keys in `BRIEF_SECTION_KEYS`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct BriefSection {
+    /// Rewrite `brief.md`'s current-state section after a batch of turns
+    /// that wrote files.
+    #[serde(default = "default_true")]
+    pub refresh: bool,
+}
+
+impl Default for BriefSection {
+    fn default() -> Self {
+        Self { refresh: true }
+    }
 }
 
 fn default_true() -> bool {

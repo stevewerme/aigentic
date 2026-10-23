@@ -23,6 +23,7 @@ pub use aigentic_tools;
 mod approver;
 mod audit;
 pub mod brief;
+mod brief_refresh;
 pub mod checks;
 mod compaction;
 pub mod config_keys;
