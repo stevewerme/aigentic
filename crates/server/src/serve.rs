@@ -116,6 +116,9 @@ impl Bound {
         // client can ask (issue #58, rule 8). An embedded daemon's
         // `resume_runs` is false, so it claims nothing on its own.
         server.threads.resume_unfinished_runs();
+        // A job that ended while no daemon was there to post its return
+        // gets it now; one still mid-turn is left as it is.
+        tokio::spawn(crate::jobs::post_unreturned(server.threads.clone()));
         let sweeper = {
             let server = server.clone();
             tokio::spawn(async move {

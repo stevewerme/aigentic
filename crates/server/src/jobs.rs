@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aigentic_api::{Notice, Response, ThreadState};
-use aigentic_runtime::aigentic_core::{Author, ContentBlock, Event, EventKind};
+use aigentic_runtime::aigentic_core::{Author, ContentBlock, Event, EventKind, ProviderError};
 use aigentic_runtime::aigentic_log::{
     AssistantMessagePayload, DecisionAnswer, DecisionKind, JobFinishedPayload, JobOutcome,
     TurnEndedPayload, decision_records,
@@ -148,6 +148,57 @@ async fn drive(
     }
 }
 
+/// Post the return of every job that ended without one: a daemon stopped
+/// between a job's end and its post leaves the front thread's log short
+/// of it. A job whose log shows a turn still open is left alone: its
+/// thread may be another daemon's to finish, and a guess would post a
+/// second return. The front's actor drops a return it already holds, so
+/// this never posts one twice.
+pub async fn post_unreturned(threads: Arc<ThreadTable>) {
+    for (child, front) in threads.job_threads() {
+        let Ok(events) = threads.events_from(child, 0) else {
+            continue;
+        };
+        if !ended(&events) {
+            continue;
+        }
+        let Ok(front_events) = threads.events_from(front, 0) else {
+            continue;
+        };
+        if returned(&front_events, child) {
+            continue;
+        }
+        let payload = job_return(child, &events, None);
+        let Ok((front_box, _)) = threads.open(front).await else {
+            continue;
+        };
+        let posted = send(&front_box, |reply| Mail::JobFinished { payload, reply }).await;
+        threads.close(front);
+        if posted != Some(Response::Ok) {
+            eprintln!("warn  job {child}: its return was not posted at start-up: {posted:?}");
+        }
+    }
+}
+
+/// Whether a job's log shows no turn open: it holds a message and the
+/// last `turn_ended` comes after the last message.
+pub fn ended(events: &[Event]) -> bool {
+    let last = |kind| events.iter().rev().find(|e| e.kind == kind).map(|e| e.seq);
+    match (last(EventKind::UserMessage), last(EventKind::TurnEnded)) {
+        (Some(message), Some(end)) => end > message,
+        _ => false,
+    }
+}
+
+/// Whether the front thread already holds `child`'s return.
+pub fn returned(front_events: &[Event], child: Ulid) -> bool {
+    front_events
+        .iter()
+        .filter(|e| e.kind == EventKind::JobFinished)
+        .filter_map(|e| serde_json::from_value::<JobFinishedPayload>(e.payload.clone()).ok())
+        .any(|p| p.job_thread == child)
+}
+
 /// This job's place among the front thread's jobs, counted from 1 in
 /// start order: every approved job proposal in the front's log, this
 /// one's included, since its approval is written before it starts. Read
@@ -255,6 +306,22 @@ pub fn job_return(child: Ulid, events: &[Event], stopped: Option<Duration>) -> J
     let failed = ended
         .as_ref()
         .filter(|e| e.error.is_some() || e.reason.starts_with("provider_error"));
+    // The last model reply was a final answer — words and no call — so a
+    // failure after it came once the work was done.
+    let answered = events
+        .iter()
+        .rev()
+        .find(|event| event.kind == EventKind::AssistantMessage)
+        .and_then(|event| {
+            serde_json::from_value::<AssistantMessagePayload>(event.payload.clone()).ok()
+        })
+        .is_some_and(|payload| {
+            !payload
+                .blocks
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolCall(_)))
+                && !text_of(&payload.blocks).trim().is_empty()
+        });
     let (outcome, summary) = if stopped.is_some() || interrupted {
         let why = match stopped {
             Some(deadline) => {
@@ -267,12 +334,40 @@ pub fn job_return(child: Ulid, events: &[Event], stopped: Option<Duration>) -> J
             None => why,
         };
         (JobOutcome::Stopped, summary)
+    } else if let Some(ended) = failed
+        && !answered
+    {
+        let (cause, again) = match &ended.error {
+            Some(error) if error.is_transient() || matches!(error, ProviderError::Cut) => (
+                format!("{} ({error})", error.cause_line()),
+                "The fault looks passing: starting the job again would likely get past it.",
+            ),
+            Some(error) => (
+                format!("{} ({error})", error.cause_line()),
+                "Starting the job again would fail the same way until that is fixed.",
+            ),
+            None => (
+                ended.reason.clone(),
+                "Read the job's own thread before starting it again.",
+            ),
+        };
+        (
+            JobOutcome::Failed,
+            format!("The job fell over: {cause}. {again}"),
+        )
     } else if let Some(ended) = failed {
         let cause = match &ended.error {
-            Some(error) => error.to_string(),
+            Some(error) => error.cause_line(),
             None => ended.reason.clone(),
         };
-        (JobOutcome::Failed, format!("The job fell over: {cause}"))
+        let words = last_words.as_deref().unwrap_or_default();
+        (
+            JobOutcome::Finished,
+            format!(
+                "{}\n\nA call after this answer fell over ({cause}); the work above was done.",
+                one_screen(words)
+            ),
+        )
     } else {
         let summary = match &last_words {
             Some(words) => one_screen(words),
@@ -397,6 +492,129 @@ mod tests {
         let cut = one_screen(&one_line);
         let (kept, _) = cut.split_once("\n\n").unwrap();
         assert_eq!(kept.chars().count(), JOB_SUMMARY_CHARS);
+    }
+
+    /// A job's log: the brief, then each `(kind, payload)` in order.
+    fn job_log(dir: &std::path::Path, tail: Vec<(EventKind, serde_json::Value)>) -> Vec<Event> {
+        let mut log = ThreadLog::open(dir, Ulid::generate()).unwrap();
+        let brief = serde_json::json!({"blocks": [{"type": "text", "text": "the brief"}]});
+        for (kind, payload) in std::iter::once((EventKind::UserMessage, brief)).chain(tail) {
+            log.append(NewEvent {
+                kind,
+                author: Author::System,
+                payload,
+                parent_event: None,
+            })
+            .unwrap();
+        }
+        log.read_all().unwrap()
+    }
+
+    fn answer(text: &str) -> (EventKind, serde_json::Value) {
+        (
+            EventKind::AssistantMessage,
+            serde_json::json!({"blocks": [{"type": "text", "text": text}]}),
+        )
+    }
+
+    fn fell_over(error: ProviderError) -> (EventKind, serde_json::Value) {
+        (
+            EventKind::TurnEnded,
+            serde_json::json!({
+                "reason": format!("provider_error: {error}"),
+                "error": serde_json::to_value(&error).unwrap(),
+            }),
+        )
+    }
+
+    /// A job that gave its answer and then lost a later call did its work:
+    /// the person is told it finished, with the answer, and why a call
+    /// failed after it.
+    #[test]
+    fn a_job_that_failed_after_its_answer_is_reported_finished() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = job_log(
+            dir.path(),
+            vec![
+                answer("Three callers: main, reload and the test helper."),
+                fell_over(ProviderError::Http {
+                    status: 503,
+                    body: "busy".into(),
+                }),
+            ],
+        );
+        let payload = job_return(Ulid::generate(), &events, None);
+        assert_eq!(payload.outcome, JobOutcome::Finished);
+        assert!(
+            payload.summary.starts_with("Three callers"),
+            "{}",
+            payload.summary
+        );
+        assert!(payload.summary.contains("fell over"), "{}", payload.summary);
+    }
+
+    /// A failure before any answer is a failure, and the person is told
+    /// whether starting the job again could get past it.
+    #[test]
+    fn a_job_that_fell_over_says_whether_starting_it_again_would_help() {
+        let dir = tempfile::tempdir().unwrap();
+        let passing = job_log(
+            dir.path(),
+            vec![fell_over(ProviderError::Http {
+                status: 503,
+                body: "busy".into(),
+            })],
+        );
+        let payload = job_return(Ulid::generate(), &passing, None);
+        assert_eq!(payload.outcome, JobOutcome::Failed);
+        assert!(
+            payload.summary.contains("would likely get past it"),
+            "{}",
+            payload.summary
+        );
+
+        let lasting = job_log(
+            dir.path(),
+            vec![fell_over(ProviderError::Unsupported("tools".into()))],
+        );
+        let payload = job_return(Ulid::generate(), &lasting, None);
+        assert_eq!(payload.outcome, JobOutcome::Failed);
+        assert!(
+            payload.summary.contains("fail the same way"),
+            "{}",
+            payload.summary
+        );
+    }
+
+    /// The start-up repair touches only a job whose last turn has ended,
+    /// and only when the front does not hold its return yet.
+    #[test]
+    fn only_an_ended_job_without_a_return_is_repaired() {
+        let dir = tempfile::tempdir().unwrap();
+        let running = job_log(dir.path(), vec![answer("still going")]);
+        assert!(!ended(&running), "no turn_ended after the brief");
+        let done = job_log(
+            dir.path(),
+            vec![
+                answer("done"),
+                (EventKind::TurnEnded, serde_json::json!({"reason": "done"})),
+            ],
+        );
+        assert!(ended(&done));
+
+        let child = Ulid::generate();
+        let mut front = ThreadLog::open(dir.path(), Ulid::generate()).unwrap();
+        assert!(!returned(&front.read_all().unwrap(), child));
+        front
+            .append(NewEvent {
+                kind: EventKind::JobFinished,
+                author: Author::System,
+                payload: serde_json::to_value(job_return(child, &done, None)).unwrap(),
+                parent_event: None,
+            })
+            .unwrap();
+        assert!(returned(&front.read_all().unwrap(), child));
+        assert!(!returned(&front.read_all().unwrap(), Ulid::generate()));
     }
 
     /// Append a `kind` proposal answered `answer`, as the front's turn

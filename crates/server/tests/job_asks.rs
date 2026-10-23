@@ -439,3 +439,53 @@ async fn the_front_thread_sees_none_of_the_jobs_other_traffic() {
         "only state reaches the front for a job that asks nothing: {forwarded:?}"
     );
 }
+
+/// A daemon stopped after a job's turn ended but before its return was
+/// posted: the next start posts it, once, however often the repair runs.
+/// A job still mid-turn is left for whoever is running it.
+#[tokio::test]
+async fn a_job_that_ended_before_a_restart_reports_back_exactly_once() {
+    let rig = rig(Router::new(Vec::new(), Vec::new()));
+    let root = rig._dir.path().join("p");
+    let front = rig.table.create("p", steve(), true).await.unwrap().id;
+    let ended = rig.table.create_job(front, "p", &root, steve()).unwrap();
+    let running = rig.table.create_job(front, "p", &root, steve()).unwrap();
+    let write = |id: Ulid, events: &[(EventKind, serde_json::Value)]| {
+        let mut log = ThreadLog::open(&rig.threads, id).unwrap();
+        for (kind, payload) in events {
+            log.append(aigentic_runtime::aigentic_log::NewEvent {
+                kind: *kind,
+                author: Author::System,
+                payload: payload.clone(),
+                parent_event: None,
+            })
+            .unwrap();
+        }
+    };
+    let brief = (
+        EventKind::UserMessage,
+        json!({"blocks": [{"type": "text", "text": BRIEF}]}),
+    );
+    let words = (
+        EventKind::AssistantMessage,
+        json!({"blocks": [{"type": "text", "text": JOB_WORDS}]}),
+    );
+    write(
+        ended,
+        &[
+            brief.clone(),
+            words.clone(),
+            (EventKind::TurnEnded, json!({"reason": "done"})),
+        ],
+    );
+    write(running, &[brief, words]);
+
+    aigentic_server::jobs::post_unreturned(rig.table.clone()).await;
+    aigentic_server::jobs::post_unreturned(rig.table.clone()).await;
+
+    let posted = returns(&events(&rig.threads, front));
+    assert_eq!(posted.len(), 1, "one return, for the ended job: {posted:?}");
+    assert_eq!(posted[0].job_thread, ended);
+    assert_eq!(posted[0].outcome, JobOutcome::Finished);
+    assert_eq!(posted[0].summary, JOB_WORDS);
+}

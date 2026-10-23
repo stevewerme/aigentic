@@ -1526,6 +1526,20 @@ impl ThreadTable {
 
     /// Which kind of run-owned thread `thread` is, from its own log,
     /// wherever that log lives.
+    /// Every job thread the index knows, with the front thread it reports
+    /// to.
+    pub fn job_threads(&self) -> Vec<(Ulid, Ulid)> {
+        self.index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter_map(|(id, indexed)| match indexed.run {
+                RunThread::Job { front } => Some((*id, front)),
+                _ => None,
+            })
+            .collect()
+    }
+
     pub fn run_thread(&self, thread: Ulid) -> RunThread {
         let Some(dir) = self.dir_of(thread) else {
             return RunThread::No;

@@ -640,8 +640,18 @@ impl ThreadActor {
         self
     }
 
-    /// Append a job's return through the runtime, and say how it went.
+    /// Append a job's return through the runtime, and say how it went. A
+    /// return this thread already holds for the same job is not written
+    /// again: a driver and the start-up repair may both reach here.
     fn write_job_note(&mut self, payload: JobFinishedPayload, reply: oneshot::Sender<Response>) {
+        let held = crate::jobs::returned(
+            &self.shared.events.lock().unwrap_or_else(|e| e.into_inner()),
+            payload.job_thread,
+        );
+        if held {
+            let _ = reply.send(Response::Ok);
+            return;
+        }
         let shared = self.shared.clone();
         let sys = Author::System;
         let written = self.runtime.append_note(
