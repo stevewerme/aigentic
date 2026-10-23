@@ -157,6 +157,18 @@ async fn a_jobs_ask_is_refused_and_nothing_is_left_waiting() {
     );
 }
 
+/// A job runs under the front's mode at the moment of the answer, not
+/// whatever mode its own thread was built with: the approval is what a
+/// person agreed to.
+#[tokio::test]
+async fn a_job_runs_in_the_mode_it_was_approved_in() {
+    let dir = tempfile::tempdir().unwrap();
+    for (built, approved) in [(Mode::Manual, Mode::Auto), (Mode::Auto, Mode::Manual)] {
+        let job = as_job(rig(vec![], dir.path(), built, false), false, approved);
+        assert_eq!(job.mode(), approved);
+    }
+}
+
 /// A read-only job changes nothing, whatever mode the front was in, and it
 /// runs no shell command the rules would ask about.
 #[tokio::test]

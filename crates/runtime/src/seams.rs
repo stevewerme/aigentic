@@ -177,9 +177,9 @@ impl Runtime {
                 }
                 (reason, false, None)
             }
-            // A step or job thread has no person to answer, and #77 needs
-            // a job in `auto` to stay inside its project: outside a
-            // boundary the step is refused outright.
+            // A step or job thread has no person to answer, and a job in
+            // `auto` must still stay inside its project: outside a
+            // boundary either is refused outright.
             Outcome::AskBoundary { reason, .. } if self.step.is_some() || self.job.is_some() => {
                 let (rule, instead) = if self.job.is_some() {
                     (JOB_RULE_BOUNDARY, "a job stays inside its project")

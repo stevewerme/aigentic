@@ -561,13 +561,15 @@ impl Runtime {
     }
 
     /// Make this thread a background job's: `spec` is the approval it runs
-    /// under, and the loop's deny list is parsed once, here, so a typo in
-    /// it fails where the job is built rather than at its first call. The
-    /// overlay stands before the rules, as a step's does; a job differs in
-    /// that it asks nobody and reaches nothing outside its project.
+    /// under, and its mode becomes the thread's permission mode. The loop's
+    /// deny list is parsed once, here, so a typo in it fails where the job
+    /// is built rather than at its first call. The overlay stands before
+    /// the rules, as a step's does; a job differs in that it asks nobody
+    /// and reaches nothing outside its project.
     pub fn with_job(mut self, spec: JobSpec) -> Result<Self, aigentic_policy::DenyParseError> {
         let deny: Vec<String> = JOB_DENY.iter().map(|entry| (*entry).to_owned()).collect();
         let overlay = StepOverlay::parse(&deny)?;
+        self.mode = spec.mode;
         self.job = Some(Job::new(spec, overlay));
         Ok(self)
     }
