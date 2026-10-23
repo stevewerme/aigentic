@@ -448,6 +448,8 @@ pub(crate) mod fake_daemon {
                                 None => Response::Ok,
                             },
                             Request::AnswerSwitch { .. } => Response::Ok,
+                            // A job's ask is answered on the job's thread.
+                            Request::Decide { .. } | Request::AnswerHuman { .. } => Response::Ok,
                             other => panic!("the tests sent an unscripted request: {other:?}"),
                         };
                         write

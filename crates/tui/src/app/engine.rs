@@ -495,6 +495,15 @@ pub struct ClientRepl {
     /// The call id of the request or question this client prompted for
     /// and has not answered: a decision from elsewhere withdraws it.
     prompted: Option<String>,
+    /// The thread `prompted` belongs to when it is a background job's
+    /// ask, not this thread's: an answer goes to the job's own thread.
+    prompted_thread: Option<Ulid>,
+    /// The asks this thread's jobs are waiting on, oldest first, each
+    /// with the job's number and the state that carries the ask. The
+    /// oldest is prompted for whenever nothing else is.
+    job_asks: Vec<(Ulid, u32, ThreadState)>,
+    /// The jobs whose start this client has drawn.
+    jobs_seen: std::collections::HashSet<Ulid>,
     /// The prompt menu while `prompted`.
     menu: Option<Menu>,
     /// The running turn's figures; `None` while idle.
@@ -638,6 +647,9 @@ impl ClientRepl {
             streamed_text: false,
             reply_stream_start: 0,
             prompted: None,
+            prompted_thread: None,
+            job_asks: Vec::new(),
+            jobs_seen: std::collections::HashSet::new(),
             menu: None,
             turn: None,
             project: None,
@@ -939,6 +951,14 @@ impl ClientRepl {
         // sending it to the front thread.
         if let Some(hint) = self.chat_refusal(line) {
             out.line(&hint);
+            return;
+        }
+        // A job's ask on screen takes a typed answer before the chat does.
+        if self.prompted_thread.is_some()
+            && !line.trim().starts_with('/')
+            && let Some(keyed) = self.menu.as_ref().and_then(|m| m.line(line))
+        {
+            self.apply(keyed, out).await;
             return;
         }
         // A pending question, request or switch proposal this client
@@ -2156,7 +2176,7 @@ impl ClientRepl {
         };
         let r = self
             .request(Request::Decide {
-                thread: self.thread,
+                thread: self.prompted_thread.unwrap_or(self.thread),
                 call_id,
                 allow,
                 session,
@@ -2244,7 +2264,12 @@ impl ClientRepl {
             return Some("project:pick".to_owned());
         }
         if let Some(call_id) = self.prompted.as_ref() {
-            return self.menu.as_ref().map(|_| format!("chat:{call_id}"));
+            // A job's ask is its own prompt: a key in flight from the
+            // chat's never lands on it, nor one job's on another's.
+            return self.menu.as_ref().map(|_| match self.prompted_thread {
+                Some(job) => format!("job:{job}:{call_id}"),
+                None => format!("chat:{call_id}"),
+            });
         }
         self.checkpoint
             .as_ref()
@@ -2555,7 +2580,7 @@ impl ClientRepl {
         };
         let r = self
             .request(Request::AnswerHuman {
-                thread: self.thread,
+                thread: self.prompted_thread.unwrap_or(self.thread),
                 call_id,
                 text,
             })
@@ -2649,16 +2674,21 @@ impl ClientRepl {
     fn answered(&mut self, response: Response, out: &mut dyn Printer) {
         match response {
             Response::Ok => {
+                self.drop_job_ask();
                 self.prompted = None;
+                self.prompted_thread = None;
                 self.menu = None;
             }
             Response::Refused { reason } if reason.contains("already decided") => {
+                self.drop_job_ask();
                 self.prompted = None;
+                self.prompted_thread = None;
                 self.menu = None;
                 out.line(&format!("[{reason}; someone else was first]"));
             }
             other => self.show(other, "", out),
         }
+        self.prompt_next_job_ask(out);
     }
 
     async fn report(&mut self, kind: ReportKind, out: &mut dyn Printer) {
@@ -3063,11 +3093,106 @@ impl ClientRepl {
             // The followed run's segment is the run view's; a notice for
             // any other lead has nothing to draw here either.
             Notice::RunStatus { .. } => {}
-            // A job's asks are answered on the job's own thread; this
-            // client draws none of them yet, so a job waits until someone
-            // answers it from a client that does.
-            Notice::Job { .. } => {}
+            Notice::Job {
+                job,
+                number,
+                notice,
+                ..
+            } => self.on_job_notice(job, number, *notice, out),
         }
+    }
+
+    /// A background job's notice: its first one draws the job's start,
+    /// an ask joins the queue, and any other state takes that job's ask
+    /// off it, withdrawing the prompt when it was on screen.
+    fn on_job_notice(&mut self, job: Ulid, number: u32, notice: Notice, out: &mut dyn Printer) {
+        let Notice::State { state, .. } = notice else {
+            return;
+        };
+        if self.jobs_seen.insert(job) {
+            out.line(&format!("[job {number} started · thread {job}]"));
+        }
+        let asks = matches!(
+            state,
+            ThreadState::AwaitingApproval { .. } | ThreadState::AwaitingHuman { .. }
+        );
+        self.job_asks.retain(|(id, ..)| *id != job);
+        if asks {
+            self.job_asks.push((job, number, state));
+        } else if self.prompted_thread == Some(job) {
+            self.prompted = None;
+            self.prompted_thread = None;
+            self.menu = None;
+            out.line(&format!("[job {number}: answered elsewhere]"));
+        }
+        self.prompt_next_job_ask(out);
+    }
+
+    /// Take the job's ask on screen off the queue once it is answered.
+    fn drop_job_ask(&mut self) {
+        if let Some(job) = self.prompted_thread {
+            self.job_asks.retain(|(id, ..)| *id != job);
+        }
+    }
+
+    /// Prompt for the oldest job ask while nothing else is prompted: the
+    /// chat's own prompt always comes first, and one job prompt is on
+    /// screen at a time. Only a person who may answer this thread's asks
+    /// is prompted; anyone else is told which job waits.
+    fn prompt_next_job_ask(&mut self, out: &mut dyn Printer) {
+        if self.prompted.is_some() {
+            return;
+        }
+        let Some((job, number, state)) = self.job_asks.first().cloned() else {
+            return;
+        };
+        let (call_id, menu, said) = match &state {
+            ThreadState::AwaitingApproval {
+                call_id,
+                call,
+                class,
+                reason,
+            } => (
+                call_id.clone(),
+                Menu::permission(call, *class, reason),
+                format!("job {number} wants to: {}", describe_call(call)),
+            ),
+            ThreadState::AwaitingHuman {
+                call_id,
+                question,
+                questions,
+            } => {
+                let all = if questions.is_empty() {
+                    vec![aigentic_api::AskedQuestion {
+                        question: question.clone(),
+                        header: None,
+                        options: Vec::new(),
+                        multi: false,
+                    }]
+                } else {
+                    questions.clone()
+                };
+                (
+                    call_id.clone(),
+                    Menu::asking(all),
+                    format!("job {number} asks: {question}"),
+                )
+            }
+            _ => return,
+        };
+        let may = match &state {
+            ThreadState::AwaitingApproval { .. } => self.may_approve(),
+            _ => self.may_write(),
+        };
+        if !may {
+            out.line(&format!("[{said}; waiting for someone who may answer]"));
+            return;
+        }
+        out.line(&format!("[{said}]"));
+        out.prompt(&menu);
+        self.menu = Some(menu);
+        self.prompted = Some(call_id);
+        self.prompted_thread = Some(job);
     }
 
     /// What the thread waits for, as this user sees it: a prompt when
@@ -3086,6 +3211,9 @@ impl ClientRepl {
                     out.prompt(&menu);
                     self.menu = Some(menu);
                     self.prompted = Some(call_id.clone());
+                    // This thread's own ask comes first; a job's ask that
+                    // was on screen stays queued and comes back after.
+                    self.prompted_thread = None;
                 } else {
                     out.line(&format!(
                         "[waiting for an approver: {}]",
@@ -3115,6 +3243,7 @@ impl ClientRepl {
                     out.prompt(&menu);
                     self.menu = Some(menu);
                     self.prompted = Some(call_id.clone());
+                    self.prompted_thread = None;
                 } else {
                     out.line(&format!("[waiting for an answer: {question}]"));
                 }
@@ -3133,6 +3262,7 @@ impl ClientRepl {
                     out.prompt(&menu);
                     self.menu = Some(menu);
                     self.prompted = Some(call_id.clone());
+                    self.prompted_thread = None;
                 } else {
                     out.line(&format!("[waiting for an answer: switch to {project}?]"));
                 }
@@ -3141,10 +3271,14 @@ impl ClientRepl {
                 // A decision's or an answer's event named its author
                 // before this state arrived and closed the prompt; this
                 // is the fallback for a wait that ended some other way.
-                if self.prompted.take().is_some() {
-                    out.line("[answered elsewhere]");
+                // A job's ask on screen is not this thread's to close.
+                if self.prompted_thread.is_none() {
+                    if self.prompted.take().is_some() {
+                        out.line("[answered elsewhere]");
+                    }
+                    self.menu = None;
+                    self.prompt_next_job_ask(out);
                 }
-                self.menu = None;
             }
         }
     }
@@ -13575,5 +13709,157 @@ mod tests {
             );
             assert_eq!(system_line(&e), Some(want));
         }
+    }
+
+    // ---- background jobs' asks in the front thread ------------------
+
+    /// A job's notice for the chat thread `front`.
+    fn job_notice(front: Ulid, job: Ulid, number: u32, state: ThreadState) -> Notice {
+        Notice::Job {
+            thread: front,
+            job,
+            number,
+            notice: Box::new(Notice::State { thread: job, state }),
+        }
+    }
+
+    /// A job's permission ask is drawn tagged with the job, and the
+    /// answer goes to the job's own thread, never the front's.
+    #[tokio::test]
+    async fn a_jobs_ask_is_prompted_tagged_and_answered_on_the_jobs_thread() {
+        let mut lead = Lead::start(Ulid::generate(), Vec::new()).await;
+        let front = lead.repl.thread;
+        let job = Ulid::generate();
+        lead.repl.render(
+            job_notice(
+                front,
+                job,
+                1,
+                ThreadState::Running {
+                    by: Author::System,
+                    queued: 0,
+                },
+            ),
+            &mut lead.out,
+        );
+        lead.repl.render(
+            job_notice(front, job, 1, approval_state("j1")),
+            &mut lead.out,
+        );
+        let lines = lead.lines();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l == &format!("[job 1 started · thread {job}]")),
+            "{lines:#?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.starts_with("[job 1 wants to:")),
+            "{lines:#?}"
+        );
+        assert_eq!(lead.repl.menu_id(), Some(format!("job:{job}:j1")));
+
+        let keyed = lead
+            .repl
+            .menu_key(&key_for('1'), true, true, &mut lead.out)
+            .await;
+        assert!(matches!(keyed, MenuKey::Used), "{keyed:?}");
+        let decided: Vec<Request> = lead
+            .daemon
+            .requests()
+            .into_iter()
+            .filter(|r| matches!(r, Request::Decide { .. }))
+            .collect();
+        assert_eq!(decided.len(), 1, "{decided:?}");
+        let Request::Decide {
+            thread,
+            call_id,
+            allow,
+            ..
+        } = &decided[0]
+        else {
+            unreachable!()
+        };
+        assert_eq!((*thread, call_id.as_str(), *allow), (job, "j1", true));
+        assert!(
+            lead.repl.menu().is_none(),
+            "the prompt closes once answered"
+        );
+        lead.daemon.stop();
+    }
+
+    /// Two jobs waiting are prompted oldest first, one at a time, and the
+    /// chat's own ask comes before both; a key meant for one prompt is
+    /// never read as the next one's.
+    #[tokio::test]
+    async fn job_asks_queue_oldest_first_behind_the_chats_own() {
+        let mut lead = Lead::start(Ulid::generate(), Vec::new()).await;
+        let front = lead.repl.thread;
+        let (first, second) = (Ulid::generate(), Ulid::generate());
+        lead.repl.render(
+            job_notice(front, first, 1, approval_state("a1")),
+            &mut lead.out,
+        );
+        lead.repl.render(
+            job_notice(front, second, 2, approval_state("b1")),
+            &mut lead.out,
+        );
+        assert_eq!(lead.repl.menu_id(), Some(format!("job:{first}:a1")));
+
+        // The chat's own ask takes the screen; the job's waits behind it.
+        lead.repl.render(
+            Notice::State {
+                thread: front,
+                state: approval_state("c1"),
+            },
+            &mut lead.out,
+        );
+        assert_eq!(lead.repl.menu_id().as_deref(), Some("chat:c1"));
+        lead.repl
+            .menu_key(&key_for('1'), true, true, &mut lead.out)
+            .await;
+        assert_eq!(
+            lead.repl.menu_id(),
+            Some(format!("job:{first}:a1")),
+            "the first job's ask comes back after the chat's"
+        );
+
+        // Answering the first brings the second; nothing answers it yet.
+        lead.repl
+            .menu_key(&key_for('1'), true, true, &mut lead.out)
+            .await;
+        assert_eq!(lead.repl.menu_id(), Some(format!("job:{second}:b1")));
+        let answered: Vec<(Ulid, String)> = lead
+            .daemon
+            .requests()
+            .into_iter()
+            .filter_map(|r| match r {
+                Request::Decide {
+                    thread, call_id, ..
+                } => Some((thread, call_id)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            answered,
+            vec![(front, "c1".into()), (first, "a1".into())],
+            "each answer went to its own thread, the second job's not yet"
+        );
+
+        // The second job's ask settled elsewhere: the prompt goes.
+        lead.repl.render(
+            job_notice(
+                front,
+                second,
+                2,
+                ThreadState::Running {
+                    by: Author::System,
+                    queued: 0,
+                },
+            ),
+            &mut lead.out,
+        );
+        assert!(lead.repl.menu().is_none(), "{:#?}", lead.lines());
+        lead.daemon.stop();
     }
 }
