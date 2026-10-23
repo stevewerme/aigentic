@@ -136,6 +136,14 @@ pub enum Mail {
         payload: JobFinishedPayload,
         reply: oneshot::Sender<Response>,
     },
+    /// A notice from a job this thread approved, for this thread's
+    /// subscribers: broadcast as `Notice::Job`, never written, so it is
+    /// taken idle and mid-turn alike.
+    JobNotice {
+        job: Ulid,
+        number: u32,
+        notice: Notice,
+    },
     /// The state now, for the table's idle sweep.
     Status {
         reply: oneshot::Sender<ThreadState>,
@@ -319,6 +327,17 @@ impl Shared {
             queued,
             thread_tokens: Some(usage.thread_tokens),
             working: self.working.count(),
+        });
+    }
+
+    /// Pass a job's own notice to this thread's subscribers, tagged with
+    /// the job.
+    fn forward_job(&self, job: Ulid, number: u32, notice: Notice) {
+        self.broadcast(Notice::Job {
+            thread: self.thread,
+            job,
+            number,
+            notice: Box::new(notice),
         });
     }
 
@@ -940,6 +959,14 @@ impl ThreadActor {
                 self.write_job_note(payload, reply);
                 None
             }
+            Mail::JobNotice {
+                job,
+                number,
+                notice,
+            } => {
+                self.shared.forward_job(job, number, notice);
+                None
+            }
             Mail::Status { reply } => {
                 let _ = reply.send(self.shared.state());
                 None
@@ -1414,6 +1441,11 @@ impl ThreadActor {
                     .unwrap_or_else(|e| e.into_inner())
                     .push((payload, reply));
             }
+            Mail::JobNotice {
+                job,
+                number,
+                notice,
+            } => shared.forward_job(job, number, notice),
             Mail::Interrupt { by, reply } => {
                 cancel.cancel(by);
                 let _ = reply.send(Response::Ok);

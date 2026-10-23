@@ -210,6 +210,9 @@ impl Follow {
             // The followed run's line belongs to the interactive footer;
             // plain exec already prints the frame as JSON when asked.
             Notice::RunStatus { .. } => {}
+            // A job's asks go to the person at the front thread's REPL;
+            // exec answers nothing, as it answers no ask of its own.
+            Notice::Job { .. } => {}
             Notice::TextDelta { text, .. } => {
                 if !self.json {
                     write!(err, "{text}")?;

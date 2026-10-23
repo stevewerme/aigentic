@@ -627,13 +627,19 @@ async fn handle(
     // A run-owned thread belongs to its run (issue #58, rule 5): its
     // step child or its lead is written by the run's task alone, so
     // nothing here may post into it, and no actor is started for it. A
-    // job's own thread is written by its driver alone, and only a
-    // person watching a runaway job may interrupt it.
+    // job's own thread is written by its driver alone; a person may only
+    // answer what it asks, which reaches them through the front thread,
+    // or interrupt a runaway job.
     if let Some(thread) = mutates_run(&request)
         && let run = threads.run_thread(thread)
         && (run != RunThread::No
             && !(matches!(run, RunThread::Job { .. })
-                && matches!(request, Request::Interrupt { .. })))
+                && matches!(
+                    request,
+                    Request::Interrupt { .. }
+                        | Request::Decide { .. }
+                        | Request::AnswerHuman { .. }
+                )))
     {
         return Response::Refused {
             reason: "this thread belongs to a run".into(),
@@ -1530,12 +1536,10 @@ mod tests {
         .unwrap();
     }
 
-    /// Only a person can stop a runaway job, so an `Interrupt` is the one
-    /// write a job's thread accepts: `Decide` and `AnswerHuman` wait for
-    /// the follow-up that forwards them, and nothing else writes into a
-    /// thread whose driver owns it.
+    /// A job's thread is its driver's to write: a person may answer what
+    /// the job asks and stop a runaway job, and nothing else reaches it.
     #[tokio::test]
-    async fn a_job_child_accepts_an_interrupt_and_nothing_else() {
+    async fn a_job_child_accepts_an_answer_or_an_interrupt_and_nothing_else() {
         let dir = tempfile::tempdir().unwrap();
         let root = project(dir.path(), "p", "");
         let table = quiet_table(dir.path(), root.clone());
@@ -1575,19 +1579,6 @@ mod tests {
                 )],
                 interrupt: false,
             },
-            Request::Decide {
-                thread: job,
-                call_id: "c".into(),
-                allow: true,
-                session: false,
-                prefix: None,
-                reason: None,
-            },
-            Request::AnswerHuman {
-                thread: job,
-                call_id: "c".into(),
-                text: "yes".into(),
-            },
             Request::Pin {
                 thread: job,
                 text: "x".into(),
@@ -1608,23 +1599,34 @@ mod tests {
             }
         }
 
-        // The interrupt reaches the job's actor.
-        match handle(
-            &config,
-            &table,
-            "u",
-            &author,
-            &mut open,
-            &out,
+        // An answer and an interrupt reach the job's actor. Nothing is
+        // waiting on call `c`, so the actor may refuse the answers, but
+        // never as a run's thread.
+        let reaching = [
+            Request::Decide {
+                thread: job,
+                call_id: "c".into(),
+                allow: true,
+                session: false,
+                prefix: None,
+                reason: None,
+            },
+            Request::AnswerHuman {
+                thread: job,
+                call_id: "c".into(),
+                text: "yes".into(),
+            },
             Request::Interrupt { thread: job },
-        )
-        .await
-        {
-            Response::Refused { reason } | Response::Error { message: reason } => {
-                assert!(!reason.contains("belongs to a run"), "{reason}")
+        ];
+        for request in reaching {
+            let named = format!("{request:?}");
+            match handle(&config, &table, "u", &author, &mut open, &out, request).await {
+                Response::Refused { reason } | Response::Error { message: reason } => {
+                    assert!(!reason.contains("belongs to a run"), "{named}: {reason}")
+                }
+                Response::Ok => {}
+                other => panic!("{named} was answered oddly: {other:?}"),
             }
-            Response::Ok => {}
-            other => panic!("the interrupt was answered oddly: {other:?}"),
         }
 
         // A step child is still the runner's alone.

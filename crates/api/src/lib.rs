@@ -23,8 +23,10 @@ use ulid::Ulid;
 /// version 6 adds `Notice::RunStatus`, which an older client cannot
 /// decode; version 7 adds `RunPhase::Stopped`, which an older client
 /// would render as a move; version 8 adds `Jobs`/`JobRow`, so a client
-/// that cannot show today's builds must refuse rather than misread one.
-pub const PROTOCOL_VERSION: u32 = 8;
+/// that cannot show today's builds must refuse rather than misread one;
+/// version 9 adds `Notice::Job`, which carries a background job's asks to
+/// the front thread, so a client that could not answer them must refuse.
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// One line on the wire.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -487,6 +489,17 @@ pub enum Notice {
     RunStatus {
         thread: Ulid,
         status: RunStatus,
+    },
+    /// A background job's own notice, forwarded to the front thread it
+    /// reports to: its asks, the answers that settle them, and its state.
+    /// `thread` is the front, `job` the job's own thread, which a
+    /// `Decide` or `AnswerHuman` for the ask is sent to, and `number` the
+    /// job's place among the front's jobs, counted from 1 in start order.
+    Job {
+        thread: Ulid,
+        job: Ulid,
+        number: u32,
+        notice: Box<Notice>,
     },
 }
 
@@ -1345,7 +1358,7 @@ mod tests {
     /// its log and the client cannot tell.
     #[test]
     fn t7_front_asked_round_trips_and_the_old_frame_still_decodes() {
-        assert_eq!(PROTOCOL_VERSION, 8, "the jobs pair moved it");
+        assert_eq!(PROTOCOL_VERSION, 9, "the job notice moved it");
         let asked = StartAsk {
             offered: "web".into(),
             chosen: "api".into(),
@@ -1397,7 +1410,7 @@ mod tests {
     /// (which always named one) still decodes.
     #[test]
     fn t1_list_threads_project_is_optional_on_the_wire() {
-        assert_eq!(PROTOCOL_VERSION, 8, "the jobs pair moved it");
+        assert_eq!(PROTOCOL_VERSION, 9, "the job notice moved it");
         let some = Frame::request(
             1,
             Request::ListThreads {
@@ -1712,6 +1725,31 @@ mod tests {
         assert!(
             decode(r#"{"notice":{"kind":"run_status","thread":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":{"issue":1,"phase":{"phase":"teleported"},"idle_secs":0}}}"#).is_err()
         );
-        assert_eq!(PROTOCOL_VERSION, 8, "the jobs pair moved it");
+        assert_eq!(PROTOCOL_VERSION, 9, "the job notice moved it");
+    }
+
+    /// A job's ask reaches the front thread inside one frame that names
+    /// both threads, so a client answers the job's thread, not the front.
+    #[test]
+    fn a_job_notice_carries_the_jobs_own_notice_and_both_threads() {
+        let front = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap();
+        let job = Ulid::from_string("01BX5ZZKBKACTAV9WEVGEMMVRZ").unwrap();
+        let frame = Frame::notice(Notice::Job {
+            thread: front,
+            job,
+            number: 2,
+            notice: Box::new(Notice::State {
+                thread: job,
+                state: ThreadState::Idle,
+            }),
+        });
+        let line = encode(&frame);
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["notice"]["kind"], "job");
+        assert_eq!(v["notice"]["thread"], front.to_string());
+        assert_eq!(v["notice"]["job"], job.to_string());
+        assert_eq!(v["notice"]["number"], 2);
+        assert_eq!(v["notice"]["notice"]["kind"], "state");
+        assert_eq!(decode(&line).unwrap(), frame, "{line}");
     }
 }

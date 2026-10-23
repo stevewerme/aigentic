@@ -3063,6 +3063,10 @@ impl ClientRepl {
             // The followed run's segment is the run view's; a notice for
             // any other lead has nothing to draw here either.
             Notice::RunStatus { .. } => {}
+            // A job's asks are answered on the job's own thread; this
+            // client draws none of them yet, so a job waits until someone
+            // answers it from a client that does.
+            Notice::Job { .. } => {}
         }
     }
 
@@ -4370,6 +4374,7 @@ fn notice_thread(notice: &Notice) -> Ulid {
         | Notice::Usage { thread, .. }
         | Notice::Note { thread, .. }
         | Notice::RunStatus { thread, .. }
+        | Notice::Job { thread, .. }
         | Notice::ToolCallStarted { thread, .. } => *thread,
     }
 }

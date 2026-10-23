@@ -11,13 +11,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aigentic_api::{Response, ThreadState};
+use aigentic_api::{Notice, Response, ThreadState};
 use aigentic_runtime::aigentic_core::{Author, ContentBlock, Event, EventKind};
 use aigentic_runtime::aigentic_log::{
-    AssistantMessagePayload, JobFinishedPayload, JobOutcome, TurnEndedPayload,
+    AssistantMessagePayload, DecisionAnswer, DecisionKind, JobFinishedPayload, JobOutcome,
+    TurnEndedPayload, decision_records,
 };
 use aigentic_runtime::{INTERRUPTED, JobSpec, Mode};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use ulid::Ulid;
 
 use crate::actor::{Mail, Mailbox};
@@ -73,14 +74,31 @@ async fn run(
         read_only: approved.read_only,
         mode: approved.mode,
     };
-    let (mailbox, _) = threads.open_job(child, spec).await?;
+    let number = job_number(&threads.events_from(front, 0)?);
+    let (front_box, _) = threads.open(front).await?;
+    let (mailbox, _) = match threads.open_job(child, spec).await {
+        Ok(opened) => opened,
+        Err(e) => {
+            threads.close(front);
+            return Err(e);
+        }
+    };
+    let forwarding = forward(&mailbox, front_box.clone(), child, number).await;
     let ended = drive(threads, &mailbox, approved.brief).await;
     threads.close(child);
-    let stopped = ended?;
+    if let Some(task) = forwarding {
+        task.abort();
+    }
+    let stopped = match ended {
+        Ok(stopped) => stopped,
+        Err(e) => {
+            threads.close(front);
+            return Err(e);
+        }
+    };
     let events = threads.events_from(child, 0)?;
     let payload = job_return(child, &events, stopped);
 
-    let (front_box, _) = threads.open(front).await?;
     let posted = send(&front_box, |reply| Mail::JobFinished { payload, reply }).await;
     threads.close(front);
     match posted {
@@ -128,6 +146,74 @@ async fn drive(
             return Ok(Some(deadline));
         }
     }
+}
+
+/// This job's place among the front thread's jobs, counted from 1 in
+/// start order: every approved job proposal in the front's log, this
+/// one's included, since its approval is written before it starts. Read
+/// from the log, so a number is never handed out twice, across restarts
+/// too.
+pub fn job_number(front_events: &[Event]) -> u32 {
+    decision_records(front_events)
+        .records
+        .iter()
+        .filter(|r| r.kind == DecisionKind::Job)
+        .filter(|r| {
+            r.answer
+                .as_ref()
+                .is_some_and(|a| a.answer == DecisionAnswer::Yes)
+        })
+        .count() as u32
+}
+
+/// Whether a job's notice is one the front thread's watchers need: a
+/// change of state, which carries a waiting permission request or
+/// question, and the permission events that ask and settle one.
+pub fn forwarded(notice: &Notice) -> bool {
+    match notice {
+        Notice::State { .. } => true,
+        Notice::Event { event, .. } => matches!(
+            event.kind,
+            EventKind::PermissionRequested | EventKind::PermissionDecided
+        ),
+        _ => false,
+    }
+}
+
+/// Subscribe to the job's thread and pass every forwarded notice to the
+/// front thread's actor, tagged with the job, until either side goes.
+/// `None` when the job's actor is already gone.
+async fn forward(
+    child_box: &Mailbox,
+    front_box: Mailbox,
+    job: Ulid,
+    number: u32,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let (notices, mut rx) = mpsc::unbounded_channel();
+    let (reply, ack) = oneshot::channel();
+    child_box
+        .send(Mail::Subscribe {
+            from_seq: u64::MAX,
+            notices,
+            reply,
+        })
+        .ok()?;
+    ack.await.ok()?;
+    Some(tokio::spawn(async move {
+        while let Some(notice) = rx.recv().await {
+            if forwarded(&notice)
+                && front_box
+                    .send(Mail::JobNotice {
+                        job,
+                        number,
+                        notice,
+                    })
+                    .is_err()
+            {
+                return;
+            }
+        }
+    }))
 }
 
 async fn status(mailbox: &Mailbox) -> Result<ThreadState, ThreadError> {
@@ -258,7 +344,10 @@ fn one_screen(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aigentic_runtime::aigentic_log::{NewEvent, ThreadLog, project_body};
+    use aigentic_runtime::aigentic_log::{
+        DecisionAnsweredPayload, DecisionProposedPayload, DecisionStage, NewEvent, ThreadLog,
+        project_body,
+    };
 
     /// A job stopped before any priced call costs nothing, and the front
     /// thread's context must say so rather than a negative zero.
@@ -308,5 +397,87 @@ mod tests {
         let cut = one_screen(&one_line);
         let (kept, _) = cut.split_once("\n\n").unwrap();
         assert_eq!(kept.chars().count(), JOB_SUMMARY_CHARS);
+    }
+
+    /// Append a `kind` proposal answered `answer`, as the front's turn
+    /// writes the pair.
+    fn decide(log: &mut ThreadLog, kind: DecisionKind, answer: DecisionAnswer) {
+        let proposed = log
+            .append(NewEvent {
+                kind: EventKind::DecisionProposed,
+                author: Author::System,
+                payload: serde_json::to_value(DecisionProposedPayload {
+                    kind,
+                    proposal: "a proposal".into(),
+                    target: None,
+                    reason: "a reason".into(),
+                    call_id: None,
+                    job: None,
+                    stage: DecisionStage::Ask,
+                })
+                .unwrap(),
+                parent_event: None,
+            })
+            .unwrap();
+        log.append(NewEvent {
+            kind: EventKind::DecisionAnswered,
+            author: Author::System,
+            payload: serde_json::to_value(DecisionAnsweredPayload {
+                answer,
+                correction: None,
+                note: None,
+            })
+            .unwrap(),
+            parent_event: Some(proposed.id),
+        })
+        .unwrap();
+    }
+
+    /// A job's number counts only the jobs a person said yes to, so a
+    /// declined proposal or another kind of decision never uses one up.
+    #[test]
+    fn a_jobs_number_counts_the_approved_jobs_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = ThreadLog::open(dir.path(), Ulid::generate()).unwrap();
+        assert_eq!(job_number(&log.read_all().unwrap()), 0);
+        decide(&mut log, DecisionKind::Job, DecisionAnswer::Yes);
+        assert_eq!(job_number(&log.read_all().unwrap()), 1);
+        decide(&mut log, DecisionKind::Job, DecisionAnswer::No);
+        decide(&mut log, DecisionKind::Project, DecisionAnswer::Yes);
+        assert_eq!(job_number(&log.read_all().unwrap()), 1);
+        decide(&mut log, DecisionKind::Job, DecisionAnswer::Yes);
+        assert_eq!(job_number(&log.read_all().unwrap()), 2);
+    }
+
+    /// The front thread is told what it may have to answer and nothing of
+    /// the job's working: a model reply or a tool result stays in the
+    /// job's own thread.
+    #[test]
+    fn only_state_and_permission_events_are_forwarded() {
+        let dir = tempfile::tempdir().unwrap();
+        let thread = Ulid::generate();
+        let mut log = ThreadLog::open(dir.path(), thread).unwrap();
+        let mut event = |kind| {
+            log.append(NewEvent {
+                kind,
+                author: Author::System,
+                payload: serde_json::json!({}),
+                parent_event: None,
+            })
+            .unwrap()
+        };
+        let notice = |event| Notice::Event { thread, event };
+        assert!(forwarded(&notice(event(EventKind::PermissionRequested))));
+        assert!(forwarded(&notice(event(EventKind::PermissionDecided))));
+        assert!(!forwarded(&notice(event(EventKind::AssistantMessage))));
+        assert!(!forwarded(&notice(event(EventKind::ToolResult))));
+        assert!(forwarded(&Notice::State {
+            thread,
+            state: ThreadState::Idle,
+        }));
+        assert!(!forwarded(&Notice::Note {
+            thread,
+            text: "a note".into(),
+        }));
     }
 }
