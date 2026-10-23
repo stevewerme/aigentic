@@ -176,6 +176,18 @@ impl Working {
         }
     }
 
+    /// The state a driven build or job was last noted at, or `None` when
+    /// nothing here drives it.
+    #[must_use]
+    pub fn state_of(&self, id: Ulid) -> Option<Option<JobState>> {
+        self.0
+            .jobs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&id)
+            .map(|job| job.state.clone())
+    }
+
     /// `lead` is no longer driven, whatever held it left behind.
     pub fn release(&self, lead: Ulid) {
         self.0

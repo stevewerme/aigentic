@@ -11,7 +11,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aigentic_api::{Notice, Response, ThreadState};
+use aigentic_api::{JobState, Notice, Response, ThreadState};
 use aigentic_runtime::aigentic_core::{Author, ContentBlock, Event, EventKind, ProviderError};
 use aigentic_runtime::aigentic_log::{
     AssistantMessagePayload, DecisionAnswer, DecisionKind, JobFinishedPayload, JobOutcome,
@@ -22,6 +22,7 @@ use tokio::sync::{mpsc, oneshot};
 use ulid::Ulid;
 
 use crate::actor::{Mail, Mailbox};
+use crate::runs::Working;
 use crate::threads::{ThreadError, ThreadTable};
 
 /// How often the driver asks the child whether it has ended.
@@ -69,6 +70,8 @@ async fn run(
         .root_of_thread(front)
         .ok_or(ThreadError::NoThread(front))?;
     let child = threads.create_job(front, &project, &root, approved.by.clone())?;
+    let working = threads.runs().working();
+    let _driven = Driven::new(working.clone(), child);
     let spec = JobSpec {
         front,
         read_only: approved.read_only,
@@ -83,7 +86,7 @@ async fn run(
             return Err(e);
         }
     };
-    let forwarding = forward(&mailbox, front_box.clone(), child, number).await;
+    let forwarding = forward(&mailbox, front_box.clone(), child, number, working).await;
     let ended = drive(threads, &mailbox, approved.brief).await;
     threads.close(child);
     if let Some(task) = forwarding {
@@ -217,6 +220,86 @@ pub fn job_number(front_events: &[Event]) -> u32 {
         .count() as u32
 }
 
+/// A driven job's place in the working count, held for as long as its
+/// driver runs: it joins as running and leaves when the driver ends,
+/// whichever way that is.
+struct Driven {
+    working: Working,
+    job: Ulid,
+}
+
+impl Driven {
+    fn new(working: Working, job: Ulid) -> Self {
+        working.register(job);
+        Self { working, job }
+    }
+}
+
+impl Drop for Driven {
+    fn drop(&mut self) {
+        self.working.release(self.job);
+    }
+}
+
+/// What a running job's thread state reads as on `/jobs`: waiting on a
+/// person while it holds an ask, running otherwise.
+pub fn job_state(state: &ThreadState) -> JobState {
+    match state {
+        ThreadState::AwaitingApproval { .. }
+        | ThreadState::AwaitingHuman { .. }
+        | ThreadState::AwaitingSwitch { .. } => JobState::WaitingOnYou,
+        _ => JobState::Running,
+    }
+}
+
+/// A job's row facts, from its log and, while a driver holds it, the
+/// state the driver last noted: `driven` is that state, or `None` when no
+/// driver here holds the job. An undriven job that ended reads as its
+/// return would, and one cut off mid-turn as stopped.
+pub fn job_facts(
+    events: &[Event],
+    driven: Option<Option<JobState>>,
+) -> (Option<JobState>, Option<f64>) {
+    let cost = Some(cost_of(events));
+    if let Some(state) = driven {
+        return (state, cost);
+    }
+    if !ended(events) {
+        return (
+            Some(JobState::Stopped {
+                reason: "no daemon is running it".into(),
+            }),
+            cost,
+        );
+    }
+    let child = events.first().map_or_else(Ulid::nil, |e| e.thread_id);
+    let state = match job_return(child, events, None).outcome {
+        JobOutcome::Finished => JobState::Done,
+        JobOutcome::Failed => JobState::Stopped {
+            reason: "it fell over".into(),
+        },
+        JobOutcome::Stopped => JobState::Stopped {
+            reason: "it was stopped".into(),
+        },
+    };
+    (Some(state), cost)
+}
+
+/// The first line of the job's brief: the work the person approved.
+pub fn brief_line(events: &[Event]) -> Option<String> {
+    events
+        .iter()
+        .find(|e| e.kind == EventKind::UserMessage)
+        .and_then(|e| {
+            serde_json::from_value::<aigentic_runtime::aigentic_log::UserMessagePayload>(
+                e.payload.clone(),
+            )
+            .ok()
+        })
+        .map(|p| crate::threads::first_line_of(&text_of(&p.blocks)))
+        .filter(|line| !line.trim().is_empty())
+}
+
 /// Whether a job's notice is one the front thread's watchers need: a
 /// change of state, which carries a waiting permission request or
 /// question, and the permission events that ask and settle one.
@@ -239,6 +322,7 @@ async fn forward(
     front_box: Mailbox,
     job: Ulid,
     number: u32,
+    working: Working,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let (notices, mut rx) = mpsc::unbounded_channel();
     let (reply, ack) = oneshot::channel();
@@ -252,6 +336,10 @@ async fn forward(
     ack.await.ok()?;
     Some(tokio::spawn(async move {
         while let Some(notice) = rx.recv().await {
+            if let Notice::State { state, .. } = &notice {
+                working.note_state(job, Some(job_state(state)));
+                working.recount();
+            }
             if forwarded(&notice)
                 && front_box
                     .send(Mail::JobNotice {
@@ -626,6 +714,39 @@ mod tests {
             "the advice is whole: {}",
             payload.summary
         );
+    }
+
+    /// A job's row reads what its driver last noted while one holds it,
+    /// and what its log says otherwise: done, fallen over, or cut off.
+    #[test]
+    fn a_jobs_row_reads_its_driver_or_else_its_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let running = job_log(dir.path(), vec![answer("still going")]);
+        assert_eq!(
+            job_facts(&running, Some(Some(JobState::WaitingOnYou))).0,
+            Some(JobState::WaitingOnYou)
+        );
+        assert!(matches!(
+            job_facts(&running, None).0,
+            Some(JobState::Stopped { .. })
+        ));
+        let done = job_log(
+            dir.path(),
+            vec![
+                answer("done"),
+                (EventKind::TurnEnded, serde_json::json!({"reason": "done"})),
+            ],
+        );
+        assert_eq!(job_facts(&done, None).0, Some(JobState::Done));
+        let fell = job_log(
+            dir.path(),
+            vec![fell_over(ProviderError::Unsupported("tools".into()))],
+        );
+        assert!(matches!(
+            job_facts(&fell, None).0,
+            Some(JobState::Stopped { .. })
+        ));
+        assert_eq!(brief_line(&done).as_deref(), Some("the brief"));
     }
 
     /// The start-up repair touches only a job whose last turn has ended,

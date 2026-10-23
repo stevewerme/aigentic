@@ -782,6 +782,25 @@ async fn handle(
                     Ok(rows
                         .into_iter()
                         .map(|row| {
+                            if row.issue.is_none() {
+                                let Ok(events) = table.events_from(row.id, 0) else {
+                                    return row;
+                                };
+                                let (state, cost_usd) = crate::jobs::job_facts(
+                                    &events,
+                                    table.runs().working().state_of(row.id),
+                                );
+                                let what = match crate::jobs::brief_line(&events) {
+                                    Some(line) => format!("{}: {line}", row.what),
+                                    None => row.what,
+                                };
+                                return JobRow {
+                                    what,
+                                    state,
+                                    cost_usd,
+                                    ..row
+                                };
+                            }
                             let Some(dir) = table.dir_of(row.id) else {
                                 return row;
                             };

@@ -9,7 +9,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use aigentic_api::{Notice, Response, ThreadState};
+use aigentic_api::{JobState, Notice, Response, ThreadState};
 use aigentic_runtime::aigentic_core::{
     Author, Capabilities, CompletionRequest, ContentBlock, Event, EventKind, Message, Provider,
     ProviderEvent, ToolCall, Usage, UserId,
@@ -374,6 +374,15 @@ async fn a_jobs_ask_reaches_the_front_and_an_answer_on_the_job_lets_it_finish() 
     assert_eq!(waiting_on, job, "the job's own state, as the job sent it");
     assert_eq!(call.args["command"], WRITE);
 
+    // `/jobs` and the working count see the job waiting on a person.
+    let working = rig.table.runs().working();
+    assert_eq!(working.state_of(job), Some(Some(JobState::WaitingOnYou)));
+    assert_eq!(working.count(), 1, "a waiting job counts as working");
+    let rows = rig.table.job_rows(None, |_| true).unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!((rows[0].id, rows[0].issue), (job, None));
+    assert_eq!(rows[0].what, "job 1");
+
     // Answer on the job's thread, which its driver holds open.
     let (job_box, _) = rig.table.open(job).await.unwrap();
     assert_eq!(
@@ -413,6 +422,18 @@ async fn a_jobs_ask_reaches_the_front_and_an_answer_on_the_job_lets_it_finish() 
     let posted = returns(&events(&rig.threads, front));
     assert_eq!(posted.len(), 1, "one return: {posted:?}");
     assert_eq!(posted[0].outcome, JobOutcome::Finished);
+
+    // An ended job leaves the working count, and its row reads done.
+    let working = rig.table.runs().working();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while working.state_of(job).is_some() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(working.state_of(job), None, "the driver released it");
+    assert_eq!(working.count(), 0);
+    let (state, _) =
+        aigentic_server::jobs::job_facts(&events(&rig.threads, job), working.state_of(job));
+    assert_eq!(state, Some(JobState::Done));
 }
 
 #[tokio::test]

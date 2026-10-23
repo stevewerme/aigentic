@@ -1032,9 +1032,11 @@ impl ThreadTable {
         rows
     }
 
-    /// A build's row as `/jobs` shows it: every lead this daemon knows,
-    /// newest first, with the project the caller may read. A step's child
-    /// and an ordinary thread are never rows, and a lead whose project the
+    /// The rows `/jobs` shows: every build lead and every background job
+    /// this daemon knows from today, newest first, with the project the
+    /// caller may read. A build's `what` is `build #<issue>`, a job's
+    /// `job <n>`, its place among its front thread's jobs. A step's child
+    /// and an ordinary thread are never rows, and a row whose project the
     /// caller cannot read is left out — a listing they may not read
     /// anywhere is empty rather than refused.
     ///
@@ -1059,8 +1061,12 @@ impl ThreadTable {
                     return None;
                 }
                 let indexed = self.lookup(id)?;
-                let RunThread::Lead { issue } = indexed.run else {
-                    return None;
+                let (issue, what) = match indexed.run {
+                    RunThread::Lead { issue } => (Some(issue), format!("build #{issue}")),
+                    RunThread::Job { front } => {
+                        (None, format!("job {}", self.job_number_of(id, front)))
+                    }
+                    _ => return None,
                 };
                 let its = indexed
                     .switched
@@ -1073,8 +1079,8 @@ impl ThreadTable {
                 }
                 Some(JobRow {
                     id,
-                    issue: Some(issue),
-                    what: format!("build #{issue}"),
+                    issue,
+                    what,
                     project: its,
                     state: None,
                     cost_usd: None,
@@ -1526,6 +1532,15 @@ impl ThreadTable {
 
     /// Which kind of run-owned thread `thread` is, from its own log,
     /// wherever that log lives.
+    /// `job`'s place among `front`'s jobs, counted from 1 in the order
+    /// they were made, as the front thread numbers them.
+    fn job_number_of(&self, job: Ulid, front: Ulid) -> usize {
+        self.job_threads()
+            .into_iter()
+            .filter(|(id, of)| *of == front && *id <= job)
+            .count()
+    }
+
     /// Every job thread the index knows, with the front thread it reports
     /// to.
     pub fn job_threads(&self) -> Vec<(Ulid, Ulid)> {
