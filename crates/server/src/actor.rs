@@ -1308,6 +1308,22 @@ impl ThreadActor {
             }
             Err(_) => note(&self.shared, "memory extraction timed out".into()),
         }
+        // The brief is written only after the whole reply, so a timeout
+        // drops the call before anything reaches the file.
+        match tokio::time::timeout(
+            SIDE_JOB_LIMIT,
+            self.runtime.refresh_project_brief(&mut observe),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(ref e)) => {
+                if let Some(text) = Self::side_job_note("brief refresh", e) {
+                    note(&self.shared, text);
+                }
+            }
+            Err(_) => note(&self.shared, "brief refresh timed out".into()),
+        }
         match tokio::time::timeout(SIDE_JOB_LIMIT, self.runtime.title_if_untitled(&mut observe))
             .await
         {

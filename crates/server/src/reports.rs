@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 use aigentic_api::ReportKind;
 use aigentic_runtime::aigentic_core::{Author, Event, EventKind};
 use aigentic_runtime::aigentic_log::{
-    AssistantMessagePayload, CompactedPayload, CompactionStrategy, MemoryExtractedPayload,
-    ThreadRenamedPayload, UserMessagePayload,
+    AssistantMessagePayload, BriefRefreshedPayload, CompactedPayload, CompactionStrategy,
+    MemoryExtractedPayload, ThreadRenamedPayload, UserMessagePayload,
 };
 use aigentic_runtime::aigentic_policy::Decision;
 use aigentic_runtime::project::{DOT_DIR, INSTRUCTIONS_FILE};
@@ -71,6 +71,9 @@ pub struct Cost {
     /// `/rename` — is no call and is not counted, so an old title is
     /// never priced after the fact.
     pub titles: u32,
+    /// Brief refreshes: each `brief_refreshed` line is one utility call
+    /// that rewrote, or kept, the project brief's current state.
+    pub briefs: u32,
     /// Tokens the side jobs sent and produced: the extractions' and the
     /// title calls' (issues #46, #49).
     pub side_input: u64,
@@ -146,6 +149,21 @@ pub fn cost_of(events: &[Event]) -> Cost {
         cost.side_input += usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens;
         cost.side_output += usage.output_tokens;
         if let Some(usd) = usage.cost_usd {
+            cost.side_spent = Some(cost.side_spent.unwrap_or(0.0) + usd);
+        }
+    }
+    for event in events
+        .iter()
+        .filter(|e| e.kind == EventKind::BriefRefreshed)
+    {
+        let Ok(p) = serde_json::from_value::<BriefRefreshedPayload>(event.payload.clone()) else {
+            continue;
+        };
+        cost.briefs += 1;
+        cost.side_input +=
+            p.usage.input_tokens + p.usage.cache_read_tokens + p.usage.cache_write_tokens;
+        cost.side_output += p.usage.output_tokens;
+        if let Some(usd) = p.usage.cost_usd {
             cost.side_spent = Some(cost.side_spent.unwrap_or(0.0) + usd);
         }
     }
@@ -263,7 +281,7 @@ fn last_message_line(events: &[Event]) -> Option<String> {
 
 /// What the side-jobs line says the jobs were, in its own wording:
 /// `1 extraction, 2 lines`, `1 title`, or both (issues #46, #49).
-fn side_parts(extractions: u32, lines: u32, titles: u32) -> String {
+fn side_parts(extractions: u32, lines: u32, titles: u32, briefs: u32) -> String {
     let mut parts = Vec::new();
     if extractions > 0 {
         parts.push(format!(
@@ -275,6 +293,12 @@ fn side_parts(extractions: u32, lines: u32, titles: u32) -> String {
         parts.push(format!(
             "{titles} title{}",
             if titles == 1 { "" } else { "s" }
+        ));
+    }
+    if briefs > 0 {
+        parts.push(format!(
+            "{briefs} brief{}",
+            if briefs == 1 { "" } else { "s" }
         ));
     }
     parts.join(", ")
@@ -319,11 +343,16 @@ impl fmt::Display for Cost {
                 }
             )?;
         }
-        if self.extractions + self.titles > 0 {
+        if self.extractions + self.titles + self.briefs > 0 {
             writeln!(
                 f,
                 "side jobs  {}   tokens in {} out {}{}",
-                side_parts(self.extractions, self.extraction_lines, self.titles),
+                side_parts(
+                    self.extractions,
+                    self.extraction_lines,
+                    self.titles,
+                    self.briefs
+                ),
                 self.side_input,
                 self.side_output,
                 // Only when the lines carry a price (issues #46, #49):
@@ -763,6 +792,7 @@ mod cost_tests {
                 extractions: 1,
                 extraction_lines: 2,
                 titles: 0,
+                briefs: 0,
                 side_input: 300,
                 side_output: 20,
                 side_spent: None,
@@ -1242,6 +1272,31 @@ mod cost_tests {
         assert_eq!(last_message_line(&runner_only), None);
         assert_eq!(last_message_line(&[costed(1000, 100, 0, Some(0.5))]), None);
         assert_eq!(last_message_line(&[]), None);
+    }
+
+    /// A brief refresh is a side job: the side line counts it, with its
+    /// tokens and its price beside the other side jobs'.
+    #[test]
+    fn a_brief_refresh_is_counted_and_priced_on_the_side_line() {
+        let events = vec![event(
+            EventKind::BriefRefreshed,
+            json!({
+                "through_seq": 4,
+                "old_hash": "a",
+                "new_hash": "b",
+                "model": "utility",
+                "usage": {"input_tokens": 900, "output_tokens": 60, "cost_usd": 0.0125},
+            }),
+        )];
+        let cost = cost_of(&events);
+        assert_eq!(cost.briefs, 1);
+        assert_eq!((cost.side_input, cost.side_output), (900, 60));
+        assert_eq!(cost.side_spent, Some(0.0125));
+        let shown = cost.to_string();
+        assert!(
+            shown.contains("side jobs  1 brief   tokens in 900 out 60   $0.0125 priced"),
+            "{shown}"
+        );
     }
 }
 
