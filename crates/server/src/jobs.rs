@@ -203,7 +203,8 @@ pub fn job_return(child: Ulid, events: &[Event], stopped: Option<Duration>) -> J
 }
 
 /// The sum of the prices the runtime stamped on the job's model calls; a
-/// call on an unpriced endpoint adds nothing.
+/// call on an unpriced endpoint adds nothing. Folded from `0.0` because
+/// `Sum for f64` starts at `-0.0`, which prints as `$-0.00`.
 fn cost_of(events: &[Event]) -> f64 {
     events
         .iter()
@@ -212,7 +213,7 @@ fn cost_of(events: &[Event]) -> f64 {
             serde_json::from_value::<AssistantMessagePayload>(event.payload.clone()).ok()
         })
         .filter_map(|payload| payload.usage.and_then(|usage| usage.cost_usd))
-        .sum()
+        .fold(0.0, |total, cost| total + cost)
 }
 
 fn text_of(blocks: &[ContentBlock]) -> String {
@@ -257,6 +258,36 @@ fn one_screen(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aigentic_runtime::aigentic_log::{NewEvent, ThreadLog, project_body};
+
+    /// A job stopped before any priced call costs nothing, and the front
+    /// thread's context must say so rather than a negative zero.
+    #[test]
+    fn a_job_with_no_priced_call_costs_exactly_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = ThreadLog::open(dir.path(), Ulid::generate()).unwrap();
+        let payload = job_return(Ulid::generate(), &[], Some(JOB_DEADLINE));
+        assert_eq!(payload.cost_usd.to_bits(), 0.0f64.to_bits());
+
+        log.append(NewEvent {
+            kind: EventKind::JobFinished,
+            author: Author::System,
+            payload: serde_json::to_value(&payload).unwrap(),
+            parent_event: None,
+        })
+        .unwrap();
+        let body = project_body(&log.read_all().unwrap()).unwrap();
+        let text = body
+            .iter()
+            .flat_map(|message| message.blocks.iter())
+            .filter_map(|block| match block {
+                ContentBlock::Text(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert!(text.contains("cost $0.00"), "{text}");
+        assert!(!text.contains("$-"), "{text}");
+    }
 
     /// The return is one screen on the front thread, and a cut never
     /// leaves half a line or reads as a cut of the log.
