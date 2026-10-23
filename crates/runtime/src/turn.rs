@@ -19,7 +19,7 @@ use crate::decisions::{CancelToken, Inbox, Queued};
 use crate::harness_tools::{
     ASK_HUMAN, FINISH_STEP, HARNESS_CLASS, NOT_RUN_JOB_SIBLING, NOT_RUN_JOB_SOLO, NOT_RUN_LENGTH,
     NOT_RUN_OVER_LIMIT, NOT_RUN_SIBLING, NOT_RUN_SOLO, READ_BRIEF, START_JOB, SUGGEST_PROJECT,
-    harness_specs_with, is_harness_tool, stale_tasks_reminder,
+    harness_specs_with, is_harness_tool, stale_tasks_reminder, start_job_spec,
 };
 use crate::runtime::{ASKED_HUMAN, INTERRUPTED, LENGTH_STOP, MAX_TOKENS_STOP, STEP_REPORTED};
 use crate::seams::{Verdict, author_name, denial_text};
@@ -893,6 +893,12 @@ impl Runtime {
             // some project in reach other than this one has one.
             self.read_brief_offered(),
         ));
+        // A proposal needs a person to answer it, so an ordinary thread is
+        // the only kind offered one: a step thread is watched by nobody
+        // and a job cannot start a job.
+        if self.step.is_none() && self.job.is_none() {
+            specs.push(start_job_spec());
+        }
         specs.retain(|s| self.tool_visible(&s.name));
         // A job's thread is offered none of the three that need a person:
         // they are answerable, so hiding is not what keeps it out of them,

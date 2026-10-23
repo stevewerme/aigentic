@@ -300,6 +300,11 @@ fn call_reply(id: &str, msg: &str) -> Vec<ProviderEvent> {
     ]
 }
 
+/// What an ordinary thread's `start_job` spec adds to every request.
+fn start_job_overhead() -> u64 {
+    aigentic_runtime::schemas_tokens(&[aigentic_runtime::harness_tools::start_job_spec()])
+}
+
 /// Runs one scripted turn against the echo tool: the double reports
 /// `k ×` its own count of every request it was sent, tools included
 /// ([`common::reporting_scripted`]), and the ceiling is `ceiling`. The
@@ -389,7 +394,9 @@ fn saturation_seqs(events: &[Event]) -> Vec<u64> {
 async fn the_same_script_sweeps_at_the_same_calls_scaled_or_not() {
     let ki = 2u64;
     let k = ki as f64;
-    let ceiling = 32_000u64;
+    // Sized for the tool list without `start_job`; every request carries
+    // its schema too, so the ceiling moves by what it reports.
+    let ceiling = 32_000u64 + ki * start_job_overhead();
     assert_eq!(ceiling % ki, 0, "C/k must be a whole number of tokens");
 
     // The seed is 1.0 and each call moves `RATIO_SMOOTHING` of the way to
@@ -1658,9 +1665,12 @@ fn projected_text(events: &[Event]) -> String {
 /// from `min_free` on the line the runtime itself prints.
 #[tokio::test]
 async fn a_batch_stubs_the_closed_turns_once_the_target_is_crossed() {
-    let (mut ran, prompts) = run_turns(7, 3, 1_200, batching(2_800)).await;
+    // Sized for the tool list without `start_job`; every request carries
+    // its schema too, so the target moves by what it adds.
+    let target = 2_800 + start_job_overhead();
+    let (mut ran, prompts) = run_turns(7, 3, 1_200, batching(target)).await;
     let line = ran.runtime.window_line();
-    assert_eq!(line, 2_800, "a wide window leaves the target as the line");
+    assert_eq!(line, target, "a wide window leaves the target as the line");
 
     let recorded = batches(&ran.events);
     assert!(

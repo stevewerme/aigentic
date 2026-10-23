@@ -99,6 +99,7 @@ async fn the_prefix_lists_skills_after_pins_and_offers_load_skill() {
             "load_skill",
             "pin",
             "recall",
+            "start_job",
             "suggest_project",
             "update_tasks"
         ]
@@ -142,6 +143,7 @@ async fn without_skills_there_is_no_prefix_block_and_no_load_skill() {
             "ask_human",
             "pin",
             "recall",
+            "start_job",
             "suggest_project",
             "update_tasks"
         ]

@@ -14,7 +14,7 @@ use aigentic_log::{PolicyRecord, ThreadLog, ToolResultPayload};
 use aigentic_policy::{Decision, Policy, Rule};
 use aigentic_runtime::harness_tools::{
     ASK_HUMAN, JOB_ASKS_NOBODY, JOB_STARTS_NO_JOB, JOB_STAYS_PUT, RECALL, START_JOB,
-    SUGGEST_PROJECT,
+    SUGGEST_PROJECT, harness_specs_with, start_job_spec,
 };
 use aigentic_runtime::{
     JOB_DENY, JOB_RULE_ASK, JOB_RULE_BOUNDARY, JOB_RULE_READ_ONLY, JobSpec, Mode, Runtime, Verdict,
@@ -334,6 +334,46 @@ async fn the_loops_deny_list_binds_a_job_in_every_mode() {
     let mut plain = rig(vec![], dir.path(), Mode::Auto, true);
     let verdict = decide(&mut plain, &env, RiskClass::Exec).await;
     assert!(!matches!(verdict, Verdict::Refuse(_)), "{verdict:?}");
+}
+
+/// An ordinary thread is the one place a job is proposed from; a step thread
+/// and a job's own child are not.
+#[tokio::test]
+async fn an_ordinary_thread_is_offered_start_job_a_step_or_job_child_is_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let plain = rig(vec![], dir.path(), Mode::Auto, true);
+    let offered = plain.tool_specs();
+    assert_eq!(
+        offered
+            .iter()
+            .filter(|s| s.name == start_job_spec().name)
+            .count(),
+        1,
+        "an ordinary thread offers start_job once"
+    );
+
+    let step = rig(vec![], dir.path(), Mode::Auto, true)
+        .with_step("implement", &[])
+        .expect("an empty deny list parses");
+    assert!(
+        !step.tool_specs().iter().any(|s| s.name == START_JOB),
+        "a step thread is offered nothing new"
+    );
+
+    let job = as_job(rig(vec![], dir.path(), Mode::Auto, true), false, Mode::Auto);
+    assert!(
+        !job.tool_specs().iter().any(|s| s.name == START_JOB),
+        "a job cannot start a job"
+    );
+
+    // The harness list itself never carries the spec: the offering is the
+    // runtime's, because only it knows what kind of thread it is.
+    for specs in [
+        harness_specs_with(true, true, true, true),
+        harness_specs_with(false, false, true, false),
+    ] {
+        assert!(!specs.iter().any(|s| s.name == START_JOB));
+    }
 }
 
 fn result_of(runtime: &Runtime) -> aigentic_core::ToolResult {
