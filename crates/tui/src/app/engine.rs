@@ -18,9 +18,10 @@ use aigentic_runtime::aigentic_core::{Author, ContentBlock, Event, EventKind, To
 use aigentic_runtime::aigentic_log::{
     AssistantMessagePayload, CheckpointAnsweredPayload, CheckpointAskedPayload, CompactedPayload,
     CompactionStrategy, DecisionAnswer, DecisionAnsweredPayload, DecisionKind,
-    DecisionProposedPayload, DecisionScope, InterruptedPayload, MemoryExtractedPayload, MemoryHome,
-    MemoryRememberedPayload, PermissionDecidedPayload, PolicyRecord, RunFinishedPayload,
-    SkillLoadedPayload, ToolResultPayload, TurnEndedPayload, Usage, UserMessagePayload,
+    DecisionProposedPayload, DecisionScope, InterruptedPayload, JobFinishedPayload,
+    MemoryExtractedPayload, MemoryHome, MemoryRememberedPayload, PermissionDecidedPayload,
+    PolicyRecord, RunFinishedPayload, SkillLoadedPayload, ToolResultPayload, TurnEndedPayload,
+    Usage, UserMessagePayload,
 };
 use aigentic_runtime::harness_tools::{TaskState, open_checklist};
 use aigentic_runtime::{ASKED_HUMAN, INTERRUPTED, LENGTH_STOP, NOT_RUN_OVER_LIMIT, NOT_RUN_SOLO};
@@ -3604,6 +3605,9 @@ fn system_line(event: &Event) -> Option<String> {
                 line.push_str(&format!(" ({note})"));
             }
             line
+        }),
+        EventKind::JobFinished => payload(event, |p: JobFinishedPayload| {
+            aigentic_runtime::aigentic_log::job_marker(&p.job_thread, p.outcome, p.cost_usd)
         }),
         _ => None,
     }
@@ -13542,6 +13546,29 @@ mod tests {
                     assert_eq!(system_line(&e).as_deref(), Some(want), "home {home:?}");
                 }
             }
+        }
+
+        /// A job's return draws the same marker the front thread's context
+        /// carries, so a returning job is never silent on screen.
+        #[test]
+        fn a_finished_job_draws_its_marker() {
+            let payload = aigentic_runtime::aigentic_log::JobFinishedPayload {
+                job_thread: ulid(7),
+                outcome: aigentic_runtime::aigentic_log::JobOutcome::Finished,
+                summary: "three callers".into(),
+                cost_usd: 0.25,
+            };
+            let want = aigentic_runtime::aigentic_log::job_marker(
+                &payload.job_thread,
+                payload.outcome,
+                payload.cost_usd,
+            );
+            let e = event(
+                EventKind::JobFinished,
+                1,
+                serde_json::to_value(&payload).unwrap(),
+            );
+            assert_eq!(system_line(&e), Some(want));
         }
     }
 }
