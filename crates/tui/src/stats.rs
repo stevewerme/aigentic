@@ -25,8 +25,8 @@ use std::path::Path;
 use aigentic_runtime::Prices;
 use aigentic_runtime::aigentic_core::{Author, ContentBlock, Event, EventKind};
 use aigentic_runtime::aigentic_log::{
-    AssistantMessagePayload, DecisionAnswer, DecisionKind, DecisionRecord, Invoker,
-    MemoryExtractedPayload, RunStartedPayload, SkillLoadedPayload, ThreadRenamedPayload,
+    AssistantMessagePayload, BriefRefreshedPayload, DecisionAnswer, DecisionKind, DecisionRecord,
+    Invoker, MemoryExtractedPayload, RunStartedPayload, SkillLoadedPayload, ThreadRenamedPayload,
     ThreadStartedPayload, ToolResultPayload, TurnEndedPayload, Usage, UserMessagePayload,
     decision_records,
 };
@@ -107,6 +107,8 @@ pub struct DayStats {
     pub job_unpriced_calls: u32,
     pub extractions: u32,
     pub titles: u32,
+    /// Brief refreshes among the side jobs.
+    pub briefs: u32,
     /// Tokens the side jobs sent and produced, also apart: folding them
     /// into the calls' context would make the hit rate fiction.
     pub job_context: u64,
@@ -142,6 +144,8 @@ pub struct ProjectStats {
     pub job_unpriced_calls: u32,
     pub extractions: u32,
     pub titles: u32,
+    /// Brief refreshes among the side jobs.
+    pub briefs: u32,
     pub job_context: u64,
     pub job_output: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -180,6 +184,8 @@ pub struct ModelStats {
     pub job_unpriced_calls: u32,
     pub extractions: u32,
     pub titles: u32,
+    /// Brief refreshes among the side jobs.
+    pub briefs: u32,
     pub job_context: u64,
     pub job_output: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -351,6 +357,8 @@ pub struct ThreadReport {
     pub job_unpriced_calls: u32,
     pub extractions: u32,
     pub titles: u32,
+    /// Brief refreshes among the side jobs.
+    pub briefs: u32,
     pub job_context: u64,
     pub job_output: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -406,6 +414,8 @@ pub struct IssueTotals {
     pub job_unpriced_calls: u32,
     pub extractions: u32,
     pub titles: u32,
+    /// Brief refreshes among the side jobs.
+    pub briefs: u32,
     pub job_context: u64,
     pub job_output: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -444,6 +454,7 @@ impl IssueTotals {
             total.job_unpriced_calls += t.job_unpriced_calls;
             total.extractions += t.extractions;
             total.titles += t.titles;
+            total.briefs += t.briefs;
             total.job_context += t.job_context;
             total.job_output += t.job_output;
             sum(&mut total.job_spent, t.job_spent);
@@ -996,6 +1007,7 @@ fn collect_issue(
 pub(crate) enum SideJob {
     Extraction,
     Title,
+    Brief,
 }
 
 /// One group's running totals — a day or a project, folded the same way.
@@ -1028,6 +1040,7 @@ pub(crate) struct Accum {
     /// `job_calls` split by kind: how many extractions, how many titles.
     extractions: u32,
     titles: u32,
+    briefs: u32,
     job_context: u64,
     job_output: u64,
     job_spent: Option<f64>,
@@ -1076,6 +1089,7 @@ impl Accum {
         match job {
             SideJob::Extraction => self.extractions += 1,
             SideJob::Title => self.titles += 1,
+            SideJob::Brief => self.briefs += 1,
         }
         self.job_context += context;
         self.job_output += output;
@@ -1115,6 +1129,7 @@ impl Accum {
             job_unpriced_calls: self.job_unpriced_calls,
             extractions: self.extractions,
             titles: self.titles,
+            briefs: self.briefs,
             job_context: self.job_context,
             job_output: self.job_output,
             job_spent: self.job_spent,
@@ -1148,6 +1163,7 @@ impl Accum {
             job_unpriced_calls: self.job_unpriced_calls,
             extractions: self.extractions,
             titles: self.titles,
+            briefs: self.briefs,
             job_context: self.job_context,
             job_output: self.job_output,
             job_spent: self.job_spent,
@@ -1178,6 +1194,7 @@ impl Accum {
             job_unpriced_calls: self.job_unpriced_calls,
             extractions: self.extractions,
             titles: self.titles,
+            briefs: self.briefs,
             job_context: self.job_context,
             job_output: self.job_output,
             job_spent: self.job_spent,
@@ -1234,6 +1251,7 @@ impl Accum {
             job_unpriced_calls: self.job_unpriced_calls,
             extractions: self.extractions,
             titles: self.titles,
+            briefs: self.briefs,
             job_context: self.job_context,
             job_output: self.job_output,
             job_spent: self.job_spent,
@@ -1424,6 +1442,33 @@ fn absorb(
                     output: usage.output_tokens,
                     cost,
                     job: SideJob::Extraction,
+                });
+            }
+            EventKind::BriefRefreshed => {
+                // A brief refresh is a side job, priced and counted the
+                // way an extraction is.
+                if !in_window {
+                    continue;
+                }
+                let Ok(p) = serde_json::from_value::<BriefRefreshedPayload>(event.payload.clone())
+                else {
+                    continue;
+                };
+                let mut usage = p.usage;
+                if usage.model.is_none() {
+                    usage.model = Some(p.model);
+                }
+                let context =
+                    usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens;
+                let cost = classify_cost(&usage, book);
+                thread.add_job(SideJob::Brief, context, usage.output_tokens, cost);
+                job_days.push(QueuedJob {
+                    model: model_key(&usage, book),
+                    day,
+                    context,
+                    output: usage.output_tokens,
+                    cost,
+                    job: SideJob::Brief,
                 });
             }
             EventKind::ProviderRetried => {
@@ -1715,13 +1760,16 @@ fn cost_line(
 /// The side jobs' parts, in the line's own wording: `1 title`,
 /// `2 extractions`, or both. Empty only when there are none — no caller
 /// prints it then.
-fn job_parts(extractions: u32, titles: u32) -> String {
+fn job_parts(extractions: u32, titles: u32, briefs: u32) -> String {
     let mut parts = Vec::new();
     if extractions > 0 {
         parts.push(format!("{extractions} extraction{}", plural(extractions)));
     }
     if titles > 0 {
         parts.push(format!("{titles} title{}", plural(titles)));
+    }
+    if briefs > 0 {
+        parts.push(format!("{briefs} brief{}", plural(briefs)));
     }
     parts.join(", ")
 }
@@ -1745,13 +1793,14 @@ fn side_line(
     unpriced: u32,
     extractions: u32,
     titles: u32,
+    briefs: u32,
     context: u64,
     output: u64,
 ) -> String {
     let detail = format!(
         "{priced} priced, {price_estimated} estimated, {unpriced} unpriced; {}, \
          in {context} out {output}",
-        job_parts(extractions, titles),
+        job_parts(extractions, titles, briefs),
     );
     if stamped > 0.0 && estimated > 0.0 {
         format!("side jobs  ${stamped:.4} + ~${estimated:.4} ({detail})")
@@ -1820,6 +1869,7 @@ pub fn render_thread(t: &ThreadReport) -> String {
                 t.job_unpriced_calls,
                 t.extractions,
                 t.titles,
+                t.briefs,
                 t.job_context,
                 t.job_output
             )
@@ -1906,6 +1956,7 @@ pub fn render_issue(report: &IssueReport) -> String {
                 total.job_unpriced_calls,
                 total.extractions,
                 total.titles,
+                total.briefs,
                 total.job_context,
                 total.job_output
             )
@@ -1989,6 +2040,7 @@ pub fn render(stats: &Stats) -> String {
     let jobs: u32 = stats.days.iter().map(|d| d.job_calls).sum();
     let extractions: u32 = stats.days.iter().map(|d| d.extractions).sum();
     let titles: u32 = stats.days.iter().map(|d| d.titles).sum();
+    let briefs: u32 = stats.days.iter().map(|d| d.briefs).sum();
     let job_priced: u32 = stats.days.iter().map(|d| d.job_priced_calls).sum();
     let job_price_estimated: u32 = stats.days.iter().map(|d| d.job_price_estimated_calls).sum();
     let job_unpriced: u32 = stats.days.iter().map(|d| d.job_unpriced_calls).sum();
@@ -2021,6 +2073,7 @@ pub fn render(stats: &Stats) -> String {
                 job_unpriced,
                 extractions,
                 titles,
+                briefs,
                 job_context,
                 job_output
             )
@@ -4151,6 +4204,46 @@ api_key_env = "TENSORX_API_KEY"
         );
         assert_eq!(stats.threads[0].spent, None);
         assert_eq!(stats.threads[0].price_estimated_spent, Some(retro));
+    }
+
+    /// A brief refresh is a side job: `stats` counts it, prices it from
+    /// its own stamp, and names it on the side-jobs line.
+    #[test]
+    fn a_brief_refresh_is_a_side_job_with_its_cost() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = Ulid::generate();
+        let lines = vec![
+            user("2026-09-28T11:00:00Z", "write the notes"),
+            json!({
+                "kind": "brief_refreshed",
+                "author": {"kind": "system"},
+                "payload": {
+                    "through_seq": 1,
+                    "old_hash": "a",
+                    "new_hash": "b",
+                    "model": "deepseek/deepseek-v4.1-flash",
+                    "usage": {
+                        "input_tokens": 900,
+                        "output_tokens": 60,
+                        "cache_read_tokens": 0,
+                        "cache_write_tokens": 0,
+                        "estimated": false,
+                        "cost_usd": 0.0125,
+                        "model": "deepseek/deepseek-v4.1-flash",
+                    },
+                },
+                "created_at": "2026-09-28T11:00:02Z",
+            }),
+        ];
+        write_thread(&dir.path().join("alpha"), id, &lines);
+        let stats = collect(dir.path(), &[], None, None, &book_of(PRICED_CONFIG)).unwrap();
+        let day = &stats.days[0];
+        assert_eq!((day.job_calls, day.briefs), (1, 1));
+        assert_eq!(day.job_spent, Some(0.0125));
+        assert_eq!((day.job_context, day.job_output), (900, 60));
+        let text = render(&stats);
+        assert!(text.contains("side jobs  $0.0125 ("), "{text}");
+        assert!(text.contains("; 1 brief, in 900 out 60)"), "{text}");
     }
 
     /// T7 (issue #46): the two lines a window with extractions adds. The

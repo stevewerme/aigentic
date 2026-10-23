@@ -213,6 +213,9 @@ name = "{name}"
 # enabled = true
 # every_n_turns = 1
 
+# [brief]
+# refresh = true
+
 # [skills]
 # enabled = []
 "#

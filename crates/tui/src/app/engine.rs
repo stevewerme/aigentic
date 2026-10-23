@@ -3585,6 +3585,25 @@ fn system_line(event: &Event) -> Option<String> {
                 line
             }
         }),
+        EventKind::BriefRefreshed => payload(
+            event,
+            |p: aigentic_runtime::aigentic_log::BriefRefreshedPayload| {
+                let mut line = if p.old_hash == p.new_hash {
+                    "brief: current state unchanged".to_owned()
+                } else {
+                    "brief: current state refreshed".to_owned()
+                };
+                if !p.model.is_empty() {
+                    line.push_str(&format!(" · {}", p.model));
+                }
+                let (stamped, estimated) = money_cells(&p.usage);
+                let money = crate::stats::money(stamped, estimated);
+                if money != "-" {
+                    line.push_str(&format!(" · {money}"));
+                }
+                line
+            },
+        ),
         EventKind::MemoryRemembered => payload(event, |p: MemoryRememberedPayload| {
             let home = memory_home_name(p.home);
             if p.written {
@@ -13550,6 +13569,26 @@ mod tests {
                     let e = event(EventKind::MemoryRemembered, 1, payload);
                     assert_eq!(system_line(&e).as_deref(), Some(want), "home {home:?}");
                 }
+            }
+        }
+
+        /// A brief refresh says whether the current state changed, which
+        /// model ran it and what it cost, as a memory extraction does.
+        #[test]
+        fn a_brief_refresh_draws_whether_it_changed_the_brief() {
+            for (new_hash, want) in [
+                ("b", "brief: current state refreshed · flash · $0.0125"),
+                ("a", "brief: current state unchanged · flash · $0.0125"),
+            ] {
+                let payload = serde_json::json!({
+                    "through_seq": 4,
+                    "old_hash": "a",
+                    "new_hash": new_hash,
+                    "model": "flash",
+                    "usage": {"input_tokens": 900, "output_tokens": 60, "cost_usd": 0.0125},
+                });
+                let e = event(EventKind::BriefRefreshed, 1, payload);
+                assert_eq!(system_line(&e).as_deref(), Some(want));
             }
         }
 

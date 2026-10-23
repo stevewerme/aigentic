@@ -498,6 +498,18 @@ impl Tally {
                     }
                     tally.price(&mut accum, &usage, book, Some(SideJob::Extraction));
                 }
+                EventKind::BriefRefreshed => {
+                    let Ok(p) = serde_json::from_value::<
+                        aigentic_runtime::aigentic_log::BriefRefreshedPayload,
+                    >(event.payload.clone()) else {
+                        continue;
+                    };
+                    let mut usage = p.usage;
+                    if usage.model.is_none() {
+                        usage.model = Some(p.model);
+                    }
+                    tally.price(&mut accum, &usage, book, Some(SideJob::Brief));
+                }
                 EventKind::ThreadRenamed => {
                     let Ok(p) =
                         serde_json::from_value::<ThreadRenamedPayload>(event.payload.clone())
