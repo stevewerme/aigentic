@@ -1530,8 +1530,6 @@ impl ThreadTable {
         Ok(None)
     }
 
-    /// Which kind of run-owned thread `thread` is, from its own log,
-    /// wherever that log lives.
     /// `job`'s place among `front`'s jobs, counted from 1 in the order
     /// they were made, as the front thread numbers them.
     fn job_number_of(&self, job: Ulid, front: Ulid) -> usize {
@@ -1555,6 +1553,8 @@ impl ThreadTable {
             .collect()
     }
 
+    /// Which kind of run-owned thread `thread` is, from its own log,
+    /// wherever that log lives.
     pub fn run_thread(&self, thread: Ulid) -> RunThread {
         let Some(dir) = self.dir_of(thread) else {
             return RunThread::No;

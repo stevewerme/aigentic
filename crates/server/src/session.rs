@@ -1555,6 +1555,84 @@ mod tests {
         .unwrap();
     }
 
+    /// `/jobs` through the session: a job's row carries its number and its
+    /// brief's first line, the state its log ended in and what it cost, as
+    /// a client is sent them.
+    #[tokio::test]
+    async fn the_jobs_answer_lists_a_job_with_its_brief_state_and_cost() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = project(dir.path(), "p", "");
+        let table = quiet_table(dir.path(), root.clone());
+        let config = Arc::new(ServerConfig {
+            listen: "unix".into(),
+            idle_unload_secs: 3600,
+            users: vec![UserConfig {
+                name: "u".into(),
+                token_env: None,
+                token: Some("t".into()),
+            }],
+            projects: vec![ProjectConfig {
+                name: "p".into(),
+                root: root.clone(),
+            }],
+            resume_runs: false,
+        });
+        let author = Author::User(UserId("u".into()));
+        let front = table.create("p", author.clone(), true).await.unwrap().id;
+        let job = table.create_job(front, "p", &root, author.clone()).unwrap();
+        let mut log =
+            aigentic_runtime::aigentic_log::ThreadLog::open(dir.path().join("threads"), job)
+                .unwrap();
+        for (kind, payload) in [
+            (
+                aigentic_runtime::aigentic_core::EventKind::UserMessage,
+                serde_json::json!({"blocks": [{"type": "text", "text": "List the callers\nof parse_config."}]}),
+            ),
+            (
+                aigentic_runtime::aigentic_core::EventKind::AssistantMessage,
+                serde_json::json!({
+                    "blocks": [{"type": "text", "text": "Three callers."}],
+                    "usage": {"input_tokens": 1, "output_tokens": 1, "cost_usd": 0.25},
+                }),
+            ),
+            (
+                aigentic_runtime::aigentic_core::EventKind::TurnEnded,
+                serde_json::json!({"reason": "done"}),
+            ),
+        ] {
+            log.append(aigentic_runtime::aigentic_log::NewEvent {
+                kind,
+                author: Author::System,
+                payload,
+                parent_event: None,
+            })
+            .unwrap();
+        }
+        let mut open: HashMap<Ulid, OpenThread> = HashMap::new();
+        let (out, _rx) = mpsc::unbounded_channel();
+        let Response::Jobs { rows } = handle(
+            &config,
+            &table,
+            "u",
+            &author,
+            &mut open,
+            &out,
+            Request::Jobs { project: None },
+        )
+        .await
+        else {
+            panic!("a Jobs answer");
+        };
+        let row = rows
+            .iter()
+            .find(|row| row.id == job)
+            .expect("the job is listed");
+        assert_eq!(row.issue, None);
+        assert_eq!(row.what, "job 1: List the callers");
+        assert_eq!(row.state, Some(aigentic_api::JobState::Done));
+        assert_eq!(row.cost_usd, Some(0.25));
+    }
+
     /// A job's thread is its driver's to write: a person may answer what
     /// the job asks and stop a runaway job, and nothing else reaches it.
     #[tokio::test]

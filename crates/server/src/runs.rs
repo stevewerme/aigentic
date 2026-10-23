@@ -111,13 +111,14 @@ pub struct RunWorld {
     pub working: Working,
 }
 
-/// How many builds the daemon drives right now, and the figure the wire
-/// carries.
+/// How many builds and background jobs the daemon drives right now, and
+/// the figure the wire carries.
 ///
-/// Only the daemon that drives the runs can count them, so the count lives
+/// Only the daemon that drives them can count them, so the count lives
 /// here: a client watching any thread still sees how busy the machine is.
-/// A build is in the map while its [`Runs`] slot is held — exactly while
-/// its task is alive — and the figure is what the wire's `working` reads.
+/// A build is in the map while its [`Runs`] slot is held, and a job while
+/// its driver runs — exactly while each task is alive — and the figure is
+/// what the wire's `working` reads.
 #[derive(Clone, Default)]
 pub struct Working(Arc<WorkingInner>);
 
@@ -142,10 +143,11 @@ struct WorkingJob {
 }
 
 impl Working {
-    /// A build is now driven: `lead` joins the count as `Running`, under
-    /// the day its id was minted on, the day its row is listed under. A
-    /// lead resumed after a restart keeps the day it started. Called by the
-    /// run path that takes the lead's slot.
+    /// A build or a job is now driven: `lead` (a build's lead, or a job's
+    /// own thread) joins the count as `Running`, under the day its id was
+    /// minted on, the day its row is listed under. A lead resumed after a
+    /// restart keeps the day it started. Called by the run path that takes
+    /// the lead's slot, and by a job's driver when it starts.
     pub fn register(&self, lead: Ulid) {
         self.0
             .jobs
@@ -198,8 +200,8 @@ impl Working {
         self.recount();
     }
 
-    /// Forget every driven build: a daemon ending its tasks drives
-    /// nothing.
+    /// Forget every driven build and job: a daemon ending its tasks
+    /// drives nothing.
     fn clear(&self) {
         self.0
             .jobs
@@ -209,9 +211,9 @@ impl Working {
         self.recount();
     }
 
-    /// How many builds are driven right now, from the same rule the rows
-    /// use: a build whose state is `Running` or `WaitingOnYou`, on today's
-    /// day, so the figure and the listing agree.
+    /// How many builds and jobs are driven right now, from the same rule
+    /// the rows use: one whose state is `Running` or `WaitingOnYou`, on
+    /// today's day, so the figure and the listing agree.
     #[must_use]
     pub fn count(&self) -> u32 {
         let today = day_of(OffsetDateTime::now_utc());
