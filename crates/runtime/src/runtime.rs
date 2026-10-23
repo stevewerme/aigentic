@@ -12,6 +12,7 @@ use aigentic_tools::{KnowledgeSnapshot, SEARCH_KNOWLEDGE, SearchKnowledgeTool};
 
 use crate::approver::{Approver, DenyAll};
 use crate::decisions::{Decisions, Pending};
+use crate::job::{JOB_DENY, Job, JobSpec};
 use crate::knowledge::{Knowledge, KnowledgeMode};
 use crate::layers::Layers;
 use crate::mode::Mode;
@@ -117,6 +118,10 @@ pub struct Runtime {
     /// on `Policy`, so `set_project` or a whole `Policy` swap cannot
     /// drop it (`## Plan amendment 2` item 2).
     pub(crate) step: Option<StepContext>,
+    /// Set when this thread is a background job's: its spec, and the deny
+    /// overlay the loop's list parses to. Held beside `step`, for the
+    /// same reason, and checked in the same place.
+    pub(crate) job: Option<Job>,
     pub(crate) skills: SkillSet,
     pub(crate) log: ThreadLog,
     pub(crate) agent: AgentId,
@@ -253,6 +258,7 @@ impl Runtime {
             session_grants: Vec::new(),
             mode: Mode::default(),
             step: None,
+            job: None,
             skills: SkillSet::default(),
             log,
             agent,
@@ -552,6 +558,28 @@ impl Runtime {
             overlay,
         });
         Ok(self)
+    }
+
+    /// Make this thread a background job's: `spec` is the approval it runs
+    /// under, and the loop's deny list is parsed once, here, so a typo in
+    /// it fails where the job is built rather than at its first call. The
+    /// overlay stands before the rules, as a step's does; a job differs in
+    /// that it asks nobody and reaches nothing outside its project.
+    pub fn with_job(mut self, spec: JobSpec) -> Result<Self, aigentic_policy::DenyParseError> {
+        let deny: Vec<String> = JOB_DENY.iter().map(|entry| (*entry).to_owned()).collect();
+        let overlay = StepOverlay::parse(&deny)?;
+        self.job = Some(Job::new(spec, overlay));
+        Ok(self)
+    }
+
+    /// What this thread is as a job, when it is one.
+    pub fn job(&self) -> Option<&JobSpec> {
+        self.job.as_ref().map(Job::spec)
+    }
+
+    /// The job's deny overlay, for the policy seam.
+    pub(crate) fn job_overlay(&self) -> Option<&StepOverlay> {
+        self.job.as_ref().map(Job::overlay)
     }
 
     /// Arm the fold: `base` is the head this step's first attempt recorded,

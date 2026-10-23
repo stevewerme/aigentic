@@ -200,6 +200,17 @@ pub const NOT_IN_PROJECT: &str = "a job runs in a project, and this thread is in
 /// The refusal of a `start_job` call in a step thread.
 pub const STEP_REFUSED: &str = "start_job is proposed from the front thread, not a step thread";
 
+/// The refusal of an `ask_human` call in a job's own thread: nobody is
+/// watching it, so a question there would park the job for good.
+pub const JOB_ASKS_NOBODY: &str =
+    "a job asks nobody: decide from the brief and the project, and report what you found";
+
+/// The refusal of a `start_job` call in a job's own thread.
+pub const JOB_STARTS_NO_JOB: &str = "a job cannot start a job: do the work in this thread";
+
+/// The refusal of a `suggest_project` call in a job's own thread.
+pub const JOB_STAYS_PUT: &str = "a job cannot move project: it runs where it was started";
+
 /// The ack a `yes` to a job proposal is answered with when it hands a
 /// context over: a job proposal takes no project, so no context is used.
 pub const JOB_NO_TARGET: &str = "a job proposal takes no project";
@@ -1051,6 +1062,12 @@ impl Runtime {
             is_error: true,
         };
         let result = match call.name.as_str() {
+            // A job's thread has nobody to ask, nowhere to move to and no
+            // front thread to propose another job from, so those three are
+            // refused before anything is written.
+            ASK_HUMAN if self.job.is_some() => err(JOB_ASKS_NOBODY.into()),
+            START_JOB if self.job.is_some() => err(JOB_STARTS_NO_JOB.into()),
+            SUGGEST_PROJECT if self.job.is_some() => err(JOB_STAYS_PUT.into()),
             PIN => match serde_json::from_value::<PinArgs>(call.args.clone()) {
                 Ok(args) => {
                     let payload = serde_json::to_value(PinnedPayload { text: args.text })

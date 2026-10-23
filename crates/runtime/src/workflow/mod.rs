@@ -776,6 +776,9 @@ pub(crate) mod tests {
                 "copy .env",
             ]
         );
+        // A job runs with nobody watching, under this same list: the two
+        // are one list, so an entry added here cannot miss jobs.
+        assert_eq!(crate::JOB_DENY, step.deny.as_slice());
 
         let mut slots: BTreeMap<String, serde_json::Value> = loaded
             .workflow

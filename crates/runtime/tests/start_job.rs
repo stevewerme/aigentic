@@ -592,10 +592,11 @@ async fn calls_after_a_job_proposal_do_not_run() {
     assert_eq!(proposals(&events).len(), 1, "the proposal stands");
 }
 
-/// `start_job` is answerable and never offered, so what a model
-/// receives is unchanged.
+/// The harness list carries no `start_job` spec: that list is what a
+/// thread's kind does not decide. `Runtime::tool_specs` offers it in an
+/// ordinary thread and in no other.
 #[tokio::test]
-async fn start_job_is_answerable_but_not_offered() {
+async fn the_harness_list_carries_no_start_job_spec() {
     for offered in [
         harness_specs_with(true, true, true, true),
         harness_specs(true, true, true),

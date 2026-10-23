@@ -13,6 +13,7 @@ use ulid::Ulid;
 
 use crate::approver::Answer;
 use crate::decisions::{Answered, CancelToken, Pending};
+use crate::job::{JOB_RULE_ASK, JOB_RULE_BOUNDARY, JOB_RULE_READ_ONLY};
 use crate::mode::Mode;
 use crate::{Runtime, RuntimeError, Signal};
 
@@ -97,14 +98,19 @@ fn bash_command(call: &ToolCall) -> Option<String> {
 impl Runtime {
     /// The policy seam. The file boundary is asked first, before the
     /// overlay: nothing but a person may let a file tool reach another
-    /// project. The rules decide next, and when the thread has a step
-    /// overlay its outcome replaces theirs — unless the boundary asked,
-    /// which the overlay never answers — so an overlay deny never reaches
-    /// the mode, the grants or the approver. What is left an `Ask`
+    /// project. The rules decide next, and when the thread has a step or
+    /// job overlay its outcome replaces theirs — unless the boundary
+    /// asked, which the overlay never answers — so an overlay deny never
+    /// reaches the mode, the grants or the approver. What is left an `Ask`
     /// consults the mode, then the session grants, then `Decisions` when
     /// set (the turn parks until someone decides or `cancel` fires) or
     /// else the approver, appending `permission_requested` and
     /// `permission_decided` so every human answer is an attributed event.
+    ///
+    /// A job's thread shortens the last steps, because nobody watches it:
+    /// a write in a read-only job and a path outside the project are
+    /// refused outright, and an ask that nothing stood in for is refused
+    /// rather than parked in a request no one will answer.
     pub async fn policy_check(
         &mut self,
         call: &ToolCall,
@@ -121,6 +127,17 @@ impl Runtime {
         // from that same directory, which is what closes the
         // `cd .aigentic` memory escape.
         let cwd = self.registry.workdir().map(|w| w.current());
+        let read_only = self.job.as_ref().is_some_and(|job| job.spec().read_only);
+        let job_overlay = self.job_overlay();
+        // A read-only job changes nothing: no project rule and no mode may
+        // let a write class call through.
+        let read_only_refusal = || {
+            Verdict::Refuse(PolicyRecord::rule_with_reason(
+                JOB_RULE_READ_ONLY,
+                "deny",
+                "this job only reads: it was approved to change nothing",
+            ))
+        };
         let outcome = {
             let decided = self.policy.decide(call, class, cwd.as_deref());
             match decided {
@@ -129,6 +146,7 @@ impl Runtime {
                     .step
                     .as_ref()
                     .and_then(|step| step.overlay.decide(call))
+                    .or_else(|| job_overlay.and_then(|overlay| overlay.decide(call)))
                 {
                     Some(overlay) => overlay,
                     None => inside,
@@ -140,6 +158,9 @@ impl Runtime {
         // an ordinary ask.
         let (reason, outside, boundary_scope) = match outcome {
             Outcome::Allow { rule } => {
+                if read_only && class == RiskClass::Write {
+                    return Ok(read_only_refusal());
+                }
                 return Ok(Verdict::Run(PolicyRecord::rule(rule, "allow")));
             }
             Outcome::Deny { rule, reason } if reason.is_empty() => {
@@ -150,15 +171,25 @@ impl Runtime {
                     rule, "deny", reason,
                 )));
             }
-            Outcome::Ask { reason } => (reason, false, None),
+            Outcome::Ask { reason } => {
+                if read_only && class == RiskClass::Write {
+                    return Ok(read_only_refusal());
+                }
+                (reason, false, None)
+            }
             // A step or job thread has no person to answer, and #77 needs
             // a job in `auto` to stay inside its project: outside a
             // boundary the step is refused outright.
-            Outcome::AskBoundary { reason, .. } if self.step.is_some() => {
+            Outcome::AskBoundary { reason, .. } if self.step.is_some() || self.job.is_some() => {
+                let (rule, instead) = if self.job.is_some() {
+                    (JOB_RULE_BOUNDARY, "a job stays inside its project")
+                } else {
+                    (BOUNDARY_RULE, "a step never reaches another project")
+                };
                 return Ok(Verdict::Refuse(PolicyRecord::rule_with_reason(
-                    BOUNDARY_RULE,
+                    rule,
                     "deny",
-                    format!("{reason} — a step never reaches another project"),
+                    format!("{reason} — {instead}"),
                 )));
             }
             Outcome::AskBoundary { reason, path } => (reason, true, path),
@@ -167,17 +198,28 @@ impl Runtime {
         // The mode stands in for the human on what the rules would ask
         // about, never on what they deny, and never on a boundary ask: an
         // outside path is a person's to answer in every mode. The record
-        // names the mode.
-        let mode_allows = !outside
-            && match self.mode {
-                Mode::Manual => false,
-                Mode::AcceptEdits => class == RiskClass::Write,
-                Mode::Auto => true,
-            };
+        // names the mode. A read-only job runs only reads through the
+        // mode, so a shell write the rules would ask about stays asked.
+        let by_mode = match self.mode {
+            Mode::Manual => false,
+            Mode::AcceptEdits => class == RiskClass::Write,
+            Mode::Auto => true,
+        };
+        let mode_allows = !outside && by_mode && (!read_only || class == RiskClass::Read);
         if mode_allows {
             return Ok(Verdict::Run(PolicyRecord::rule(
                 self.mode.rule_name(),
                 "allow",
+            )));
+        }
+
+        // A job writes no request nobody can answer: it would park there
+        // for good, watching a thread no one is in.
+        if self.job.is_some() {
+            return Ok(Verdict::Refuse(PolicyRecord::rule_with_reason(
+                JOB_RULE_ASK,
+                "deny",
+                reason,
             )));
         }
 

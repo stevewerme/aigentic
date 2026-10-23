@@ -894,6 +894,12 @@ impl Runtime {
             self.read_brief_offered(),
         ));
         specs.retain(|s| self.tool_visible(&s.name));
+        // A job's thread is offered none of the three that need a person:
+        // they are answerable, so hiding is not what keeps it out of them,
+        // but a job's model should not be invited either.
+        if self.job.is_some() {
+            specs.retain(|s| !matches!(s.name.as_str(), ASK_HUMAN | START_JOB | SUGGEST_PROJECT));
+        }
         specs.sort_by(|a, b| a.name.cmp(&b.name));
         specs
     }

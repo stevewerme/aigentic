@@ -31,6 +31,7 @@ mod decisions;
 mod error;
 pub mod evict;
 pub mod harness_tools;
+pub mod job;
 pub mod knowledge;
 pub mod layers;
 mod memory;
@@ -62,7 +63,11 @@ pub use evict::{
     Decision, EVICT_BLOCK_CALLS, EVICT_MIN_FREE_PERCENT, RATIO_MAX, RATIO_MIN, RATIO_SMOOTHING,
     calibrated, calibrated_delta, min_free, next_ratio, schemas_tokens,
 };
-pub use harness_tools::{IdleProposal, NOT_RUN_LENGTH, NOT_RUN_OVER_LIMIT, NOT_RUN_SOLO, Settled};
+pub use harness_tools::{
+    IdleProposal, JOB_ASKS_NOBODY, JOB_STARTS_NO_JOB, JOB_STAYS_PUT, NOT_RUN_LENGTH,
+    NOT_RUN_OVER_LIMIT, NOT_RUN_SOLO, Settled,
+};
+pub use job::{JOB_DENY, JOB_RULE_ASK, JOB_RULE_BOUNDARY, JOB_RULE_READ_ONLY, JobSpec};
 pub use knowledge::{Knowledge, KnowledgeMode, ScopeSources};
 pub use layers::{Decided, GlobalLayer, Layers, PERSON_MEMORY_HEADING, WorkspaceLayer};
 pub use memory::{MEMORY_FILES, MEMORY_PROMPT, MEMORY_REQUEST};
