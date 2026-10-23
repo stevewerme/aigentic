@@ -339,15 +339,15 @@ pub fn job_return(child: Ulid, events: &[Event], stopped: Option<Duration>) -> J
     {
         let (cause, again) = match &ended.error {
             Some(error) if error.is_transient() || matches!(error, ProviderError::Cut) => (
-                format!("{} ({error})", error.cause_line()),
+                format!("{} ({})", error.cause_line(), clipped(&error.to_string())),
                 "The fault looks passing: starting the job again would likely get past it.",
             ),
             Some(error) => (
-                format!("{} ({error})", error.cause_line()),
+                format!("{} ({})", error.cause_line(), clipped(&error.to_string())),
                 "Starting the job again would fail the same way until that is fixed.",
             ),
             None => (
-                ended.reason.clone(),
+                clipped(&ended.reason),
                 "Read the job's own thread before starting it again.",
             ),
         };
@@ -358,7 +358,7 @@ pub fn job_return(child: Ulid, events: &[Event], stopped: Option<Duration>) -> J
     } else if let Some(ended) = failed {
         let cause = match &ended.error {
             Some(error) => error.cause_line(),
-            None => ended.reason.clone(),
+            None => clipped(&ended.reason),
         };
         let words = last_words.as_deref().unwrap_or_default();
         (
@@ -406,6 +406,20 @@ fn text_of(blocks: &[ContentBlock]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// The most characters of a provider's own error text a return quotes:
+/// enough to name the fault, never a whole response body.
+pub const JOB_ERROR_CHARS: usize = 300;
+
+/// `text` cut at [`JOB_ERROR_CHARS`] characters, with `…` where it was
+/// cut, so a failure's return stays one screen whatever the provider sent.
+fn clipped(text: &str) -> String {
+    if text.chars().count() <= JOB_ERROR_CHARS {
+        return text.to_owned();
+    }
+    let kept: String = text.chars().take(JOB_ERROR_CHARS).collect();
+    format!("{kept}…")
 }
 
 /// `text` whole when it fits in [`JOB_SUMMARY_CHARS`], else as many whole
@@ -582,6 +596,34 @@ mod tests {
         assert!(
             payload.summary.contains("fail the same way"),
             "{}",
+            payload.summary
+        );
+    }
+
+    /// A provider that answers a failure with a huge body still gives a
+    /// one-screen return: the error is clipped and the advice kept whole,
+    /// since the return sits in the front thread's context from then on.
+    #[test]
+    fn a_failures_return_stays_one_screen_whatever_the_provider_sent() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = job_log(
+            dir.path(),
+            vec![fell_over(ProviderError::Http {
+                status: 502,
+                body: "x".repeat(200_000),
+            })],
+        );
+        let payload = job_return(Ulid::generate(), &events, None);
+        assert_eq!(payload.outcome, JobOutcome::Failed);
+        assert!(
+            payload.summary.chars().count() <= JOB_SUMMARY_CHARS,
+            "{} characters",
+            payload.summary.chars().count()
+        );
+        assert!(payload.summary.contains("HTTP 502"), "{}", payload.summary);
+        assert!(
+            payload.summary.ends_with("would likely get past it."),
+            "the advice is whole: {}",
             payload.summary
         );
     }
