@@ -450,3 +450,48 @@ async fn a_job_that_can_be_answered_asks_and_parks_instead_of_refusing() {
         "the request is in the job's log for the front thread to see"
     );
 }
+
+/// A front thread reads its own job's live line by number or by id, and
+/// is refused a number it has no job for, so `inspect_job` never reads a
+/// thread that is not one of its own jobs.
+#[tokio::test]
+async fn inspect_job_reads_this_threads_own_job_and_nothing_else() {
+    let dir = tempfile::tempdir().unwrap();
+    let front = rig(vec![], dir.path(), Mode::Auto, false);
+    let job = Ulid::generate();
+    let mut log = ThreadLog::open(dir.path(), job).unwrap();
+    for (kind, payload) in [
+        (
+            EventKind::ThreadStarted,
+            json!({
+                "project": "aigentic",
+                "root": dir.path(),
+                "created_by": {"kind": "system"},
+                "parent_thread": front.log().thread_id().to_string(),
+                "job": true,
+            }),
+        ),
+        (
+            EventKind::UserMessage,
+            json!({"blocks": [{"type": "text", "text": "list the callers"}]}),
+        ),
+    ] {
+        log.append(aigentic_runtime::aigentic_log::NewEvent {
+            kind,
+            author: aigentic_runtime::aigentic_core::Author::System,
+            payload,
+            parent_event: None,
+        })
+        .unwrap();
+    }
+
+    let by_number = front.inspect_job("1").unwrap();
+    assert!(
+        by_number.starts_with(&format!("job 1 ({job}): running")),
+        "{by_number}"
+    );
+    assert_eq!(front.inspect_job(&job.to_string()).unwrap(), by_number);
+    let refused = front.inspect_job("2").unwrap_err();
+    assert!(refused.contains("1 job(s)"), "{refused}");
+    assert!(front.inspect_job(&Ulid::generate().to_string()).is_err());
+}

@@ -898,6 +898,11 @@ impl Runtime {
         // and a job cannot start a job.
         if self.step.is_none() && self.job.is_none() {
             specs.push(start_job_spec());
+            // A thread with a job to ask about is offered the way to ask;
+            // one that never started a job keeps the list it had.
+            if self.has_approved_job() {
+                specs.push(crate::harness_tools::inspect_job_spec());
+            }
         }
         specs.retain(|s| self.tool_visible(&s.name));
         // A job's thread is never offered a job or a move, and is offered

@@ -32,6 +32,7 @@ mod error;
 pub mod evict;
 pub mod harness_tools;
 pub mod job;
+pub mod job_view;
 pub mod knowledge;
 pub mod layers;
 mod memory;

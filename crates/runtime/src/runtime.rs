@@ -944,6 +944,54 @@ impl Runtime {
         }
     }
 
+    /// The live line of one of this thread's jobs: `id` is its number,
+    /// counted from 1 as the jobs were made, or its thread id. A job that
+    /// is not this thread's is refused, so no other thread's log is read.
+    pub fn inspect_job(&self, id: &str) -> Result<String, String> {
+        let dir = self
+            .log
+            .path()
+            .parent()
+            .ok_or_else(|| "this thread's log has no directory".to_owned())?;
+        let jobs = crate::job_view::jobs_of(dir, self.log.thread_id());
+        let found = match id.parse::<usize>() {
+            Ok(n) if n >= 1 => jobs.get(n - 1).map(|job| (n, *job)),
+            Ok(_) => None,
+            Err(_) => id.parse::<ulid::Ulid>().ok().and_then(|wanted| {
+                jobs.iter()
+                    .position(|j| *j == wanted)
+                    .map(|i| (i + 1, wanted))
+            }),
+        };
+        let Some((number, job)) = found else {
+            return Err(format!(
+                "no job {id} here: this thread has started {} job(s)",
+                jobs.len()
+            ));
+        };
+        let events = crate::job_view::read_events(dir, job)
+            .ok_or_else(|| format!("job {number}'s log could not be read"))?;
+        Ok(crate::job_view::job_line(
+            number,
+            job,
+            &events,
+            time::OffsetDateTime::now_utc(),
+        ))
+    }
+
+    /// Whether this thread's log holds a job proposal a person said yes to.
+    pub fn has_approved_job(&self) -> bool {
+        aigentic_log::decision_records(self.log.events())
+            .records
+            .iter()
+            .any(|r| {
+                r.kind == aigentic_log::DecisionKind::Job
+                    && r.answer
+                        .as_ref()
+                        .is_some_and(|a| a.answer == aigentic_log::DecisionAnswer::Yes)
+            })
+    }
+
     /// Whether `read_brief` is in the tool list the model sees (issue
     /// #123): some project in reach other than this thread's own carries
     /// a brief. A project's own brief is no reason to offer it — that

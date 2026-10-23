@@ -57,6 +57,12 @@ pub const SUGGEST_PROJECT: &str = "suggest_project";
 /// thread. Not offered in any thread's spec here; `is_harness_tool` answers
 /// it so a call can be refused honestly.
 pub const START_JOB: &str = "start_job";
+
+/// The tool a front thread's model reads one of its jobs' live line with.
+pub const INSPECT_JOB: &str = "inspect_job";
+
+/// What `inspect_job`'s description says.
+pub const INSPECT_JOB_DESCRIPTION: &str = "Read how one of the background jobs this thread started is going, from its own log: its state, its turns, how long it has run, its tool calls, its cost, its checklist and its last call. `id` is the job's number (1 for the first job this thread started) or its thread id.";
 /// Opening a sibling's brief (issue #123): the one-line in the projects
 /// block is always there, the body on demand. Offered only when some
 /// project in reach other than this thread's own carries a brief.
@@ -933,6 +939,21 @@ pub fn start_job_spec() -> ToolSpec {
     }
 }
 
+pub fn inspect_job_spec() -> ToolSpec {
+    ToolSpec {
+        name: INSPECT_JOB.into(),
+        description: INSPECT_JOB_DESCRIPTION.into(),
+        schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "id": {"type": "string", "description": "The job's number, as this thread counts its jobs, or its thread id."}
+            },
+            "required": ["id"]
+        }),
+    }
+}
+
 /// The harness tools' names, for a skill's `requires` check: they are
 /// always available, whatever the registry holds.
 pub fn harness_names() -> Vec<String> {
@@ -962,6 +983,7 @@ pub fn is_harness_tool(name: &str) -> bool {
             | FINISH_STEP
             | SUGGEST_PROJECT
             | START_JOB
+            | INSPECT_JOB
     )
 }
 
@@ -1223,6 +1245,13 @@ impl Runtime {
                     },
                 }
             }
+            INSPECT_JOB => match call.args.get("id").and_then(|v| v.as_str()) {
+                None => err("invalid arguments: `id` is a job's number or thread id".into()),
+                Some(id) => match self.inspect_job(id.trim()) {
+                    Ok(line) => ok(line),
+                    Err(message) => err(message),
+                },
+            },
             RECALL => match recall_form(&call.args) {
                 Err(e) => err(e),
                 Ok(form) => match crate::recall_tool::output(self.log.events(), &form) {
