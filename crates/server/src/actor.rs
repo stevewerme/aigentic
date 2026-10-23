@@ -11,13 +11,13 @@
 //! from the actor's mirror of the log. What needs the runtime itself
 //! (pin, compact, set the mode, a report) waits for the turn to end.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
 
 use aigentic_api::{AskedOption, AskedQuestion, Notice, ReportKind, Response, ThreadState};
 use aigentic_runtime::aigentic_core::{Author, ContentBlock, Event, EventKind};
 use aigentic_runtime::aigentic_log::{
-    PermissionRequestedPayload, UserMessagePayload, declined_at_startup,
+    JobFinishedPayload, PermissionRequestedPayload, UserMessagePayload, declined_at_startup,
 };
 use aigentic_runtime::{
     ASKED_HUMAN, Answered, CancelToken, Decisions, IdleProposal, Mode, Outbox, Pending, Queued,
@@ -129,6 +129,13 @@ pub enum Mail {
         kind: ReportKind,
         reply: oneshot::Sender<Response>,
     },
+    /// A job this thread approved has ended: append its `job_finished`,
+    /// then reply. Taken idle and mid-turn; mid-turn it is written when
+    /// the turn ends, since only the turn may write while it runs.
+    JobFinished {
+        payload: JobFinishedPayload,
+        reply: oneshot::Sender<Response>,
+    },
     /// The state now, for the table's idle sweep.
     Status {
         reply: oneshot::Sender<ThreadState>,
@@ -214,6 +221,12 @@ struct Shared {
     /// it, and a change wakes the loop so every open thread re-pushes
     /// that line.
     working: crate::runs::Working,
+    /// The table that opened this actor, weak because the table owns it.
+    /// A job a person approves in a turn is started through it; a handle
+    /// that no longer upgrades is a daemon shutting down.
+    store: Mutex<Weak<crate::threads::ThreadTable>>,
+    /// Job returns that arrived mid-turn, written when the turn ends.
+    job_notes: Mutex<Vec<(JobFinishedPayload, oneshot::Sender<Response>)>>,
     /// The keep-awake guard and whether a hold is outstanding (issue
     /// #47), under one lock. `held` keeps hold and release paired, so a
     /// turn interrupted while it was waiting cannot release twice, and
@@ -419,6 +432,29 @@ impl Shared {
                 thread: self.thread,
                 call: call.clone(),
             }),
+            Signal::JobApproved {
+                task,
+                brief,
+                read_only,
+                by,
+                mode,
+            } => {
+                let table = self
+                    .store
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .upgrade();
+                if let Some(table) = table {
+                    let approved = crate::jobs::Approved {
+                        by: by.clone(),
+                        task: task.to_owned(),
+                        brief: brief.to_owned(),
+                        read_only,
+                        mode,
+                    };
+                    tokio::spawn(crate::jobs::start(table, self.thread, approved));
+                }
+            }
             // A wait is not work: a person may take minutes, and the
             // machine must be free to sleep meanwhile (issue #47).
             Signal::Waiting(pending) => {
@@ -541,6 +577,8 @@ impl ThreadActor {
             labels,
             working: working.clone(),
             switched: Mutex::new(false),
+            store: Mutex::new(Weak::new()),
+            job_notes: Mutex::new(Vec::new()),
             guard: Mutex::new(Hold {
                 guard: Arc::new(crate::awake::ProcessGuard::off()),
                 held: false,
@@ -574,6 +612,31 @@ impl ThreadActor {
             waiting: false,
         };
         self
+    }
+
+    /// Hand the actor the table that opened it, so a job approved in one
+    /// of its turns can be started.
+    pub fn with_store(self, store: Weak<crate::threads::ThreadTable>) -> Self {
+        *self.shared.store.lock().unwrap_or_else(|e| e.into_inner()) = store;
+        self
+    }
+
+    /// Append a job's return through the runtime, and say how it went.
+    fn write_job_note(&mut self, payload: JobFinishedPayload, reply: oneshot::Sender<Response>) {
+        let shared = self.shared.clone();
+        let sys = Author::System;
+        let written = self.runtime.append_note(
+            EventKind::JobFinished,
+            Author::System,
+            serde_json::to_value(payload).expect("job_finished serialises"),
+            &mut |s| shared.observe(s, &sys),
+        );
+        let _ = reply.send(match written {
+            Ok(_) => Response::Ok,
+            Err(e) => Response::Error {
+                message: e.to_string(),
+            },
+        });
     }
 
     /// Phase 2's resume: repair events are appended (and mirrored) and,
@@ -873,6 +936,10 @@ impl ThreadActor {
                 self.subscribe(from_seq, notices, reply);
                 None
             }
+            Mail::JobFinished { payload, reply } => {
+                self.write_job_note(payload, reply);
+                None
+            }
             Mail::Status { reply } => {
                 let _ = reply.send(self.shared.state());
                 None
@@ -1136,6 +1203,16 @@ impl ThreadActor {
                 .take();
             next = self.after_turn(outcome, last_poster);
         }
+        let notes = std::mem::take(
+            &mut *self
+                .shared
+                .job_notes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+        for (payload, reply) in notes {
+            self.write_job_note(payload, reply);
+        }
         *self
             .shared
             .started
@@ -1329,6 +1406,13 @@ impl ThreadActor {
             }
             Mail::Status { reply } => {
                 let _ = reply.send(shared.state());
+            }
+            Mail::JobFinished { payload, reply } => {
+                shared
+                    .job_notes
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((payload, reply));
             }
             Mail::Interrupt { by, reply } => {
                 cancel.cancel(by);

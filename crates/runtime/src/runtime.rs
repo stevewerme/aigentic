@@ -1270,6 +1270,18 @@ pub enum Signal<'a> {
     /// The turn parked on a decision (phase 5); a client shows what is
     /// waited for.
     Waiting(&'a Pending),
+    /// A person approved a `start_job` proposal, and the answer is in the
+    /// log: the work, the brief the job's own thread starts from, whether
+    /// it may change files, who approved it, and this thread's permission
+    /// mode at that moment, which the job runs under. The daemon starts
+    /// the job from it; a client that runs no jobs ignores it.
+    JobApproved {
+        task: &'a str,
+        brief: &'a str,
+        read_only: bool,
+        by: &'a aigentic_core::Author,
+        mode: Mode,
+    },
 }
 
 /// One project in reach, as `read_brief` needs it (issue #123): the name

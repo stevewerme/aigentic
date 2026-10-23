@@ -13,13 +13,14 @@ use aigentic_api::{
 };
 use aigentic_runtime::ProjectFile;
 use aigentic_runtime::ProjectRow;
-use aigentic_runtime::aigentic_core::{Author, ContentBlock, Event, EventKind, UserId};
+use aigentic_runtime::aigentic_core::{Author, ContentBlock, Event, EventKind, RiskClass, UserId};
 use aigentic_runtime::aigentic_log::{
     NewEvent, ProjectSwitchedPayload, Repair, RunStartedPayload, ThreadLog, ThreadStartedPayload,
     UserMessagePayload,
 };
 use aigentic_runtime::aigentic_policy::Participants;
 use aigentic_runtime::workflow::WorkflowFile;
+use aigentic_runtime::{JobSpec, Mode};
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
 use ulid::{Generator, Ulid};
@@ -191,6 +192,10 @@ pub struct ThreadTable {
     /// time: a test drives a daemon the way a client does, through
     /// `Server::new`.
     run_deps: Mutex<Arc<dyn RunDeps>>,
+    /// How often a job's driver looks at its child, and how long it lets
+    /// one run before stopping it: [`crate::jobs::JOB_TICK`] and
+    /// [`crate::jobs::JOB_DEADLINE`] unless a test installed its own.
+    job_limits: Mutex<(Duration, Duration)>,
     /// Each project's brief one-liner, by root and the mtime it was read
     /// at (issue #123). A `stat` per project per build or switch is
     /// cheap; a read happens only when the file changed, and `None` — no
@@ -344,6 +349,7 @@ impl ThreadTable {
             ids: Mutex::new(Arc::new(Ids::live())),
             runs: Arc::new(Runs::new()),
             run_deps: Mutex::new(Arc::new(ProdDeps)),
+            job_limits: Mutex::new((crate::jobs::JOB_TICK, crate::jobs::JOB_DEADLINE)),
             brief_cache: Mutex::new(HashMap::new()),
             build_lock: AsyncMutex::new(()),
             profile_override: None,
@@ -405,6 +411,18 @@ impl ThreadTable {
     /// unless a test installed its own; see [`crate::runs::RunDeps`].
     pub fn with_run_deps(&self, deps: Arc<dyn RunDeps>) {
         *self.run_deps.lock().unwrap_or_else(|e| e.into_inner()) = deps;
+    }
+
+    /// Replace how often a job's driver looks at its child and how long a
+    /// job may run, so a test need not wait out the real ones.
+    #[doc(hidden)]
+    pub fn with_job_limits(&self, tick: Duration, deadline: Duration) {
+        *self.job_limits.lock().unwrap_or_else(|e| e.into_inner()) = (tick, deadline);
+    }
+
+    /// The driver's tick and a job's deadline, as they stand now.
+    pub(crate) fn job_limits(&self) -> (Duration, Duration) {
+        *self.job_limits.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// The seams a run drives the world through, as they stand now.
@@ -1230,8 +1248,37 @@ impl ThreadTable {
     }
 
     /// The mailbox of a thread, starting its actor when it is not open.
-    /// Counts one more open session on it.
-    pub async fn open(&self, thread: Ulid) -> Result<(Mailbox, String), ThreadError> {
+    /// Counts one more open session on it. A job's thread opened this way
+    /// is built read-only and in `manual`: its approval is not in its log,
+    /// so the narrowest reading of it is the one a stray open gets.
+    pub async fn open(self: &Arc<Self>, thread: Ulid) -> Result<(Mailbox, String), ThreadError> {
+        let job = match self.run_thread(thread) {
+            RunThread::Job { front } => Some(JobSpec {
+                front,
+                read_only: true,
+                mode: Mode::Manual,
+            }),
+            _ => None,
+        };
+        self.open_as(thread, job).await
+    }
+
+    /// Open a job's own thread with the approval it runs under: `spec`
+    /// sets its mode and its limits, and a read-only job's registry holds
+    /// no write tool. Counts one more open session, as `open` does.
+    pub async fn open_job(
+        self: &Arc<Self>,
+        thread: Ulid,
+        spec: JobSpec,
+    ) -> Result<(Mailbox, String), ThreadError> {
+        self.open_as(thread, Some(spec)).await
+    }
+
+    async fn open_as(
+        self: &Arc<Self>,
+        thread: Ulid,
+        job: Option<JobSpec>,
+    ) -> Result<(Mailbox, String), ThreadError> {
         {
             let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(e) = entries.get_mut(&thread) {
@@ -1267,14 +1314,34 @@ impl ThreadTable {
             reach,
         )
         .await?;
+        let mut runtime = built.runtime;
+        if let Some(spec) = job {
+            let read_only = spec.read_only;
+            runtime = runtime
+                .with_job(spec)
+                .map_err(|e| ThreadError::Refused(e.to_string()))?;
+            if read_only {
+                let writers: Vec<String> = runtime
+                    .registry()
+                    .iter()
+                    .filter(|tool| tool.risk_class() == RiskClass::Write)
+                    .map(|tool| tool.name().to_owned())
+                    .collect();
+                for name in writers {
+                    runtime.registry_mut().remove(&name);
+                }
+            }
+        }
         let (actor, mailbox) = ThreadActor::new(
-            built.runtime,
+            runtime,
             built.torn,
             self.reports.clone(),
             self.labels(),
             self.runs().working(),
         )?;
-        let actor = actor.with_keep_awake(self.guard());
+        let actor = actor
+            .with_keep_awake(self.guard())
+            .with_store(Arc::downgrade(self));
         tokio::spawn(actor.run());
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         // Two sessions may have raced to build it; the first in wins and

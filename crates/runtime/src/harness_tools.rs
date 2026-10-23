@@ -1464,6 +1464,13 @@ impl Runtime {
                     proposal,
                     observe,
                 )?;
+                observe(Signal::JobApproved {
+                    task: &args.task,
+                    brief: &args.brief,
+                    read_only: args.read_only,
+                    by: &who,
+                    mode: self.mode,
+                });
                 Ok((said(id, job_approved_text(&args.task)), who))
             }
             crate::SwitchAnswer::No => {

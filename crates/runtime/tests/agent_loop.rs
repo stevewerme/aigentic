@@ -49,6 +49,7 @@ async fn tool_call_round_trip_produces_the_exact_event_sequence() {
                 Signal::ToolCallStarted(_)
                 | Signal::Waiting(_)
                 | Signal::Usage(_)
+                | Signal::JobApproved { .. }
                 | Signal::Note(_) => {}
             },
         )

@@ -240,6 +240,20 @@ impl Runtime {
         observe(Signal::Event(&event));
         Ok(event)
     }
+
+    /// Append one event from outside a turn, through the thread's own
+    /// writer: counted and observed like any event a turn appends. For a
+    /// daemon writing what happened elsewhere into this thread (a job's
+    /// return on its front thread); it never starts a turn.
+    pub fn append_note(
+        &mut self,
+        kind: EventKind,
+        author: Author,
+        payload: serde_json::Value,
+        observe: &mut (dyn FnMut(Signal<'_>) + Send),
+    ) -> Result<Event, RuntimeError> {
+        self.append(kind, author, payload, None, observe)
+    }
 }
 
 impl Runtime {
