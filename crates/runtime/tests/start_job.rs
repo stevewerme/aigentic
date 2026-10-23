@@ -644,3 +644,171 @@ async fn the_start_job_spec_asks_for_a_task_and_a_brief() {
             .is_err()
     );
 }
+
+/// A turn held to one second of wall time, so a park longer than that
+/// ends it unless the park is exempt.
+fn held_to_a_second(runtime: Runtime) -> Runtime {
+    runtime.with_budget(aigentic_core::Budget {
+        max_iterations: 10,
+        max_tokens: u64::MAX,
+        max_wall_time: std::time::Duration::from_millis(1_000),
+        max_cost_usd: None,
+        cache_read_price_ratio: 0.25,
+    })
+}
+
+/// The id of the first call waiting on `decisions`, once one is.
+async fn parked_call(decisions: &Decisions) -> String {
+    for _ in 0..4_000 {
+        if let Some(pending) = decisions.pending().first() {
+            return pending.call_id().to_owned();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("the turn never parked");
+}
+
+/// A model that makes `first`, then speaks once the result is back.
+fn calls_then_speaks(first: ToolCall) -> Vec<Vec<ProviderEvent>> {
+    vec![
+        vec![ProviderEvent::ToolCall(first), done("tool_use")],
+        speaks("ok"),
+    ]
+}
+
+/// A person's time is never the turn's. A park refused after longer than
+/// the whole budget hands the model an error and the turn carries on, so
+/// it must end `done` after a second call, never on `max_wall_time`.
+fn carried_on(outcome: &aigentic_runtime::TurnOutcome) {
+    assert_eq!(outcome.reason, "done", "not max_wall_time");
+    assert_eq!(outcome.iterations, 2, "the model was called again");
+}
+
+/// Park on `first`, answer it with `answer` after one and a half seconds,
+/// and say how the turn ended.
+async fn refused_past_the_budget(
+    first: ToolCall,
+    answer: fn() -> Answered,
+) -> aigentic_runtime::TurnOutcome {
+    let dir = tempfile::tempdir().unwrap();
+    let decisions = Arc::new(Decisions::new());
+    let mut runtime = held_to_a_second(here(calls_then_speaks(first), dir.path()))
+        .with_decisions(decisions.clone());
+    let answering = tokio::spawn(async move {
+        let call_id = parked_call(&decisions).await;
+        tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+        decisions.decide(&call_id, answer()).unwrap();
+    });
+    let outcome = quiet_turn(&mut runtime).await.unwrap();
+    answering.await.unwrap();
+    outcome
+}
+
+/// No one answers a question: the approver's default, after a person-sized
+/// wait.
+struct NobodyAfterAWhile;
+impl aigentic_runtime::Approver for NobodyAfterAWhile {
+    fn author(&self) -> Author {
+        steve()
+    }
+    fn ask(&mut self, _: &aigentic_log::PermissionRequestedPayload) -> aigentic_runtime::Answer {
+        aigentic_runtime::Answer::Deny
+    }
+    fn ask_human(&mut self, _: &str) -> Option<String> {
+        std::thread::sleep(std::time::Duration::from_millis(1_500));
+        None
+    }
+}
+
+#[tokio::test]
+async fn an_unanswered_question_past_the_wall_budget_lets_the_turn_carry_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let ask = ToolCall {
+        id: "h1".into(),
+        name: aigentic_runtime::harness_tools::ASK_HUMAN.into(),
+        args: json!({"question": "which branch?"}),
+    };
+    let mut runtime = held_to_a_second(here(calls_then_speaks(ask), dir.path()))
+        .with_approver(Box::new(NobodyAfterAWhile));
+    carried_on(&quiet_turn(&mut runtime).await.unwrap());
+}
+
+#[tokio::test]
+async fn a_refused_project_proposal_past_the_wall_budget_lets_the_turn_carry_on() {
+    let suggest = ToolCall {
+        id: "s1".into(),
+        name: aigentic_runtime::harness_tools::SUGGEST_PROJECT.into(),
+        args: json!({"project": "aigentic-web", "reason": "it is there"}),
+    };
+    // A yes that brings no context is refused.
+    let outcome = refused_past_the_budget(suggest, || Answered::Switch {
+        answer: SwitchAnswer::Yes,
+        by: steve(),
+        ctx: SwitchCtx::none(),
+    })
+    .await;
+    carried_on(&outcome);
+}
+
+#[tokio::test]
+async fn a_withdrawn_job_proposal_past_the_wall_budget_lets_the_turn_carry_on() {
+    let outcome =
+        refused_past_the_budget(propose("j1", json!({"task": TASK, "brief": BRIEF})), || {
+            Answered::Switch {
+                answer: SwitchAnswer::Withdrawn("the daemon restarted".into()),
+                by: steve(),
+                ctx: SwitchCtx::none(),
+            }
+        })
+        .await;
+    carried_on(&outcome);
+}
+
+/// The proposal carries the read-only flag the call set, both ways, so a
+/// read-only job is never approved as one that may write.
+#[tokio::test]
+async fn a_job_proposal_carries_the_read_only_flag_it_was_given() {
+    for read_only in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let decisions = Arc::new(Decisions::new());
+        let mut runtime = here(
+            vec![
+                vec![
+                    ProviderEvent::ToolCall(propose(
+                        "j1",
+                        json!({"task": TASK, "brief": BRIEF, "read_only": read_only}),
+                    )),
+                    done("tool_use"),
+                ],
+                speaks("ok"),
+            ],
+            dir.path(),
+        )
+        .with_decisions(decisions.clone());
+        let answering = tokio::spawn(async move {
+            let call_id = parked_call(&decisions).await;
+            decisions
+                .decide(
+                    &call_id,
+                    Answered::Switch {
+                        answer: SwitchAnswer::No,
+                        by: steve(),
+                        ctx: SwitchCtx::none(),
+                    },
+                )
+                .unwrap();
+        });
+        quiet_turn(&mut runtime).await.unwrap();
+        answering.await.unwrap();
+        let proposed: DecisionProposedPayload = log_events(&runtime)
+            .into_iter()
+            .find(|e| e.kind == EventKind::DecisionProposed)
+            .map(|e| serde_json::from_value(e.payload).unwrap())
+            .expect("the proposal is in the log");
+        assert_eq!(
+            proposed.job.map(|job| job.read_only),
+            Some(read_only),
+            "read_only {read_only}"
+        );
+    }
+}
