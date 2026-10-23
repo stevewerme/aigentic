@@ -104,17 +104,24 @@ impl Runtime {
             .format(&Rfc3339)
             .unwrap_or_default();
         let date = date.get(..10).unwrap_or(&date).to_owned();
-        let new_text = splice_current_state(&text, &reply, &date);
-        let written = write_brief_atomically(&path, &old_hash, &new_text).map_err(|source| {
-            crate::ProjectError::Io {
-                path: path.clone(),
-                source,
+        // An empty reply would splice an empty section over the old state, so
+        // the brief is left as it is; the call is still recorded and priced.
+        let new_hash = if reply.trim().is_empty() {
+            old_hash.clone()
+        } else {
+            let new_text = splice_current_state(&text, &reply, &date);
+            let written =
+                write_brief_atomically(&path, &old_hash, &new_text).map_err(|source| {
+                    crate::ProjectError::Io {
+                        path: path.clone(),
+                        source,
+                    }
+                })?;
+            match written {
+                WriteOutcome::ChangedUnderneath => return Ok(None),
+                WriteOutcome::Unchanged => old_hash.clone(),
+                WriteOutcome::Written => brief_hash(&new_text),
             }
-        })?;
-        let new_hash = match written {
-            WriteOutcome::ChangedUnderneath => return Ok(None),
-            WriteOutcome::Unchanged => old_hash.clone(),
-            WriteOutcome::Written => brief_hash(&new_text),
         };
 
         // The utility profile's label and prices when one is configured,

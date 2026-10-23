@@ -195,6 +195,25 @@ async fn a_batch_that_wrote_files_rewrites_the_current_state_once() {
 }
 
 #[tokio::test]
+async fn an_empty_reply_leaves_the_brief_as_it_was() {
+    let dir = project(true, "");
+    let blank = vec![vec![
+        ProviderEvent::TextDelta(" \n".into()),
+        usage(1_000, 100),
+    ]];
+    let (mut runtime, _, _) = thread(&dir, turn("fix it", &["src/lib.rs"]), blank, None);
+
+    let payload = runtime
+        .refresh_project_brief(&mut |_| {})
+        .await
+        .unwrap()
+        .expect("the call is recorded");
+    let brief = std::fs::read_to_string(project_brief_path(dir.path())).unwrap();
+    assert_eq!(brief, BRIEF);
+    assert_eq!(payload.old_hash, payload.new_hash);
+}
+
+#[tokio::test]
 async fn nothing_runs_without_writes_without_a_brief_or_with_refresh_off() {
     let quiet = project(true, "");
     let (mut runtime, seen, _) = thread(&quiet, turn("look around", &[]), reply(), None);
