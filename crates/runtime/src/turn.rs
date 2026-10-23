@@ -900,11 +900,17 @@ impl Runtime {
             specs.push(start_job_spec());
         }
         specs.retain(|s| self.tool_visible(&s.name));
-        // A job's thread is offered none of the three that need a person:
-        // they are answerable, so hiding is not what keeps it out of them,
-        // but a job's model should not be invited either.
+        // A job's thread is never offered a job or a move, and is offered
+        // a question only when an answer can reach it: those calls are
+        // answerable, so hiding is not what keeps a job out of them, but a
+        // job's model should not be invited to make one it cannot.
         if self.job.is_some() {
-            specs.retain(|s| !matches!(s.name.as_str(), ASK_HUMAN | START_JOB | SUGGEST_PROJECT));
+            let asks = self.decisions.is_some();
+            specs.retain(|s| match s.name.as_str() {
+                START_JOB | SUGGEST_PROJECT => false,
+                ASK_HUMAN => asks,
+                _ => true,
+            });
         }
         specs.sort_by(|a, b| a.name.cmp(&b.name));
         specs

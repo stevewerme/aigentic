@@ -107,10 +107,11 @@ impl Runtime {
     /// else the approver, appending `permission_requested` and
     /// `permission_decided` so every human answer is an attributed event.
     ///
-    /// A job's thread shortens the last steps, because nobody watches it:
-    /// a write in a read-only job and a path outside the project are
-    /// refused outright, and an ask that nothing stood in for is refused
-    /// rather than parked in a request no one will answer.
+    /// A job's thread shortens the last steps: a write in a read-only job
+    /// and a path outside the project are refused outright. An ask that
+    /// nothing stood in for parks like any other, since the daemon
+    /// forwards it to the front thread; only a job with no `Decisions`,
+    /// which nothing could answer, refuses it instead.
     pub async fn policy_check(
         &mut self,
         call: &ToolCall,
@@ -213,9 +214,9 @@ impl Runtime {
             )));
         }
 
-        // A job writes no request nobody can answer: it would park there
-        // for good, watching a thread no one is in.
-        if self.job.is_some() {
+        // A job with nothing to route an answer back writes no request: it
+        // would park there for good.
+        if self.job.is_some() && self.decisions.is_none() {
             return Ok(Verdict::Refuse(PolicyRecord::rule_with_reason(
                 JOB_RULE_ASK,
                 "deny",

@@ -241,8 +241,9 @@ async fn a_job_stays_inside_its_project() {
     assert_ne!(rule_name(&verdict), Some(JOB_RULE_BOUNDARY));
 }
 
-/// A job's model is invited to none of the three tools that need a person,
-/// and a call it makes anyway is refused with a reason it can act on.
+/// A job that nothing can answer is invited to none of the three tools
+/// that need a person, and a call it makes anyway is refused with a
+/// reason it can act on.
 #[tokio::test]
 async fn a_job_is_offered_no_tool_that_starts_asks_or_moves_and_is_told_why() {
     let dir = tempfile::tempdir().unwrap();
@@ -408,4 +409,44 @@ async fn quiet_turn(runtime: &mut Runtime) {
         .run_turn(steve(), vec![ContentBlock::Text("go".into())], &mut |_| {})
         .await
         .expect("the turn finishes");
+}
+
+/// A job whose thread routes answers back is offered a question, since
+/// the daemon carries it to the person at the front thread, and its
+/// command the rules would ask about is written as a request and parked
+/// rather than refused. Starting a job or moving stays closed to it.
+#[tokio::test]
+async fn a_job_that_can_be_answered_asks_and_parks_instead_of_refusing() {
+    let dir = tempfile::tempdir().unwrap();
+    let decisions = std::sync::Arc::new(aigentic_runtime::Decisions::new());
+    let mut runtime = as_job(
+        rig(vec![], dir.path(), Mode::Manual, false),
+        false,
+        Mode::Manual,
+    )
+    .with_decisions(decisions.clone());
+    let specs = runtime.tool_specs();
+    assert!(
+        specs.iter().any(|s| s.name == ASK_HUMAN),
+        "a question is offered"
+    );
+    for name in [START_JOB, SUGGEST_PROJECT] {
+        assert!(!specs.iter().any(|s| s.name == name), "{name} stays closed");
+    }
+
+    let write = call("bash", json!({"command": "touch found.txt"}));
+    let cancel = aigentic_runtime::CancelToken::never();
+    let mut observe = |_: aigentic_runtime::Signal<'_>| {};
+    let parked = {
+        let check = runtime.policy_check(&write, RiskClass::Write, &cancel, &mut observe);
+        tokio::time::timeout(std::time::Duration::from_millis(200), check).await
+    };
+    assert!(
+        parked.is_err(),
+        "the ask waits for an answer instead of a refusal"
+    );
+    assert!(
+        kinds(&runtime).contains(&EventKind::PermissionRequested),
+        "the request is in the job's log for the front thread to see"
+    );
 }
