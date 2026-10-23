@@ -1118,7 +1118,6 @@ impl ThreadTable {
         };
         self.masthead(
             id,
-            project,
             &root,
             by.clone(),
             ThreadStartedPayload {
@@ -1148,13 +1147,11 @@ impl ThreadTable {
         Ok(summarise(&root.threads_dir, id, project))
     }
 
-    /// Write `thread`'s `thread_started`, and nothing else. `author` is
-    /// the person the payload names, and `project` the one it was made
-    /// for.
+    /// Write `thread`'s `thread_started` into `root`'s threads directory,
+    /// and nothing else. `author` is who the event is by.
     fn masthead(
         &self,
         thread: Ulid,
-        project: &str,
         root: &Root,
         author: Author,
         payload: ThreadStartedPayload,
@@ -1167,7 +1164,6 @@ impl ThreadTable {
             parent_event: None,
         })?;
         drop(log);
-        let _ = project;
         Ok(())
     }
 
@@ -1183,8 +1179,10 @@ impl ThreadTable {
         root: &Path,
         by: Author,
     ) -> Result<Ulid, ThreadError> {
+        // The log sits with every other thread's; `root` is where the
+        // job works.
         let root = Root {
-            threads_dir: root.to_path_buf(),
+            root: root.to_path_buf(),
             ..self.root_of(project)?
         };
         std::fs::create_dir_all(&root.threads_dir).map_err(BuildError::from)?;
@@ -1202,7 +1200,6 @@ impl ThreadTable {
         drop(log);
         self.masthead(
             id,
-            project,
             &root,
             by.clone(),
             ThreadStartedPayload {
@@ -2522,7 +2519,7 @@ mod tests {
     }
 
     /// A daemon-driven thread and a runner's child have the same parent
-    /// field, so the masthead's own flag is what tells them apart: a job
+    /// field, so the `job` flag in `thread_started` tells them apart: a job
     /// read as a stepless step child would be refused writes by rule 5
     /// that its driver must make, and a step child would lose its step.
     #[test]

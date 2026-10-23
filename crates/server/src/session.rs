@@ -1556,6 +1556,12 @@ mod tests {
         let author = Author::User(UserId("u".into()));
         let front = table.create("p", author.clone(), true).await.unwrap().id;
         let job = table.create_job(front, "p", &root, author.clone()).unwrap();
+        assert_eq!(
+            table.dir_of(job),
+            Some(dir.path().join("threads")),
+            "a job's log sits with every other thread's"
+        );
+        assert_eq!(table.root_of_thread(job), Some(root.clone()));
         // The driver opens its child, so an actor is there to take a mail.
         table.open(job).await.unwrap();
         let mut open: HashMap<Ulid, OpenThread> = HashMap::new();
@@ -1581,6 +1587,10 @@ mod tests {
                 thread: job,
                 call_id: "c".into(),
                 text: "yes".into(),
+            },
+            Request::Pin {
+                thread: job,
+                text: "x".into(),
             },
             Request::SetMode {
                 thread: job,
