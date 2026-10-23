@@ -626,9 +626,14 @@ async fn handle(
 ) -> Response {
     // A run-owned thread belongs to its run (issue #58, rule 5): its
     // step child or its lead is written by the run's task alone, so
-    // nothing here may post into it, and no actor is started for it.
+    // nothing here may post into it, and no actor is started for it. A
+    // job's own thread is written by its driver alone, and only a
+    // person watching a runaway job may interrupt it.
     if let Some(thread) = mutates_run(&request)
-        && threads.run_thread(thread) != RunThread::No
+        && let run = threads.run_thread(thread)
+        && (run != RunThread::No
+            && !(matches!(run, RunThread::Job { .. })
+                && matches!(request, Request::Interrupt { .. })))
     {
         return Response::Refused {
             reason: "this thread belongs to a run".into(),
@@ -1412,5 +1417,225 @@ mod tests {
             let allowed = role_in_project(&config, &table, name, "mia").is_some();
             assert_eq!(listing.contains(name), allowed, "{listing}");
         }
+    }
+
+    /// A provider that answers every call with one message and asks for
+    /// nothing: enough for an actor to build and a turn to end.
+    struct Quiet;
+
+    impl aigentic_runtime::aigentic_core::Provider for Quiet {
+        fn complete(
+            &self,
+            _: &aigentic_runtime::aigentic_core::CompletionRequest<'_>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn futures_core::Stream<Item = aigentic_runtime::aigentic_core::ProviderEvent>
+                    + Send
+                    + '_,
+            >,
+        > {
+            use aigentic_runtime::aigentic_core::ProviderEvent;
+            Box::pin(futures_util::stream::iter(vec![
+                ProviderEvent::TextDelta("done".into()),
+                ProviderEvent::Done {
+                    finish_reason: "stop".into(),
+                },
+            ]))
+        }
+
+        fn count_tokens(&self, _: &[aigentic_runtime::aigentic_core::Message]) -> u64 {
+            7
+        }
+
+        fn capabilities(&self) -> aigentic_runtime::aigentic_core::Capabilities {
+            aigentic_runtime::aigentic_core::Capabilities {
+                supports_tools: false,
+                supports_images: false,
+                supports_caching: false,
+                supports_structured_output: false,
+                max_context_tokens: 1000,
+            }
+        }
+    }
+
+    struct QuietFactory;
+
+    impl crate::build::ProviderFactory for QuietFactory {
+        fn build(
+            &self,
+            _: &str,
+        ) -> Result<
+            (Box<dyn aigentic_runtime::aigentic_core::Provider>, String),
+            crate::build::BuildError,
+        > {
+            Ok((Box::new(Quiet), "stub".into()))
+        }
+    }
+
+    /// A table whose actors build, over one project `p` at `root`.
+    fn quiet_table(dir: &std::path::Path, root: PathBuf) -> Arc<ThreadTable> {
+        let config = Arc::new(ServerConfig {
+            listen: "unix".into(),
+            idle_unload_secs: 3600,
+            users: vec![UserConfig {
+                name: "u".into(),
+                token_env: None,
+                token: Some("t".into()),
+            }],
+            projects: vec![ProjectConfig {
+                name: "p".into(),
+                root,
+            }],
+            resume_runs: false,
+        });
+        Arc::new(ThreadTable::new(
+            Arc::new(
+                Config::parse(
+                    "default_profile = \"a\"\n[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n",
+                )
+                .unwrap(),
+            ),
+            dir.join("cfg"),
+            config,
+            Arc::new(QuietFactory),
+            Arc::new(crate::actor::NoReports),
+            dir.join("threads"),
+            detect(false),
+        ))
+    }
+
+    /// Write `id`'s masthead under `parent`, as a runner's step child has
+    /// one.
+    fn step_child_log(threads: &std::path::Path, id: Ulid, front: Ulid) {
+        use aigentic_runtime::aigentic_log::{NewEvent, Repair, ThreadLog, ThreadStartedPayload};
+        std::fs::create_dir_all(threads).unwrap();
+        let (mut log, _cut) = ThreadLog::open_with(threads, id, Repair::TruncateTornTail).unwrap();
+        log.append(NewEvent {
+            kind: aigentic_runtime::aigentic_core::EventKind::ThreadStarted,
+            author: Author::Agent(aigentic_runtime::aigentic_core::AgentId("runner".into())),
+            payload: serde_json::to_value(ThreadStartedPayload {
+                project: Some("p".into()),
+                root: "/tmp/p".into(),
+                created_by: Author::Agent(aigentic_runtime::aigentic_core::AgentId(
+                    "runner".into(),
+                )),
+                parent_thread: Some(front),
+                step: Some("implement".into()),
+                front: false,
+                job: false,
+            })
+            .unwrap(),
+            parent_event: None,
+        })
+        .unwrap();
+    }
+
+    /// Only a person can stop a runaway job, so an `Interrupt` is the one
+    /// write a job's thread accepts: `Decide` and `AnswerHuman` wait for
+    /// the follow-up that forwards them, and nothing else writes into a
+    /// thread whose driver owns it.
+    #[tokio::test]
+    async fn a_job_child_accepts_an_interrupt_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = project(dir.path(), "p", "");
+        let table = quiet_table(dir.path(), root.clone());
+        let config = Arc::new(ServerConfig {
+            listen: "unix".into(),
+            idle_unload_secs: 3600,
+            users: vec![UserConfig {
+                name: "u".into(),
+                token_env: None,
+                token: Some("t".into()),
+            }],
+            projects: vec![ProjectConfig {
+                name: "p".into(),
+                root: root.clone(),
+            }],
+            resume_runs: false,
+        });
+        let author = Author::User(UserId("u".into()));
+        let front = table.create("p", author.clone(), true).await.unwrap().id;
+        let job = table.create_job(front, "p", &root, author.clone()).unwrap();
+        // The driver opens its child, so an actor is there to take a mail.
+        table.open(job).await.unwrap();
+        let mut open: HashMap<Ulid, OpenThread> = HashMap::new();
+        let (out, _rx) = mpsc::unbounded_channel();
+
+        let mutating = [
+            Request::Post {
+                thread: job,
+                blocks: vec![aigentic_runtime::aigentic_core::ContentBlock::Text(
+                    "x".into(),
+                )],
+                interrupt: false,
+            },
+            Request::Decide {
+                thread: job,
+                call_id: "c".into(),
+                allow: true,
+                session: false,
+                prefix: None,
+                reason: None,
+            },
+            Request::AnswerHuman {
+                thread: job,
+                call_id: "c".into(),
+                text: "yes".into(),
+            },
+            Request::SetMode {
+                thread: job,
+                mode: "auto".into(),
+            },
+            Request::Compact { thread: job },
+        ];
+        for request in mutating {
+            let named = format!("{request:?}");
+            match handle(&config, &table, "u", &author, &mut open, &out, request).await {
+                Response::Refused { reason } => {
+                    assert!(reason.contains("belongs to a run"), "{named}: {reason}")
+                }
+                other => panic!("{named} was not refused: {other:?}"),
+            }
+        }
+
+        // The interrupt reaches the job's actor.
+        match handle(
+            &config,
+            &table,
+            "u",
+            &author,
+            &mut open,
+            &out,
+            Request::Interrupt { thread: job },
+        )
+        .await
+        {
+            Response::Refused { reason } | Response::Error { message: reason } => {
+                assert!(!reason.contains("belongs to a run"), "{reason}")
+            }
+            Response::Ok => {}
+            other => panic!("the interrupt was answered oddly: {other:?}"),
+        }
+
+        // A step child is still the runner's alone.
+        let step = Ulid::generate();
+        step_child_log(&dir.path().join("threads"), step, front);
+        match handle(
+            &config,
+            &table,
+            "u",
+            &author,
+            &mut open,
+            &out,
+            Request::Interrupt { thread: step },
+        )
+        .await
+        {
+            Response::Refused { reason } => {
+                assert!(reason.contains("belongs to a run"), "{reason}")
+            }
+            other => panic!("a step child's interrupt was not refused: {other:?}"),
+        }
+        table.close(job);
     }
 }

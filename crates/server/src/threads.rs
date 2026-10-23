@@ -1116,11 +1116,12 @@ impl ThreadTable {
             Author::User(user) => Some(user.clone()),
             Author::Agent(_) | Author::System => None,
         };
-        let mut log = ThreadLog::open(&root.threads_dir, id)?;
-        log.append(NewEvent {
-            kind: EventKind::ThreadStarted,
-            author: by.clone(),
-            payload: serde_json::to_value(ThreadStartedPayload {
+        self.masthead(
+            id,
+            project,
+            &root,
+            by.clone(),
+            ThreadStartedPayload {
                 project: Some(project.to_owned()),
                 root: root.root.clone(),
                 created_by: by,
@@ -1128,11 +1129,8 @@ impl ThreadTable {
                 step: None,
                 front,
                 job: false,
-            })
-            .expect("serialisable"),
-            parent_event: None,
-        })?;
-        drop(log);
+            },
+        )?;
         self.index.lock().unwrap_or_else(|e| e.into_inner()).insert(
             id,
             Indexed {
@@ -1148,6 +1146,90 @@ impl ThreadTable {
             },
         );
         Ok(summarise(&root.threads_dir, id, project))
+    }
+
+    /// Write `thread`'s `thread_started`, and nothing else. `author` is
+    /// the person the payload names, and `project` the one it was made
+    /// for.
+    fn masthead(
+        &self,
+        thread: Ulid,
+        project: &str,
+        root: &Root,
+        author: Author,
+        payload: ThreadStartedPayload,
+    ) -> Result<(), ThreadError> {
+        let mut log = ThreadLog::open(&root.threads_dir, thread)?;
+        log.append(NewEvent {
+            kind: EventKind::ThreadStarted,
+            author,
+            payload: serde_json::to_value(payload).expect("thread_started serialises"),
+            parent_event: None,
+        })?;
+        drop(log);
+        let _ = project;
+        Ok(())
+    }
+
+    /// A job's own thread: `front`'s project and root, the person who
+    /// approved it as its author, and a masthead that says it is a job.
+    /// Its id is new, so the file holds no `thread_started` yet; the
+    /// check is what stops a second one being written over an id already
+    /// on disk.
+    pub fn create_job(
+        &self,
+        front: Ulid,
+        project: &str,
+        root: &Path,
+        by: Author,
+    ) -> Result<Ulid, ThreadError> {
+        let root = Root {
+            threads_dir: root.to_path_buf(),
+            ..self.root_of(project)?
+        };
+        std::fs::create_dir_all(&root.threads_dir).map_err(BuildError::from)?;
+        let id = self.ids().next();
+        let (log, _cut) = ThreadLog::open_with(&root.threads_dir, id, Repair::TruncateTornTail)?;
+        if log
+            .events()
+            .iter()
+            .any(|event| event.kind == EventKind::ThreadStarted)
+        {
+            return Err(ThreadError::Refused(format!(
+                "thread {id} already has a masthead"
+            )));
+        }
+        drop(log);
+        self.masthead(
+            id,
+            project,
+            &root,
+            by.clone(),
+            ThreadStartedPayload {
+                project: Some(project.to_owned()),
+                root: root.root.clone(),
+                created_by: by,
+                parent_thread: Some(front),
+                step: None,
+                front: false,
+                job: true,
+            },
+        )?;
+        self.index.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            id,
+            Indexed {
+                dir: root.threads_dir.clone(),
+                home: Some(project.to_owned()),
+                switched: None,
+                switched_root: None,
+                root: Some(root.root.clone()),
+                creator: None,
+                run: RunThread::Job { front },
+                torn_run: false,
+                front: false,
+            },
+        );
+        Ok(id)
     }
 
     /// The mailbox of a thread, starting its actor when it is not open.
@@ -1403,16 +1485,25 @@ impl ThreadTable {
             })
             .find_map(|p| p.parent_thread);
         match child {
-            Some(lead) => {
-                let step = log
+            Some(front) => {
+                let header = log
                     .events()
                     .iter()
                     .filter(|event| event.kind == EventKind::ThreadStarted)
                     .filter_map(|event| {
                         serde_json::from_value::<ThreadStartedPayload>(event.payload.clone()).ok()
                     })
-                    .find_map(|p| p.step);
-                RunThread::Child { lead, step }
+                    .next();
+                // A job's header is a daemon's, not a runner's: it is read
+                // before `step`, so a job never reads as a stepless step
+                // child.
+                if header.as_ref().is_some_and(|p| p.job) {
+                    return RunThread::Job { front };
+                }
+                RunThread::Child {
+                    lead: front,
+                    step: header.and_then(|p| p.step),
+                }
             }
             None => RunThread::No,
         }
@@ -1769,6 +1860,9 @@ pub enum RunThread {
     /// run it belongs to, `step` the step it works when the header names
     /// one.
     Child { lead: Ulid, step: Option<String> },
+    /// A job's own thread: `front` is the thread whose person approved it
+    /// and whose permission mode it runs under.
+    Job { front: Ulid },
 }
 
 impl RunThread {
@@ -1781,6 +1875,12 @@ impl RunThread {
             RunThread::Child { lead, step } => Some(aigentic_api::RunThread::Child {
                 lead: *lead,
                 step: step.clone(),
+            }),
+            // The wire carries no job variant yet; a job is a daemon-driven
+            // child of its front thread.
+            RunThread::Job { front } => Some(aigentic_api::RunThread::Child {
+                lead: *front,
+                step: None,
             }),
         }
     }
@@ -1899,6 +1999,7 @@ fn scan_log(
     };
     let mut parent: Option<Ulid> = None;
     let mut step: Option<String> = None;
+    let mut job = false;
     for line in BufReader::new(file).lines() {
         let Ok(line) = line else {
             break;
@@ -1934,6 +2035,7 @@ fn scan_log(
                 // The person's front thread (issue #84); a line written
                 // before the field reads as `false`.
                 entry.front = p.front;
+                job = p.job;
                 parent = p.parent_thread;
                 step = p.step.clone();
             }
@@ -1957,8 +2059,12 @@ fn scan_log(
             _ => {}
         }
     }
-    if let Some(lead) = parent {
-        entry.run = RunThread::Child { lead, step };
+    if let Some(front) = parent {
+        entry.run = if job {
+            RunThread::Job { front }
+        } else {
+            RunThread::Child { lead: front, step }
+        };
     }
     Some((id, entry))
 }
@@ -2328,6 +2434,73 @@ fn fnv1a_32(bytes: &[u8]) -> u32 {
 mod tests {
     use super::*;
 
+    /// A factory the classification tests never reach: they read logs, and
+    /// no thread of theirs is opened.
+    struct Unused;
+
+    impl crate::build::ProviderFactory for Unused {
+        fn build(
+            &self,
+            _: &str,
+        ) -> Result<
+            (Box<dyn aigentic_runtime::aigentic_core::Provider>, String),
+            crate::build::BuildError,
+        > {
+            Err(crate::build::BuildError::Config("no build".into()))
+        }
+    }
+
+    /// A table over `threads`, in one project `p` at `root`.
+    fn table(dir: &Path, root: &Path) -> ThreadTable {
+        let server = Arc::new(ServerConfig {
+            listen: "unix".into(),
+            idle_unload_secs: 3600,
+            users: Vec::new(),
+            projects: vec![crate::config::ProjectConfig {
+                name: "p".into(),
+                root: root.to_path_buf(),
+            }],
+            resume_runs: false,
+        });
+        ThreadTable::new(
+            Arc::new(
+                Config::parse(
+                    "default_profile = \"a\"\n[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n",
+                )
+                .unwrap(),
+            ),
+            dir.join("cfg"),
+            server,
+            Arc::new(Unused),
+            Arc::new(crate::actor::NoReports),
+            dir.join("threads"),
+            crate::awake::detect(false),
+        )
+    }
+
+    /// Write `id`'s `thread_started` into `threads` with `parent`, `step`
+    /// and `job` as given, the shapes a runner's and a daemon's mastheads
+    /// have.
+    fn masthead(threads: &Path, id: Ulid, parent: Option<Ulid>, step: Option<&str>, job: bool) {
+        let (mut log, _cut) = ThreadLog::open_with(threads, id, Repair::TruncateTornTail).unwrap();
+        log.append(NewEvent {
+            kind: EventKind::ThreadStarted,
+            author: Author::System,
+            payload: serde_json::to_value(ThreadStartedPayload {
+                project: Some("p".into()),
+                root: "/tmp/p".into(),
+                created_by: Author::System,
+                parent_thread: parent,
+                step: step.map(str::to_owned),
+                front: false,
+                job,
+            })
+            .unwrap(),
+            parent_event: None,
+        })
+        .unwrap();
+    }
+
     /// A workspace `name` listing `roots`, for the resolver tests.
     fn workspace(name: &str, roots: &[&Path]) -> Workspace {
         Workspace {
@@ -2346,6 +2519,54 @@ mod tests {
             std::fs::write(root.join("aigentic.toml"), text).unwrap();
         }
         root
+    }
+
+    /// A daemon-driven thread and a runner's child have the same parent
+    /// field, so the masthead's own flag is what tells them apart: a job
+    /// read as a stepless step child would be refused writes by rule 5
+    /// that its driver must make, and a step child would lose its step.
+    #[test]
+    fn a_jobs_masthead_reads_as_a_job_and_a_steps_as_a_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = root(dir.path(), "p", None);
+        let threads = dir.path().join("threads");
+        std::fs::create_dir_all(&threads).unwrap();
+        let front = Ulid::generate();
+        masthead(&threads, front, None, None, false);
+        let job = Ulid::generate();
+        masthead(&threads, job, Some(front), None, true);
+        let step = Ulid::generate();
+        masthead(&threads, step, Some(front), Some("implement"), false);
+        let plain_child = Ulid::generate();
+        masthead(&threads, plain_child, Some(front), None, false);
+
+        let table = table(dir.path(), &project);
+        assert_eq!(table.run_thread(job), RunThread::Job { front });
+        assert_eq!(
+            table.run_thread(step),
+            RunThread::Child {
+                lead: front,
+                step: Some("implement".into())
+            }
+        );
+        assert_eq!(
+            table.run_thread(plain_child),
+            RunThread::Child {
+                lead: front,
+                step: None
+            }
+        );
+        assert_eq!(table.run_thread(front), RunThread::No);
+
+        // The wire has no job variant yet: a job travels as a child of the
+        // thread that started it, which is what it is.
+        assert_eq!(
+            table.run_thread(job).wire(),
+            Some(aigentic_api::RunThread::Child {
+                lead: front,
+                step: None
+            })
+        );
     }
 
     /// T9: an entry that does not resolve adds no row and warns once,
