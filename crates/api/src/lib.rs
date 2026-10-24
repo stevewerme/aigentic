@@ -604,15 +604,29 @@ pub enum ThreadState {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         questions: Vec<AskedQuestion>,
     },
-    /// A `suggest_project` proposal waits for someone with `write`
-    /// (issue #7). `workspace` is the daemon's label for the target.
+    /// A `suggest_project` or `start_job` proposal waits for someone
+    /// with `write`. `workspace` is the daemon's label for `project`;
+    /// `job` is set for a `start_job` proposal, whose `project` is the
+    /// one the job would run in.
     AwaitingSwitch {
         call_id: String,
         project: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         workspace: Option<String>,
         reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        job: Option<JobAsk>,
     },
+}
+
+/// The work a waiting `start_job` proposal asks to start. Mirrors the
+/// log's `JobProposed` without its brief, rather than take an edge to
+/// `log` (AGENTS.md).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobAsk {
+    pub task: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read_only: bool,
 }
 
 /// A person's answer to a switch proposal (issue #7). Mirrors the
@@ -1082,6 +1096,20 @@ mod tests {
                     project: "aigentic-web".into(),
                     workspace: Some("~/aigentic-web".into()),
                     reason: "the message is about the site".into(),
+                    job: None,
+                },
+            },
+            Notice::State {
+                thread: thread(),
+                state: ThreadState::AwaitingSwitch {
+                    call_id: "c4".into(),
+                    project: "aigentic".into(),
+                    workspace: None,
+                    reason: "work too big for this conversation".into(),
+                    job: Some(JobAsk {
+                        task: "rewrite the CLI help".into(),
+                        read_only: true,
+                    }),
                 },
             },
             Notice::Mode {
@@ -1307,6 +1335,20 @@ mod tests {
     /// frame carrying it round-trips; one without it is serialised with
     /// no `here` key at all and a frame that predates the field decodes
     /// as `here: None`, the old client's frame.
+    /// A daemon that sends no `job` is a project switch to a new
+    /// client, so an old frame keeps meaning what it meant.
+    #[test]
+    fn a_switch_wait_without_a_job_still_decodes_as_a_switch() {
+        let state: ThreadState = serde_json::from_str(
+            r#"{"state":"awaiting_switch","call_id":"c","project":"p","reason":"r"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            state,
+            ThreadState::AwaitingSwitch { job: None, .. }
+        ));
+    }
+
     #[test]
     fn t1_front_here_round_trips_and_the_old_frame_still_decodes() {
         let with = Frame::request(

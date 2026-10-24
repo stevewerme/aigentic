@@ -44,6 +44,9 @@ pub enum Pending {
         call_id: String,
         project: String,
         reason: String,
+        /// The job a `start_job` proposal asks for; `None` for a
+        /// project switch.
+        job: Option<aigentic_log::JobProposed>,
     },
 }
 

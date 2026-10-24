@@ -204,6 +204,7 @@ async fn when_parked(decisions: &Arc<Decisions>) -> (String, String, String) {
             call_id,
             project,
             reason,
+            ..
         }) = decisions.pending().first()
         {
             return (call_id.clone(), project.clone(), reason.clone());

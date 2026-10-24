@@ -1350,6 +1350,7 @@ impl Runtime {
                     call_id: id.clone(),
                     project: args.project.clone(),
                     reason: args.reason.clone(),
+                    job: None,
                 };
                 let rx = decisions.register(pending.clone());
                 observe(Signal::Waiting(&pending));
@@ -1440,6 +1441,11 @@ impl Runtime {
             call_id: id.clone(),
             project,
             reason: JOB_REASON.to_owned(),
+            job: Some(JobProposed {
+                task: args.task.clone(),
+                brief: args.brief.clone(),
+                read_only: args.read_only,
+            }),
         };
         let rx = decisions.register(pending.clone());
         observe(Signal::Waiting(&pending));

@@ -593,12 +593,14 @@ async fn post_and_park(
                 project,
                 workspace,
                 reason,
+                job,
             },
         ..
     } = notice
     else {
         panic!("the proposal state")
     };
+    assert_eq!(job, None, "a project proposal carries no job");
     (call_id, project, workspace, reason)
 }
 
