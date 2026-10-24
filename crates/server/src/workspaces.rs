@@ -131,7 +131,9 @@ pub fn create(
 
 /// Lists the absolute `root` in `workspace`, found without case. A root
 /// already there is left alone; one in another workspace is refused,
-/// since a project is in at most one.
+/// since a project is in at most one, and so is a root whose name the
+/// workspace already holds — two projects of one name inside a workspace
+/// could not both be addressed.
 pub fn add_project(
     config_dir: &Path,
     workspace: &str,
@@ -153,6 +155,13 @@ pub fn add_project(
         });
     }
     if !target.projects.iter().any(|p| p == root) {
+        let leaf = project_name(root);
+        if let Some(first) = target.projects.iter().find(|p| project_name(p) == leaf) {
+            return Err(WorkspaceError::NameTaken {
+                name: qualified_name(&target.name, root),
+                roots: vec![first.clone(), root.to_path_buf()],
+            });
+        }
         target.projects.push(root.to_path_buf());
         save(config_dir, &target)?;
     }
@@ -724,6 +733,67 @@ mod tests {
             "{message}"
         );
         assert!(message.contains(&web.display().to_string()), "{message}");
+    }
+
+    #[test]
+    fn a_second_project_of_one_name_in_one_workspace_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("cfg");
+        let one = root(dir.path(), "one", "web");
+        let two = root(dir.path(), "two", "web");
+        create(&cfg, "getscale", None).unwrap();
+        add_project(&cfg, "getscale", &one).unwrap();
+        let file = cfg.join("workspaces/getscale.toml");
+        let before = std::fs::read_to_string(&file).unwrap();
+
+        let refused = add_project(&cfg, "getscale", &two);
+        let Err(WorkspaceError::NameTaken { name, roots }) = &refused else {
+            panic!("{refused:?}");
+        };
+        assert_eq!(name, &qualified_name("getscale", &two));
+        assert!(roots.contains(&one) && roots.contains(&two), "{roots:?}");
+        let message = refused.unwrap_err().to_string();
+        assert!(message.contains(&one.display().to_string()), "{message}");
+        assert!(message.contains(&two.display().to_string()), "{message}");
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            before,
+            "the refused project is not written"
+        );
+
+        // The same root again stays the no-op it was.
+        let again = add_project(&cfg, "getscale", &one).unwrap();
+        assert_eq!(again.projects, vec![one]);
+    }
+
+    #[test]
+    fn the_same_name_in_two_workspaces_is_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("cfg");
+        let one = root(dir.path(), "one", "web");
+        let two = root(dir.path(), "two", "web");
+        create(&cfg, "getscale", None).unwrap();
+        create(&cfg, "acme", None).unwrap();
+        add_project(&cfg, "getscale", &one).unwrap();
+        add_project(&cfg, "acme", &two).unwrap();
+
+        let loaded = load_all(&cfg).unwrap();
+        let expected: Vec<String> = loaded
+            .iter()
+            .flat_map(|w| {
+                w.projects
+                    .iter()
+                    .map(|r| qualified_name(&w.name, r))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let merged = merge(Vec::new(), &loaded).unwrap();
+        assert_eq!(
+            merged.iter().map(|p| p.name.clone()).collect::<Vec<_>>(),
+            expected,
+            "one project per root, each under its own workspace"
+        );
+        assert_eq!(merged.len(), 2, "neither web is dropped");
     }
 
     #[test]
