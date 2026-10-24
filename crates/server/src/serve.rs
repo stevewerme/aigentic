@@ -390,7 +390,7 @@ impl Server {
             .filter(|(name, front_root)| {
                 !known
                     .iter()
-                    .any(|p| &p.name == name || &p.root == front_root)
+                    .any(|p| &p.name == name || crate::threads::same_root(&p.root, front_root))
                     && front_root.is_dir()
             })
             .map(|(name, front_root)| ProjectConfig {

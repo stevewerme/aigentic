@@ -1405,10 +1405,9 @@ pub struct UserConfig {
 #[serde(deny_unknown_fields)]
 pub struct ProjectConfig {
     /// `server.toml`'s name for the project, or a workspace project's
-    /// `<workspace>/<project>` (issue #122). Must equal `[project] name`
-    /// in the checkout's `aigentic.toml` when one exists, unless a
-    /// workspace file named it; a root without one is a bare working
-    /// directory.
+    /// `<workspace>/<project>`. A `server.toml` name must equal
+    /// `[project] name` in the checkout's `aigentic.toml` when one
+    /// exists; a root without one is a bare working directory.
     pub name: String,
     pub root: PathBuf,
 }
@@ -1476,9 +1475,9 @@ impl ServerConfig {
 
     /// The project `name` addresses: an exact match on the listed name
     /// first, then — only for a query with no `/` — the one project
-    /// whose leaf is `name` (issue #122). A leaf that two projects share
-    /// resolves to nothing, never to a guess, so a stale bare name
-    /// cannot write in the wrong root.
+    /// whose leaf is `name`. A leaf that two projects share resolves to
+    /// nothing, never to a guess, so a bare name cannot write in the
+    /// wrong root.
     pub fn project(&self, name: &str) -> Option<&ProjectConfig> {
         if let Some(p) = self.projects.iter().find(|p| p.name == name) {
             return Some(p);

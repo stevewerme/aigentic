@@ -1391,9 +1391,9 @@ async fn t88_5a_a_switched_front_thread_resumes_after_being_unloaded() {
     assert_eq!(again, made);
 }
 
-/// T5b — a workspace project of the thread's own leaf name, at another
-/// root, does not take the name away: the thread's project is registered
-/// under its bare name and resumed in its own root, never in that one.
+/// A workspace project of the thread's own leaf name, at another root,
+/// does not take the name away: the thread's project keeps its own name
+/// and is resumed in its own root, never in that one.
 #[tokio::test]
 async fn t88_5b_a_taken_leaf_name_still_resumes_in_its_own_root() {
     let dir = tempfile::tempdir().unwrap();
@@ -1602,6 +1602,45 @@ async fn t88_8_the_served_daemon_never_registers_a_front_project() {
     };
     assert!(reason.contains("does not know"), "{reason}");
     assert_ne!(made, id, "not the thread in a");
+}
+
+/// A front thread whose log names the bare `web` at a root the
+/// workspace lists as `getscale/web` adds no second row for its root:
+/// the daemon keeps the listed name, and the ask shows one row.
+#[tokio::test]
+async fn the_front_thread_does_not_add_a_second_row_for_its_own_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = project(dir.path(), "a", "");
+    let web = project(dir.path(), "web", "");
+    workspace_naming(dir.path(), "getscale", &[&web]);
+    let listed = aigentic_server::workspaces::qualified_name("getscale", &web);
+
+    // A front thread that started in `a` and switched to the bare `web`,
+    // as a client holding the leaf sent it before the project was
+    // qualified.
+    let id = Ulid::generate();
+    let mut log = hand_log(&dir.path().join("threads"), id);
+    append_started(&mut log, Some("a"), &a, "steve", true);
+    append_switch(&mut log, "web", &web);
+
+    let daemon = Plain::new(dir.path(), &a, "steve").await;
+    assert_eq!(
+        daemon.inner.front_project, None,
+        "the root is already listed as {listed}"
+    );
+    let projects = &daemon.inner.server.server.projects;
+    let at_root: Vec<&str> = projects
+        .iter()
+        .filter(|p| p.root == web)
+        .map(|p| p.name.as_str())
+        .collect();
+    assert_eq!(at_root, vec![listed.as_str()], "one project for the root");
+
+    let rows = daemon.inner.server.threads.start_rows("steve");
+    let front: Vec<_> = rows.iter().filter(|r| r.id == id).collect();
+    assert_eq!(front.len(), 1, "one row for the thread");
+    assert_eq!(front[0].project, listed, "under the listed name");
+    assert_eq!(front[0].root.as_deref(), Some(web.as_path()));
 }
 
 // ---------------------------------------------------------------------------

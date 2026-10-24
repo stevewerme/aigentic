@@ -228,6 +228,63 @@ async fn until_idle(rx: &mut mpsc::Receiver<Notice>) {
     }
 }
 
+/// A log for a thread that started as `project` (the daemon's own name,
+/// `None` for the legacy `_none`) at `root`, in the legacy layout: the
+/// form every log written before a project was qualified has.
+fn log_started_at(base: &Path, folder: &str, project: Option<&str>, root: &Path) -> Ulid {
+    let threads = base.join(folder);
+    std::fs::create_dir_all(&threads).unwrap();
+    let id = Ulid::generate();
+    let mut log = ThreadLog::open(&threads, id).unwrap();
+    log.append(NewEvent {
+        kind: EventKind::ThreadStarted,
+        author: Author::User(UserId("steve".into())),
+        payload: to_value(ThreadStartedPayload {
+            project: project.map(str::to_owned),
+            root: root.to_path_buf(),
+            created_by: Author::User(UserId("steve".into())),
+            parent_thread: None,
+            step: None,
+            front: false,
+            job: false,
+        })
+        .unwrap(),
+        parent_event: None,
+    })
+    .unwrap();
+    id
+}
+
+/// Append a `project_switched` to `id`'s log, as a client that sent
+/// `to` wrote it.
+fn log_switched(base: &Path, folder: &str, id: Ulid, to: &str, root: &Path) {
+    let mut log = ThreadLog::open(base.join(folder), id).unwrap();
+    log.append(NewEvent {
+        kind: EventKind::ProjectSwitched,
+        author: Author::User(UserId("steve".into())),
+        payload: to_value(aigentic_runtime::aigentic_log::ProjectSwitchedPayload {
+            from: None,
+            to: Some(to.to_owned()),
+            root: root.to_path_buf(),
+            workspace: None,
+        })
+        .unwrap(),
+        parent_event: None,
+    })
+    .unwrap();
+}
+
+/// The listed project whose root is `root`, found the way the daemon's
+/// own `merge` leaves its list: by root.
+fn listed_at(server: &Arc<Server>, root: &Path) -> Option<String> {
+    server
+        .server
+        .projects
+        .iter()
+        .find(|p| p.root == root)
+        .map(|p| p.name.clone())
+}
+
 /// Create a thread in `project` and open it for `client`.
 async fn created(client: &mut Client, project: &str) -> Ulid {
     let Response::Thread { thread } = client
@@ -886,4 +943,147 @@ async fn a_related_project_shows_on_the_other_workspaces_line_with_its_brief() {
     );
     assert_eq!(block, expected);
     println!("the same rig without the key:\n{block}");
+}
+
+/// A thread whose log names `web`, at a root the daemon lists as
+/// `getscale/web`, follows its root to that name: the log is not
+/// rewritten, and the thread counts under the row its root is listed as.
+#[tokio::test]
+async fn an_old_thread_follows_its_root_to_its_new_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let web = project(dir.path(), "web", "");
+    let d = daemon(dir.path(), vec![], &[("getscale", vec![web.clone()])]).await;
+    let listed = listed_at(&d.server, &web).expect("the root is listed");
+
+    let id = log_started_at(&d.threads_base, "web", Some("web"), &web);
+    assert_eq!(
+        d.server.threads.project_of(id).as_deref(),
+        Some(listed.as_str()),
+        "the logged name follows its root"
+    );
+    let rows = d.server.threads.projects();
+    let (_, _, count) = rows
+        .iter()
+        .find(|(name, _, _)| *name == listed)
+        .expect("the row");
+    assert_eq!(*count, 1, "counted under {listed}: {rows:?}");
+}
+
+/// A logged switch to a bare `web` is resolved by the root the switch
+/// recorded, and a live switch sent as `web` counts the thread under the
+/// listed name at once, before any rescan.
+#[tokio::test]
+async fn a_switched_name_is_canonicalised() {
+    // Two `web`s, each in its own workspace: only the switch's root can
+    // say which one it meant.
+    let dir = tempfile::tempdir().unwrap();
+    let ours = project(dir.path(), "web-ours", "");
+    let theirs = project(dir.path(), "web-theirs", "");
+    // The projects' own `[project] name` is what a workspace entry
+    // qualifies, so both are called `web` on disk.
+    for root in [&ours, &theirs] {
+        std::fs::write(root.join("aigentic.toml"), "[project]\nname = \"web\"\n").unwrap();
+    }
+    let d = daemon(
+        dir.path(),
+        vec![],
+        &[
+            ("getscale", vec![ours.clone()]),
+            ("acme", vec![theirs.clone()]),
+        ],
+    )
+    .await;
+    let target = listed_at(&d.server, &theirs).expect("the root is listed");
+    let id = log_started_at(&d.threads_base, "web", Some("web"), &ours);
+    log_switched(&d.threads_base, "web", id, "web", &theirs);
+    assert_eq!(
+        d.server.threads.project_of(id).as_deref(),
+        Some(target.as_str()),
+        "the switch's root decides between two `web`s"
+    );
+
+    // One `web`: a switch sent as the bare leaf lands on the listed name
+    // in the live table, so the count is right before any rescan.
+    let one = tempfile::tempdir().unwrap();
+    let web = project(one.path(), "web", "");
+    let mut live = daemon(one.path(), vec![], &[("getscale", vec![web.clone()])]).await;
+    let listed = listed_at(&live.server, &web).expect("the root is listed");
+    let id = created(&mut live.steve, &listed).await;
+    assert_eq!(
+        live.steve
+            .request(Request::SwitchProject {
+                thread: id,
+                project: "web".into(),
+            })
+            .await
+            .unwrap(),
+        Response::Ok
+    );
+    assert_eq!(
+        live.server.threads.project_of(id).as_deref(),
+        Some(listed.as_str()),
+        "a live switch to the bare leaf"
+    );
+    let rows = live.server.threads.projects();
+    let (_, _, count) = rows
+        .iter()
+        .find(|(name, _, _)| *name == listed)
+        .expect("the row");
+    assert_eq!(*count, 1, "counted under {listed}: {rows:?}");
+}
+
+/// A legacy `_none` thread takes its project's listed name by root; at a
+/// root in no workspace it keeps the leaf (and counts nowhere), and a
+/// leaf another root's project answers still yields no project.
+#[tokio::test]
+async fn a_legacy_none_thread_counts_under_its_projects_listed_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let web = project(dir.path(), "web", "");
+    let loose = dir.path().join("loose");
+    std::fs::create_dir_all(&loose).unwrap();
+    // A project called `other` at a root that is not this log's root.
+    let elsewhere = dir.path().join("elsewhere-other");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let other = dir.path().join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    let d = daemon(
+        dir.path(),
+        vec![ProjectConfig {
+            name: "other".into(),
+            root: elsewhere,
+        }],
+        &[("getscale", vec![web.clone()])],
+    )
+    .await;
+    let listed = listed_at(&d.server, &web).expect("the root is listed");
+
+    let id = log_started_at(&d.threads_base, "_none", Some("_none"), &web);
+    assert_eq!(
+        d.server.threads.project_of(id).as_deref(),
+        Some(listed.as_str()),
+        "the root names the project"
+    );
+    let rows = d.server.threads.projects();
+    let (_, _, count) = rows
+        .iter()
+        .find(|(name, _, _)| *name == listed)
+        .expect("the row");
+    assert_eq!(*count, 1, "counted under {listed}: {rows:?}");
+
+    let loose_id = log_started_at(&d.threads_base, "_none", Some("_none"), &loose);
+    assert_eq!(
+        d.server.threads.project_of(loose_id).as_deref(),
+        Some("loose"),
+        "no workspace: the leaf stands"
+    );
+    let rows = d.server.threads.projects();
+    let total: u64 = rows.iter().map(|(_, _, n)| n).sum();
+    assert_eq!(total, 1, "the leaf counts in no row: {rows:?}");
+
+    let clashing = log_started_at(&d.threads_base, "_none", Some("_none"), &other);
+    assert_eq!(
+        d.server.threads.project_of(clashing),
+        None,
+        "another root's `other` is not this thread's project"
+    );
 }

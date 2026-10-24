@@ -681,7 +681,7 @@ async fn t4_the_index_says_which_project_a_thread_is_in() {
     assert_eq!(t.dir_of(legacy_new), Some(daemon.base().join("p")));
 }
 
-/// roles follow the log, not the directory the log used to sit in.
+/// Roles follow the log, not the directory it shares a name with.
 #[tokio::test]
 async fn t5_roles_follow_the_log_across_a_switch() {
     let dir = tempfile::tempdir().unwrap();
