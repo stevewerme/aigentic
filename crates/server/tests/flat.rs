@@ -24,7 +24,7 @@ use aigentic_runtime::runner::RunnerHost;
 use aigentic_server::build::{BuildError, ProviderFactory};
 use aigentic_server::config::{Config, ProjectConfig, ServerConfig, UserConfig};
 use aigentic_server::migrate::migrate;
-use aigentic_server::runs::{IssueLock, ServerHost};
+use aigentic_server::runs::{IssueLock, ServerHost, lock_name};
 use aigentic_server::threads::project_name_at;
 use aigentic_server::workspaces::Workspace;
 use aigentic_server::{Listener, NoReports, Server};
@@ -376,13 +376,16 @@ impl Daemon {
             projects,
             resume_runs: false,
         };
-        let server = Arc::new(Server::new(
-            config,
-            cfg_dir,
-            server_cfg,
-            Arc::new(OkFactory),
-            Arc::new(NoReports),
-        ));
+        let server = Arc::new(
+            Server::new(
+                config,
+                cfg_dir,
+                server_cfg,
+                Arc::new(OkFactory),
+                Arc::new(NoReports),
+            )
+            .unwrap(),
+        );
         let socket = dir.join("d.sock");
         tokio::spawn(server.clone().serve(Listener::Unix(socket.clone())));
         for _ in 0..400 {
@@ -591,7 +594,7 @@ fn append_user_message(log: &mut ThreadLog, text: &str) {
     .unwrap();
 }
 
-/// T4 — the index answers `project_of` from the log, and a miss is a
+/// the index answers `project_of` from the log, and a miss is a
 /// miss, not "no thread".
 #[tokio::test]
 async fn t4_the_index_says_which_project_a_thread_is_in() {
@@ -678,7 +681,7 @@ async fn t4_the_index_says_which_project_a_thread_is_in() {
     assert_eq!(t.dir_of(legacy_new), Some(daemon.base().join("p")));
 }
 
-/// T5 — roles follow the log, not the directory the log used to sit in.
+/// roles follow the log, not the directory the log used to sit in.
 #[tokio::test]
 async fn t5_roles_follow_the_log_across_a_switch() {
     let dir = tempfile::tempdir().unwrap();
@@ -736,7 +739,7 @@ async fn t5_roles_follow_the_log_across_a_switch() {
     }
 }
 
-/// T6 — listings and counts come from the log.
+/// listings and counts come from the log.
 #[tokio::test]
 async fn t6_listings_and_counts_follow_the_log() {
     let dir = tempfile::tempdir().unwrap();
@@ -871,7 +874,7 @@ async fn a_thread_made_behind_the_daemon_is_listed_and_counted() {
     assert_eq!(rows, vec![("p", 2), ("q", 1)]);
 }
 
-/// T7 — the issue lock names the project, so two projects' builds of one
+/// the issue lock names the project, so two projects' builds of one
 /// issue never wait on each other, and only one build of one issue in one
 /// project runs.
 #[tokio::test]
@@ -1026,7 +1029,7 @@ fn tear(base: &Path, id: Ulid, kind: &str) {
     std::fs::write(path, body).unwrap();
 }
 
-/// T8 — `title_of` reads the log, and an unknown id has none.
+/// `title_of` reads the log, and an unknown id has none.
 #[tokio::test]
 async fn t8_title_of_comes_from_the_log() {
     let dir = tempfile::tempdir().unwrap();
@@ -1055,7 +1058,7 @@ async fn t8_title_of_comes_from_the_log() {
     assert_eq!(daemon.threads().title_of(Ulid::generate()), None);
 }
 
-/// T9 — the embedded daemon names a bare root by its basename, and a
+/// the embedded daemon names a bare root by its basename, and a
 /// clash with a workspace project at another root gets a hex suffix.
 #[tokio::test]
 async fn t9_embedded_naming() {
@@ -1077,6 +1080,32 @@ async fn t9_embedded_naming() {
     let named = project_name_at(&root, &[workspace]);
     let expected = format!("x-{:08x}", fnv1a32(root.to_string_lossy().as_bytes()));
     assert_eq!(named, expected, "the clash gets the root's hash");
+}
+
+/// a qualified project name stays inside one path segment, so the
+/// build lock is a file directly under the threads base.
+#[tokio::test]
+async fn a_build_lock_names_the_qualified_project_without_a_slash() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("threads");
+    let (workspace, leaf) = ("getscale", "web");
+    let qualified = format!("{workspace}/{leaf}");
+    assert_eq!(
+        lock_name(&qualified),
+        format!("{workspace}_{leaf}"),
+        "the `/` becomes one `_`"
+    );
+    let issue = 7;
+    let _held = IssueLock::take(&base, &qualified, issue)
+        .await
+        .expect("the lock is free");
+    let lock = base.join(format!("issue-{issue}-{}.lock", lock_name(&qualified)));
+    assert!(lock.is_file(), "{}", lock.display());
+    assert_eq!(
+        lock.parent().unwrap(),
+        base,
+        "directly under the base, in no subfolder"
+    );
 }
 
 /// FNV-1a 32 over `bytes`, the hash the clash suffix comes from.

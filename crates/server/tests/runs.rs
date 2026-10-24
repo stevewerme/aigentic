@@ -483,17 +483,20 @@ impl Fixture {
             repo: self.repo.clone(),
             installer: FakeInstaller::echoing_head(),
         });
-        let server = Arc::new(Server::new(
-            config,
-            self.cfg_dir.clone(),
-            server_cfg,
-            Arc::new(Actors {
-                scripts: scripts.clone(),
-                repo: self.repo.clone(),
-                model: MODEL.into(),
-            }),
-            Arc::new(NoReports),
-        ));
+        let server = Arc::new(
+            Server::new(
+                config,
+                self.cfg_dir.clone(),
+                server_cfg,
+                Arc::new(Actors {
+                    scripts: scripts.clone(),
+                    repo: self.repo.clone(),
+                    model: MODEL.into(),
+                }),
+                Arc::new(NoReports),
+            )
+            .unwrap(),
+        );
         server.threads.with_run_deps(deps.clone());
         let socket = self.dir.path().join(format!("d{}.sock", Ulid::generate()));
         let task = tokio::spawn(server.clone().serve(Listener::Unix(socket.clone())));

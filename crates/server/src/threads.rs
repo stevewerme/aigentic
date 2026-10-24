@@ -313,8 +313,17 @@ fn related_in_reach(
             ));
             continue;
         }
+        // The name the daemon lists this root under, not the entry's own
+        // form: a collapsed project (`aigentic` in workspace `aigentic`)
+        // is addressed by that bare name, which no `aigentic/aigentic`
+        // row counts and `root_of` cannot resolve.
+        let name = rows
+            .iter()
+            .find(|r| r.root == *root)
+            .map(|r| r.name.clone())
+            .unwrap_or_else(|| format!("{ws}/{project}"));
         added.push(Listed {
-            name: format!("{ws}/{project}"),
+            name,
             root: root.clone(),
             workspace: Some(ws.to_owned()),
             one_line: None,

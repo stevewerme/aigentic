@@ -496,13 +496,16 @@ mod tests {
                 root: p,
             }],
         };
-        let server = Arc::new(Server::new(
-            config,
-            cfg_dir,
-            server,
-            Arc::new(Factory(Mutex::new(Some(script)))),
-            Arc::new(NoReports),
-        ));
+        let server = Arc::new(
+            Server::new(
+                config,
+                cfg_dir,
+                server,
+                Arc::new(Factory(Mutex::new(Some(script)))),
+                Arc::new(NoReports),
+            )
+            .unwrap(),
+        );
         let socket = dir.path().join("d.sock");
         tokio::spawn(server.serve(Listener::Unix(socket.clone())));
         for _ in 0..200 {

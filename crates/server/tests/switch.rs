@@ -209,16 +209,19 @@ async fn a_thread_moves_to_another_project_and_stays_there_across_a_reload() {
         vec![text("still q"), done()],
     ])));
     let seen: Seen = Arc::new(Mutex::new(Vec::new()));
-    let server = Arc::new(Server::new(
-        config,
-        cfg_dir,
-        server,
-        Arc::new(Factory {
-            script,
-            seen: seen.clone(),
-        }),
-        Arc::new(NoReports),
-    ));
+    let server = Arc::new(
+        Server::new(
+            config,
+            cfg_dir,
+            server,
+            Arc::new(Factory {
+                script,
+                seen: seen.clone(),
+            }),
+            Arc::new(NoReports),
+        )
+        .unwrap(),
+    );
     let socket = dir.path().join("d.sock");
     tokio::spawn(server.clone().serve(Listener::Unix(socket.clone())));
     for _ in 0..200 {
@@ -231,7 +234,9 @@ async fn a_thread_moves_to_another_project_and_stays_there_across_a_reload() {
         .await
         .unwrap();
     let names: Vec<&str> = welcome.projects.iter().map(|p| p.name.as_str()).collect();
-    assert!(names.contains(&"p") && names.contains(&"q"), "{names:?}");
+    // `p` is the workspace's, so it is addressed as `w/p`; `q` is in no
+    // workspace and keeps its folder's name.
+    assert!(names.contains(&"w/p") && names.contains(&"q"), "{names:?}");
 
     let Response::Thread { thread } = client
         .request(Request::CreateThread {
@@ -494,16 +499,19 @@ async fn rig(dir: &std::path::Path, script: Vec<Vec<ProviderEvent>>) -> Rig {
         resume_runs: false,
     };
     let seen: Seen = Arc::new(Mutex::new(Vec::new()));
-    let server = Arc::new(Server::new(
-        config,
-        cfg_dir,
-        server,
-        Arc::new(Factory {
-            script: Arc::new(Mutex::new(VecDeque::from(script))),
-            seen: seen.clone(),
-        }),
-        Arc::new(NoReports),
-    ));
+    let server = Arc::new(
+        Server::new(
+            config,
+            cfg_dir,
+            server,
+            Arc::new(Factory {
+                script: Arc::new(Mutex::new(VecDeque::from(script))),
+                seen: seen.clone(),
+            }),
+            Arc::new(NoReports),
+        )
+        .unwrap(),
+    );
     let socket = dir.join("d.sock");
     tokio::spawn(server.clone().serve(Listener::Unix(socket.clone())));
     for _ in 0..200 {
@@ -910,17 +918,20 @@ async fn t9_a_switch_project_mid_turn_is_refused() {
     let started = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     let seen: Seen = Arc::new(Mutex::new(Vec::new()));
-    let server = Arc::new(Server::new(
-        config,
-        cfg_dir,
-        server,
-        Arc::new(HeldFactory {
-            started: started.clone(),
-            release: release.clone(),
-            seen,
-        }),
-        Arc::new(NoReports),
-    ));
+    let server = Arc::new(
+        Server::new(
+            config,
+            cfg_dir,
+            server,
+            Arc::new(HeldFactory {
+                started: started.clone(),
+                release: release.clone(),
+                seen,
+            }),
+            Arc::new(NoReports),
+        )
+        .unwrap(),
+    );
     let socket = dir.path().join("d.sock");
     tokio::spawn(server.clone().serve(Listener::Unix(socket.clone())));
     for _ in 0..200 {

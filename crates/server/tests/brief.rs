@@ -233,17 +233,20 @@ async fn daemon(script: Vec<Vec<ProviderEvent>>) -> Daemon {
     };
     let seen: Arc<Mutex<Vec<RequestSeen>>> = Arc::new(Mutex::new(Vec::new()));
     let descriptions: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
-    let server = Arc::new(Server::new(
-        config,
-        cfg_dir,
-        server,
-        Arc::new(RecordingFactory {
-            script: Arc::new(Mutex::new(VecDeque::from(script))),
-            seen: seen.clone(),
-            descriptions: descriptions.clone(),
-        }),
-        Arc::new(NoReports),
-    ));
+    let server = Arc::new(
+        Server::new(
+            config,
+            cfg_dir,
+            server,
+            Arc::new(RecordingFactory {
+                script: Arc::new(Mutex::new(VecDeque::from(script))),
+                seen: seen.clone(),
+                descriptions: descriptions.clone(),
+            }),
+            Arc::new(NoReports),
+        )
+        .unwrap(),
+    );
     let socket = dir.path().join("d.sock");
     tokio::spawn(server.clone().serve(Listener::Unix(socket.clone())));
     for _ in 0..200 {
@@ -298,7 +301,7 @@ async fn t5_a_thread_carries_both_briefs_names_the_sibling_and_can_read_it() {
             ProviderEvent::ToolCall(ToolCall {
                 id: "c1".into(),
                 name: "read_brief".into(),
-                args: json!({"project": "q"}),
+                args: json!({"project": "w/q"}),
             }),
             tool_use(),
         ],
@@ -309,7 +312,10 @@ async fn t5_a_thread_carries_both_briefs_names_the_sibling_and_can_read_it() {
         .await
         .unwrap();
     let names: Vec<&str> = welcome.projects.iter().map(|p| p.name.as_str()).collect();
-    assert!(names.contains(&"p") && names.contains(&"q"), "{names:?}");
+    assert!(
+        names.contains(&"w/p") && names.contains(&"w/q"),
+        "{names:?}"
+    );
 
     let Response::Thread { thread } = client
         .request(Request::CreateThread {
@@ -385,7 +391,7 @@ async fn t5_a_thread_carries_both_briefs_names_the_sibling_and_can_read_it() {
     assert_eq!(result.result.id, "c1");
     assert!(!result.result.is_error, "{}", result.result.content);
     assert!(
-        result.result.content.starts_with("[read-only · q]"),
+        result.result.content.starts_with("[read-only · w/q]"),
         "{}",
         result.result.content
     );
@@ -600,10 +606,14 @@ fn description_of(tools: &[String], descriptions: &[String], name: &str) -> Stri
 
 #[tokio::test]
 async fn t6_a_sibling_is_searched_by_name_and_marked_read_only() {
-    let run = run(search_turn(json!({"query": "vercel", "project": "q"})), "p").await;
+    let run = run(
+        search_turn(json!({"query": "vercel", "project": "w/q"})),
+        "p",
+    )
+    .await;
     let content = &run.results[0].result.content;
     assert!(!run.results[0].result.is_error, "{content}");
-    assert!(content.starts_with("[read-only · q]\n"), "{content}");
+    assert!(content.starts_with("[read-only · w/q]\n"), "{content}");
     assert!(
         content.contains("Q builds with the vercel flag set."),
         "{content}"
@@ -665,14 +675,14 @@ async fn t6_a_project_in_another_workspace_is_refused() {
     );
     // The refusal offers only the projects this thread understands.
     assert!(
-        result.content.contains("searchable: p, q"),
+        result.content.contains("searchable: p, w/q"),
         "{}",
         result.content
     );
-    // The refused project is still named in the block, as any other
-    // workspace's projects are.
+    // The refused project is still named in the block, under the name its
+    // workspace gives it, as any other workspace's projects are.
     assert!(
-        run.prefix.contains("Other workspaces: v: r"),
+        run.prefix.contains("Other workspaces: v: v/r"),
         "{}",
         run.prefix
     );
