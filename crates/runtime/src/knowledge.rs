@@ -420,9 +420,14 @@ impl ScopeSources {
             );
             (p.name.clone(), p.root.clone(), sections)
         });
+        // Not the thread's own project: the daemon may list it under a
+        // qualified name and hand it to the runtime under the project
+        // file's, so the root decides.
         state.siblings = rows
             .iter()
-            .filter(|r| r.understood && project.is_none_or(|p| p.name != r.name))
+            .filter(|r| {
+                r.understood && project.is_none_or(|p| p.name != r.name && p.root != r.root)
+            })
             .map(|r| (r.name.clone(), r.root.clone()))
             .collect();
         state.workspace = workspace.map(|w| {

@@ -120,32 +120,35 @@ pub(crate) async fn daemon(
     let cfg_dir = dir.join("cfg");
     std::fs::create_dir_all(&cfg_dir).unwrap();
     let socket = dir.join("s.sock");
-    let server = Arc::new(Server::new(
-        config(dir),
-        cfg_dir,
-        ServerConfig {
-            listen: "unix".to_owned(),
-            idle_unload_secs: 24 * 3600,
-            resume_runs: false,
-            users: users
-                .iter()
-                .map(|(name, token)| UserConfig {
-                    name: (*name).into(),
-                    token_env: None,
-                    token: Some((*token).into()),
-                })
-                .collect(),
-            projects: projects
-                .iter()
-                .map(|(name, root)| ProjectConfig {
-                    name: (*name).into(),
-                    root: root.clone(),
-                })
-                .collect(),
-        },
-        Arc::new(SilentFactory),
-        Arc::new(NoReports),
-    ));
+    let server = Arc::new(
+        Server::new(
+            config(dir),
+            cfg_dir,
+            ServerConfig {
+                listen: "unix".to_owned(),
+                idle_unload_secs: 24 * 3600,
+                resume_runs: false,
+                users: users
+                    .iter()
+                    .map(|(name, token)| UserConfig {
+                        name: (*name).into(),
+                        token_env: None,
+                        token: Some((*token).into()),
+                    })
+                    .collect(),
+                projects: projects
+                    .iter()
+                    .map(|(name, root)| ProjectConfig {
+                        name: (*name).into(),
+                        root: root.clone(),
+                    })
+                    .collect(),
+            },
+            Arc::new(SilentFactory),
+            Arc::new(NoReports),
+        )
+        .expect("the test's projects do not clash"),
+    );
     tokio::spawn(server.clone().serve(Listener::Unix(socket.clone())));
     for _ in 0..200 {
         if socket.exists() {

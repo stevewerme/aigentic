@@ -340,7 +340,7 @@ async fn run() -> anyhow::Result<()> {
         );
         let daemon = std::sync::Arc::new(aigentic_server::Server::from_configs(
             config, config_dir, server,
-        ));
+        )?);
         daemon.serve(listener).await?;
         return Ok(());
     }

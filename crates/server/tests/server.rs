@@ -83,13 +83,16 @@ async fn daemon(scripts: Vec<Vec<Option<Vec<ProviderEvent>>>>, idle_secs: u64) -
         ],
         resume_runs: false,
     };
-    let server = Arc::new(Server::new(
-        config,
-        cfg_dir,
-        server,
-        Arc::new(Factory::new(scripts.into())),
-        Arc::new(NoReports),
-    ));
+    let server = Arc::new(
+        Server::new(
+            config,
+            cfg_dir,
+            server,
+            Arc::new(Factory::new(scripts.into())),
+            Arc::new(NoReports),
+        )
+        .unwrap(),
+    );
     let socket = dir.path().join("d.sock");
     let task = tokio::spawn(server.clone().serve(Listener::Unix(socket.clone())));
     for _ in 0..200 {

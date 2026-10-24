@@ -5394,15 +5394,18 @@ mod tests {
                 root,
             }],
         };
-        let server = Arc::new(Server::new(
-            config(dir.path()),
-            cfg_dir.clone(),
-            server_config,
-            Factory::scripted(script),
-            Arc::new(DefaultReports {
-                global_instructions: cfg_dir.join("instructions.md"),
-            }),
-        ));
+        let server = Arc::new(
+            Server::new(
+                config(dir.path()),
+                cfg_dir.clone(),
+                server_config,
+                Factory::scripted(script),
+                Arc::new(DefaultReports {
+                    global_instructions: cfg_dir.join("instructions.md"),
+                }),
+            )
+            .unwrap(),
+        );
         let socket = dir.path().join("d.sock");
         let task = tokio::spawn(server.clone().serve(Listener::Unix(socket.clone())));
         for _ in 0..200 {
@@ -5592,15 +5595,18 @@ mod tests {
                 root,
             }],
         };
-        let server = Arc::new(Server::new(
-            config(dir.path()),
-            cfg_dir.clone(),
-            server_config,
-            Factory::scripted(script),
-            Arc::new(DefaultReports {
-                global_instructions: cfg_dir.join("instructions.md"),
-            }),
-        ));
+        let server = Arc::new(
+            Server::new(
+                config(dir.path()),
+                cfg_dir.clone(),
+                server_config,
+                Factory::scripted(script),
+                Arc::new(DefaultReports {
+                    global_instructions: cfg_dir.join("instructions.md"),
+                }),
+            )
+            .unwrap(),
+        );
         let socket = dir.path().join("d.sock");
         let task = tokio::spawn(server.clone().serve(Listener::Unix(socket.clone())));
         for _ in 0..200 {
