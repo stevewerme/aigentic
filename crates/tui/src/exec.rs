@@ -626,6 +626,32 @@ mod tests {
         assert_eq!(o.reason.as_deref(), Some("done"), "{err}");
     }
 
+    /// A job proposal is declined the same way, and the line names the job
+    /// rather than a switch.
+    #[tokio::test]
+    async fn a_job_proposal_is_declined_by_name_and_exit_is_three() {
+        let call = ProviderEvent::ToolCall(ToolCall {
+            id: "c1".into(),
+            name: "start_job".into(),
+            args: serde_json::json!({"task": "list the callers", "brief": "find them"}),
+        });
+        let (o, _, err) = exec(
+            vec![
+                vec![call, finish("tool_use")],
+                vec![text("doing it here"), finish("stop")],
+            ],
+            args(false),
+        )
+        .await;
+        assert_eq!(o.denied, 1, "{err}");
+        assert_eq!(o.code, EXIT_NEEDS_HUMAN, "{err}");
+        assert!(
+            err.contains(&job_declined_line("list the callers")),
+            "{err}"
+        );
+        assert!(!err.contains("switch to"), "{err}");
+    }
+
     #[tokio::test]
     async fn json_prints_notices_then_a_summary() {
         let (o, out, _) = exec(vec![vec![text("ok"), finish("stop")]], args(true)).await;

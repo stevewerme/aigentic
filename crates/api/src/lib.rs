@@ -25,8 +25,10 @@ use ulid::Ulid;
 /// would render as a move; version 8 adds `Jobs`/`JobRow`, so a client
 /// that cannot show today's builds must refuse rather than misread one;
 /// version 9 adds `Notice::Job`, which carries a background job's asks to
-/// the front thread, so a client that could not answer them must refuse.
-pub const PROTOCOL_VERSION: u32 = 9;
+/// the front thread, so a client that could not answer them must refuse;
+/// version 10 adds `AwaitingSwitch`'s `job`, which an older client decodes
+/// as a project switch and would prompt as one while its yes starts a job.
+pub const PROTOCOL_VERSION: u32 = 10;
 
 /// One line on the wire.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1331,12 +1333,9 @@ mod tests {
         }
     }
 
-    /// T1 (issue #92): `Front`'s `here` is an additive optional field. A
-    /// frame carrying it round-trips; one without it is serialised with
-    /// no `here` key at all and a frame that predates the field decodes
-    /// as `here: None`, the old client's frame.
-    /// A daemon that sends no `job` is a project switch to a new
-    /// client, so an old frame keeps meaning what it meant.
+    /// A wait with no `job` is a project switch, so a `suggest_project`
+    /// wait and one from a daemon that never sends `job` still prompt as
+    /// one.
     #[test]
     fn a_switch_wait_without_a_job_still_decodes_as_a_switch() {
         let state: ThreadState = serde_json::from_str(
@@ -1349,6 +1348,9 @@ mod tests {
         ));
     }
 
+    /// `Front`'s `here` is an additive optional field. A frame carrying it
+    /// round-trips; one without it is serialised with no `here` key at
+    /// all, and a frame that predates the field decodes as `here: None`.
     #[test]
     fn t1_front_here_round_trips_and_the_old_frame_still_decodes() {
         let with = Frame::request(
@@ -1400,7 +1402,7 @@ mod tests {
     /// its log and the client cannot tell.
     #[test]
     fn t7_front_asked_round_trips_and_the_old_frame_still_decodes() {
-        assert_eq!(PROTOCOL_VERSION, 9, "the job notice moved it");
+        assert_eq!(PROTOCOL_VERSION, 10, "a job's wait moved it");
         let asked = StartAsk {
             offered: "web".into(),
             chosen: "api".into(),
@@ -1452,7 +1454,7 @@ mod tests {
     /// (which always named one) still decodes.
     #[test]
     fn t1_list_threads_project_is_optional_on_the_wire() {
-        assert_eq!(PROTOCOL_VERSION, 9, "the job notice moved it");
+        assert_eq!(PROTOCOL_VERSION, 10, "a job's wait moved it");
         let some = Frame::request(
             1,
             Request::ListThreads {
@@ -1767,7 +1769,7 @@ mod tests {
         assert!(
             decode(r#"{"notice":{"kind":"run_status","thread":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":{"issue":1,"phase":{"phase":"teleported"},"idle_secs":0}}}"#).is_err()
         );
-        assert_eq!(PROTOCOL_VERSION, 9, "the job notice moved it");
+        assert_eq!(PROTOCOL_VERSION, 10, "a job's wait moved it");
     }
 
     /// A job's ask reaches the front thread inside one frame that names

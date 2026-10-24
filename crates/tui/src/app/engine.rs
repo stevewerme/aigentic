@@ -11159,16 +11159,7 @@ mod tests {
     /// start, and its `Yes` goes back as the switch answer it is.
     #[tokio::test]
     async fn a_job_proposal_is_prompted_with_its_task_and_answered_yes() {
-        let state = ThreadState::AwaitingSwitch {
-            call_id: "j1".into(),
-            project: "aigentic".into(),
-            workspace: Some("aigentic".into()),
-            reason: "work too big for this conversation".into(),
-            job: Some(aigentic_api::JobAsk {
-                task: "rewrite the CLI help".into(),
-                read_only: false,
-            }),
-        };
+        let state = job_state("j1");
         let (mut repl, mut out, daemon) = repl_for(Ulid::generate(), vec![]).await;
         repl.render(
             Notice::State {
@@ -11193,6 +11184,20 @@ mod tests {
             out.0.0
         );
         daemon.stop();
+    }
+
+    /// The chat thread waiting on a `start_job` proposal.
+    fn job_state(call_id: &str) -> ThreadState {
+        ThreadState::AwaitingSwitch {
+            call_id: call_id.into(),
+            project: "aigentic".into(),
+            workspace: Some("aigentic".into()),
+            reason: "work too big for this conversation".into(),
+            job: Some(aigentic_api::JobAsk {
+                task: "rewrite the CLI help".into(),
+                read_only: false,
+            }),
+        }
     }
 
     /// The chat thread waiting on a switch proposal (issue #82).
@@ -11355,6 +11360,25 @@ mod tests {
                 .0
                 .iter()
                 .any(|l| l == "[waiting for an answer: switch to customer?]"),
+            "{:#?}",
+            out.0.0
+        );
+
+        // A job's wait names the job, never a switch.
+        repl.render(
+            Notice::State {
+                thread: repl.thread,
+                state: job_state("j1"),
+            },
+            &mut out,
+        );
+        assert_eq!(repl.menu(), None);
+        assert!(
+            out.0
+                .0
+                .iter()
+                .any(|l| l
+                    == "[waiting for an answer: start a background job? rewrite the CLI help]"),
             "{:#?}",
             out.0.0
         );
