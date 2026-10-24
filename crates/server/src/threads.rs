@@ -517,15 +517,22 @@ impl ThreadTable {
 
     /// Remember that the thread is in `project` now. The log's
     /// `project_switched` is the truth; this is the entry, so the next
-    /// open does not rebuild the old project.
+    /// open does not rebuild the old project. The name is the one this
+    /// daemon lists the project by, so a switch sent as a bare leaf shows
+    /// under the project's listed name at once, before any scan.
     pub fn note_project(&self, thread: Ulid, project: &str) {
+        let project = self
+            .server
+            .project(project)
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| project.to_owned());
         if let Some(e) = self
             .entries
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get_mut(&thread)
         {
-            e.project = project.to_owned();
+            e.project = project.clone();
         }
         // The index too, so a listing and the next open see the switch
         // without rereading the log (issue #9).
@@ -535,12 +542,12 @@ impl ThreadTable {
             .unwrap_or_else(|e| e.into_inner())
             .get_mut(&thread)
         {
-            i.switched = Some(project.to_owned());
+            i.switched = Some(project.clone());
             // Where the daemon has that project now (issue #88): the
             // switch's root is this daemon's, not the one an older log
             // line recorded. A name this daemon cannot resolve leaves
             // the field as the log had it.
-            i.switched_root = self.root_of(project).ok().map(|r| r.root);
+            i.switched_root = self.root_of(&project).ok().map(|r| r.root);
         }
     }
 
@@ -873,12 +880,13 @@ impl ThreadTable {
         Ok(file.participants)
     }
 
-    /// Which project a thread belongs to (issue #9). The entry while it
-    /// is open; otherwise what its log says: its last switch if this
-    /// daemon knows that project — the one `open` would build in — else
-    /// its home. `None` for a log with no project: a pre-phase-4 one, or
-    /// a `_none` thread whose name another project holds at a different
-    /// root.
+    /// Which project a thread belongs to, always under the name this
+    /// daemon lists it by. The entry while it is open;
+    /// otherwise what its log says: its last switch if this daemon knows
+    /// that project — the one `open` would build in — else the project
+    /// that switch's root is now listed as, else its home. `None` for a
+    /// log with no project: a pre-phase-4 one, or a `_none` thread whose
+    /// name another project holds at a different root.
     pub fn project_of(&self, thread: Ulid) -> Option<String> {
         if let Some(e) = self
             .entries
@@ -891,7 +899,18 @@ impl ThreadTable {
         let indexed = self.lookup(thread)?;
         indexed
             .switched
-            .filter(|name| self.server.project(name).is_some())
+            .as_deref()
+            .and_then(|name| self.server.project(name))
+            .map(|p| p.name.clone())
+            .or_else(|| {
+                let root = indexed.switched_root.as_deref()?;
+                let p = self
+                    .server
+                    .projects
+                    .iter()
+                    .find(|p| same_root(&p.root, root))?;
+                Some(p.name.clone())
+            })
             .or(indexed.home)
     }
 
@@ -2039,41 +2058,70 @@ pub(crate) fn same_root(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// What a scan works out once per root: the name the daemon lists the
+/// project at that root under, and the root's own project name — a file
+/// read that 456 logs sharing a root must not repeat.
+struct RootNames {
+    listed: Option<String>,
+    leaf: String,
+}
+
+fn root_names<'a>(
+    server: &ServerConfig,
+    root: &Path,
+    memo: &'a mut HashMap<PathBuf, RootNames>,
+) -> &'a RootNames {
+    memo.entry(root.to_path_buf()).or_insert_with(|| RootNames {
+        listed: server
+            .projects
+            .iter()
+            .find(|p| same_root(&p.root, root))
+            .map(|p| p.name.clone()),
+        leaf: crate::workspaces::project_name(root),
+    })
+}
+
 /// The project a `thread_started` gives a thread (issue #9): its own
-/// `project`.
+/// `project`, under the name the daemon lists that project by — a thread
+/// started before its project was qualified still belongs to it.
 ///
 /// A pre-phase-6 log wrote [`LEGACY_NONE_PROJECT`] for a root with no
 /// project file, because the per-project directory was the index. That
-/// stand-in name is gone, so such a thread belongs to
-/// `project_name_at(root)` — and to no project at all when that name is
-/// another project's, at a different canonical root.
+/// stand-in name is gone, so such a thread belongs to the project at its
+/// root — and to no project at all when only a project at another root
+/// answers to the root's name.
 fn home_of(
     server: &ServerConfig,
     project: Option<&str>,
     root: Option<&Path>,
-    memo: &mut HashMap<PathBuf, Option<String>>,
+    memo: &mut HashMap<PathBuf, RootNames>,
 ) -> Option<String> {
     let name = project?;
+    let names = root.map(|root| root_names(server, root, memo));
     if name != LEGACY_NONE_PROJECT {
+        // The logged name stands unless this root is listed under
+        // another one.
+        if let (Some(p), Some(root)) = (server.project(name), root)
+            && same_root(&p.root, root)
+        {
+            return Some(p.name.clone());
+        }
+        if let Some(listed) = names.and_then(|n| n.listed.clone()) {
+            return Some(listed);
+        }
         return Some(name.to_owned());
     }
-    let root = root?;
-    // Canonicalising is memoised per distinct root: a scan of 456 logs
-    // must not canonicalise one path 456 times.
-    if let Some(known) = memo.get(root) {
-        return known.clone();
+    if let Some(listed) = names.and_then(|n| n.listed.clone()) {
+        return Some(listed);
     }
-    // The root's project file name if one exists now, else the root's
-    // own basename: the rule the embedded daemon names a bare root by,
-    // minus its hex suffix. A configured project at a different root
-    // claims that name, so the thread has no project it can be built in.
-    let candidate = crate::workspaces::project_name(root);
-    let home = match server.project(&candidate) {
-        Some(p) if !same_root(&p.root, root) => None,
-        _ => Some(candidate),
-    };
-    memo.insert(root.to_path_buf(), home.clone());
-    home
+    // No project at this root: its own name counts only when no project
+    // at another root answers to it, so a thread is never built in the
+    // wrong root.
+    let names = names?;
+    match server.project(&names.leaf) {
+        Some(_) => None,
+        None => Some(names.leaf.clone()),
+    }
 }
 
 /// Read one log into its index entry (issue #9): the `thread_started`,
@@ -2083,7 +2131,7 @@ fn home_of(
 fn scan_log(
     path: &Path,
     server: &ServerConfig,
-    memo: &mut HashMap<PathBuf, Option<String>>,
+    memo: &mut HashMap<PathBuf, RootNames>,
 ) -> Option<(Ulid, Indexed)> {
     let id: Ulid = path.file_stem()?.to_str()?.parse().ok()?;
     let dir = path.parent()?.to_path_buf();
@@ -2150,7 +2198,12 @@ fn scan_log(
                     // whatever its `to` is, so `switched` and
                     // `switched_root` never disagree.
                     entry.switched_root = p.to.as_ref().map(|_| p.root.clone());
-                    entry.switched = p.to;
+                    // The name this daemon lists the project by, so a
+                    // log written before its project was qualified, or
+                    // a switch sent as a bare leaf, still names the row
+                    // the thread counts under.
+                    entry.switched =
+                        p.to.map(|to| server.project(&to).map(|p| p.name.clone()).unwrap_or(to));
                 }
             }
             EventKind::RunStarted if wants_run => {
@@ -2175,7 +2228,7 @@ fn scan_log(
 /// logs once, at start-up (issue #9). The flat directory is read first,
 /// then each legacy subdirectory; if an id is in both, the flat one wins.
 fn scan_index(base: &Path, server: &ServerConfig) -> HashMap<Ulid, Indexed> {
-    let mut memo: HashMap<PathBuf, Option<String>> = HashMap::new();
+    let mut memo: HashMap<PathBuf, RootNames> = HashMap::new();
     let mut index: HashMap<Ulid, Indexed> = HashMap::new();
     for path in log_files(base) {
         if let Some((id, entry)) = scan_log(&path, server, &mut memo) {
