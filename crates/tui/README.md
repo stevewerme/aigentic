@@ -980,3 +980,114 @@ call's `tool_result` is the answerer's event and the client prints
 fourth, from writing item 26: `--profile` was a no-op on the REPL path
 between steps 9 and 11, fixed the same day (the flag reaches
 `Server::embed`; a test holds it).
+
+### Phase 6 acceptance (docs/PLAN-phase6.md done-when 1 to 12)
+
+One person, the installed binary, a week of real work on TensorX from
+one front thread. Fill this in as you go: tick an item when you have
+seen it hold, and put the thread id and the date under it, plus a
+line on anything that went wrong. An item that breaks gets an issue,
+and the issue's number goes on its line.
+
+Before the first day, install from `main` and check the version line
+names the commit:
+
+```bash
+cargo install --path crates/tui --force --locked
+```
+
+```bash
+aigentic --version
+```
+
+#### The checklist
+
+- [ ] **1. One front thread, three projects, one day.** Work on this
+  repository, the marketing site and the marketing notes from the same
+  front thread. Expect the model to propose a switch when a message
+  belongs to another project, `y` to move the thread, and
+  `/project use <name>` to do the same by hand. After a switch the
+  project's rules, knowledge and working directory are the new one's.
+  Quit and restart: you land in the project you were last in.
+  Thread: · Date: · Notes:
+- [ ] **2. Understanding crosses projects, touching does not.** In the
+  marketing notes, ask what the harness does and where the site
+  stands: it answers from the other projects' briefs and knowledge,
+  and a request to read or write their files is refused. State a fact
+  about yourself in one project and check it is in your person memory;
+  state a fact about the project and check it is in that project's.
+  Thread: · Date: · Notes:
+- [ ] **3. Start is resume.** `aigentic` with no flags resumes your
+  front thread, and the banner names its title and project. Started
+  from another project's folder, it proposes the switch. Every thread
+  has a title after its first turn.
+  Thread: · Date: · Notes:
+- [ ] **4. Interrupt is a reflex.** Ctrl-C during a turn stops it
+  within a second and the status row says so. Ctrl-C twice within a
+  second on an empty composer quits. Esc-Esc puts your last message
+  back. A message typed during a turn shows as queued; `!` sends it
+  now; Alt-Up pulls it back.
+  Thread: · Date: · Notes:
+- [ ] **5. You always know what it is doing and what it costs.** The
+  status line shows model, mode, project, context percentage, the
+  turn's elapsed seconds and the queue depth.
+  Thread: · Date: · Notes:
+- [ ] **6. Edits are readable, output is expandable.** Edits show a
+  coloured diff of three lines with the whole one a key away. Bash
+  results show head and tail with `… +N lines`. Ctrl-T opens the
+  whole transcript. Consecutive reads fold into one `Explored` cell.
+  `/diff` shows the working tree.
+  Thread: · Date: · Notes:
+- [ ] **7. Approvals ask rarely and answer richly.** In manual mode on
+  this repository, a working session asks fewer than five times and
+  never twice for the same command. Try each key once: `y`, `a`, `p`
+  (check the rule lands in `.aigentic/rules.toml`), `n`, and `Esc`
+  with a reason the model then reads.
+  Thread: · Date: · Requests in the session: · Notes:
+- [ ] **8. Non-interactive mode.** `aigentic exec "prompt"` prints
+  progress to stderr and the answer to stdout. Check the exit codes:
+  0 done, 1 failed, 3 done with a denial, 130 interrupted. `--json`
+  prints the events instead.
+  Thread: · Date: · Notes:
+- [ ] **9. Nothing lost.** Rerun items 1 to 20 above in this client
+  with the same outcomes, and open, replay and list a pre-phase-6 log
+  (`/threads`, then `--thread <id>`).
+  Thread: · Date: · Notes:
+- [ ] **10. Big work runs in the background.** When the model proposes
+  a background job, `y` starts it. Its questions come to the front
+  thread tagged `[job N …]`, the status line counts it, `/jobs`
+  lists it beside builds, and its summary comes back as a cell.
+  Thread: · Job thread: · Date: · Notes:
+- [ ] **11. Length is irrelevant.** After a long day the front thread
+  stays near its 120k-token working set (the `peak` column in
+  `aigentic stats --thread <id>`), and something said early still
+  comes back when you ask for it.
+  Thread: · Peak: · Date: · Notes:
+- [ ] **12. Every decision is measured.**
+  `aigentic stats --decisions` reports acceptance per kind, and its
+  counts match what you answered.
+  Date: · Notes:
+
+#### The daily log
+
+One row a day. Asks are permission prompts. Proposals are the
+model's `project` and `job` proposals; write each as answered out of
+asked (for example `3/4`). Peak is the front thread's from
+`aigentic stats`. The last column is yes or no, with a word on why
+when yes.
+
+| Day | Date | Asks | Project proposals | Job proposals | Jobs and how useful | Peak context | `/new` or thread-thinking needed? |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | | | | | | | |
+| 2 | | | | | | | |
+| 3 | | | | | | | |
+| 4 | | | | | | | |
+| 5 | | | | | | | |
+| 6 | | | | | | | |
+| 7 | | | | | | | |
+
+When the week is done, `aigentic stats --decisions` over the week
+and this table are the input for ADR 0002's thresholds.
+
+Results: not yet run as of 2026-10-24. Every phase 6 ticket is merged
+(`main` at `997d93b`).
