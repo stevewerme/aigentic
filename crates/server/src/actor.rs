@@ -14,7 +14,7 @@
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
 
-use aigentic_api::{AskedOption, AskedQuestion, Notice, ReportKind, Response, ThreadState};
+use aigentic_api::{AskedOption, AskedQuestion, JobAsk, Notice, ReportKind, Response, ThreadState};
 use aigentic_runtime::aigentic_core::{Author, ContentBlock, Event, EventKind};
 use aigentic_runtime::aigentic_log::{
     JobFinishedPayload, PermissionRequestedPayload, UserMessagePayload, declined_at_startup,
@@ -496,11 +496,16 @@ impl Shared {
                         call_id,
                         project,
                         reason,
+                        job,
                     } => ThreadState::AwaitingSwitch {
                         call_id: call_id.clone(),
                         project: project.clone(),
                         workspace: (self.labels)(project),
                         reason: reason.clone(),
+                        job: job.as_ref().map(|job| JobAsk {
+                            task: job.task.clone(),
+                            read_only: job.read_only,
+                        }),
                     },
                     Pending::Human {
                         call_id,
@@ -1038,6 +1043,7 @@ impl ThreadActor {
                     project: waiting.project.clone(),
                     workspace: (self.shared.labels)(&waiting.project),
                     reason,
+                    job: None,
                 };
                 self.idle_switch = Some(waiting);
                 self.shared.set_state(state);

@@ -46,6 +46,11 @@ pub fn switch_declined_line(project: &str) -> String {
     format!("[switch to {project} not answered: non-interactive]")
 }
 
+/// The line `exec` prints when it declines a background job proposal.
+pub fn job_declined_line(task: &str) -> String {
+    format!("[background job not started: non-interactive: {task}]")
+}
+
 /// How many result lines the progress on stderr shows per tool call.
 const RESULT_LINES: usize = 3;
 
@@ -339,12 +344,19 @@ impl Follow {
                         .await?;
                 }
                 ThreadState::AwaitingSwitch {
-                    call_id, project, ..
+                    call_id,
+                    project,
+                    job,
+                    ..
                 } => {
                     self.running = true;
                     self.end_line(err)?;
                     self.denied += 1;
-                    writeln!(err, "{}", switch_declined_line(&project))?;
+                    let line = match job {
+                        Some(job) => job_declined_line(&job.task),
+                        None => switch_declined_line(&project),
+                    };
+                    writeln!(err, "{line}")?;
                     client
                         .request(Request::AnswerSwitch {
                             thread,

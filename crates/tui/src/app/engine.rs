@@ -346,6 +346,14 @@ fn system_cell(out: &mut dyn Printer, line: String) {
     }
 }
 
+/// What a waiting proposal asks, for a line that is not its prompt.
+fn switch_wait(project: &str, job: &Option<aigentic_api::JobAsk>) -> String {
+    match job {
+        Some(job) => format!("start a background job? {}", job.task),
+        None => format!("switch to {project}?"),
+    }
+}
+
 /// A vector, for tests. Field 1 asks for the developer view's cells
 /// (issue #115); `Default` is off, so every scripted turn that builds
 /// `Lines::default()` prints HEAD's rows.
@@ -1150,8 +1158,8 @@ impl ClientRepl {
                 ThreadState::AwaitingHuman { question, .. } => {
                     format!("waiting for an answer: {question}")
                 }
-                ThreadState::AwaitingSwitch { project, .. } => {
-                    format!("waiting for an answer: switch to {project}?")
+                ThreadState::AwaitingSwitch { project, job, .. } => {
+                    format!("waiting for an answer: {}", switch_wait(project, job))
                 }
             }),
             Command::Threads => {
@@ -3253,18 +3261,25 @@ impl ClientRepl {
                 project,
                 workspace,
                 reason,
+                job,
             } => {
                 if self.may_write() {
                     // The in-place block (issue #82): the same prompt as
                     // a permission or a question, answered in one
                     // keystroke (ADR 0002).
-                    let menu = Menu::switch(project, workspace.as_deref(), reason);
+                    let menu = match job {
+                        Some(job) => Menu::job(&job.task, job.read_only),
+                        None => Menu::switch(project, workspace.as_deref(), reason),
+                    };
                     out.prompt(&menu);
                     self.menu = Some(menu);
                     self.prompted = Some(call_id.clone());
                     self.prompted_thread = None;
                 } else {
-                    out.line(&format!("[waiting for an answer: switch to {project}?]"));
+                    out.line(&format!(
+                        "[waiting for an answer: {}]",
+                        switch_wait(project, job)
+                    ));
                 }
             }
             ThreadState::Running { .. } | ThreadState::Idle => {
@@ -11031,6 +11046,7 @@ mod tests {
             project: "there".into(),
             workspace: Some("~/there".into()),
             reason: "the message is about the site".into(),
+            job: None,
         };
         repl.render(
             Notice::State {
@@ -11139,6 +11155,46 @@ mod tests {
             .collect()
     }
 
+    /// A waiting `start_job` proposal is prompted as the job it would
+    /// start, and its `Yes` goes back as the switch answer it is.
+    #[tokio::test]
+    async fn a_job_proposal_is_prompted_with_its_task_and_answered_yes() {
+        let state = ThreadState::AwaitingSwitch {
+            call_id: "j1".into(),
+            project: "aigentic".into(),
+            workspace: Some("aigentic".into()),
+            reason: "work too big for this conversation".into(),
+            job: Some(aigentic_api::JobAsk {
+                task: "rewrite the CLI help".into(),
+                read_only: false,
+            }),
+        };
+        let (mut repl, mut out, daemon) = repl_for(Ulid::generate(), vec![]).await;
+        repl.render(
+            Notice::State {
+                thread: repl.thread,
+                state,
+            },
+            &mut out,
+        );
+        let menu = repl.menu().expect("the job is prompted");
+        assert_eq!(menu.title, "start a background job?");
+        assert_eq!(menu.body, "rewrite the CLI help");
+        repl.menu_key(&key_for('1'), true, true, &mut out).await;
+        assert_eq!(switch_answers(&daemon), vec![SwitchReply::Yes]);
+        assert!(
+            out.0.0.iter().any(|l| l == "↳ Yes, start it"),
+            "{:#?}",
+            out.0.0
+        );
+        assert!(
+            out.0.0.iter().all(|l| !l.contains("switch to")),
+            "{:#?}",
+            out.0.0
+        );
+        daemon.stop();
+    }
+
     /// The chat thread waiting on a switch proposal (issue #82).
     fn switch_state(call_id: &str) -> ThreadState {
         ThreadState::AwaitingSwitch {
@@ -11146,6 +11202,7 @@ mod tests {
             project: "customer".into(),
             workspace: Some("~/customer".into()),
             reason: "the message is about the site".into(),
+            job: None,
         }
     }
 

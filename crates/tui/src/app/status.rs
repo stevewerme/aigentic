@@ -673,6 +673,7 @@ mod tests {
             project: "there".into(),
             workspace: Some("~/there".into()),
             reason: "belongs there".into(),
+            job: None,
         });
         assert_eq!(s.waiting, Some("awaiting switch"));
         s.apply_state(&ThreadState::Idle);

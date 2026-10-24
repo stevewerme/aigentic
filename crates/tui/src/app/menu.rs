@@ -446,6 +446,26 @@ impl Menu {
         menu
     }
 
+    /// A background job proposal: the switch proposal's keys and answers,
+    /// worded for starting work rather than moving the thread. The task
+    /// is the body; a read-only job says so on its own line.
+    pub fn job(task: &str, read_only: bool) -> Self {
+        let mut menu = Self::switch("", None, task);
+        menu.title = "start a background job?".into();
+        if read_only {
+            menu.body.push_str("\nread-only: it changes no files");
+        }
+        let labels = [
+            "Yes, start it",
+            "No, don't start it",
+            "No, it belongs in another project…",
+        ];
+        for (row, label) in menu.rows.iter_mut().zip(labels) {
+            row.label = label.into();
+        }
+        menu
+    }
+
     /// The switch proposal (issue #82; ADR 0002): a proposal is answered
     /// in one keystroke, in the same in-place block as a permission or a
     /// question. The title names the project the thread would move to;
@@ -1755,6 +1775,40 @@ mod tests {
             reason: None,
             echo: echo.to_owned(),
         }
+    }
+
+    /// A job proposal names the work it would start, never a switch, and
+    /// keeps the switch's rows so the same keys answer it.
+    #[test]
+    fn a_job_proposal_names_its_task_and_offers_to_start_it() {
+        let menu = Menu::job("rewrite the CLI help", false);
+        assert_eq!(menu.kind, Kind::Switch);
+        assert_eq!(menu.title, "start a background job?");
+        assert_eq!(menu.body, "rewrite the CLI help");
+        let rows: Vec<(&str, &Pick)> = menu
+            .rows
+            .iter()
+            .map(|r| (r.label.as_str(), &r.pick))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("Yes, start it", &Pick::SwitchYes),
+                ("No, don't start it", &Pick::SwitchNo),
+                ("No, it belongs in another project…", &Pick::SwitchElsewhere),
+            ]
+        );
+        assert!(
+            menu.plain().iter().all(|l| !l.contains("switch to")),
+            "{:#?}",
+            menu.plain()
+        );
+
+        let read_only = Menu::job("survey the callers", true);
+        assert_eq!(
+            read_only.body,
+            "survey the callers\nread-only: it changes no files"
+        );
     }
 
     /// T1 (#82): `Menu::switch` is titled `switch to {project}?`, shows

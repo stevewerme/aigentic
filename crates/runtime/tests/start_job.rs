@@ -205,6 +205,7 @@ async fn when_parked(decisions: &Arc<Decisions>) -> (String, String, String) {
             call_id,
             project,
             reason,
+            ..
         }) = decisions.pending().first()
         {
             return (call_id.clone(), project.clone(), reason.clone());
@@ -261,7 +262,10 @@ async fn start_job_parks_the_turn_with_a_job_proposal() {
         Signal::Event(event) if event.kind == EventKind::DecisionProposed => {
             seen.push("proposed".into())
         }
-        Signal::Waiting(Pending::Switch { project, .. }) => seen.push(format!("waiting:{project}")),
+        Signal::Waiting(Pending::Switch { project, job, .. }) => {
+            let task = job.as_ref().map(|job| job.task.as_str());
+            seen.push(format!("waiting:{project}:{}", task.unwrap_or("no job")))
+        }
         _ => {}
     };
     let waiting = decisions.clone();
@@ -272,8 +276,8 @@ async fn start_job_parks_the_turn_with_a_job_proposal() {
     assert_eq!(outcome.unwrap().reason, ASKED_HUMAN);
     assert_eq!(
         seen,
-        vec!["proposed".to_string(), format!("waiting:{HERE}")],
-        "the event is written first, then the wait fires"
+        vec!["proposed".to_string(), format!("waiting:{HERE}:{TASK}")],
+        "the event is written first, then the wait fires, naming the job"
     );
     assert_eq!(call_id, "c1", "the waiting entry names the call");
     assert_eq!(project, HERE);

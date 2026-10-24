@@ -291,12 +291,17 @@ async fn approve_and_wait(rig: &Rig) -> Ulid {
     })
     .await;
     let Notice::State {
-        state: ThreadState::AwaitingSwitch { call_id, .. },
+        state: ThreadState::AwaitingSwitch { call_id, job, .. },
         ..
     } = parked
     else {
         unreachable!()
     };
+    assert_eq!(
+        job.map(|job| job.task).as_deref(),
+        Some("list the callers"),
+        "the wait names the job it would start"
+    );
     assert_eq!(
         ask(&mailbox, |reply| Mail::AnswerSwitch {
             by: steve(),
