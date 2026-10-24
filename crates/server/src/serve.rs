@@ -29,6 +29,8 @@ pub enum ServerError {
     Io(#[from] std::io::Error),
     #[error("listen = {0:?}: use \"unix\", \"unix:/path\" or \"tcp:host:port\"")]
     Listen(String),
+    #[error(transparent)]
+    Workspace(#[from] crate::workspaces::WorkspaceError),
 }
 
 /// Where to listen.
@@ -179,14 +181,15 @@ pub struct Server {
 
 impl Server {
     /// Wire the table up. `providers` is `Profiles` in production;
-    /// `reports` is `NoReports` until step 9.
+    /// `reports` is `NoReports` until step 9. Fails when two project
+    /// roots would share one name.
     pub fn new(
         config: Config,
         config_dir: PathBuf,
         server: ServerConfig,
         providers: Arc<dyn ProviderFactory>,
         reports: Arc<dyn Reports>,
-    ) -> Self {
+    ) -> Result<Self, ServerError> {
         Self::build(config, config_dir, server, providers, reports, None)
     }
 
@@ -199,16 +202,18 @@ impl Server {
         providers: Arc<dyn ProviderFactory>,
         reports: Arc<dyn Reports>,
         profile: Option<String>,
-    ) -> Self {
+    ) -> Result<Self, ServerError> {
         // The listing's day is the person's. The binary reads the zone
         // before its runtime starts; a daemon embedded some other way reads
         // it here, and where `time` refuses by then the day is UTC's.
         crate::runs::read_day_zone();
-        // Workspace files name more projects; server.toml wins on a clash.
-        // A broken workspace file leaves the daemon on server.toml alone.
+        // Workspace files name more projects, each as
+        // `<workspace>/<project>`. A broken workspace file leaves the
+        // daemon on server.toml alone; two roots one name stop it, since
+        // a daemon that starts with one of them shadowed is the bug.
         let workspaces = crate::workspaces::load_all(&config_dir).unwrap_or_default();
         let mut server = server;
-        server.projects = crate::workspaces::merge(server.projects, &workspaces);
+        server.projects = crate::workspaces::merge(server.projects, &workspaces)?;
         // One keep-awake guard for the daemon, built once: `keep_awake =
         // false` turns it off, and a machine without the program reports
         // itself unavailable rather than pretending (issue #47).
@@ -238,17 +243,21 @@ impl Server {
             .with_profile(profile)
             .with_workspaces(workspaces),
         );
-        Self {
+        Ok(Self {
             config,
             config_dir,
             server,
             threads,
-        }
+        })
     }
 
     /// Production wiring: providers from the config's profiles, every
     /// report rendered.
-    pub fn from_configs(config: Config, config_dir: PathBuf, mut server: ServerConfig) -> Self {
+    pub fn from_configs(
+        config: Config,
+        config_dir: PathBuf,
+        mut server: ServerConfig,
+    ) -> Result<Self, ServerError> {
         // The served daemon is the one that picks up the runs a killed
         // daemon left behind (issue #58). An embedded daemon does not.
         server.resume_runs = true;
@@ -362,9 +371,10 @@ impl Server {
         // once the daemon starts (#87 is live reload). Learn it here, at
         // start: when the front thread's project is not in the set
         // `build` will end with, and its folder is still there, register
-        // it. A name already taken is left alone — a different project of
-        // that name must answer `Replaced`, never resume in the wrong
-        // root, and `resumable` sorts the roots out.
+        // it. A root already listed is left alone, whichever name it is
+        // listed under, and so is a name another root holds — a different
+        // project of that name must answer `Replaced`, never resume in
+        // the wrong root, and `resumable` sorts the roots out.
         let threads_base = config
             .threads_dir
             .clone()
@@ -375,10 +385,13 @@ impl Server {
                 root: root.clone(),
             }],
             &workspaces,
-        );
+        )?;
         let front_project = crate::threads::front_root(&threads_base, user)
             .filter(|(name, front_root)| {
-                !known.iter().any(|p| &p.name == name) && front_root.is_dir()
+                !known
+                    .iter()
+                    .any(|p| &p.name == name || crate::threads::same_root(&p.root, front_root))
+                    && front_root.is_dir()
             })
             .map(|(name, front_root)| ProjectConfig {
                 name,
@@ -416,7 +429,7 @@ impl Server {
             providers,
             reports,
             profile.map(str::to_owned),
-        ));
+        )?);
         let listener = Listener::Unix(socket.clone());
         let task = tokio::spawn(server.clone().serve(listener));
         // Wait for the socket to appear.

@@ -282,13 +282,9 @@ impl Daemon {
             projects,
             resume_runs: false,
         };
-        let server = Arc::new(Server::new(
-            config,
-            cfg_dir,
-            server_cfg,
-            factory,
-            Arc::new(NoReports),
-        ));
+        let server = Arc::new(
+            Server::new(config, cfg_dir, server_cfg, factory, Arc::new(NoReports)).unwrap(),
+        );
         let socket = dir.join("d.sock");
         let serve = server.clone();
         let listen = socket.clone();
@@ -1395,10 +1391,11 @@ async fn t88_5a_a_switched_front_thread_resumes_after_being_unloaded() {
     assert_eq!(again, made);
 }
 
-/// T5b — the same thread under a daemon whose project of that name is
-/// another live root is refused.
+/// A workspace project of the thread's own leaf name, at another root,
+/// does not take the name away: the thread's project keeps its own name
+/// and is resumed in its own root, never in that one.
 #[tokio::test]
-async fn t88_5b_another_root_of_the_same_name_is_refused() {
+async fn t88_5b_a_taken_leaf_name_still_resumes_in_its_own_root() {
     let dir = tempfile::tempdir().unwrap();
     let a = project(dir.path(), "a", "");
     let c = project(dir.path(), "c", "");
@@ -1431,17 +1428,35 @@ async fn t88_5b_another_root_of_the_same_name_is_refused() {
     );
     drop(first);
 
-    // Now `c` is the other folder: the workspace names that one.
+    // Now `c` is the other folder too: the workspace names it as `w/c`,
+    // so the bare name `c` is still the front thread's own.
     workspace_naming(dir.path(), "w", &[&other]);
     let second = Plain::new(dir.path(), &b, "steve").await;
-    assert_eq!(second.inner.front_project, None, "the name is taken");
+    assert_eq!(
+        second.inner.front_project.as_deref(),
+        Some("c"),
+        "the workspace's project is `w/c`, not `c`"
+    );
+    let projects = &second.inner.server.server;
+    let own = projects
+        .project("c")
+        .expect("the front thread's own")
+        .root
+        .clone();
+    assert_eq!(
+        std::fs::canonicalize(&own).unwrap(),
+        std::fs::canonicalize(&c).unwrap(),
+        "registered at its own root"
+    );
+    let listed = projects.project("w/c").expect("the workspace's project");
+    assert_eq!(
+        std::fs::canonicalize(&listed.root).unwrap(),
+        std::fs::canonicalize(&other).unwrap()
+    );
     let mut client = second.connect().await;
     let (again, outcome) = front(&mut client, second.project()).await;
-    assert!(
-        matches!(outcome, FrontOutcome::Replaced { .. }),
-        "another root's `c`: {outcome:?}"
-    );
-    assert_ne!(again, made);
+    assert_eq!(outcome, FrontOutcome::Resumed, "{outcome:?}");
+    assert_eq!(again, made, "the same thread, in its own `c`");
 }
 
 /// T5c — a project whose folder moved: the recorded root no longer
@@ -1587,6 +1602,45 @@ async fn t88_8_the_served_daemon_never_registers_a_front_project() {
     };
     assert!(reason.contains("does not know"), "{reason}");
     assert_ne!(made, id, "not the thread in a");
+}
+
+/// A front thread whose log names the bare `web` at a root the
+/// workspace lists as `getscale/web` adds no second row for its root:
+/// the daemon keeps the listed name, and the ask shows one row.
+#[tokio::test]
+async fn the_front_thread_does_not_add_a_second_row_for_its_own_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = project(dir.path(), "a", "");
+    let web = project(dir.path(), "web", "");
+    workspace_naming(dir.path(), "getscale", &[&web]);
+    let listed = aigentic_server::workspaces::qualified_name("getscale", &web);
+
+    // A front thread that started in `a` and switched to the bare `web`,
+    // as a client holding the leaf sent it before the project was
+    // qualified.
+    let id = Ulid::generate();
+    let mut log = hand_log(&dir.path().join("threads"), id);
+    append_started(&mut log, Some("a"), &a, "steve", true);
+    append_switch(&mut log, "web", &web);
+
+    let daemon = Plain::new(dir.path(), &a, "steve").await;
+    assert_eq!(
+        daemon.inner.front_project, None,
+        "the root is already listed as {listed}"
+    );
+    let projects = &daemon.inner.server.server.projects;
+    let at_root: Vec<&str> = projects
+        .iter()
+        .filter(|p| p.root == web)
+        .map(|p| p.name.as_str())
+        .collect();
+    assert_eq!(at_root, vec![listed.as_str()], "one project for the root");
+
+    let rows = daemon.inner.server.threads.start_rows("steve");
+    let front: Vec<_> = rows.iter().filter(|r| r.id == id).collect();
+    assert_eq!(front.len(), 1, "one row for the thread");
+    assert_eq!(front[0].project, listed, "under the listed name");
+    assert_eq!(front[0].root.as_deref(), Some(web.as_path()));
 }
 
 // ---------------------------------------------------------------------------

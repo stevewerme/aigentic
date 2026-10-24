@@ -68,10 +68,25 @@ pub enum WorkspaceError {
         project: String,
         workspaces: Vec<String>,
     },
+    #[error(
+        "{name:?} names more than one project: {}; rename one of them, or put it in another workspace",
+        roots_list(roots)
+    )]
+    NameTaken { name: String, roots: Vec<PathBuf> },
     #[error(transparent)]
     Config(#[from] ConfigError),
     #[error("{0}")]
     Io(String),
+}
+
+/// A [`WorkspaceError::NameTaken`]'s roots, comma-separated, so the
+/// message shows which folder to rename.
+fn roots_list(roots: &[PathBuf]) -> String {
+    roots
+        .iter()
+        .map(|r| r.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// A workspace's file name: the name lowercased, every run of other
@@ -116,7 +131,9 @@ pub fn create(
 
 /// Lists the absolute `root` in `workspace`, found without case. A root
 /// already there is left alone; one in another workspace is refused,
-/// since a project is in at most one.
+/// since a project is in at most one, and so is a root whose name the
+/// workspace already holds — two projects of one name inside a workspace
+/// could not both be addressed.
 pub fn add_project(
     config_dir: &Path,
     workspace: &str,
@@ -138,6 +155,13 @@ pub fn add_project(
         });
     }
     if !target.projects.iter().any(|p| p == root) {
+        let leaf = project_name(root);
+        if let Some(first) = target.projects.iter().find(|p| project_name(p) == leaf) {
+            return Err(WorkspaceError::NameTaken {
+                name: qualified_name(&target.name, root),
+                roots: vec![first.clone(), root.to_path_buf()],
+            });
+        }
         target.projects.push(root.to_path_buf());
         save(config_dir, &target)?;
     }
@@ -278,14 +302,28 @@ pub fn project_name(root: &Path) -> String {
         .unwrap_or_else(|| root.display().to_string())
 }
 
-/// The projects the workspaces name, as `server.toml` would list them.
+/// A workspace project's listed name: `<workspace>/<project>`, or the
+/// project's own name when the workspace is named after it, so two
+/// workspaces can each hold a `web` and neither is shadowed.
+pub fn qualified_name(workspace: &str, root: &Path) -> String {
+    let leaf = project_name(root);
+    if leaf == workspace {
+        leaf
+    } else {
+        format!("{workspace}/{leaf}")
+    }
+}
+
+/// The projects the workspaces name, as `server.toml` would list them,
+/// each under its [`qualified_name`].
 pub fn project_configs(workspaces: &[Workspace]) -> Vec<ProjectConfig> {
     workspaces
         .iter()
-        .flat_map(|w| w.projects.iter())
-        .map(|root| ProjectConfig {
-            name: project_name(root),
-            root: root.clone(),
+        .flat_map(|w| {
+            w.projects.iter().map(|root| ProjectConfig {
+                name: qualified_name(&w.name, root),
+                root: root.clone(),
+            })
         })
         .collect()
 }
@@ -297,15 +335,51 @@ pub fn workspace_of<'a>(workspaces: &'a [Workspace], root: &Path) -> Option<&'a 
         .find(|w| w.projects.iter().any(|p| p == root))
 }
 
-/// `projects` plus every workspace project whose name is not already
-/// there: `server.toml` wins on a clash.
-pub fn merge(mut projects: Vec<ProjectConfig>, workspaces: &[Workspace]) -> Vec<ProjectConfig> {
-    for p in project_configs(workspaces) {
-        if !projects.iter().any(|q| q.name == p.name) {
-            projects.push(p);
+/// `projects` plus every workspace project, in workspace-file order. A
+/// root already listed keeps the name it has — `server.toml`'s — and a
+/// name two roots would share is [`WorkspaceError::NameTaken`], never a
+/// silently shadowed project.
+pub fn merge(
+    mut projects: Vec<ProjectConfig>,
+    workspaces: &[Workspace],
+) -> Result<Vec<ProjectConfig>, WorkspaceError> {
+    for w in workspaces {
+        for root in &w.projects {
+            if projects
+                .iter()
+                .any(|q| crate::threads::same_root(&q.root, root))
+            {
+                continue;
+            }
+            // Whether a listed project at another root answers to `name`.
+            let elsewhere = |name: &str| {
+                projects
+                    .iter()
+                    .any(|q| q.name == name && !crate::threads::same_root(&q.root, root))
+            };
+            let leaf = project_name(root);
+            let mut name = qualified_name(&w.name, root);
+            // A collapsed name is the leaf's, so it loses to any
+            // project already listed under it.
+            if name == leaf && elsewhere(&leaf) {
+                name = format!("{}/{}", w.name, leaf);
+            }
+            if elsewhere(&name) {
+                let mut roots: Vec<PathBuf> = projects
+                    .iter()
+                    .filter(|q| q.name == name)
+                    .map(|q| q.root.clone())
+                    .collect();
+                roots.push(root.clone());
+                return Err(WorkspaceError::NameTaken { name, roots });
+            }
+            projects.push(ProjectConfig {
+                name,
+                root: root.clone(),
+            });
         }
     }
-    projects
+    Ok(projects)
 }
 
 #[cfg(test)]
@@ -340,12 +414,13 @@ mod tests {
                 root: PathBuf::from("/elsewhere"),
             }],
             &ws,
-        );
+        )
+        .unwrap();
         let names: Vec<&str> = merged.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(
             names,
-            vec!["site", "marketing"],
-            "server.toml wins; a folder name for no file"
+            vec!["site", "aigentic/site", "aigentic/marketing"],
+            "workspace-file order, qualified, and `site` at two roots is two projects"
         );
         assert_eq!(merged[0].root, PathBuf::from("/elsewhere"));
         assert_eq!(
@@ -520,5 +595,224 @@ mod tests {
         let home = std::env::var("HOME").unwrap();
         assert_eq!(expand(Path::new("~/x")), PathBuf::from(home).join("x"));
         assert_eq!(expand(Path::new("/abs")), PathBuf::from("/abs"));
+    }
+
+    /// A root named `name` by its `aigentic.toml`, in a folder of its
+    /// own under `parent`, created so `project_name` reads the file.
+    fn root(parent: &Path, folder: &str, name: &str) -> PathBuf {
+        let root = parent.join(folder);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("aigentic.toml"),
+            format!("[project]\nname = {name:?}\n"),
+        )
+        .unwrap();
+        root
+    }
+
+    /// `name` holding `roots`, as `load_all` returns one.
+    fn ws(name: &str, roots: &[&Path]) -> Workspace {
+        Workspace {
+            name: name.to_owned(),
+            shared: None,
+            projects: roots.iter().map(|r| r.to_path_buf()).collect(),
+        }
+    }
+
+    #[test]
+    fn two_workspaces_may_each_hold_a_web() {
+        let dir = tempfile::tempdir().unwrap();
+        let getscale = root(dir.path(), "getscale-web", "web");
+        let acme = root(dir.path(), "acme-web", "web");
+        let all = [ws("getscale", &[&getscale]), ws("acme", &[&acme])];
+        let merged = merge(Vec::new(), &all).unwrap();
+        let names: Vec<&str> = merged.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                format!("getscale/{}", project_name(&getscale)),
+                format!("acme/{}", project_name(&acme))
+            ],
+            "both webs are listed, neither dropped"
+        );
+        assert_eq!(merged[0].root, getscale);
+        assert_eq!(merged[1].root, acme);
+    }
+
+    #[test]
+    fn a_workspace_is_not_named_twice_over_its_own_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let aigentic = root(dir.path(), "aigentic", "aigentic");
+        let other = root(dir.path(), "other", "other");
+        let merged = merge(Vec::new(), &[ws("aigentic", &[&aigentic, &other])]).unwrap();
+        let names: Vec<&str> = merged.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                project_name(&aigentic),
+                format!("aigentic/{}", project_name(&other))
+            ],
+            "the shared name is bare; the rest is qualified"
+        );
+        assert_eq!(names[0], "aigentic");
+    }
+
+    #[test]
+    fn a_collapsed_name_yields_to_a_server_toml_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let aigentic = root(dir.path(), "ws-aigentic", "aigentic");
+        let elsewhere = dir.path().join("server-aigentic");
+        let merged = merge(
+            vec![ProjectConfig {
+                name: project_name(&aigentic),
+                root: elsewhere.clone(),
+            }],
+            &[ws("aigentic", &[&aigentic])],
+        )
+        .unwrap();
+        assert_eq!(
+            merged.iter().map(|p| p.name.clone()).collect::<Vec<_>>(),
+            vec![
+                project_name(&aigentic),
+                format!("aigentic/{}", project_name(&aigentic))
+            ],
+            "server.toml keeps the collapsed name, and the workspace's is qualified"
+        );
+        assert_eq!(merged[0].root, elsewhere);
+        assert_eq!(merged[1].root, aigentic);
+    }
+
+    #[test]
+    fn a_server_toml_project_keeps_its_name_among_qualified_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let notes = dir.path().join("notes");
+        let web = root(dir.path(), "web", "web");
+        let merged = merge(
+            vec![ProjectConfig {
+                name: "notes".into(),
+                root: notes.clone(),
+            }],
+            &[ws("getscale", &[&web])],
+        )
+        .unwrap();
+        assert_eq!(
+            merged.iter().map(|p| p.name.clone()).collect::<Vec<_>>(),
+            vec![
+                "notes".to_owned(),
+                format!("getscale/{}", project_name(&web))
+            ],
+        );
+        assert_eq!(merged[0].root, notes);
+    }
+
+    #[test]
+    fn a_server_toml_project_holding_a_computed_name_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let web = root(dir.path(), "web", "web");
+        let elsewhere = dir.path().join("certified-web");
+        let taken = format!("getscale/{}", project_name(&web));
+        let refused = merge(
+            vec![ProjectConfig {
+                name: taken.clone(),
+                root: elsewhere.clone(),
+            }],
+            &[ws("getscale", &[&web])],
+        );
+        let Err(WorkspaceError::NameTaken { name, roots }) = &refused else {
+            panic!("{refused:?}");
+        };
+        assert_eq!(name, &taken);
+        assert!(
+            roots.contains(&elsewhere) && roots.contains(&web),
+            "{roots:?}"
+        );
+        // The message says which folders to look at.
+        let message = refused.unwrap_err().to_string();
+        assert!(
+            message.contains(&elsewhere.display().to_string()),
+            "{message}"
+        );
+        assert!(message.contains(&web.display().to_string()), "{message}");
+    }
+
+    #[test]
+    fn a_second_project_of_one_name_in_one_workspace_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("cfg");
+        let one = root(dir.path(), "one", "web");
+        let two = root(dir.path(), "two", "web");
+        create(&cfg, "getscale", None).unwrap();
+        add_project(&cfg, "getscale", &one).unwrap();
+        let file = cfg.join("workspaces/getscale.toml");
+        let before = std::fs::read_to_string(&file).unwrap();
+
+        let refused = add_project(&cfg, "getscale", &two);
+        let Err(WorkspaceError::NameTaken { name, roots }) = &refused else {
+            panic!("{refused:?}");
+        };
+        assert_eq!(name, &qualified_name("getscale", &two));
+        assert!(roots.contains(&one) && roots.contains(&two), "{roots:?}");
+        let message = refused.unwrap_err().to_string();
+        assert!(message.contains(&one.display().to_string()), "{message}");
+        assert!(message.contains(&two.display().to_string()), "{message}");
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            before,
+            "the refused project is not written"
+        );
+
+        // The same root again stays the no-op it was.
+        let again = add_project(&cfg, "getscale", &one).unwrap();
+        assert_eq!(again.projects, vec![one]);
+    }
+
+    #[test]
+    fn the_same_name_in_two_workspaces_is_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("cfg");
+        let one = root(dir.path(), "one", "web");
+        let two = root(dir.path(), "two", "web");
+        create(&cfg, "getscale", None).unwrap();
+        create(&cfg, "acme", None).unwrap();
+        add_project(&cfg, "getscale", &one).unwrap();
+        add_project(&cfg, "acme", &two).unwrap();
+
+        let loaded = load_all(&cfg).unwrap();
+        let expected: Vec<String> = loaded
+            .iter()
+            .flat_map(|w| {
+                w.projects
+                    .iter()
+                    .map(|r| qualified_name(&w.name, r))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let merged = merge(Vec::new(), &loaded).unwrap();
+        assert_eq!(
+            merged.iter().map(|p| p.name.clone()).collect::<Vec<_>>(),
+            expected,
+            "one project per root, each under its own workspace"
+        );
+        assert_eq!(merged.len(), 2, "neither web is dropped");
+    }
+
+    #[test]
+    fn one_root_in_both_places_is_one_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let web = root(dir.path(), "web", "web");
+        let merged = merge(
+            vec![ProjectConfig {
+                name: "notes".into(),
+                root: web.clone(),
+            }],
+            &[ws("getscale", &[&web])],
+        )
+        .unwrap();
+        assert_eq!(
+            merged.iter().map(|p| p.name.clone()).collect::<Vec<_>>(),
+            vec!["notes".to_owned()],
+            "listed once, under the server.toml name"
+        );
+        assert_eq!(merged[0].root, web);
     }
 }

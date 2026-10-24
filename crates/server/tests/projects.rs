@@ -164,14 +164,29 @@ async fn daemon(
         projects: server_projects,
         resume_runs: false,
     };
+    // Every distinct root the daemon was given: `merge` lists one project
+    // per root, whatever names the workspaces carry.
+    let given: std::collections::BTreeSet<PathBuf> = server_cfg
+        .projects
+        .iter()
+        .map(|p| p.root.clone())
+        .chain(
+            workspaces
+                .iter()
+                .flat_map(|(_, roots)| roots.iter().cloned()),
+        )
+        .collect();
     let seen: Seen = Arc::new(Mutex::new(Vec::new()));
-    let server = Arc::new(Server::new(
-        config,
-        cfg_dir,
-        server_cfg,
-        Arc::new(RecordingFactory { seen: seen.clone() }),
-        Arc::new(NoReports),
-    ));
+    let server = Arc::new(
+        Server::new(
+            config,
+            cfg_dir,
+            server_cfg,
+            Arc::new(RecordingFactory { seen: seen.clone() }),
+            Arc::new(NoReports),
+        )
+        .unwrap(),
+    );
     let socket = dir.join("d.sock");
     tokio::spawn(server.clone().serve(Listener::Unix(socket.clone())));
     for _ in 0..200 {
@@ -184,7 +199,7 @@ async fn daemon(
         .await
         .unwrap();
     let names: Vec<&str> = welcome.projects.iter().map(|p| p.name.as_str()).collect();
-    assert!(names.contains(&"p1"), "{names:?}");
+    assert_eq!(names.len(), given.len(), "{names:?}");
     let (mia, _) = Client::connect(&Addr::Unix(socket), "tok2").await.unwrap();
     Daemon {
         server,
@@ -211,6 +226,63 @@ async fn until_idle(rx: &mut mpsc::Receiver<Notice>) {
             }
         }
     }
+}
+
+/// A log for a thread that started as `project` (the daemon's own name,
+/// `None` for the legacy `_none`) at `root`, in the legacy layout: the
+/// form every log written before a project was qualified has.
+fn log_started_at(base: &Path, folder: &str, project: Option<&str>, root: &Path) -> Ulid {
+    let threads = base.join(folder);
+    std::fs::create_dir_all(&threads).unwrap();
+    let id = Ulid::generate();
+    let mut log = ThreadLog::open(&threads, id).unwrap();
+    log.append(NewEvent {
+        kind: EventKind::ThreadStarted,
+        author: Author::User(UserId("steve".into())),
+        payload: to_value(ThreadStartedPayload {
+            project: project.map(str::to_owned),
+            root: root.to_path_buf(),
+            created_by: Author::User(UserId("steve".into())),
+            parent_thread: None,
+            step: None,
+            front: false,
+            job: false,
+        })
+        .unwrap(),
+        parent_event: None,
+    })
+    .unwrap();
+    id
+}
+
+/// Append a `project_switched` to `id`'s log, as a client that sent
+/// `to` wrote it.
+fn log_switched(base: &Path, folder: &str, id: Ulid, to: &str, root: &Path) {
+    let mut log = ThreadLog::open(base.join(folder), id).unwrap();
+    log.append(NewEvent {
+        kind: EventKind::ProjectSwitched,
+        author: Author::User(UserId("steve".into())),
+        payload: to_value(aigentic_runtime::aigentic_log::ProjectSwitchedPayload {
+            from: None,
+            to: Some(to.to_owned()),
+            root: root.to_path_buf(),
+            workspace: None,
+        })
+        .unwrap(),
+        parent_event: None,
+    })
+    .unwrap();
+}
+
+/// The listed project whose root is `root`, found the way the daemon's
+/// own `merge` leaves its list: by root.
+fn listed_at(server: &Arc<Server>, root: &Path) -> Option<String> {
+    server
+        .server
+        .projects
+        .iter()
+        .find(|p| p.root == root)
+        .map(|p| p.name.clone())
 }
 
 /// Create a thread in `project` and open it for `client`.
@@ -316,9 +388,9 @@ async fn the_listing_follows_two_switches_and_opens_no_stray_log() {
     post(&mut d.steve, &mut notices, id, "hi").await;
     let first = block_since(&d.seen, mark).expect("the block in the first build");
     let expected = format!(
-        "Projects in reach. This thread is in p1 (w1).\n\
-         w1: p1 (here) {} · p2 {}\n\
-         Other workspaces: w2: q1, q2",
+        "Projects in reach. This thread is in w1/p1 (w1).\n\
+         w1: w1/p1 (here) {} · w1/p2 {}\n\
+         Other workspaces: w2: w2/q1, w2/q2",
         p1.display(),
         p2.display()
     );
@@ -345,9 +417,9 @@ async fn the_listing_follows_two_switches_and_opens_no_stray_log() {
     post(&mut d.steve, &mut notices, id, "where am I?").await;
     let second = block_since(&d.seen, mark).expect("the block after the switch");
     let expected = format!(
-        "Projects in reach. This thread is in q1 (w2).\n\
-         w2: q1 (here) {} · q2 {}\n\
-         Other workspaces: w1: p1, p2",
+        "Projects in reach. This thread is in w2/q1 (w2).\n\
+         w2: w2/q1 (here) {} · w2/q2 {}\n\
+         Other workspaces: w1: w1/p1, w1/p2",
         q1.display(),
         q2.display()
     );
@@ -356,7 +428,7 @@ async fn the_listing_follows_two_switches_and_opens_no_stray_log() {
         d.server.threads.shown_projects(id, Some("q1")),
         Some(expected.clone())
     );
-    assert!(!second.contains("This thread is in p1"), "{second}");
+    assert!(!second.contains("This thread is in w1/p1"), "{second}");
     println!("after the first switch:\n{second}");
 
     // A second switch, within the same workspace: the mark moves.
@@ -374,9 +446,9 @@ async fn the_listing_follows_two_switches_and_opens_no_stray_log() {
     post(&mut d.steve, &mut notices, id, "and now?").await;
     let third = block_since(&d.seen, mark).expect("the block after the second switch");
     let expected = format!(
-        "Projects in reach. This thread is in q2 (w2).\n\
-         w2: q1 {} · q2 (here) {}\n\
-         Other workspaces: w1: p1, p2",
+        "Projects in reach. This thread is in w2/q2 (w2).\n\
+         w2: w2/q1 {} · w2/q2 (here) {}\n\
+         Other workspaces: w1: w1/p1, w1/p2",
         q1.display(),
         q2.display()
     );
@@ -432,7 +504,7 @@ async fn the_listing_belongs_to_the_creator_and_only_a_person_has_one() {
         "the block is the creator's"
     );
     assert!(
-        block.contains("Other workspaces: w2: p2"),
+        block.contains("Other workspaces: w2: w2/p2"),
         "steve's reach, not mia's: {block}"
     );
 
@@ -442,7 +514,7 @@ async fn the_listing_belongs_to_the_creator_and_only_a_person_has_one() {
     post(&mut d.mia, &mut mia_notices, own, "mine").await;
     let block = block_since(&d.seen, mark).expect("mia's block");
     let expected = format!(
-        "Projects in reach. This thread is in p1 (w1).\nw1: p1 (here) {}",
+        "Projects in reach. This thread is in w1/p1 (w1).\nw1: w1/p1 (here) {}",
         p1.display()
     );
     assert_eq!(block, expected);
@@ -515,9 +587,9 @@ async fn the_listing_keeps_a_missing_root_and_the_first_of_two_claims() {
     post(&mut d.steve, &mut notices, id, "hi").await;
     let block = block_since(&d.seen, mark).expect("the block");
     let expected = format!(
-        "Projects in reach. This thread is in p1 (one).\n\
-         one: ghost {} · p1 (here) {} · shared {}\n\
-         Other workspaces: two: q1\n\
+        "Projects in reach. This thread is in one/p1 (one).\n\
+         one: one/ghost {} · one/p1 (here) {} · one/shared {}\n\
+         Other workspaces: two: two/dup, two/q1\n\
          In no workspace: dup",
         ghost.display(),
         p1.display(),
@@ -539,9 +611,9 @@ async fn the_listing_keeps_a_missing_root_and_the_first_of_two_claims() {
         1,
         "{block}"
     );
-    // `dup` is in the block once, at server.toml's root: the workspace
-    // folder of the same name is not listed at all.
-    assert_eq!(block.matches("dup").count(), 1, "{block}");
+    // server.toml's `dup` and the workspace project whose folder is
+    // also called `dup` are two projects: the qualified name keeps both.
+    assert_eq!(block.matches("dup").count(), 2, "{block}");
     let current = d.server.threads.shown_projects(id, Some("dup")).unwrap();
     assert!(
         current.contains(&format!("dup (here) {}", dup_a.display())),
@@ -597,6 +669,202 @@ async fn open_and_post(client: &mut Client, notices: &mut mpsc::Receiver<Notice>
     post(client, notices, thread, "hi").await;
 }
 
+/// a hand-edited workspace file with two roots of one leaf name
+/// stops the daemon: `from_configs` and `embed_with` both refuse, naming
+/// both roots.
+#[tokio::test]
+async fn a_hand_edited_duplicate_stops_the_daemon() {
+    let dir = tempfile::tempdir().unwrap();
+    let one = project(dir.path(), "web", "");
+    // A second folder carrying the same `[project] name`.
+    let leaf = aigentic_server::workspaces::project_name(&one);
+    let two = dir.path().join("web-again");
+    std::fs::create_dir_all(&two).unwrap();
+    std::fs::write(
+        two.join("aigentic.toml"),
+        format!("[project]\nname = {leaf:?}\n[memory]\nenabled = false\n"),
+    )
+    .unwrap();
+    assert_eq!(leaf, aigentic_server::workspaces::project_name(&two));
+    let cfg_dir = dir.path().join("cfg");
+    std::fs::create_dir_all(cfg_dir.join("workspaces")).unwrap();
+    let list = format!(
+        "{:?}, {:?}",
+        one.display().to_string(),
+        two.display().to_string()
+    );
+    std::fs::write(
+        cfg_dir.join("workspaces/w.toml"),
+        format!("name = \"w\"\nprojects = [{list}]\n"),
+    )
+    .unwrap();
+    let config = Config::parse(&format!(
+        "threads_dir = {:?}\n[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n",
+        dir.path().join("threads").display()
+    ))
+    .unwrap();
+    let server_cfg = ServerConfig {
+        listen: "unix".into(),
+        idle_unload_secs: 3600,
+        users: vec![UserConfig {
+            name: "steve".into(),
+            token_env: None,
+            token: Some("tok".into()),
+        }],
+        projects: Vec::new(),
+        resume_runs: false,
+    };
+
+    let Err(refused) = Server::from_configs(config.clone(), cfg_dir.clone(), server_cfg.clone())
+    else {
+        panic!("the daemon started over two roots of one name");
+    };
+    let missing = |e: &aigentic_server::ServerError| -> String {
+        let Some(aigentic_server::ServerError::Workspace(
+            aigentic_server::workspaces::WorkspaceError::NameTaken { roots, .. },
+        )) = Some(e)
+        else {
+            panic!("not a clash: {e}");
+        };
+        for root in [&one, &two] {
+            assert!(roots.contains(root), "{roots:?} misses {}", root.display());
+        }
+        e.to_string()
+    };
+    let message = missing(&refused);
+    for root in [&one, &two] {
+        assert!(message.contains(&root.display().to_string()), "{message}");
+    }
+
+    // A folder of its own, outside the workspace: the ad hoc project must
+    // not stand in for one of the two.
+    let bare = dir.path().join("bare");
+    std::fs::create_dir_all(&bare).unwrap();
+    let Err(embedded) = Server::embed_with(
+        config,
+        cfg_dir,
+        bare,
+        "steve",
+        None,
+        Arc::new(RecordingFactory {
+            seen: Arc::new(Mutex::new(Vec::new())),
+        }),
+        Arc::new(NoReports),
+    )
+    .await
+    else {
+        panic!("the embedded daemon started over two roots of one name");
+    };
+    missing(&embedded);
+}
+
+/// a setup with no workspace is what it was: the same names in the
+/// same order, `project()` still resolving them, and a block carrying
+/// exactly those names.
+#[tokio::test]
+async fn a_setup_with_no_workspace_is_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let notes = project(dir.path(), "notes", "");
+    let projects = vec![ProjectConfig {
+        name: aigentic_server::workspaces::project_name(&notes),
+        root: notes.clone(),
+    }];
+    assert_eq!(
+        aigentic_server::workspaces::merge(projects.clone(), &[]),
+        Ok(projects.clone()),
+        "no workspace: the server.toml list, unchanged"
+    );
+
+    let mut d = daemon(dir.path(), projects, &[]).await;
+    let name = &d.server.server.projects[0].name;
+    assert_eq!(
+        d.server.server.project(name).map(|p| p.root.clone()),
+        Some(notes.clone())
+    );
+    let mut notices = d.steve.take_notices().unwrap();
+    let id = created(&mut d.steve, name).await;
+    let mark = d.seen.lock().unwrap().len();
+    post(&mut d.steve, &mut notices, id, "hi").await;
+    let block = block_since(&d.seen, mark).expect("the block");
+    let expected = format!(
+        "Projects in reach. This thread is in {name} (no workspace).\n\
+         In no workspace: {name} (here) {}",
+        notes.display()
+    );
+    assert_eq!(block, expected, "the names the model gets are unchanged");
+}
+
+/// a workspace project is named as its workspace qualifies it, in
+/// the block the model reads as in the daemon's list.
+#[tokio::test]
+async fn the_projects_block_names_a_workspace_project_as_qualified() {
+    let dir = tempfile::tempdir().unwrap();
+    let web = project(dir.path(), "web", "");
+    let workspace = "getscale";
+    let leaf = aigentic_server::workspaces::project_name(&web);
+    let mut d = daemon(dir.path(), Vec::new(), &[(workspace, vec![web.clone()])]).await;
+    let name = format!("{workspace}/{leaf}");
+    let mut notices = d.steve.take_notices().unwrap();
+    let id = created(&mut d.steve, &name).await;
+    let mark = d.seen.lock().unwrap().len();
+    post(&mut d.steve, &mut notices, id, "hi").await;
+    let block = block_since(&d.seen, mark).expect("the block");
+    let expected = format!(
+        "Projects in reach. This thread is in {name} ({workspace}).\n\
+         {workspace}: {name} (here) {}",
+        web.display()
+    );
+    assert_eq!(block, expected);
+}
+
+/// a collapsed project is named by its own name in a `related`
+/// row, even though the entry addressing it carries the workspace's, and
+/// that name reaches its root.
+#[tokio::test]
+async fn a_collapsed_project_keeps_its_listed_name_through_related() {
+    let dir = tempfile::tempdir().unwrap();
+    // Workspace `aigentic` holding a project of the same name: listed as
+    // `aigentic`, not `aigentic/aigentic`.
+    let collapsed = dir.path().join("aigentic");
+    std::fs::create_dir_all(collapsed.join(".aigentic")).unwrap();
+    std::fs::write(
+        collapsed.join("aigentic.toml"),
+        format!(
+            "[project]\nname = {:?}\n[memory]\nenabled = false\n",
+            collapsed.file_name().unwrap().to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    let workspace = collapsed.file_name().unwrap().to_str().unwrap().to_owned();
+    let entry = format!("{workspace}/{workspace}");
+    let p1 = related_project(dir.path(), "p1", &[&entry]);
+    let mut d = daemon(
+        dir.path(),
+        Vec::new(),
+        &[
+            (&workspace, vec![collapsed.clone()]),
+            ("w1", vec![p1.clone()]),
+        ],
+    )
+    .await;
+
+    let mut notices = d.steve.take_notices().unwrap();
+    let id = created(&mut d.steve, "w1/p1").await;
+    let mark = d.seen.lock().unwrap().len();
+    post(&mut d.steve, &mut notices, id, "hi").await;
+    let block = block_since(&d.seen, mark).expect("the block");
+    assert!(
+        block.contains(&format!("Other workspaces: {workspace}: {workspace}")),
+        "{block}"
+    );
+    assert!(!block.contains(&entry), "not the entry's own form: {block}");
+    assert_eq!(
+        d.server.threads.project_root(&workspace),
+        Some(collapsed.clone()),
+        "the listed name reaches the collapsed project's root"
+    );
+}
+
 /// T6 (issue #129): a project `[project] related` declares shows on the
 /// other-workspaces line under its `<workspace>/<project>` address, with
 /// its brief, once — and without the key that line is unchanged.
@@ -631,9 +899,9 @@ async fn a_related_project_shows_on_the_other_workspaces_line_with_its_brief() {
     // workspace file and the project file carry.
     let one = aigentic_runtime::brief::one_line(brief).unwrap();
     let expected = format!(
-        "Projects in reach. This thread is in p1 (w1).\n\
-         w1: p1 (here) {} · p2 {}\n\
-         Other workspaces: v: v/r — {one} · w2: q1",
+        "Projects in reach. This thread is in w1/p1 (w1).\n\
+         w1: w1/p1 (here) {} · w1/p2 {}\n\
+         Other workspaces: v: v/r — {one} · w2: w2/q1",
         p1.display(),
         p2.display()
     );
@@ -643,8 +911,8 @@ async fn a_related_project_shows_on_the_other_workspaces_line_with_its_brief() {
     assert!(!block.contains("v: r"), "{block}");
     println!("the listing with a declared link:\n{block}");
 
-    // The same rig without the key: line 3 lists the project's plain
-    // name and no brief, and nothing else differs.
+    // The same rig without the key: line 3 lists the project's own name
+    // and no brief, and nothing else differs.
     let plain = tempfile::tempdir().unwrap();
     let p2 = project(plain.path(), "p2", "");
     let q1 = project(plain.path(), "q1", "");
@@ -667,12 +935,155 @@ async fn a_related_project_shows_on_the_other_workspaces_line_with_its_brief() {
     post(&mut d.steve, &mut notices, id, "hi").await;
     let block = block_since(&d.seen, mark).expect("the block");
     let expected = format!(
-        "Projects in reach. This thread is in p1 (w1).\n\
-         w1: p1 (here) {} · p2 {}\n\
-         Other workspaces: v: r · w2: q1",
+        "Projects in reach. This thread is in w1/p1 (w1).\n\
+         w1: w1/p1 (here) {} · w1/p2 {}\n\
+         Other workspaces: v: v/r · w2: w2/q1",
         p1.display(),
         p2.display()
     );
     assert_eq!(block, expected);
     println!("the same rig without the key:\n{block}");
+}
+
+/// A thread whose log names `web`, at a root the daemon lists as
+/// `getscale/web`, follows its root to that name: the log is not
+/// rewritten, and the thread counts under the row its root is listed as.
+#[tokio::test]
+async fn an_old_thread_follows_its_root_to_its_new_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let web = project(dir.path(), "web", "");
+    let d = daemon(dir.path(), vec![], &[("getscale", vec![web.clone()])]).await;
+    let listed = listed_at(&d.server, &web).expect("the root is listed");
+
+    let id = log_started_at(&d.threads_base, "web", Some("web"), &web);
+    assert_eq!(
+        d.server.threads.project_of(id).as_deref(),
+        Some(listed.as_str()),
+        "the logged name follows its root"
+    );
+    let rows = d.server.threads.projects();
+    let (_, _, count) = rows
+        .iter()
+        .find(|(name, _, _)| *name == listed)
+        .expect("the row");
+    assert_eq!(*count, 1, "counted under {listed}: {rows:?}");
+}
+
+/// A logged switch to a bare `web` is resolved by the root the switch
+/// recorded, and a live switch sent as `web` counts the thread under the
+/// listed name at once, before any rescan.
+#[tokio::test]
+async fn a_switched_name_is_canonicalised() {
+    // Two `web`s, each in its own workspace: only the switch's root can
+    // say which one it meant.
+    let dir = tempfile::tempdir().unwrap();
+    let ours = project(dir.path(), "web-ours", "");
+    let theirs = project(dir.path(), "web-theirs", "");
+    // The projects' own `[project] name` is what a workspace entry
+    // qualifies, so both are called `web` on disk.
+    for root in [&ours, &theirs] {
+        std::fs::write(root.join("aigentic.toml"), "[project]\nname = \"web\"\n").unwrap();
+    }
+    let d = daemon(
+        dir.path(),
+        vec![],
+        &[
+            ("getscale", vec![ours.clone()]),
+            ("acme", vec![theirs.clone()]),
+        ],
+    )
+    .await;
+    let target = listed_at(&d.server, &theirs).expect("the root is listed");
+    let id = log_started_at(&d.threads_base, "web", Some("web"), &ours);
+    log_switched(&d.threads_base, "web", id, "web", &theirs);
+    assert_eq!(
+        d.server.threads.project_of(id).as_deref(),
+        Some(target.as_str()),
+        "the switch's root decides between two `web`s"
+    );
+
+    // One `web`: a switch sent as the bare leaf lands on the listed name
+    // in the live table, so the count is right before any rescan.
+    let one = tempfile::tempdir().unwrap();
+    let web = project(one.path(), "web", "");
+    let mut live = daemon(one.path(), vec![], &[("getscale", vec![web.clone()])]).await;
+    let listed = listed_at(&live.server, &web).expect("the root is listed");
+    let id = created(&mut live.steve, &listed).await;
+    assert_eq!(
+        live.steve
+            .request(Request::SwitchProject {
+                thread: id,
+                project: "web".into(),
+            })
+            .await
+            .unwrap(),
+        Response::Ok
+    );
+    assert_eq!(
+        live.server.threads.project_of(id).as_deref(),
+        Some(listed.as_str()),
+        "a live switch to the bare leaf"
+    );
+    let rows = live.server.threads.projects();
+    let (_, _, count) = rows
+        .iter()
+        .find(|(name, _, _)| *name == listed)
+        .expect("the row");
+    assert_eq!(*count, 1, "counted under {listed}: {rows:?}");
+}
+
+/// A legacy `_none` thread takes its project's listed name by root; at a
+/// root in no workspace it keeps the leaf (and counts nowhere), and a
+/// leaf another root's project answers still yields no project.
+#[tokio::test]
+async fn a_legacy_none_thread_counts_under_its_projects_listed_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let web = project(dir.path(), "web", "");
+    let loose = dir.path().join("loose");
+    std::fs::create_dir_all(&loose).unwrap();
+    // A project called `other` at a root that is not this log's root.
+    let elsewhere = dir.path().join("elsewhere-other");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let other = dir.path().join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    let d = daemon(
+        dir.path(),
+        vec![ProjectConfig {
+            name: "other".into(),
+            root: elsewhere,
+        }],
+        &[("getscale", vec![web.clone()])],
+    )
+    .await;
+    let listed = listed_at(&d.server, &web).expect("the root is listed");
+
+    let id = log_started_at(&d.threads_base, "_none", Some("_none"), &web);
+    assert_eq!(
+        d.server.threads.project_of(id).as_deref(),
+        Some(listed.as_str()),
+        "the root names the project"
+    );
+    let rows = d.server.threads.projects();
+    let (_, _, count) = rows
+        .iter()
+        .find(|(name, _, _)| *name == listed)
+        .expect("the row");
+    assert_eq!(*count, 1, "counted under {listed}: {rows:?}");
+
+    let loose_id = log_started_at(&d.threads_base, "_none", Some("_none"), &loose);
+    assert_eq!(
+        d.server.threads.project_of(loose_id).as_deref(),
+        Some("loose"),
+        "no workspace: the leaf stands"
+    );
+    let rows = d.server.threads.projects();
+    let total: u64 = rows.iter().map(|(_, _, n)| n).sum();
+    assert_eq!(total, 1, "the leaf counts in no row: {rows:?}");
+
+    let clashing = log_started_at(&d.threads_base, "_none", Some("_none"), &other);
+    assert_eq!(
+        d.server.threads.project_of(clashing),
+        None,
+        "another root's `other` is not this thread's project"
+    );
 }

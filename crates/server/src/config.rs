@@ -1404,10 +1404,21 @@ pub struct UserConfig {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectConfig {
-    /// Must equal `[project] name` in the checkout's `aigentic.toml`
-    /// when one exists; a root without one is a bare working directory.
+    /// `server.toml`'s name for the project, or a workspace project's
+    /// `<workspace>/<project>`. A `server.toml` name must equal
+    /// `[project] name` in the checkout's `aigentic.toml` when one
+    /// exists; a root without one is a bare working directory.
     pub name: String,
     pub root: PathBuf,
+}
+
+/// A listed project name's leaf: the text after its last `/`, which is
+/// the whole name for a `server.toml` project.
+fn leaf(name: &str) -> &str {
+    match name.rsplit_once('/') {
+        Some((_, leaf)) => leaf,
+        None => name,
+    }
 }
 
 impl ServerConfig {
@@ -1462,8 +1473,21 @@ impl ServerConfig {
         self.users.first().map(|u| u.name.as_str())
     }
 
+    /// The project `name` addresses: an exact match on the listed name
+    /// first, then — only for a query with no `/` — the one project
+    /// whose leaf is `name`. A leaf that two projects share resolves to
+    /// nothing, never to a guess, so a bare name cannot write in the
+    /// wrong root.
     pub fn project(&self, name: &str) -> Option<&ProjectConfig> {
-        self.projects.iter().find(|p| p.name == name)
+        if let Some(p) = self.projects.iter().find(|p| p.name == name) {
+            return Some(p);
+        }
+        if name.contains('/') {
+            return None;
+        }
+        let mut found = self.projects.iter().filter(|p| leaf(&p.name) == name);
+        let first = found.next()?;
+        found.next().is_none().then_some(first)
     }
 
     pub fn idle_unload(&self) -> std::time::Duration {
@@ -1514,5 +1538,49 @@ mod server_tests {
             assert!(!err.contains("never-in-a-file"), "{err}");
         }
         assert_eq!(ServerConfig::parse("").unwrap().users.len(), 0);
+    }
+
+    /// A `server.toml` holding `(name, root)` in that order.
+    fn config(projects: &[(&str, &str)]) -> ServerConfig {
+        let list = projects
+            .iter()
+            .map(|(name, root)| format!("[[projects]]\nname = {name:?}\nroot = {root:?}\n"))
+            .collect::<String>();
+        ServerConfig::parse(&list).unwrap()
+    }
+
+    #[test]
+    fn a_qualified_name_resolves_and_a_unique_leaf_name_still_does() {
+        let (ws, leaf) = ("getscale", "web");
+        let qualified = format!("{ws}/{leaf}");
+        let c = config(&[(&qualified, "/srv/web"), ("notes", "/srv/notes")]);
+        assert_eq!(
+            c.project(&qualified).unwrap().root,
+            PathBuf::from("/srv/web")
+        );
+        assert_eq!(
+            c.project(leaf).unwrap().root,
+            PathBuf::from("/srv/web"),
+            "the only `{leaf}` answers its bare name too"
+        );
+        assert_eq!(
+            c.project("notes").unwrap().root,
+            PathBuf::from("/srv/notes")
+        );
+    }
+
+    #[test]
+    fn an_ambiguous_leaf_name_resolves_to_nothing() {
+        let (leaf, other) = ("web", "acme");
+        let one = format!("getscale/{leaf}");
+        let two = format!("{other}/{leaf}");
+        let c = config(&[(&one, "/srv/one"), (&two, "/srv/two")]);
+        assert!(c.project(leaf).is_none(), "`{leaf}` is two projects");
+        assert_eq!(c.project(&one).unwrap().root, PathBuf::from("/srv/one"));
+        assert_eq!(c.project(&two).unwrap().root, PathBuf::from("/srv/two"));
+        // A query is not trimmed at its last `/`: the remaining project
+        // answers only its own qualified name.
+        let left = config(&[(&two, "/srv/two")]);
+        assert_eq!(left.project(&two).unwrap().root, PathBuf::from("/srv/two"));
     }
 }
