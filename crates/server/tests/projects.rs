@@ -1087,3 +1087,102 @@ async fn a_legacy_none_thread_counts_under_its_projects_listed_name() {
         "another root's `other` is not this thread's project"
     );
 }
+
+/// A thread made by the bare leaf name is filed under the name the daemon
+/// lists the project by: its row counts it, and a listing by either name
+/// finds it. The log keeps the name it was asked for.
+#[tokio::test]
+async fn a_thread_created_by_a_leaf_name_is_filed_under_the_listed_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let web = project(dir.path(), "web", "");
+    let d = daemon(dir.path(), vec![], &[("getscale", vec![web.clone()])]).await;
+    let listed = listed_at(&d.server, &web).expect("the root is listed");
+    assert_ne!(listed, "web", "a workspace project is qualified");
+
+    let Response::Thread { thread } = d
+        .steve
+        .request(Request::CreateThread {
+            project: "web".into(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("a thread")
+    };
+    let id = thread.id;
+    assert_eq!(
+        d.server.threads.project_of(id).as_deref(),
+        Some(listed.as_str()),
+        "the leaf is filed under the listed name"
+    );
+    let rows = d.server.threads.projects();
+    let (_, _, count) = rows
+        .iter()
+        .find(|(name, _, _)| *name == listed)
+        .expect("the row");
+    assert_eq!(*count, 1, "counted under {listed}: {rows:?}");
+
+    // Either name lists it: the leaf resolves to the same project.
+    for name in [listed.as_str(), "web"] {
+        let Response::Threads { threads } = d
+            .steve
+            .request(Request::ListThreads {
+                project: Some(name.into()),
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("a listing")
+        };
+        assert!(threads.iter().any(|t| t.id == id), "listed by {name}");
+    }
+
+    let log_dir = d.server.threads.dir_of(id).expect("a log");
+    let events = ThreadLog::open(&log_dir, id).unwrap().read_all().unwrap();
+    let started: ThreadStartedPayload =
+        serde_json::from_value(events.first().expect("thread_started").payload.clone()).unwrap();
+    assert_eq!(
+        started.project.as_deref(),
+        Some("web"),
+        "the log records the name it was asked for"
+    );
+}
+
+/// A front thread opened by the bare leaf name is filed under the listed
+/// name, and adds no second row.
+#[tokio::test]
+async fn a_front_opened_by_a_leaf_name_is_filed_under_the_listed_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let web = project(dir.path(), "web", "");
+    let d = daemon(dir.path(), vec![], &[("getscale", vec![web.clone()])]).await;
+    let listed = listed_at(&d.server, &web).expect("the root is listed");
+
+    let Response::Front { thread, .. } = d
+        .steve
+        .request(Request::Front {
+            project: "web".into(),
+            here: Some("web".into()),
+            asked: None,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("a front")
+    };
+    assert_eq!(
+        d.server.threads.project_of(thread.id).as_deref(),
+        Some(listed.as_str()),
+        "a front sent as the leaf is filed under the listed name"
+    );
+    let rows = d.server.threads.projects();
+    let (_, _, count) = rows
+        .iter()
+        .find(|(name, _, _)| *name == listed)
+        .expect("the row");
+    assert_eq!(*count, 1, "the front counts under {listed}: {rows:?}");
+    assert_eq!(
+        rows.iter().filter(|(name, _, _)| *name == listed).count(),
+        1,
+        "one row per project: {rows:?}"
+    );
+}
