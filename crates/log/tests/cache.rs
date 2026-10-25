@@ -59,7 +59,7 @@ fn repaired_torn_tail_seeds_cache() {
     }
     assert_eq!(
         log.file_reads(),
-        2,
-        "the failed pass and the re-read after the cut"
+        3,
+        "the failed pass, the pass under the lock and the re-read after the cut"
     );
 }
