@@ -1,6 +1,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, Weak};
 
 use aigentic_core::{Author, Event, EventKind};
 use time::OffsetDateTime;
@@ -67,6 +68,10 @@ pub enum LogError {
         kind: EventKind,
         detail: String,
     },
+    /// Another process is appending to this log. Appending too would fork
+    /// it, so the append is refused.
+    #[error("{path}: another process is writing this thread's log")]
+    Busy { path: PathBuf },
     #[error("could not generate a monotonic ulid")]
     UlidOverflow,
 }
@@ -115,6 +120,10 @@ pub struct ThreadLog {
     /// truncated file), none for a path that did not exist.
     file_reads: u64,
     ids: Generator,
+    /// The file this log appends through, locked against other processes
+    /// for as long as any writer in this one holds it. Taken at the first
+    /// append, so a log that only reads never locks.
+    writer: Option<Arc<File>>,
 }
 
 impl ThreadLog {
@@ -174,6 +183,7 @@ impl ThreadLog {
                 events,
                 file_reads,
                 ids: Generator::new(),
+                writer: None,
             },
             cut,
         ))
@@ -249,11 +259,10 @@ impl ThreadLog {
             path: self.path.clone(),
             source,
         };
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .map_err(io)?;
+        if self.writer.is_none() {
+            self.writer = Some(writer(&self.path)?);
+        }
+        let mut file: &File = self.writer.as_deref().expect("opened above");
         file.write_all(&line).map_err(io)?;
         file.sync_data().map_err(io)?;
 
@@ -272,6 +281,67 @@ impl ThreadLog {
     pub fn read_all(&self) -> Result<Vec<Event>, LogError> {
         Ok(self.events.clone())
     }
+}
+
+/// The logs this process appends to, by device and inode, each locked
+/// once against other processes. Handles in this process share the lock,
+/// whatever path they reached the file by: the runner keeps two on one
+/// lead while it rebuilds, and they never append at once.
+const LOCK_TRIES: u32 = 50;
+const LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(10);
+
+static WRITERS: Mutex<Vec<(FileKey, Weak<File>)>> = Mutex::new(Vec::new());
+
+/// A file's device and inode: the same file whatever path reached it.
+type FileKey = (u64, u64);
+
+/// An append handle on `path`, locked against other processes: this
+/// process's own when one is alive, else this one, which takes the lock.
+fn writer(path: &Path) -> Result<Arc<File>, LogError> {
+    use std::os::unix::fs::MetadataExt;
+    let io = |source| LogError::Io {
+        path: path.to_path_buf(),
+        source,
+    };
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(io)?;
+    let meta = file.metadata().map_err(io)?;
+    let key = (meta.dev(), meta.ino());
+    let mut held = WRITERS.lock().unwrap_or_else(|e| e.into_inner());
+    held.retain(|(_, file)| file.strong_count() > 0);
+    if let Some(shared) = held
+        .iter()
+        .find(|(held, _)| *held == key)
+        .and_then(|(_, file)| file.upgrade())
+    {
+        // Closing this second description leaves the shared one's lock.
+        return Ok(shared);
+    }
+    // A child forked by another thread holds every open file until it
+    // execs, so a lock this process just let go can read as held for a
+    // moment. A real writer holds it far longer than these retries.
+    let mut tries = 0;
+    loop {
+        match file.try_lock() {
+            Ok(()) => break,
+            Err(std::fs::TryLockError::WouldBlock) if tries < LOCK_TRIES => {
+                tries += 1;
+                std::thread::sleep(LOCK_RETRY);
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(LogError::Busy {
+                    path: path.to_path_buf(),
+                });
+            }
+            Err(std::fs::TryLockError::Error(source)) => return Err(io(source)),
+        }
+    }
+    let file = Arc::new(file);
+    held.push((key, Arc::downgrade(&file)));
+    Ok(file)
 }
 
 fn read_file(path: &Path, thread_id: Ulid) -> Result<Vec<Event>, LogError> {
@@ -387,6 +457,47 @@ mod tests {
             payload: serde_json::to_value(TurnEndedPayload::new("done")).unwrap(),
             parent_event: None,
         }
+    }
+
+    /// Two processes appending to one log fork it: each keeps its own
+    /// `seq`, so the file ends up with a gap no reader will open. While
+    /// another process holds the log (a lock taken through a separate open
+    /// file stands in for it), an append is refused and nothing is written;
+    /// a log that only reads still opens; once it lets go, appends go on.
+    #[test]
+    fn an_append_is_refused_while_another_process_writes_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let thread = Ulid::generate();
+        let mut log = ThreadLog::open(dir.path(), thread).unwrap();
+        log.append(user("one")).unwrap();
+        drop(log);
+
+        let path = dir.path().join(format!("{thread}.jsonl"));
+        let other = File::open(&path).unwrap();
+        other.try_lock().unwrap();
+
+        let reader = ThreadLog::open(dir.path(), thread).unwrap();
+        assert_eq!(
+            reader.len(),
+            1,
+            "a reader opens a log another process holds"
+        );
+        let mut log = ThreadLog::open(dir.path(), thread).unwrap();
+        assert!(
+            matches!(log.append(user("two")), Err(LogError::Busy { .. })),
+            "the append is refused"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 1);
+
+        drop(other);
+        log.append(user("two")).unwrap();
+        let seqs: Vec<u64> = ThreadLog::open(dir.path(), thread)
+            .unwrap()
+            .events()
+            .iter()
+            .map(|e| e.seq)
+            .collect();
+        assert_eq!(seqs, vec![0, 1]);
     }
 
     #[test]

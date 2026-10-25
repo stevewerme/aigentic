@@ -17,7 +17,8 @@ use aigentic_runtime::aigentic_core::{
     ProviderEvent, RiskClass, Tool, ToolCall, ToolError, ToolOutput, UserId,
 };
 use aigentic_runtime::aigentic_log::{
-    InterruptedPayload, PermissionDecidedPayload, ThreadLog, UserMessagePayload,
+    InterruptedPayload, JobFinishedPayload, JobOutcome, PermissionDecidedPayload, ThreadLog,
+    UserMessagePayload,
 };
 use aigentic_runtime::aigentic_policy::{Decision, Policy, Rule};
 use aigentic_runtime::aigentic_tools::ToolRegistry;
@@ -423,6 +424,63 @@ async fn a_post_during_a_model_call_waits_for_the_next_turn() {
     }
     drop(rig.mailbox);
     rig.task.await.unwrap();
+}
+
+/// A job's return that arrives during a turn is written when that turn
+/// ends, before the next one starts. A front that never goes idle (a
+/// model polling its jobs) must still be told when one finishes, or it
+/// waits on a return that can never land.
+#[tokio::test]
+async fn a_jobs_return_lands_between_turns_not_only_when_idle() {
+    let rig = rig_delayed(
+        vec![
+            Some(vec![text("reply one"), done()]),
+            Some(vec![text("reply two"), done()]),
+        ],
+        true,
+        Duration::from_millis(400),
+    );
+    let (_, _, mut notices) = rig.subscribe(0).await;
+    assert_eq!(rig.post(steve(), "one", false).await, Response::Ok);
+    Rig::until_state(&mut notices, |s| matches!(s, ThreadState::Running { .. })).await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let job = ulid::Ulid::generate();
+    let (reply, returned) = oneshot::channel();
+    rig.mailbox
+        .send(Mail::JobFinished {
+            payload: JobFinishedPayload {
+                job_thread: job,
+                outcome: JobOutcome::Finished,
+                summary: "the callers are listed".into(),
+                cost_usd: 0.25,
+            },
+            reply,
+        })
+        .unwrap();
+    assert_eq!(rig.post(magnus(), "two", false).await, Response::Ok);
+
+    Rig::until_state(&mut notices, |s| *s == ThreadState::Idle).await;
+    assert_eq!(returned.await.unwrap(), Response::Ok);
+    assert_eq!(
+        rig.kinds(),
+        vec![
+            EventKind::UserMessage,
+            EventKind::AssistantMessage,
+            EventKind::UserMessage,
+            EventKind::TurnEnded,
+            EventKind::JobFinished, // before the next turn, not after it
+            EventKind::AssistantMessage,
+            EventKind::TurnEnded,
+        ]
+    );
+    let seen = rig.seen.lock().unwrap();
+    assert!(
+        texts(&seen[1])
+            .iter()
+            .any(|t| t.contains("the callers are listed")),
+        "the next turn's call carries the return: {:?}",
+        texts(&seen[1])
+    );
 }
 
 #[tokio::test]

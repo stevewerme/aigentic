@@ -49,9 +49,9 @@ pub struct Approved {
 }
 
 /// Run an approved job to its end and post its return on `front`. A job
-/// that cannot be started leaves a warning and writes nothing on the
-/// front; one whose return cannot be posted leaves its own log as the
-/// record.
+/// that fails once its thread exists posts a failed return saying why; one
+/// that fails before that, or whose return cannot be posted at all, leaves
+/// a warning on stderr.
 pub async fn start(threads: Arc<ThreadTable>, front: Ulid, approved: Approved) {
     if let Err(e) = run(&threads, front, approved).await {
         eprintln!("warn  job from thread {front}: {e}");
@@ -70,6 +70,23 @@ async fn run(
         .root_of_thread(front)
         .ok_or(ThreadError::NoThread(front))?;
     let child = threads.create_job(front, &project, &root, approved.by.clone())?;
+    // Past the masthead, a failure is the front's to hear: the person
+    // approved this job and is waiting on its return.
+    let result = run_job(threads, front, child, approved).await;
+    if let Err(e) = &result {
+        report_failure(threads, front, child, e).await;
+    }
+    result
+}
+
+/// Everything after the job's masthead: open both threads, seed the job,
+/// wait for its end and post its return.
+async fn run_job(
+    threads: &Arc<ThreadTable>,
+    front: Ulid,
+    child: Ulid,
+    approved: Approved,
+) -> Result<(), ThreadError> {
     let working = threads.runs().working();
     let _driven = Driven::new(working.clone(), child);
     let spec = JobSpec {
@@ -109,6 +126,35 @@ async fn run(
         other => Err(ThreadError::Refused(format!(
             "the return was not posted: {other:?}"
         ))),
+    }
+}
+
+/// Post a failed return for a job the driver could not run. The front's
+/// actor drops it when it already holds this job's return, so a failure
+/// in posting the real one never shows twice.
+async fn report_failure(threads: &Arc<ThreadTable>, front: Ulid, child: Ulid, error: &ThreadError) {
+    let payload = JobFinishedPayload {
+        job_thread: child,
+        outcome: JobOutcome::Failed,
+        summary: format!(
+            "The job could not be run: {}. Its thread {child} may hold nothing.",
+            clipped(&error.to_string())
+        ),
+        cost_usd: 0.0,
+    };
+    let opened = match threads.mailbox(front) {
+        Some(mailbox) => Some(mailbox),
+        None => threads.open(front).await.ok().map(|(mailbox, _)| {
+            threads.close(front);
+            mailbox
+        }),
+    };
+    let posted = match opened {
+        Some(mailbox) => send(&mailbox, |reply| Mail::JobFinished { payload, reply }).await,
+        None => None,
+    };
+    if posted != Some(Response::Ok) {
+        eprintln!("warn  job {child}: its failure was not posted on {front}: {posted:?}");
     }
 }
 
