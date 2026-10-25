@@ -370,6 +370,79 @@ fn last_turn_end(events: &[Event]) -> TurnEndedPayload {
     serde_json::from_value(ended.payload.clone()).unwrap()
 }
 
+/// A job the driver cannot run says so on the front thread: the person
+/// approved it and is waiting on its return. Here the front's log on disk
+/// is forked by a second writer while its actor holds the thread, so the
+/// driver's read of it fails after the job's masthead is written.
+#[tokio::test]
+async fn a_job_that_cannot_run_says_so_on_the_front() {
+    let rig = rig(Router::new(proposes_a_job(), vec![say(JOB_WORDS)]));
+    let (id, mailbox, mut notices) = front(&rig).await;
+    post(&mailbox, "Who calls parse_config?").await;
+    let parked = until(&mut notices, |n| {
+        matches!(
+            n,
+            Notice::State {
+                state: ThreadState::AwaitingSwitch { .. },
+                ..
+            }
+        )
+    })
+    .await;
+    let Notice::State {
+        state: ThreadState::AwaitingSwitch { call_id, .. },
+        ..
+    } = parked
+    else {
+        unreachable!()
+    };
+    let log = rig.threads.join(format!("{id}.jsonl"));
+    let first = std::fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .to_owned();
+    let mut forked = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+    std::io::Write::write_all(&mut forked, format!("{first}\n").as_bytes()).unwrap();
+
+    assert_eq!(
+        ask(&mailbox, |reply| Mail::AnswerSwitch {
+            by: steve(),
+            call_id,
+            answer: SwitchAnswer::Yes,
+            ctx: SwitchCtx::none(),
+            reply,
+        })
+        .await,
+        Response::Ok
+    );
+    let landed = until(
+        &mut notices,
+        |n| matches!(n, Notice::Event { event, .. } if event.kind == EventKind::JobFinished),
+    )
+    .await;
+    let Notice::Event { event, .. } = landed else {
+        unreachable!()
+    };
+    let payload: JobFinishedPayload = serde_json::from_value(event.payload).unwrap();
+    assert_eq!(payload.outcome, JobOutcome::Failed);
+    assert!(
+        payload.summary.starts_with("The job could not be run: "),
+        "{}",
+        payload.summary
+    );
+    let job = events(&rig.threads, payload.job_thread);
+    let started: ThreadStartedPayload = serde_json::from_value(job[0].payload.clone()).unwrap();
+    assert_eq!(
+        started.parent_thread,
+        Some(id),
+        "the return names this front's job"
+    );
+    let kinds: Vec<EventKind> = job.iter().map(|e| e.kind).collect();
+    assert_eq!(kinds, vec![EventKind::ThreadStarted], "the job never began");
+}
+
 #[tokio::test]
 async fn an_approved_job_runs_and_its_return_lands_once() {
     let rig = rig(Router::new(

@@ -645,6 +645,20 @@ impl ThreadActor {
         self
     }
 
+    /// Write the job returns that arrived while a turn ran.
+    fn write_queued_job_notes(&mut self) {
+        let notes = std::mem::take(
+            &mut *self
+                .shared
+                .job_notes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+        for (payload, reply) in notes {
+            self.write_job_note(payload, reply);
+        }
+    }
+
     /// Append a job's return through the runtime, and say how it went. A
     /// return this thread already holds for the same job is not written
     /// again: a driver and the start-up repair may both reach here.
@@ -1245,16 +1259,9 @@ impl ThreadActor {
                 .unwrap_or_else(|e| e.into_inner())
                 .take();
             next = self.after_turn(outcome, last_poster);
-        }
-        let notes = std::mem::take(
-            &mut *self
-                .shared
-                .job_notes
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()),
-        );
-        for (payload, reply) in notes {
-            self.write_job_note(payload, reply);
+            // At every turn boundary, not only when the queue empties: a
+            // front that keeps working would otherwise never see a return.
+            self.write_queued_job_notes();
         }
         *self
             .shared
