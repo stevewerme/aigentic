@@ -49,6 +49,10 @@ struct Router {
     /// The tool names each request offered: the front's, then the job's.
     tools: Arc<Mutex<Vec<Vec<String>>>>,
     job_tools: Arc<Mutex<Vec<Vec<String>>>>,
+    /// How many threads may still be built; `None` is no limit. A thread
+    /// built past it fails to build, as a job whose provider cannot be
+    /// made does.
+    builds: Arc<Mutex<Option<u32>>>,
 }
 
 impl Router {
@@ -58,7 +62,14 @@ impl Router {
             job: Arc::new(Mutex::new(job.into())),
             tools: Arc::new(Mutex::new(Vec::new())),
             job_tools: Arc::new(Mutex::new(Vec::new())),
+            builds: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// The same router, building only the first `n` threads.
+    fn building_only(self, n: u32) -> Self {
+        *self.builds.lock().unwrap() = Some(n);
+        self
     }
 }
 
@@ -109,6 +120,12 @@ impl Provider for Router {
 
 impl ProviderFactory for Router {
     fn build(&self, _: &str) -> Result<(Box<dyn Provider>, String), BuildError> {
+        if let Some(left) = self.builds.lock().unwrap().as_mut() {
+            if *left == 0 {
+                return Err(BuildError::Config("no provider for this thread".into()));
+            }
+            *left -= 1;
+        }
         Ok((Box::new(self.clone()), "router".into()))
     }
 }
@@ -371,12 +388,11 @@ fn last_turn_end(events: &[Event]) -> TurnEndedPayload {
 }
 
 /// A job the driver cannot run says so on the front thread: the person
-/// approved it and is waiting on its return. Here the front's log on disk
-/// is forked by a second writer while its actor holds the thread, so the
-/// driver's read of it fails after the job's masthead is written.
+/// approved it and is waiting on its return. Here the job's thread cannot
+/// be built once its masthead is written.
 #[tokio::test]
 async fn a_job_that_cannot_run_says_so_on_the_front() {
-    let rig = rig(Router::new(proposes_a_job(), vec![say(JOB_WORDS)]));
+    let rig = rig(Router::new(proposes_a_job(), vec![say(JOB_WORDS)]).building_only(1));
     let (id, mailbox, mut notices) = front(&rig).await;
     post(&mailbox, "Who calls parse_config?").await;
     let parked = until(&mut notices, |n| {
@@ -396,16 +412,6 @@ async fn a_job_that_cannot_run_says_so_on_the_front() {
     else {
         unreachable!()
     };
-    let log = rig.threads.join(format!("{id}.jsonl"));
-    let first = std::fs::read_to_string(&log)
-        .unwrap()
-        .lines()
-        .next()
-        .unwrap()
-        .to_owned();
-    let mut forked = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
-    std::io::Write::write_all(&mut forked, format!("{first}\n").as_bytes()).unwrap();
-
     assert_eq!(
         ask(&mailbox, |reply| Mail::AnswerSwitch {
             by: steve(),
@@ -428,7 +434,8 @@ async fn a_job_that_cannot_run_says_so_on_the_front() {
     let payload: JobFinishedPayload = serde_json::from_value(event.payload).unwrap();
     assert_eq!(payload.outcome, JobOutcome::Failed);
     assert!(
-        payload.summary.starts_with("The job could not be run: "),
+        payload.summary.starts_with("The job could not be run: ")
+            && payload.summary.contains("no provider for this thread"),
         "{}",
         payload.summary
     );
@@ -441,6 +448,7 @@ async fn a_job_that_cannot_run_says_so_on_the_front() {
     );
     let kinds: Vec<EventKind> = job.iter().map(|e| e.kind).collect();
     assert_eq!(kinds, vec![EventKind::ThreadStarted], "the job never began");
+    assert_eq!(returns(&events(&rig.threads, id)).len(), 1, "one return");
 }
 
 #[tokio::test]
