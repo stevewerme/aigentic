@@ -1779,23 +1779,29 @@ impl ThreadTable {
     ) -> Result<(Ulid, bool), ThreadError> {
         let _serial = self.build_lock.lock().await;
         let base = self.threads_base.clone();
+        // The lock, the run lookup and the world all key on the name this
+        // daemon lists the project by: a second `Build` sent as the leaf
+        // has to find the run its predecessor made, and two spellings of
+        // one project must not take two locks. Only `create` below keeps
+        // the asked name, so the log records what was asked.
+        let listed = self.listed(project);
         // Held until the lead exists and is claimed: another process's
         // `Build` for this issue then finds the lead instead of making
         // a second one. The lock names the project (issue #9), so two
         // projects' issue 7 do not wait on each other.
-        let _issue = IssueLock::take(&base, project, issue)
+        let _issue = IssueLock::take(&base, &listed, issue)
             .await
             .map_err(ThreadError::Refused)?;
-        if let Some(lead) = self.unfinished_run(project, issue)? {
+        if let Some(lead) = self.unfinished_run(&listed, issue)? {
             // The run continues where its lead's log is (issue #9): in
             // the flat base, or in a legacy subdirectory the migration
             // held back.
-            let world = self.run_world_for(project, lead)?;
+            let world = self.run_world_for(&listed, lead)?;
             self.claim_or_attach(lead, &world)?;
             return Ok((lead, true));
         }
         // A new run is written flat.
-        let world = self.run_world(project, base)?;
+        let world = self.run_world(&listed, base)?;
         // The workflow defaults to `build`, the name the acceptance uses
         // (issue #58, rule 4).
         let name = workflow.unwrap_or_else(|| DEFAULT_WORKFLOW.to_owned());

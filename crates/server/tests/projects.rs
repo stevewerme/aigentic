@@ -274,6 +274,26 @@ fn log_switched(base: &Path, folder: &str, id: Ulid, to: &str, root: &Path) {
     .unwrap();
 }
 
+/// Append a `run_started` to `id`'s log, which is what makes it a run's
+/// lead.
+fn log_run_started(base: &Path, folder: &str, id: Ulid, issue: u64) {
+    let mut log = ThreadLog::open(base.join(folder), id).unwrap();
+    log.append(NewEvent {
+        kind: EventKind::RunStarted,
+        author: Author::System,
+        payload: to_value(aigentic_runtime::aigentic_log::RunStartedPayload {
+            issue,
+            workflow: "build".into(),
+            version: 1,
+            content_hash: "x".into(),
+            budget_usd: 3.0,
+        })
+        .unwrap(),
+        parent_event: None,
+    })
+    .unwrap();
+}
+
 /// The listed project whose root is `root`, found the way the daemon's
 /// own `merge` leaves its list: by root.
 fn listed_at(server: &Arc<Server>, root: &Path) -> Option<String> {
@@ -1185,4 +1205,38 @@ async fn a_front_opened_by_a_leaf_name_is_filed_under_the_listed_name() {
         1,
         "one row per project: {rows:?}"
     );
+}
+
+/// A `Build` sent as a workspace project's leaf name finds the unfinished
+/// run that name's project already has, rather than starting a second one.
+#[tokio::test]
+async fn a_second_build_by_a_leaf_name_resumes_the_run_it_made() {
+    let dir = tempfile::tempdir().unwrap();
+    let web = project(dir.path(), "web", "");
+    let d = daemon(dir.path(), vec![], &[("getscale", vec![web.clone()])]).await;
+    let listed = listed_at(&d.server, &web).expect("the root is listed");
+
+    // A lead made earlier, by the leaf name its folder carries, and left
+    // unfinished: exactly what a first `Build` leaves behind.
+    let lead = log_started_at(&d.threads_base, "web", Some("web"), &web);
+    log_run_started(&d.threads_base, "web", lead, 7);
+
+    // Both spellings of the project find that one lead.
+    for asked in ["web", listed.as_str()] {
+        let (found, resumed) = d
+            .server
+            .threads
+            .build_run(asked, 7, None, Author::User(UserId("steve".into())))
+            .await
+            .unwrap_or_else(|e| panic!("a build by {asked}: {e:?}"));
+        assert_eq!(found, lead, "build by {asked} resumes the run it made");
+        assert!(resumed, "build by {asked} resumed rather than started");
+    }
+
+    let rows = d.server.threads.projects();
+    let (_, _, count) = rows
+        .iter()
+        .find(|(name, _, _)| *name == listed)
+        .expect("the row");
+    assert_eq!(*count, 1, "one thread under {listed}: {rows:?}");
 }
