@@ -72,9 +72,9 @@ pub enum LogError {
     /// waits. Nothing was written; the append can be tried again.
     #[error("{path}: another process is writing this thread's log")]
     Busy { path: PathBuf },
-    /// The file no longer continues what this handle read: it shrank, was
-    /// replaced, or holds events this handle's cache contradicts. Nothing
-    /// was written; reopen the log to see what it holds now.
+    /// The file no longer continues what this handle read: it shrank, or it
+    /// holds events this handle's cache contradicts. Nothing was written;
+    /// reopen the log to see what it holds now.
     #[error("{path}: the log changed under this handle")]
     Changed { path: PathBuf },
     #[error("could not generate a monotonic ulid")]
@@ -260,9 +260,10 @@ impl ThreadLog {
         &self.events
     }
 
-    /// Full-file read passes this log has made: one at a healthy open, two
-    /// when a torn tail was repaired, none for a path that did not exist.
-    /// The test seam for "the file is read only on open".
+    /// Full-file read passes this log has made: one at a healthy open, three
+    /// when a torn tail was repaired, none for a path that did not exist,
+    /// and one more for each catch-up an append makes. The test seam for
+    /// "the file is not read per call".
     pub fn file_reads(&self) -> u64 {
         self.file_reads
     }
