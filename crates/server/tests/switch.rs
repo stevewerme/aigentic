@@ -437,6 +437,9 @@ struct Rig {
     magnus: Client,
     seen: Seen,
     threads_base: PathBuf,
+    /// `p`'s name as the daemon lists it: `p` lives in a workspace and not
+    /// in `server.toml`, so it is qualified.
+    listed_p: String,
 }
 
 /// A daemon over `dir` with `p` and `q` in workspace `w1`, steve the
@@ -533,6 +536,7 @@ async fn rig(dir: &std::path::Path, script: Vec<Vec<ProviderEvent>>) -> Rig {
         magnus,
         seen,
         threads_base,
+        listed_p: aigentic_server::workspaces::qualified_name("w1", &p),
     }
 }
 
@@ -730,7 +734,10 @@ async fn t9_a_no_leaves_the_project_and_the_prefix_alone() {
     );
     until_idle(&mut notices).await;
 
-    assert_eq!(rig.server.threads.project_of(id).as_deref(), Some("p"));
+    assert_eq!(
+        rig.server.threads.project_of(id).as_deref(),
+        Some(rig.listed_p.as_str())
+    );
     let them = events_under(&rig.threads_base, id);
     assert!(
         !them.iter().any(|e| e.kind == EventKind::ProjectSwitched),
@@ -777,7 +784,10 @@ async fn t9_a_yes_without_write_in_the_target_is_refused_and_stays_pending() {
         matches!(refused, Response::Refused { .. }),
         "no write in q: {refused:?}"
     );
-    assert_eq!(rig.server.threads.project_of(id).as_deref(), Some("p"));
+    assert_eq!(
+        rig.server.threads.project_of(id).as_deref(),
+        Some(rig.listed_p.as_str())
+    );
     assert!(
         answers(&events_under(&rig.threads_base, id)).is_empty(),
         "the proposal is still open"
@@ -817,7 +827,10 @@ async fn t9_an_answer_while_idle_is_refused() {
         matches!(refused, Response::Refused { .. } | Response::Error { .. }),
         "nothing is pending: {refused:?}"
     );
-    assert_eq!(rig.server.threads.project_of(id).as_deref(), Some("p"));
+    assert_eq!(
+        rig.server.threads.project_of(id).as_deref(),
+        Some(rig.listed_p.as_str())
+    );
 }
 
 /// A provider whose first reply holds until the test lets go, so the turn
@@ -1086,7 +1099,10 @@ async fn t9_a_cancelled_turn_leaves_the_answer_refused_and_the_entry_alone() {
         matches!(refused, Response::Refused { .. }),
         "the turn left: {refused:?}"
     );
-    assert_eq!(rig.server.threads.project_of(id).as_deref(), Some("p"));
+    assert_eq!(
+        rig.server.threads.project_of(id).as_deref(),
+        Some(rig.listed_p.as_str())
+    );
     let them = events_under(&rig.threads_base, id);
     assert!(
         !them.iter().any(|e| e.kind == EventKind::ProjectSwitched),

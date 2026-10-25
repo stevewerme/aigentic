@@ -515,17 +515,26 @@ impl ThreadTable {
         Ok(built.ctx)
     }
 
+    /// `project` under the name this daemon lists it by: the listed name
+    /// when it, or a leaf only one project answers to, resolves to a
+    /// project; the string as given otherwise. A thread's index entry, a
+    /// listing and the model's block all name a project by this, so a
+    /// request sent as a bare leaf is filed and compared as the listed
+    /// name rather than as itself.
+    fn listed(&self, project: &str) -> String {
+        self.server
+            .project(project)
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| project.to_owned())
+    }
+
     /// Remember that the thread is in `project` now. The log's
     /// `project_switched` is the truth; this is the entry, so the next
     /// open does not rebuild the old project. The name is the one this
     /// daemon lists the project by, so a switch sent as a bare leaf shows
     /// under the project's listed name at once, before any scan.
     pub fn note_project(&self, thread: Ulid, project: &str) {
-        let project = self
-            .server
-            .project(project)
-            .map(|p| p.name.clone())
-            .unwrap_or_else(|| project.to_owned());
+        let project = self.listed(project);
         if let Some(e) = self
             .entries
             .lock()
@@ -980,7 +989,10 @@ impl ThreadTable {
             Some(project) => {
                 // The project has to be one this daemon knows, as before.
                 self.root_of(project)?;
-                ids.retain(|id| self.project_of(*id).as_deref() == Some(project));
+                // By the resolved name, not the asked one: a unique leaf
+                // lists the project's threads too.
+                let listed = self.listed(project);
+                ids.retain(|id| self.project_of(*id).as_deref() == Some(listed.as_str()));
                 ids.sort_unstable_by(|a, b| b.cmp(a));
                 // Which threads have an actor, read under the lock and
                 // dropped before any log is read.
@@ -1159,6 +1171,10 @@ impl ThreadTable {
         front: bool,
     ) -> Result<ThreadInfo, ThreadError> {
         let root = self.root_of(project)?;
+        // The log records the name it was asked for; the index and the
+        // summary carry the listed name, so the row counts it and a
+        // listing by either name finds it.
+        let listed = self.listed(project);
         std::fs::create_dir_all(&root.threads_dir).map_err(BuildError::from)?;
         let id = self.ids().next();
         // The creator, for the index and for the log (issue #81): only a
@@ -1186,7 +1202,7 @@ impl ThreadTable {
             id,
             Indexed {
                 dir: root.threads_dir.clone(),
-                home: Some(project.to_owned()),
+                home: Some(listed.clone()),
                 switched: None,
                 switched_root: None,
                 root: Some(root.root.clone()),
@@ -1196,7 +1212,7 @@ impl ThreadTable {
                 front,
             },
         );
-        Ok(summarise(&root.threads_dir, id, project))
+        Ok(summarise(&root.threads_dir, id, &listed))
     }
 
     /// Write `thread`'s `thread_started` into `root`'s threads directory,
@@ -1268,7 +1284,7 @@ impl ThreadTable {
             id,
             Indexed {
                 dir: root.threads_dir.clone(),
-                home: Some(project.to_owned()),
+                home: Some(self.listed(project)),
                 switched: None,
                 switched_root: None,
                 root: Some(root.root.clone()),
@@ -1821,9 +1837,10 @@ impl ThreadTable {
     /// lead is already a lead and this only refreshes its directory.
     fn note_lead(&self, thread: Ulid, issue: u64, dir: &Path, project: &str) {
         let mut index = self.index.lock().unwrap_or_else(|e| e.into_inner());
+        let listed = self.listed(project);
         let entry = index.entry(thread).or_insert_with(|| Indexed {
             dir: dir.to_path_buf(),
-            home: Some(project.to_owned()),
+            home: Some(listed.clone()),
             switched: None,
             switched_root: None,
             root: None,
@@ -1836,7 +1853,7 @@ impl ThreadTable {
         entry.dir = dir.to_path_buf();
         entry.run = RunThread::Lead { issue };
         if entry.home.is_none() {
-            entry.home = Some(project.to_owned());
+            entry.home = Some(listed);
         }
     }
 
