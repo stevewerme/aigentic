@@ -68,10 +68,15 @@ pub enum LogError {
         kind: EventKind,
         detail: String,
     },
-    /// Another process is appending to this log. Appending too would fork
-    /// it, so the append is refused.
+    /// Another process held this log's lock for longer than the append
+    /// waits. Nothing was written; the append can be tried again.
     #[error("{path}: another process is writing this thread's log")]
     Busy { path: PathBuf },
+    /// The file no longer continues what this handle read: it shrank, was
+    /// replaced, or holds events this handle's cache contradicts. Nothing
+    /// was written; reopen the log to see what it holds now.
+    #[error("{path}: the log changed under this handle")]
+    Changed { path: PathBuf },
     #[error("could not generate a monotonic ulid")]
     UlidOverflow,
 }
@@ -97,13 +102,17 @@ pub struct NewEvent {
     pub parent_event: Option<Ulid>,
 }
 
-/// The single writer for one thread's JSONL file.
+/// A writer for one thread's JSONL file.
 ///
-/// One turn at a time, one append at a time: hold one `ThreadLog` per thread
-/// and route every write through it. The events are kept in memory as they
-/// were read at open and as every append adds them, so [`read_all`] and
-/// [`events`] are cache reads: the file itself is read only at open (and
-/// again after a torn-tail repair), never per call.
+/// Hold one `ThreadLog` per thread and route every write through it. An
+/// append locks the file against other processes and first catches up on
+/// anything appended since this handle last looked, so a seq is never
+/// written twice. The events are kept in memory as they were read at open
+/// and as appends add them, so [`read_all`] and [`events`] are cache reads:
+/// the file is read at open, after a torn-tail repair, and when an append
+/// finds it grew, never per call. A file renamed or replaced under a live
+/// handle is not detected unless it shrank: the handle goes on writing
+/// where its lock is.
 ///
 /// [`read_all`]: ThreadLog::read_all
 /// [`events`]: ThreadLog::events
@@ -112,18 +121,22 @@ pub struct ThreadLog {
     thread_id: Ulid,
     path: PathBuf,
     next_seq: u64,
-    /// What the file held at open plus every append since, in order. The
-    /// store is the only writer, so this is the file.
+    /// What the file held at open, at the last catch-up, plus every append
+    /// since, in order.
     events: Vec<Event>,
-    /// Full-file passes this log has made: one at a healthy open, two when
-    /// a torn tail was repaired (the failed pass plus the re-read of the
-    /// truncated file), none for a path that did not exist.
+    /// Full-file passes this log has made: one at a healthy open, three
+    /// when a torn tail was repaired (the failed pass, the pass under the
+    /// lock and the re-read of the truncated file), none for a path that
+    /// did not exist, and one more for each catch-up an append makes.
     file_reads: u64,
     ids: Generator,
     /// The file this log appends through, locked against other processes
     /// for as long as any writer in this one holds it. Taken at the first
     /// append, so a log that only reads never locks.
     writer: Option<Arc<File>>,
+    /// The file's length as this handle last saw it. An append checks it
+    /// under the lock: another writer may have appended since.
+    file_len: u64,
 }
 
 impl ThreadLog {
@@ -145,29 +158,39 @@ impl ThreadLog {
         let path = dir.as_ref().join(format!("{thread_id}.jsonl"));
         let mut cut = None;
         let mut file_reads = 0u64;
+        let mut held = None;
         let events = if path.exists() {
             file_reads += 1;
             match read_file(&path, thread_id) {
                 Ok(events) => events,
-                Err(LogError::TruncatedTail { offset, .. })
-                    if repair == Repair::TruncateTornTail =>
-                {
+                Err(LogError::TruncatedTail { .. }) if repair == Repair::TruncateTornTail => {
                     let io = |source| LogError::Io {
                         path: path.clone(),
                         source,
                     };
-                    let len = std::fs::metadata(&path).map_err(io)?.len();
-                    OpenOptions::new()
-                        .write(true)
-                        .open(&path)
-                        .map_err(io)?
-                        .set_len(offset)
-                        .map_err(io)?;
-                    cut = Some(len - offset);
-                    // Re-read the file the repair left, so the cache and the
-                    // next `seq` are provably consistent with its bytes.
+                    // A repair is a write: under the lock, and against the
+                    // file as it is now, since a live writer may have
+                    // finished the line meanwhile.
+                    let file = writer(&path)?;
                     file_reads += 1;
-                    read_file(&path, thread_id)?
+                    match read_file(&path, thread_id) {
+                        Ok(events) => {
+                            held = Some(file);
+                            events
+                        }
+                        Err(LogError::TruncatedTail { offset, .. }) => {
+                            let len = std::fs::metadata(&path).map_err(io)?.len();
+                            file.set_len(offset).map_err(io)?;
+                            cut = Some(len - offset);
+                            held = Some(file);
+                            // Re-read the file the repair left, so the cache
+                            // and the next `seq` are provably consistent with
+                            // its bytes.
+                            file_reads += 1;
+                            read_file(&path, thread_id)?
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
                 Err(e) => return Err(e),
             }
@@ -175,6 +198,10 @@ impl ThreadLog {
             Vec::new()
         };
         let next_seq = events.len() as u64;
+        let file_len = match std::fs::metadata(&path) {
+            Ok(meta) => meta.len(),
+            Err(_) => 0,
+        };
         Ok((
             Self {
                 thread_id,
@@ -183,7 +210,8 @@ impl ThreadLog {
                 events,
                 file_reads,
                 ids: Generator::new(),
-                writer: None,
+                writer: held,
+                file_len,
             },
             cut,
         ))
@@ -225,9 +253,9 @@ impl ThreadLog {
         self.next_seq == 0
     }
 
-    /// The events the log holds: the file as it was read at open plus every
-    /// append since, oldest first. The store is the single writer, so this
-    /// is the file; it is never re-read.
+    /// The events the log holds: the file as this handle last read it plus
+    /// its appends since, oldest first. Another writer's appends show only
+    /// after this handle's next append, or a reopen.
     pub fn events(&self) -> &[Event] {
         &self.events
     }
@@ -242,6 +270,12 @@ impl ThreadLog {
     /// Append one event and return it as stored. The line is flushed and
     /// synced before this returns.
     pub fn append(&mut self, new: NewEvent) -> Result<Event, LogError> {
+        // Lock first, then learn what the file holds now: the seq is chosen
+        // from the file, not from what this handle saw last.
+        if self.writer.is_none() {
+            self.writer = Some(writer(&self.path)?);
+        }
+        self.catch_up()?;
         let event = Event {
             id: self.ids.generate().map_err(|_| LogError::UlidOverflow)?,
             thread_id: self.thread_id,
@@ -259,12 +293,10 @@ impl ThreadLog {
             path: self.path.clone(),
             source,
         };
-        if self.writer.is_none() {
-            self.writer = Some(writer(&self.path)?);
-        }
         let mut file: &File = self.writer.as_deref().expect("opened above");
         file.write_all(&line).map_err(io)?;
         file.sync_data().map_err(io)?;
+        self.file_len += line.len() as u64;
 
         // The cache is mutated only after the write succeeded: a failed
         // append never dirties it.
@@ -273,9 +305,42 @@ impl ThreadLog {
         Ok(event)
     }
 
-    /// The events this log holds, owned: the same as [`events`]. The file
-    /// is not re-read — it was read once at open, and every append since
-    /// went through this struct, its single writer.
+    /// Bring the cache up to the file under the lock. Events another writer
+    /// appended since this handle last looked are adopted when they extend
+    /// the cache; a file that shrank or contradicts it is refused.
+    fn catch_up(&mut self) -> Result<(), LogError> {
+        let io = |source| LogError::Io {
+            path: self.path.clone(),
+            source,
+        };
+        let now = std::fs::metadata(&self.path).map_err(io)?.len();
+        if now == self.file_len {
+            return Ok(());
+        }
+        let changed = || LogError::Changed {
+            path: self.path.clone(),
+        };
+        if now < self.file_len {
+            return Err(changed());
+        }
+        self.file_reads += 1;
+        let events = read_file(&self.path, self.thread_id)?;
+        let extends = events.len() >= self.events.len()
+            && events
+                .iter()
+                .zip(&self.events)
+                .all(|(file, cached)| file.id == cached.id);
+        if !extends {
+            return Err(changed());
+        }
+        self.next_seq = events.len() as u64;
+        self.events = events;
+        self.file_len = now;
+        Ok(())
+    }
+
+    /// The events this log holds, owned: the same as [`events`], with no
+    /// read of the file.
     ///
     /// [`events`]: ThreadLog::events
     pub fn read_all(&self) -> Result<Vec<Event>, LogError> {
@@ -285,8 +350,9 @@ impl ThreadLog {
 
 /// The logs this process appends to, by device and inode, each locked
 /// once against other processes. Handles in this process share the lock,
-/// whatever path they reached the file by: the runner keeps two on one
-/// lead while it rebuilds, and they never append at once.
+/// whatever path they reached the file by (the runner keeps two on one
+/// lead while it rebuilds); each catches up on the file before it appends,
+/// so their turns interleave without a seq clash.
 const LOCK_TRIES: u32 = 50;
 const LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(10);
 
@@ -321,8 +387,11 @@ fn writer(path: &Path) -> Result<Arc<File>, LogError> {
         return Ok(shared);
     }
     // A child forked by another thread holds every open file until it
-    // execs, so a lock this process just let go can read as held for a
-    // moment. A real writer holds it far longer than these retries.
+    // execs, so a lock this process just let go can read as held for a few
+    // milliseconds. The retries wait that out, and a short-lived writer in
+    // another process too, which is safe since the append catches up on
+    // what it wrote. This sleeps the calling thread: up to half a second,
+    // and only while another process holds the log.
     let mut tries = 0;
     loop {
         match file.try_lock() {
@@ -498,6 +567,84 @@ mod tests {
             .map(|e| e.seq)
             .collect();
         assert_eq!(seqs, vec![0, 1]);
+    }
+
+    /// A handle that did not see another writer's appends catches up
+    /// before it appends, so the seq it writes is the file's next one, not
+    /// its own stale count.
+    #[test]
+    fn a_stale_handle_catches_up_before_it_appends() {
+        let dir = tempfile::tempdir().unwrap();
+        let thread = Ulid::generate();
+        let mut stale = ThreadLog::open(dir.path(), thread).unwrap();
+        let mut other = ThreadLog::open(dir.path(), thread).unwrap();
+        other.append(user("one")).unwrap();
+        drop(other);
+
+        let appended = stale.append(user("two")).unwrap();
+        assert_eq!(appended.seq, 1);
+        assert_eq!(stale.len(), 2);
+        let seqs: Vec<u64> = ThreadLog::open(dir.path(), thread)
+            .unwrap()
+            .events()
+            .iter()
+            .map(|e| e.seq)
+            .collect();
+        assert_eq!(seqs, vec![0, 1]);
+    }
+
+    /// A file that no longer continues what the handle read is refused, and
+    /// nothing is written to it.
+    #[test]
+    fn a_log_that_shrank_under_its_handle_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let thread = Ulid::generate();
+        let mut log = ThreadLog::open(dir.path(), thread).unwrap();
+        log.append(user("one")).unwrap();
+        log.append(user("two")).unwrap();
+        let path = log.path().to_path_buf();
+        let first = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .to_owned();
+        std::fs::write(&path, format!("{first}\n")).unwrap();
+
+        assert!(matches!(
+            log.append(user("three")),
+            Err(LogError::Changed { .. })
+        ));
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 1);
+    }
+
+    /// A torn tail is repaired only under the lock: while another process
+    /// holds the log, the repair is refused and the file is left as it is.
+    #[test]
+    fn a_torn_tail_is_not_cut_while_another_process_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let thread = Ulid::generate();
+        let mut log = ThreadLog::open(dir.path(), thread).unwrap();
+        log.append(user("one")).unwrap();
+        let path = log.path().to_path_buf();
+        drop(log);
+        let mut torn = OpenOptions::new().append(true).open(&path).unwrap();
+        torn.write_all(b"{\"half").unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        let other = File::open(&path).unwrap();
+        other.try_lock().unwrap();
+        assert!(matches!(
+            ThreadLog::open_with(dir.path(), thread, Repair::TruncateTornTail),
+            Err(LogError::Busy { .. })
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), before, "nothing was cut");
+
+        drop(other);
+        let (log, cut) =
+            ThreadLog::open_with(dir.path(), thread, Repair::TruncateTornTail).unwrap();
+        assert_eq!(cut, Some(6));
+        assert_eq!(log.len(), 1);
     }
 
     #[test]
