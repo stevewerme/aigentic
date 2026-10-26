@@ -707,6 +707,77 @@ async fn t9_a_proposal_reaches_the_client_and_a_yes_switches_the_project() {
     assert_eq!(rig.server.threads.project_of(id).as_deref(), Some("q"));
 }
 
+/// A yes to a background job is a yes, not a refusal: the job starts and
+/// the front stays where it is, so no project's context is built for it.
+#[tokio::test]
+async fn a_yes_to_a_job_proposal_is_answered_ok_and_moves_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rig = rig(
+        dir.path(),
+        vec![vec![
+            ProviderEvent::ToolCall(ToolCall {
+                id: "j1".into(),
+                name: "start_job".into(),
+                args: json!({"task": "list the callers", "brief": "Find every caller."}),
+            }),
+            tool_use(),
+        ]],
+    )
+    .await;
+    let (id, mut notices) = thread_in_p(&mut rig).await;
+    assert_eq!(
+        rig.steve
+            .request(Request::Post {
+                thread: id,
+                blocks: vec![ContentBlock::Text("hi".into())],
+                interrupt: false,
+            })
+            .await
+            .unwrap(),
+        Response::Ok
+    );
+    let notice = until_notice(&mut notices, |n| {
+        matches!(
+            n,
+            Notice::State {
+                state: ThreadState::AwaitingSwitch { .. },
+                ..
+            }
+        )
+    })
+    .await;
+    let Notice::State {
+        state: ThreadState::AwaitingSwitch { call_id, job, .. },
+        ..
+    } = notice
+    else {
+        unreachable!()
+    };
+    assert!(job.is_some(), "a job's wait");
+
+    assert_eq!(
+        rig.steve
+            .request(Request::AnswerSwitch {
+                thread: id,
+                call_id,
+                answer: SwitchReply::Yes,
+            })
+            .await
+            .unwrap(),
+        Response::Ok
+    );
+    assert_eq!(
+        rig.server.threads.project_of(id).as_deref(),
+        Some(rig.listed_p.as_str()),
+        "the front stays in its project"
+    );
+    let kinds: Vec<EventKind> = events_under(&rig.threads_base, id)
+        .iter()
+        .map(|e| e.kind)
+        .collect();
+    assert!(!kinds.contains(&EventKind::ProjectSwitched), "{kinds:?}");
+}
+
 #[tokio::test]
 async fn t9_a_no_leaves_the_project_and_the_prefix_alone() {
     let dir = tempfile::tempdir().unwrap();

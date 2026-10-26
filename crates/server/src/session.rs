@@ -928,7 +928,8 @@ async fn handle(
             let mut target = None;
             let (answer, ctx) = match answer {
                 SwitchReply::Yes => {
-                    let Some(project) = threads.waiting_switch(thread, &call_id).await else {
+                    let Some((project, job)) = threads.waiting_switch(thread, &call_id).await
+                    else {
                         return Response::Refused {
                             reason: format!("nothing is pending for call {call_id}"),
                         };
@@ -948,14 +949,20 @@ async fn handle(
                             reason: format!("in {project}: {}", denied.reason),
                         };
                     }
-                    match threads.build_target(thread, &project).await {
-                        Ok(ctx) => {
-                            let (ctx, rx) = SwitchCtx::oneshot(ctx);
-                            ack = Some(rx);
-                            target = Some(project);
-                            (SwitchAnswer::Yes, ctx)
+                    // A job runs where the front is: nothing to build, and
+                    // nothing to wait for but the actor's own answer.
+                    if job {
+                        (SwitchAnswer::Yes, SwitchCtx::none())
+                    } else {
+                        match threads.build_target(thread, &project).await {
+                            Ok(ctx) => {
+                                let (ctx, rx) = SwitchCtx::oneshot(ctx);
+                                ack = Some(rx);
+                                target = Some(project);
+                                (SwitchAnswer::Yes, ctx)
+                            }
+                            Err(e) => return thread_error(e),
                         }
-                        Err(e) => return thread_error(e),
                     }
                 }
                 SwitchReply::No => (SwitchAnswer::No, SwitchCtx::none()),
