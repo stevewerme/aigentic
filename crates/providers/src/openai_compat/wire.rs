@@ -189,6 +189,40 @@ pub fn to_wire(context: &[Message]) -> Vec<WireMessage> {
     out
 }
 
+/// `wire` with every system message first and only one: the leading run
+/// joined into one, and a system message later in the conversation sent
+/// as a user message where it stands. Some chat templates (Qwen's on
+/// TensorX) refuse a request with a system message anywhere but first.
+pub fn single_system(wire: Vec<WireMessage>) -> Vec<WireMessage> {
+    let leading = wire
+        .iter()
+        .take_while(|m| matches!(m, WireMessage::System { .. }))
+        .count();
+    let mut out = Vec::with_capacity(wire.len());
+    let mut rest = wire.into_iter();
+    let joined: Vec<String> = rest
+        .by_ref()
+        .take(leading)
+        .filter_map(|m| match m {
+            WireMessage::System { content } => Some(content),
+            _ => None,
+        })
+        .collect();
+    if !joined.is_empty() {
+        out.push(WireMessage::System {
+            content: joined.join("\n\n"),
+        });
+    }
+    out.extend(rest.map(|m| match m {
+        WireMessage::System { content } => WireMessage::User {
+            content: UserContent::Text(content),
+            name: None,
+        },
+        other => other,
+    }));
+    out
+}
+
 fn parse_data_url(url: &str) -> Option<Image> {
     let rest = url.strip_prefix("data:")?;
     let (media_type, data) = rest.split_once(";base64,")?;
@@ -267,6 +301,49 @@ mod tests {
     use super::*;
     use aigentic_core::ToolResult;
     use serde_json::json;
+
+    fn sys(text: &str) -> Message {
+        Message {
+            role: Role::System,
+            author: Author::System,
+            blocks: vec![ContentBlock::Text(text.into())],
+        }
+    }
+
+    fn said(text: &str) -> Message {
+        Message {
+            role: Role::User,
+            author: Author::User(UserId("steve".into())),
+            blocks: vec![ContentBlock::Text(text.into())],
+        }
+    }
+
+    /// A strict template takes one system message, first. The leading run
+    /// becomes that one, in order; a later system message keeps its place
+    /// and its text as a user message; nothing else changes.
+    #[test]
+    fn single_system_sends_one_system_message_first() {
+        let ctx = vec![
+            sys("global"),
+            sys("project"),
+            said("hi"),
+            sys("a reminder"),
+            said("go on"),
+        ];
+        let wire = serde_json::to_value(single_system(to_wire(&ctx))).unwrap();
+        assert_eq!(
+            wire,
+            json!([
+                {"role": "system", "content": "global\n\nproject"},
+                {"role": "user", "content": "hi", "name": "steve"},
+                {"role": "user", "content": "a reminder"},
+                {"role": "user", "content": "go on", "name": "steve"},
+            ])
+        );
+
+        let none = vec![said("hi")];
+        assert_eq!(single_system(to_wire(&none)), to_wire(&none));
+    }
 
     fn sample() -> Vec<Message> {
         vec![
