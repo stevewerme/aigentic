@@ -560,12 +560,12 @@ impl ThreadTable {
         }
     }
 
-    /// The project a live `suggest_project` proposal names, when one
-    /// waits on `call_id` (issue #7): what a `yes` needs before it can
-    /// build the target's context and check the role there. `None` when
-    /// nothing is pending — the turn has moved on, or another client
-    /// answered first.
-    pub async fn waiting_switch(&self, thread: Ulid, call_id: &str) -> Option<String> {
+    /// The project a live proposal names when one waits on `call_id`,
+    /// and whether it is a `start_job` proposal: what a `yes` needs to
+    /// check the role there and, for a switch, build the target's
+    /// context. `None` when nothing is pending — the turn has moved on, or
+    /// another client answered first.
+    pub async fn waiting_switch(&self, thread: Ulid, call_id: &str) -> Option<(String, bool)> {
         let mailbox = self.mailbox(thread)?;
         let (reply, rx) = oneshot::channel();
         mailbox.send(Mail::Status { reply }).ok()?;
@@ -573,8 +573,9 @@ impl ThreadTable {
             ThreadState::AwaitingSwitch {
                 call_id: waiting,
                 project,
+                job,
                 ..
-            } if waiting == call_id => Some(project),
+            } if waiting == call_id => Some((project, job.is_some())),
             _ => None,
         }
     }
