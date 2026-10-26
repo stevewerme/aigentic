@@ -206,6 +206,9 @@ pub fn default_bash_allow() -> Vec<String> {
         "find",
         "wc",
         "which",
+        // Where a command lives, like `which`; `command` running one is
+        // not this pattern and still asks.
+        "command -v",
         "sort",
         "uniq",
         "diff",

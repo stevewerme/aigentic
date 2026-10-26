@@ -2477,6 +2477,18 @@ mod tests {
             .map(|w| w.join(" "))
     }
 
+    /// `command -v` looks a command up and runs nothing, so a probe for a
+    /// tool reads as `which` does; `command` running one still asks.
+    #[test]
+    fn command_v_is_a_lookup_and_command_running_one_is_not() {
+        assert!(allows("command -v rg"));
+        assert!(allows("command -v rg || echo absent"));
+        assert!(allows("command -v git && git rev-parse --show-toplevel"));
+        assert!(!allows("command rm -rf target"));
+        assert!(!allows("command -p rm -rf target"));
+        assert!(!allows("command -v rg; rm -rf target"));
+    }
+
     /// `scan` is the parts, not the verdict: the words of every segment
     /// in order, so a caller can recognise an exact command. The kinds
     /// are the same ones the whole line's verdict folds.
