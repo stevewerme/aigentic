@@ -73,6 +73,11 @@ pub struct Profile {
     /// `reasoning_effort` (issue #44).
     #[serde(default)]
     pub reasoning_effort_param: Option<String>,
+    /// `openai_compat` only: send one system message, first, for an
+    /// endpoint whose chat template refuses any other shape (Qwen on
+    /// TensorX). Default false.
+    #[serde(default)]
+    pub single_system: Option<bool>,
     /// `anthropic` only: emit cache breakpoints (default true).
     #[serde(default)]
     pub cache: Option<bool>,
@@ -258,6 +263,7 @@ pub const PROFILE_KEYS: &[&str] = &[
     "max_output_tokens",
     "reasoning_effort",
     "reasoning_effort_param",
+    "single_system",
     "cache",
     "compaction",
     "budget",
@@ -309,6 +315,7 @@ api_key_env = "TENSORX_API_KEY"
 # An integer 1-100 or "low"/"medium"/"high"; absent sends nothing.
 # reasoning_effort = 50
 # reasoning_effort_param = "reasoning_effort"
+# single_system = true             # one system message, first (Qwen)
 
 [profiles.anthropic]
 provider = "anthropic"
@@ -412,6 +419,7 @@ fn parse_config(text: &str) -> Result<Config, ConfigError> {
                     max_output_tokens: None,
                     reasoning_effort: None,
                     reasoning_effort_param: None,
+                    single_system: None,
                     cache: None,
                     compaction: None,
                     budget: None,
@@ -710,7 +718,8 @@ impl Profile {
     ) -> OpenAiCompatConfig {
         let mut c = OpenAiCompatConfig::new(self.base_url.clone().unwrap_or_default(), &self.model)
             .with_api_key(api_key)
-            .with_retry(retry);
+            .with_retry(retry)
+            .with_single_system(self.single_system.unwrap_or(false));
         if let Some(n) = self.max_context_tokens {
             c = c.with_max_context_tokens(n);
         }
@@ -1057,6 +1066,26 @@ retry_window_secs = 600
         );
         assert_eq!(b.reasoning_effort_param.as_deref(), Some("deepseek_effort"));
         assert_eq!(b.effort_label(), Some("high".to_owned()));
+    }
+
+    /// `single_system` reaches the adapter's config, and is off when the
+    /// profile does not set it.
+    #[test]
+    fn single_system_is_a_profile_key_off_by_default() {
+        let c = Config::parse(
+            "default_profile = \"d\"\n[profiles.q]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\nsingle_system = true\n[profiles.d]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n",
+        )
+        .unwrap();
+        let (_, q) = c.select(Some("q")).unwrap();
+        let (_, d) = c.select(Some("d")).unwrap();
+        assert!(
+            q.openai_config("k".into(), None, q.retry_policy())
+                .single_system
+        );
+        assert!(
+            !d.openai_config("k".into(), None, d.retry_policy())
+                .single_system
+        );
     }
 
     /// The pin `profiles_parse_select_and_build` held before issue #37:

@@ -15,7 +15,7 @@ use futures_core::Stream;
 use serde::{Deserialize, Serialize};
 
 pub use stream::{Translator, parse_stream};
-pub use wire::{WireMessage, from_wire, to_wire};
+pub use wire::{WireMessage, from_wire, single_system, to_wire};
 
 /// Name stamped on `ProviderBlob`s this adapter produces; only blobs with
 /// this name are replayed.
@@ -66,6 +66,9 @@ pub struct OpenAiCompatConfig {
     /// How long a call that fails before any content keeps retrying
     /// (issue #90).
     pub retry: crate::RetryPolicy,
+    /// Send one system message, first: see [`single_system`]. For an
+    /// endpoint whose chat template refuses any other shape.
+    pub single_system: bool,
 }
 
 /// The param name an endpoint expects when the config names none.
@@ -82,6 +85,7 @@ impl OpenAiCompatConfig {
             stall: crate::STALL,
             reasoning_effort: None,
             retry: crate::RetryPolicy::default(),
+            single_system: false,
         }
     }
 
@@ -123,6 +127,12 @@ impl OpenAiCompatConfig {
         self
     }
 
+    /// Send one system message, first, on every request.
+    pub fn with_single_system(mut self, single: bool) -> Self {
+        self.single_system = single;
+        self
+    }
+
     pub fn with_images(mut self, supported: bool) -> Self {
         self.supports_images = supported;
         self
@@ -154,7 +164,11 @@ impl OpenAiCompat {
     pub fn build_request(&self, request: &CompletionRequest<'_>) -> ChatRequest {
         ChatRequest {
             model: self.config.model.clone(),
-            messages: to_wire(request.messages),
+            messages: if self.config.single_system {
+                single_system(to_wire(request.messages))
+            } else {
+                to_wire(request.messages)
+            },
             tools: request
                 .tools
                 .iter()
@@ -457,6 +471,42 @@ mod tests {
         assert_eq!(
             dumped[REASONING_EFFORT_PARAM],
             serde_json::to_value(ReasoningEffort::Label(EFFORT.into())).unwrap()
+        );
+    }
+
+    /// The body keeps every system message as the context has it unless
+    /// the config asks for one, so a profile that does not set it sends
+    /// exactly what it sent before.
+    #[test]
+    fn only_a_single_system_config_merges_system_messages() {
+        let system = |text: &str| Message {
+            role: aigentic_core::Role::System,
+            author: aigentic_core::Author::System,
+            blocks: vec![aigentic_core::ContentBlock::Text(text.into())],
+        };
+        let messages = [system("one"), system("two")];
+        let request = CompletionRequest {
+            messages: &messages,
+            tools: &[],
+            max_output_tokens: None,
+        };
+        let roles = |config: OpenAiCompatConfig| {
+            let body =
+                serde_json::to_value(OpenAiCompat::new(config).build_request(&request)).unwrap();
+            body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["role"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            roles(OpenAiCompatConfig::new("http://x/v1", "m")),
+            ["system", "system"]
+        );
+        assert_eq!(
+            roles(OpenAiCompatConfig::new("http://x/v1", "m").with_single_system(true)),
+            ["system"]
         );
     }
 
