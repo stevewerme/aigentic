@@ -919,11 +919,11 @@ async fn handle(
             call_id,
             answer,
         } => {
-            // A `yes` needs the target's context built here, before the
-            // answer reaches the actor, so the proposal's project is
-            // read from the actor's state first (issue #7). The role in
-            // the target is the one a `SwitchProject` needs, and the
-            // refusal text is the same.
+            // A `yes` to a `suggest_project` needs the target's context
+            // built here, before the answer reaches the actor, so the
+            // proposal's project is read from the actor's state first.
+            // The role in that project is the one a `SwitchProject` needs,
+            // and the refusal text is the same.
             let mut ack = None;
             let mut target = None;
             let (answer, ctx) = match answer {
