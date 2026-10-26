@@ -776,6 +776,142 @@ async fn a_yes_to_a_job_proposal_is_answered_ok_and_moves_nothing() {
         .map(|e| e.kind)
         .collect();
     assert!(!kinds.contains(&EventKind::ProjectSwitched), "{kinds:?}");
+
+    // The job itself starts, in the front's project, with the brief.
+    let brief = wait_for_job_brief(&rig.threads_base, id).await;
+    assert!(brief.contains("Find every caller."), "{brief}");
+}
+
+/// A person who may only read where a job would run is refused its yes,
+/// and nothing starts.
+#[tokio::test]
+async fn a_readers_yes_to_a_job_proposal_is_refused_and_starts_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rig = rig(
+        dir.path(),
+        vec![vec![
+            ProviderEvent::ToolCall(ToolCall {
+                id: "j1".into(),
+                name: "start_job".into(),
+                args: json!({"task": "list the callers", "brief": "Find every caller."}),
+            }),
+            tool_use(),
+        ]],
+    )
+    .await;
+    let created = rig
+        .steve
+        .request(Request::CreateThread {
+            project: "q".into(),
+        })
+        .await
+        .unwrap();
+    let Response::Thread { thread } = created else {
+        panic!("a thread: {created:?}")
+    };
+    let id = thread.id;
+    for client in [&mut rig.steve, &mut rig.magnus] {
+        assert!(matches!(
+            client
+                .request(Request::Open {
+                    thread: id,
+                    from_seq: 0
+                })
+                .await
+                .unwrap(),
+            Response::Opened { .. }
+        ));
+    }
+    let mut notices = rig.steve.take_notices().unwrap();
+    assert_eq!(
+        rig.steve
+            .request(Request::Post {
+                thread: id,
+                blocks: vec![ContentBlock::Text("hi".into())],
+                interrupt: false,
+            })
+            .await
+            .unwrap(),
+        Response::Ok
+    );
+    let notice = until_notice(&mut notices, |n| {
+        matches!(
+            n,
+            Notice::State {
+                state: ThreadState::AwaitingSwitch { .. },
+                ..
+            }
+        )
+    })
+    .await;
+    let Notice::State {
+        state: ThreadState::AwaitingSwitch { call_id, .. },
+        ..
+    } = notice
+    else {
+        unreachable!()
+    };
+
+    let answered = rig
+        .magnus
+        .request(Request::AnswerSwitch {
+            thread: id,
+            call_id: call_id.clone(),
+            answer: SwitchReply::Yes,
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(&answered, Response::Refused { reason } if reason.contains("needs write")),
+        "{answered:?}"
+    );
+    assert!(
+        job_threads_of(&rig.threads_base, id).is_empty(),
+        "no job started"
+    );
+    assert!(
+        rig.server
+            .threads
+            .waiting_switch(id, &call_id)
+            .await
+            .is_some(),
+        "the proposal is still open"
+    );
+}
+
+/// The job threads whose masthead names `front` as their parent.
+fn job_threads_of(base: &std::path::Path, front: Ulid) -> Vec<Ulid> {
+    std::fs::read_dir(base)
+        .unwrap()
+        .filter_map(|entry| {
+            let name = entry.ok()?.file_name().into_string().ok()?;
+            name.strip_suffix(".jsonl")?.parse::<Ulid>().ok()
+        })
+        .filter(|id| {
+            events_under(base, *id).first().is_some_and(|started| {
+                started.kind == EventKind::ThreadStarted
+                    && started.payload["job"] == json!(true)
+                    && started.payload["parent_thread"] == json!(front.to_string())
+            })
+        })
+        .collect()
+}
+
+/// The brief of `front`'s first job, once its thread has one.
+async fn wait_for_job_brief(base: &std::path::Path, front: Ulid) -> String {
+    for _ in 0..400 {
+        if let Some(job) = job_threads_of(base, front).first() {
+            let brief = events_under(base, *job)
+                .iter()
+                .find(|e| e.kind == EventKind::UserMessage)
+                .map(|e| e.payload.to_string());
+            if let Some(brief) = brief {
+                return brief;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("no job started from {front}");
 }
 
 #[tokio::test]
